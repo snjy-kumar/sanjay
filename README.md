@@ -47,6 +47,23 @@ For background development server management (used by agents), see
 └── AGENT_POST_GUIDELINES.md  # Post format/template — read before writing posts
 ```
 
+## Deployment (GitHub Actions → GitHub Pages)
+
+On every push to `main`, [`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml):
+
+1. checks out the repo, installs deps (`npm ci`, Node 22), runs `npm run build`;
+2. uploads `dist/` — a **plain static HTML/CSS/JS site**, exactly what a static
+   host serves (no server-side runtime);
+3. publishes it to GitHub Pages via `actions/deploy-pages`.
+
+The site lives at **`https://snjy-kumar.github.io/sanjay/`** — a project page,
+so `base: '/sanjay'` is set in `astro.config.mjs` and all internal links go
+through `withBase()` (`src/utils/base.ts`). Never hardcode root-absolute paths.
+
+Pages source must be set to **GitHub Actions** (Settings → Pages → Source).
+Check runs under the `github-pages` environment; the run log shows the final
+URL. Preview any build locally with `npm run preview`.
+
 ## Writing posts
 
 1. Read [AGENT_POST_GUIDELINES.md](./AGENT_POST_GUIDELINES.md) — it defines the
