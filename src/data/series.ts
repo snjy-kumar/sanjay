@@ -109,7 +109,7 @@ export const series: Series[] = [
       { date: '2026-11-28', dateShort: '28 Nov', title: 'FormData', slug: '28', published: false },
       { date: '2026-11-29', dateShort: '29 Nov', title: 'URLSearchParams', slug: '29', published: false },
       { date: '2026-11-30', dateShort: '30 Nov', title: 'CustomEvent and honest JS in a portfolio snippet', slug: '30', published: false },
-      { date: '2026-12-01', dateShort: '1 Dec', title: 'JavaScript: 30 Wrong vs Right Cards', published: false },
+      { date: '2026-12-01', dateShort: '1 Dec', title: 'JavaScript: 30 Wrong vs Right Cards', slug: '31', published: false },
     ],
   }),
 ];
