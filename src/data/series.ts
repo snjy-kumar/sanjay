@@ -61,7 +61,7 @@ export const series: Series[] = [
       { date: '2026-10-17', dateShort: '17 Oct', title: 'Missing/unstable list keys', slug: '03', published: false },
       { date: '2026-10-18', dateShort: '18 Oct', title: 'Lifting state too high too early', slug: '04', published: false },
       { date: '2026-10-19', dateShort: '19 Oct', title: 'Controlled inputs done wrong (fighting the DOM)', slug: '05', published: false },
-      { date: '2026-10-20', dateShort: '20 Oct', title: 'Stale closures in handlers/effects', published: false },
+      { date: '2026-10-20', dateShort: '20 Oct', title: 'Stale closures in handlers/effects', slug: '06', published: false },
       { date: '2026-10-21', dateShort: '21 Oct', title: 'Breaking rules of hooks / conditional hooks', published: false },
       { date: '2026-10-22', dateShort: '22 Oct', title: 'useMemo/useCallback cargo cult', published: false },
       { date: '2026-10-23', dateShort: '23 Oct', title: 'Context for every prop', published: false },
