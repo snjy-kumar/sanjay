@@ -93,7 +93,7 @@ export const series: Series[] = [
       { date: '2026-11-12', dateShort: '12 Nov', title: 'Prototypes vs classes', slug: '12', published: false },
       { date: '2026-11-13', dateShort: '13 Nov', title: 'Async vs await error handling', slug: '13', published: false },
       { date: '2026-11-14', dateShort: '14 Nov', title: 'Promise.all vs Promise.allSettled', slug: '14', published: false },
-      { date: '2026-11-15', dateShort: '15 Nov', title: 'Event loop misconceptions', published: false },
+      { date: '2026-11-15', dateShort: '15 Nov', title: 'Event loop misconceptions', slug: '15', published: false },
       { date: '2026-11-16', dateShort: '16 Nov', title: 'Debouncing', published: false },
       { date: '2026-11-17', dateShort: '17 Nov', title: 'Module vs script', published: false },
       { date: '2026-11-18', dateShort: '18 Nov', title: 'Destructuring defaults', published: false },
