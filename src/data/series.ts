@@ -44,7 +44,7 @@ export const series: Series[] = [
       { date: '2026-10-05', dateShort: '5 Oct', title: 'Generics I actually use', slug: '09', published: true },
       { date: '2026-10-06', dateShort: '6 Oct', title: 'Partial / Pick / Omit', slug: '10', published: true },
       { date: '2026-10-07', dateShort: '7 Oct', title: 'Discriminated unions (advanced)', slug: '11', published: true },
-      { date: '2026-10-08', dateShort: '8 Oct', title: 'unknown + validation (advanced)', published: false },
+      { date: '2026-10-08', dateShort: '8 Oct', title: 'unknown + validation (advanced)', slug: '12', published: true },
       { date: '2026-10-09', dateShort: '9 Oct', title: 'Mapped types / strict config objects (advanced)', published: false },
       { date: '2026-10-10', dateShort: '10 Oct', title: 'Learning one TS feature from a real bug', published: false },
       { date: '2026-10-11', dateShort: '11 Oct', title: 'What honest TypeScript signals in a portfolio', published: false },
