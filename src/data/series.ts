@@ -100,7 +100,7 @@ export const series: Series[] = [
       { date: '2026-11-19', dateShort: '19 Nov', title: 'Optional chaining overuse', slug: '19', published: false },
       { date: '2026-11-20', dateShort: '20 Nov', title: 'structuredClone vs JSON clone', slug: '20', published: false },
       { date: '2026-11-21', dateShort: '21 Nov', title: 'innerHTML and XSS', slug: '21', published: false },
-      { date: '2026-11-22', dateShort: '22 Nov', title: 'Event delegation', published: false },
+      { date: '2026-11-22', dateShort: '22 Nov', title: 'Event delegation', slug: '22', published: false },
       { date: '2026-11-23', dateShort: '23 Nov', title: 'preventDefault vs stopPropagation', published: false },
       { date: '2026-11-24', dateShort: '24 Nov', title: 'Layout thrashing', published: false },
       { date: '2026-11-25', dateShort: '25 Nov', title: 'IntersectionObserver', published: false },
