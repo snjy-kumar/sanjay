@@ -70,7 +70,7 @@ export const series: Series[] = [
       { date: '2026-10-26', dateShort: '26 Oct', title: 'Over-abstracting components too early', slug: '12', published: false },
       { date: '2026-10-27', dateShort: '27 Oct', title: 'Fetch waterfalls / no cleanup on unmount', slug: '13', published: false },
       { date: '2026-10-28', dateShort: '28 Oct', title: 'ref vs state confusion', slug: '14', published: false },
-      { date: '2026-10-29', dateShort: '29 Oct', title: 'What honest React looks like in a portfolio component', published: false },
+      { date: '2026-10-29', dateShort: '29 Oct', title: 'What honest React looks like in a portfolio component', slug: '15', published: false },
       { date: '2026-10-30', dateShort: '30 Oct', title: 'React: 30 Wrong vs Right Cards', published: false },
     ],
   }),
