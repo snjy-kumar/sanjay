@@ -40,7 +40,7 @@ export const series: Series[] = [
       { date: '2026-10-01', dateShort: '1 Oct', title: 'Arrays vs tuples', slug: '05', published: true },
       { date: '2026-10-02', dateShort: '2 Oct', title: 'Typing functions properly', slug: '06', published: true },
       { date: '2026-10-03', dateShort: '3 Oct', title: 'The `any` trap', slug: '07', published: true },
-      { date: '2026-10-04', dateShort: '4 Oct', title: 'Type narrowing', published: false },
+      { date: '2026-10-04', dateShort: '4 Oct', title: 'Type narrowing', slug: '08', published: true },
       { date: '2026-10-05', dateShort: '5 Oct', title: 'Generics I actually use', published: false },
       { date: '2026-10-06', dateShort: '6 Oct', title: 'Partial / Pick / Omit', published: false },
       { date: '2026-10-07', dateShort: '7 Oct', title: 'Discriminated unions (advanced)', published: false },
