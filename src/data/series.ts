@@ -104,7 +104,7 @@ export const series: Series[] = [
       { date: '2026-11-23', dateShort: '23 Nov', title: 'preventDefault vs stopPropagation', slug: '23', published: false },
       { date: '2026-11-24', dateShort: '24 Nov', title: 'Layout thrashing', slug: '24', published: false },
       { date: '2026-11-25', dateShort: '25 Nov', title: 'IntersectionObserver', slug: '25', published: false },
-      { date: '2026-11-26', dateShort: '26 Nov', title: 'fetch abort and cleanup', published: false },
+      { date: '2026-11-26', dateShort: '26 Nov', title: 'fetch abort and cleanup', slug: '26', published: false },
       { date: '2026-11-27', dateShort: '27 Nov', title: 'localStorage sync traps', published: false },
       { date: '2026-11-28', dateShort: '28 Nov', title: 'FormData', published: false },
       { date: '2026-11-29', dateShort: '29 Nov', title: 'URLSearchParams', published: false },
