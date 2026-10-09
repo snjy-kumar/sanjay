@@ -79,7 +79,7 @@ export const series: Series[] = [
     name: 'JavaScript',
     dateRange: '1 Nov – 1 Dec 2026',
     posts: [
-      { date: '2026-11-01', dateShort: '1 Nov', title: 'var / let / const', published: false },
+      { date: '2026-11-01', dateShort: '1 Nov', title: 'var / let / const', slug: '01', published: false },
       { date: '2026-11-02', dateShort: '2 Nov', title: '== vs ===', published: false },
       { date: '2026-11-03', dateShort: '3 Nov', title: 'Truthy / falsy traps', published: false },
       { date: '2026-11-04', dateShort: '4 Nov', title: 'typeof null', published: false },
