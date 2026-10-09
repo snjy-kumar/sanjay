@@ -42,7 +42,7 @@ export const series: Series[] = [
       { date: '2026-10-03', dateShort: '3 Oct', title: 'The `any` trap', slug: '07', published: true },
       { date: '2026-10-04', dateShort: '4 Oct', title: 'Type narrowing', slug: '08', published: true },
       { date: '2026-10-05', dateShort: '5 Oct', title: 'Generics I actually use', slug: '09', published: true },
-      { date: '2026-10-06', dateShort: '6 Oct', title: 'Partial / Pick / Omit', published: false },
+      { date: '2026-10-06', dateShort: '6 Oct', title: 'Partial / Pick / Omit', slug: '10', published: true },
       { date: '2026-10-07', dateShort: '7 Oct', title: 'Discriminated unions (advanced)', published: false },
       { date: '2026-10-08', dateShort: '8 Oct', title: 'unknown + validation (advanced)', published: false },
       { date: '2026-10-09', dateShort: '9 Oct', title: 'Mapped types / strict config objects (advanced)', published: false },
