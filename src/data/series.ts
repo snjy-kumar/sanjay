@@ -81,7 +81,7 @@ export const series: Series[] = [
     posts: [
       { date: '2026-11-01', dateShort: '1 Nov', title: 'var / let / const', slug: '01', published: false },
       { date: '2026-11-02', dateShort: '2 Nov', title: '== vs ===', slug: '02', published: false },
-      { date: '2026-11-03', dateShort: '3 Nov', title: 'Truthy / falsy traps', published: false },
+      { date: '2026-11-03', dateShort: '3 Nov', title: 'Truthy / falsy traps', slug: '03', published: false },
       { date: '2026-11-04', dateShort: '4 Nov', title: 'typeof null', published: false },
       { date: '2026-11-05', dateShort: '5 Nov', title: 'Type coercion', published: false },
       { date: '2026-11-06', dateShort: '6 Nov', title: 'Scope and hoisting myths', published: false },
