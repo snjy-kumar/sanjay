@@ -90,7 +90,7 @@ export const series: Series[] = [
       { date: '2026-11-09', dateShort: '9 Nov', title: 'Objects vs Maps', slug: '09', published: false },
       { date: '2026-11-10', dateShort: '10 Nov', title: 'JSON.parse pitfalls', slug: '10', published: false },
       { date: '2026-11-11', dateShort: '11 Nov', title: 'this binding', slug: '11', published: false },
-      { date: '2026-11-12', dateShort: '12 Nov', title: 'Prototypes vs classes', published: false },
+      { date: '2026-11-12', dateShort: '12 Nov', title: 'Prototypes vs classes', slug: '12', published: false },
       { date: '2026-11-13', dateShort: '13 Nov', title: 'Async vs await error handling', published: false },
       { date: '2026-11-14', dateShort: '14 Nov', title: 'Promise.all vs Promise.allSettled', published: false },
       { date: '2026-11-15', dateShort: '15 Nov', title: 'Event loop misconceptions', published: false },
