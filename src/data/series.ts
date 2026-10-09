@@ -106,7 +106,7 @@ export const series: Series[] = [
       { date: '2026-11-25', dateShort: '25 Nov', title: 'IntersectionObserver', slug: '25', published: false },
       { date: '2026-11-26', dateShort: '26 Nov', title: 'fetch abort and cleanup', slug: '26', published: false },
       { date: '2026-11-27', dateShort: '27 Nov', title: 'localStorage sync traps', slug: '27', published: false },
-      { date: '2026-11-28', dateShort: '28 Nov', title: 'FormData', published: false },
+      { date: '2026-11-28', dateShort: '28 Nov', title: 'FormData', slug: '28', published: false },
       { date: '2026-11-29', dateShort: '29 Nov', title: 'URLSearchParams', published: false },
       { date: '2026-11-30', dateShort: '30 Nov', title: 'CustomEvent and honest JS in a portfolio snippet', published: false },
       { date: '2026-12-01', dateShort: '1 Dec', title: 'JavaScript: 30 Wrong vs Right Cards', published: false },
