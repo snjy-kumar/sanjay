@@ -87,7 +87,7 @@ export const series: Series[] = [
       { date: '2026-11-06', dateShort: '6 Nov', title: 'Scope and hoisting myths', slug: '06', published: false },
       { date: '2026-11-07', dateShort: '7 Nov', title: 'Closures basics', slug: '07', published: false },
       { date: '2026-11-08', dateShort: '8 Nov', title: 'Array methods misuse', slug: '08', published: false },
-      { date: '2026-11-09', dateShort: '9 Nov', title: 'Objects vs Maps', published: false },
+      { date: '2026-11-09', dateShort: '9 Nov', title: 'Objects vs Maps', slug: '09', published: false },
       { date: '2026-11-10', dateShort: '10 Nov', title: 'JSON.parse pitfalls', published: false },
       { date: '2026-11-11', dateShort: '11 Nov', title: 'this binding', published: false },
       { date: '2026-11-12', dateShort: '12 Nov', title: 'Prototypes vs classes', published: false },
