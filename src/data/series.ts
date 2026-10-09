@@ -65,7 +65,7 @@ export const series: Series[] = [
       { date: '2026-10-21', dateShort: '21 Oct', title: 'Breaking rules of hooks / conditional hooks', slug: '07', published: false },
       { date: '2026-10-22', dateShort: '22 Oct', title: 'useMemo/useCallback cargo cult', slug: '08', published: false },
       { date: '2026-10-23', dateShort: '23 Oct', title: 'Context for every prop', slug: '09', published: false },
-      { date: '2026-10-24', dateShort: '24 Oct', title: 'Ignoring loading / error / empty UI states', published: false },
+      { date: '2026-10-24', dateShort: '24 Oct', title: 'Ignoring loading / error / empty UI states', slug: '10', published: false },
       { date: '2026-10-25', dateShort: '25 Oct', title: 'One giant form state blob', published: false },
       { date: '2026-10-26', dateShort: '26 Oct', title: 'Over-abstracting components too early', published: false },
       { date: '2026-10-27', dateShort: '27 Oct', title: 'Fetch waterfalls / no cleanup on unmount', published: false },
