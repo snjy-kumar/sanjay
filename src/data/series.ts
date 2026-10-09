@@ -47,7 +47,7 @@ export const series: Series[] = [
       { date: '2026-10-08', dateShort: '8 Oct', title: 'unknown + validation (advanced)', slug: '12', published: true },
       { date: '2026-10-09', dateShort: '9 Oct', title: 'Mapped types / strict config objects (advanced)', slug: '13', published: true },
       { date: '2026-10-10', dateShort: '10 Oct', title: 'Learning one TS feature from a real bug', slug: '14', published: false },
-      { date: '2026-10-11', dateShort: '11 Oct', title: 'What honest TypeScript signals in a portfolio', published: false },
+      { date: '2026-10-11', dateShort: '11 Oct', title: 'What honest TypeScript signals in a portfolio', slug: '15', published: false },
       { date: '2026-10-12', dateShort: '12 Oct', title: 'TypeScript: 30 Wrong vs Right Cards', published: false },
     ],
   }),
