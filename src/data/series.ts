@@ -56,7 +56,7 @@ export const series: Series[] = [
     name: 'React',
     dateRange: '15–30 Oct 2026',
     posts: [
-      { date: '2026-10-15', dateShort: '15 Oct', title: 'Derived state (store fullName vs derive)', published: false },
+      { date: '2026-10-15', dateShort: '15 Oct', title: 'Derived state (store fullName vs derive)', slug: '01', published: false },
       { date: '2026-10-16', dateShort: '16 Oct', title: 'useEffect used as an event handler', published: false },
       { date: '2026-10-17', dateShort: '17 Oct', title: 'Missing/unstable list keys', published: false },
       { date: '2026-10-18', dateShort: '18 Oct', title: 'Lifting state too high too early', published: false },
