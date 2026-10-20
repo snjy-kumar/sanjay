@@ -46,16 +46,22 @@ for (const file of htmlFiles) {
   const rel = path.relative(dist, file);
   const html = await readFile(file, 'utf8');
 
-  const title = html.match(/<title>([^<]*)<\/title>/)?.[1]?.trim();
-  if (!title) note(`${rel}: no <title>`);
+  // A forwarded old address is not a page: it is a redirect, and it is not
+  // in the sitemap on purpose.
+  const isRedirect = html.includes('http-equiv="refresh"');
 
-  const description = html.match(/<meta name="description" content="([^"]*)"/)?.[1]?.trim();
-  if (!description) note(`${rel}: no meta description`);
+  if (!isRedirect) {
+    const title = html.match(/<title>([^<]*)<\/title>/)?.[1]?.trim();
+    if (!title) note(`${rel}: no <title>`);
 
-  if (!/<link rel="canonical" href="[^"]+"/.test(html)) note(`${rel}: no canonical link`);
+    const description = html.match(/<meta name="description" content="([^"]*)"/)?.[1]?.trim();
+    if (!description) note(`${rel}: no meta description`);
 
-  const h1s = html.match(/<h1[\s>]/g)?.length ?? 0;
-  if (h1s !== 1) note(`${rel}: ${h1s} <h1> elements, expected exactly 1`);
+    if (!/<link rel="canonical" href="[^"]+"/.test(html)) note(`${rel}: no canonical link`);
+
+    const h1s = html.match(/<h1[\s>]/g)?.length ?? 0;
+    if (h1s !== 1) note(`${rel}: ${h1s} <h1> elements, expected exactly 1`);
+  }
 
   // Internal links have to resolve to something that was built.
   const refs = [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map((match) => match[1]);
@@ -109,6 +115,8 @@ if (!sitemap) {
     const name = path.basename(file);
     // The 404 page is not a page to list, and it is built as a flat file.
     if (name === '404.html') continue;
+    // A forwarded old address is a redirect, not a page.
+    if ((await readFile(file, 'utf8')).includes('http-equiv="refresh"')) continue;
     const rel = path.relative(dist, file).replace(/index\.html$/, '');
     const url = site + base + '/' + rel;
     if (!listed.has(url)) note(`sitemap-0.xml: ${url} is not listed`);

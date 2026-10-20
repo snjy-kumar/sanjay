@@ -7,6 +7,8 @@ export interface SiteProfile {
   location: string;
   email: string;
   github: string;
+  /** Where the notes are written, for the "view source" link. */
+  repo: string;
   /** Leave empty until there is a profile to point at. */
   linkedin: string;
 }
@@ -17,6 +19,7 @@ export const profile: SiteProfile = {
   location: 'Pune',
   email: 'sanjay17126@gmail.com',
   github: 'https://github.com/snjy-kumar',
+  repo: 'https://github.com/snjy-kumar/sanjay',
   linkedin: '',
 };
 

@@ -54,6 +54,7 @@ For background development server management (used by agents), see
 ├── scripts/
 │   ├── publish-due-notes.mjs # The publishing bot, run by the workflow
 │   ├── focus-code-blocks.mjs # Makes scrollable code blocks keyboard reachable
+│   ├── legacy-redirects.mjs  # Forwards the addresses the old site used
 │   └── check-build.mjs       # Checks the built site before it is published
 ├── astro.config.mjs          # site URL, Tailwind vite plugin, sitemap, MDX
 └── AGENT_POST_GUIDELINES.md  # Post format/template — read before writing posts
@@ -73,6 +74,11 @@ On every push to `main`, [`.github/workflows/deploy.yml`](./.github/workflows/de
 
 The same check runs before the bot merges a note, so a broken note never
 reaches `main`.
+
+The build also writes a forwarding page for each address the old
+hand-written site used (`/posts/typescript/01.html` and so on), so links
+shared from before the rewrite still land on the note. GitHub Pages cannot
+send a 301, so those pages forward with a meta refresh.
 
 The site also publishes an **RSS feed** at `/rss.xml` (one item per note,
 newest first, with the whole note in it) and a **share card** per note at
