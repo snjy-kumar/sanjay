@@ -1,5 +1,6 @@
 import rss from '@astrojs/rss';
-import { getCollection } from 'astro:content';
+import { getCollection, render } from 'astro:content';
+import { experimental_AstroContainer } from 'astro/container';
 import type { APIContext } from 'astro';
 import { series } from '../data/series';
 import { withBase } from '../utils/base';
@@ -10,20 +11,26 @@ const seriesName = (id: string) => series.find((s) => s.id === id)?.name ?? id;
 // followed in a reader instead of checked by hand.
 export async function GET(context: APIContext) {
   const posts = await getCollection('blog');
+  const container = await experimental_AstroContainer.create();
 
-  const items = posts
-    .slice()
-    .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf())
-    .map((post) => {
-      const [seriesId, slug] = post.id.split('/');
-      return {
-        title: post.data.title,
-        link: withBase(`/posts/${seriesId}/${slug}/`),
-        pubDate: post.data.date,
-        description: post.data.description,
-        categories: [seriesName(seriesId), post.data.readTime],
-      };
+  const items = [];
+  for (const post of posts) {
+    const [seriesId, slug] = post.id.split('/');
+    // The full note, so a reader can read it without leaving the feed.
+    const { Content } = await render(post);
+    const content = await container.renderToString(Content);
+
+    items.push({
+      title: post.data.title,
+      link: withBase(`/posts/${seriesId}/${slug}/`),
+      pubDate: post.data.date,
+      description: post.data.description,
+      content,
+      categories: [seriesName(seriesId), post.data.readTime],
     });
+  }
+
+  items.sort((a, b) => b.pubDate.valueOf() - a.pubDate.valueOf());
 
   return rss({
     title: 'Sanjay Kumar Thakur',
