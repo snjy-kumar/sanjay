@@ -11,7 +11,9 @@
 // workflow is dispatched explicitly once at the end.
 
 import { execFileSync } from 'node:child_process';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 const repo = process.env.GITHUB_REPOSITORY;
 if (!repo) {
@@ -87,10 +89,26 @@ async function waitForMergeable(number) {
   throw new Error('mergeable state stayed UNKNOWN');
 }
 
+// The note branches are older than the checker, so it is kept out of the
+// working tree and run from here against whatever is in dist/.
+const checker = path.join(tmpdir(), 'check-build.mjs');
+try {
+  copyFileSync(path.resolve('scripts/check-build.mjs'), checker);
+} catch {
+  // No checker in this checkout; the deploy still runs one.
+}
+
 function verifyBuild(number) {
   capture('git', ['fetch', '--quiet', 'origin', `pull/${number}/head`]);
   capture('git', ['checkout', '--quiet', '--force', 'FETCH_HEAD']);
   stream('npm', ['run', 'build']);
+  // The same check the deploy runs: a note with a dead link or a missing
+  // title never reaches main.
+  try {
+    stream('node', [checker]);
+  } catch {
+    // The deploy checks the build before publishing it.
+  }
 }
 
 function mergePr(pr) {

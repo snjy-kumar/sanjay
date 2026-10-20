@@ -13,6 +13,7 @@ All commands run from the repository root:
 | `npm install`   | Install dependencies                       |
 | `npm run dev`   | Start the dev server (`localhost:4321`)    |
 | `npm run build` | Build the production site into `./dist/`   |
+| `npm run check` | Check the built site (links, metadata, feed) |
 | `npm run preview` | Preview the production build locally     |
 
 For background development server management (used by agents), see
@@ -32,7 +33,8 @@ For background development server management (used by agents), see
 │   ├── content/
 │   │   └── blog/<series>/   # Posts: 01.md, 02.md, ... per series
 │   ├── data/
-│   │   └── series.ts         # Single source of truth for series journeys
+│   │   ├── series.ts         # Single source of truth for series journeys
+│   │   └── site.ts           # Name, role, email, profiles
 │   ├── layouts/
 │   │   ├── BaseLayout.astro  # <html>/<head>, global.css, optional bodyClass
 │   │   └── PostLayout.astro  # Post shell: rail, overview TOC, pager
@@ -50,7 +52,9 @@ For background development server management (used by agents), see
 │   │   └── og.ts             # Share card renderer
 │   └── content.config.ts     # Blog collection schema (zod)
 ├── scripts/
-│   └── publish-due-notes.mjs # The publishing bot, run by the workflow
+│   ├── publish-due-notes.mjs # The publishing bot, run by the workflow
+│   ├── focus-code-blocks.mjs # Makes scrollable code blocks keyboard reachable
+│   └── check-build.mjs       # Checks the built site before it is published
 ├── astro.config.mjs          # site URL, Tailwind vite plugin, sitemap, MDX
 └── AGENT_POST_GUIDELINES.md  # Post format/template — read before writing posts
 ```
@@ -62,7 +66,13 @@ On every push to `main`, [`.github/workflows/deploy.yml`](./.github/workflows/de
 1. checks out the repo, installs deps (`npm ci`, Node 22), runs `npm run build`;
 2. uploads `dist/` — a **plain static HTML/CSS/JS site**, exactly what a static
    host serves (no server-side runtime);
-3. publishes it to GitHub Pages via `actions/deploy-pages`.
+3. runs `npm run check`, which fails the deploy if an internal link goes
+   nowhere, a page is missing a title, a description, a canonical link or its
+   single `h1`, the feed is empty, or a share card is missing;
+4. publishes it to GitHub Pages via `actions/deploy-pages`.
+
+The same check runs before the bot merges a note, so a broken note never
+reaches `main`.
 
 The site also publishes an **RSS feed** at `/rss.xml` (one item per note,
 newest first, with the whole note in it) and a **share card** per note at
