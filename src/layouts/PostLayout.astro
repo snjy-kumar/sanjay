@@ -4,16 +4,6 @@ import BaseLayout from './BaseLayout.astro';
 import { series } from '../data/series';
 import { withBase } from '../utils/base';
 
-interface PostListItem {
-  id: string;
-  slug: string;
-  title: string;
-  series: string;
-  seriesOrder: number;
-  date: Date;
-  dateShort: string;
-}
-
 interface Props {
   title: string;
   series: string;
@@ -22,7 +12,6 @@ interface Props {
   readTime: string;
   description?: string;
   currentSlug: string;
-  allPosts: PostListItem[];
   prevPost: { slug: string; title: string; series: string } | null;
   nextPost: { slug: string; title: string; series: string } | null;
 }
@@ -35,7 +24,6 @@ const {
   readTime,
   description,
   currentSlug,
-  allPosts,
   prevPost,
   nextPost,
 } = Astro.props;
@@ -70,15 +58,45 @@ const seriesHref = (seriesId: string) => {
   return withBase(`/posts/${seriesName}/${postSlug}/`);
 };
 
-const tsHref = seriesHref('typescript');
-const reactHref = seriesHref('react');
-const jsHref = seriesHref('javascript');
-
 const seriesById = Object.fromEntries(series.map((s) => [s.id, s]));
 const currentSeries = seriesById[postSeries];
 const tsSeries = seriesById['typescript'];
 const reactSeries = seriesById['react'];
 const jsSeries = seriesById['javascript'];
+
+const tsHref = seriesHref('typescript');
+const reactHref = seriesHref('react');
+const jsHref = seriesHref('javascript');
+
+// Every published note, the current series first, so the rail can list them
+// all and the filter can search across the series.
+const shortDateFormatter = new Intl.DateTimeFormat('en-GB', {
+  day: 'numeric',
+  month: 'short',
+  timeZone: 'UTC',
+});
+
+const allPublished = blogPosts
+  .map((post) => {
+    const [seriesId, slug] = post.id.split('/');
+    return {
+      series: seriesId,
+      seriesName: seriesById[seriesId]?.name ?? seriesId,
+      slug,
+      title: post.data.title,
+      seriesOrder: post.data.seriesOrder,
+      dateShort: shortDateFormatter.format(post.data.date),
+    };
+  })
+  .sort((a, b) => {
+    if (a.series === postSeries && b.series !== postSeries) return -1;
+    if (a.series !== postSeries && b.series === postSeries) return 1;
+    return a.seriesOrder - b.seriesOrder;
+  });
+
+const inSeries = allPublished.filter((p) => p.series === postSeries);
+const positionInSeries = inSeries.findIndex((p) => p.slug === currentSlug) + 1;
+const seriesTotal = inSeries.length;
 
 // Absolute URLs for the share card, the series links and the structured
 // data. `site` in astro.config.mjs is the same source the sitemap uses.
@@ -166,11 +184,29 @@ const jsonLd = {
         </nav>
 
         <p class="list-label">Published</p>
+        <div class="note-search">
+          <input
+            class="note-search-input"
+            type="search"
+            placeholder="Filter notes"
+            aria-label="Filter notes by title"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <p class="note-search-count" hidden></p>
+        </div>
         <nav class="note-list" aria-label="Published">
-          {allPosts.map(p => {
-            const isCurr = p.slug === currentSlug;
+          {allPublished.map(p => {
+            const isCurr = p.slug === currentSlug && p.series === postSeries;
+            const isOther = p.series !== postSeries;
             return (
-              <a class={`note-row ${isCurr ? 'is-current' : ''}`} href={withBase(`/posts/${p.series}/${p.slug}/`)} aria-current={isCurr ? 'page' : undefined}>
+              <a
+                class={`note-row ${isCurr ? 'is-current' : ''} ${isOther ? 'is-other-series' : ''}`}
+                data-series={p.series}
+                data-search={`${p.title} ${p.seriesName}`.toLowerCase()}
+                href={withBase(`/posts/${p.series}/${p.slug}/`)}
+                aria-current={isCurr ? 'page' : undefined}
+              >
                 <span class="d">{p.dateShort}</span>
                 <span class="t">{p.title}</span>
               </a>
@@ -186,6 +222,27 @@ const jsonLd = {
           <p class="note-meta">{formattedDateFull} · {readTime} · Published</p>
 
           <slot />
+
+          <div class="note-end">
+            <p class="note-end-meta">
+              Note {String(positionInSeries).padStart(2, '0')} of {seriesTotal} · {currentSeries.name} series
+            </p>
+            {nextPost ? (
+              <p class="note-end-next">
+                <span class="note-end-label">Next</span>
+                <a href={withBase(`/posts/${nextPost.series}/${nextPost.slug}/`)}>{nextPost.title}</a>
+              </p>
+            ) : (
+              <p class="note-end-next">
+                <span class="note-end-done">That is the last note published in this series so far.</span>
+              </p>
+            )}
+            <p class="note-end-meta">
+              <a class="note-end-rss" href={withBase('/rss.xml')}>Follow the series</a>
+              <span aria-hidden="true"> · </span>
+              <a href={withBase('/')}>All notes</a>
+            </p>
+          </div>
         </div>
       </main>
 
@@ -369,6 +426,14 @@ const jsonLd = {
 
         function sync() {
           mark(activeId());
+          readProgress();
+        }
+
+        function readProgress() {
+          const scroller = document.scrollingElement || document.documentElement;
+          const max = scroller.scrollHeight - window.innerHeight;
+          const progress = max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 1;
+          document.documentElement.style.setProperty('--read-progress', String(progress));
         }
 
         for (let j = 0; j < links.length; j++) {
@@ -476,6 +541,64 @@ const jsonLd = {
         w.__copyHooked = true;
         // astro:page-load is dispatched on document and does not bubble,
         // so it has to be listened for there rather than on window.
+        document.addEventListener('astro:page-load', init);
+      }
+    })();
+  </script>
+
+  <script>
+    // Filter the published list. Every note is in the page already, so the
+    // filter only shows and hides rows — nothing is fetched.
+    (function () {
+      const w = window as any;
+
+      function init() {
+        const input = document.querySelector('.note-search-input') as HTMLInputElement | null;
+        const list = document.querySelector('.note-list');
+        const count = document.querySelector('.note-search-count');
+        if (!input || !list || !count) return;
+
+        const rows = Array.prototype.slice.call(
+          list.querySelectorAll('.note-row')
+        ) as HTMLElement[];
+
+        function apply() {
+          const term = input.value.trim().toLowerCase();
+
+          if (!term) {
+            list.classList.remove('is-searching');
+            for (let i = 0; i < rows.length; i++) rows[i].classList.remove('is-hidden');
+            count.setAttribute('hidden', '');
+            return;
+          }
+
+          list.classList.add('is-searching');
+          let matches = 0;
+          for (let i = 0; i < rows.length; i++) {
+            const hit = (rows[i].getAttribute('data-search') ?? '').indexOf(term) !== -1;
+            rows[i].classList.toggle('is-hidden', !hit);
+            if (hit) matches += 1;
+          }
+          list.scrollTop = 0;
+          count.textContent = matches + ' of ' + rows.length + ' notes';
+          count.removeAttribute('hidden');
+        }
+
+        input.addEventListener('input', apply);
+        // The little clear button inside a search field fires `search`.
+        input.addEventListener('search', apply);
+        input.addEventListener('keydown', function (event: KeyboardEvent) {
+          if (event.key === 'Escape') {
+            input.value = '';
+            apply();
+          }
+        });
+        apply();
+      }
+
+      init();
+      if (!w.__searchHooked) {
+        w.__searchHooked = true;
         document.addEventListener('astro:page-load', init);
       }
     })();

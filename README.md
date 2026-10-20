@@ -38,11 +38,19 @@ For background development server management (used by agents), see
 │   │   └── PostLayout.astro  # Post shell: rail, overview TOC, pager
 │   ├── pages/
 │   │   ├── index.astro       # Homepage (work + LinkedIn series journey)
-│   │   └── posts/[series]/[slug].astro
+│   │   ├── posts/[series]/[slug].astro
+│   │   ├── rss.xml.ts        # Feed: every note, newest first, full text
+│   │   └── og/               # Share cards, one PNG per note
+│   ├── fonts/                # IBM Plex TTFs, used only to draw the cards
 │   ├── styles/
 │   │   └── global.css        # Homepage + post styles (post rules scoped
 │   │                         #   under body.post-page)
+│   ├── utils/
+│   │   ├── base.ts           # withBase() — every internal link goes through it
+│   │   └── og.ts             # Share card renderer
 │   └── content.config.ts     # Blog collection schema (zod)
+├── scripts/
+│   └── publish-due-notes.mjs # The publishing bot, run by the workflow
 ├── astro.config.mjs          # site URL, Tailwind vite plugin, sitemap, MDX
 └── AGENT_POST_GUIDELINES.md  # Post format/template — read before writing posts
 ```
@@ -56,6 +64,11 @@ On every push to `main`, [`.github/workflows/deploy.yml`](./.github/workflows/de
    host serves (no server-side runtime);
 3. publishes it to GitHub Pages via `actions/deploy-pages`.
 
+The site also publishes an **RSS feed** at `/rss.xml` (one item per note,
+newest first, with the whole note in it) and a **share card** per note at
+`/og/<series>/<number>.png`, generated at build time with the site's own
+typeface. The feed is linked from the head of every page and from the footer.
+
 The site lives at **`https://snjy-kumar.github.io/sanjay/`** — a project page,
 so `base: '/sanjay'` is set in `astro.config.mjs` and all internal links go
 through `withBase()` (`src/utils/base.ts`). Never hardcode root-absolute paths.
@@ -64,18 +77,43 @@ Pages source must be set to **GitHub Actions** (Settings → Pages → Source).
 Check runs under the `github-pages` environment; the run log shows the final
 URL. Preview any build locally with `npm run preview`.
 
-## Writing posts
+## The daily series
+
+The series is published one note a day, and it is automated.
+
+Every note is an **open draft pull request** on a `note/<series>-<number>`
+branch, titled:
+
+```text
+Note: <series> NN — <title> (YYYY-MM-DD)
+```
+
+The date in the title is the day the note is due.
+[`.github/workflows/publish-notes.yml`](./.github/workflows/publish-notes.yml)
+runs at **11:00 IST** (05:30 UTC), finds the pull requests whose date has
+arrived, **builds the branch first** so a broken note never reaches `main`,
+then marks them ready and merges them. The deploy workflow is dispatched
+afterwards, so the note, the homepage row, the feed and its share card all go
+live together.
+
+Nothing has to be done by hand. To see what would be published without
+publishing it, run the workflow by hand with `dry_run` and an optional
+`date`.
+
+### Adding a note
 
 1. Read [AGENT_POST_GUIDELINES.md](./AGENT_POST_GUIDELINES.md) — it defines the
    frontmatter schema, the canonical 7-section structure, and the code block
    markup every post follows.
-2. Create `src/content/blog/<series>/<number>.md`
+2. Add `src/content/blog/<series>/<number>.md`
    (series: `typescript` | `react` | `javascript`; routes are
    `/posts/<series>/<number>/`).
-3. Mark the post as published in `src/data/series.ts`
-   (`published: true`, add its `slug`). Published/scheduled counts in the
-   post rail are derived from this file automatically.
+3. Add the title and date to the matching series in `src/data/series.ts`.
+   That file is the single source of truth for the homepage timeline; a note
+   is linked on the site and in the feed as soon as its file exists.
 4. `npm run build` must pass.
+5. Open a **draft** pull request from a `note/<series>-<number>` branch with
+   the title format above, and the bot publishes it on its date.
 
 ## Styling notes
 
@@ -92,3 +130,6 @@ therefore re-initialize after each navigation — hook them up with the
 `astro:page-load` event (see the clock in `index.astro` and the TOC scrollspy
 in `PostLayout.astro` for the pattern: init once, guard with a `window` flag,
 clean up previous listeners).
+
+`astro:page-load` is dispatched on **`document`** and does not bubble, so it
+has to be listened for on `document` — a listener on `window` never fires it.
