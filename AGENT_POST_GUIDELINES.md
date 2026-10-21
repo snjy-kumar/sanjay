@@ -18,17 +18,51 @@ Each post corresponds to a route: `/posts/<series>/<number>/` (e.g. `/posts/type
 
 ## 2. Frontmatter Schema
 
-Every post file must begin with YAML frontmatter containing these exact fields:
+Every post file must begin with YAML frontmatter containing these fields:
 
 ```yaml
 ---
 title: "Precise title of the post"
-series: "typescript" # "typescript" | "react" | "javascript"
+series: "typescript" # "typescript" | "react" | "javascript" | "redux"
 seriesOrder: 1 # Integer: sequential order in the series
 date: "2026-09-27" # ISO format YYYY-MM-DD
 readTime: "about 5 min" # "about X min"
 description: "Short SEO description of the topic and problem solved."
+tags: ['types', 'narrowing'] # Topic slugs — see below. At least one.
+related: ['typescript/08'] # Ids of related notes, "<series>/<number>"
+source: "https://github.com/.../file.ts#L10-L20" # Optional: the code this came from
 ---
+```
+
+### Tags
+
+`tags` is the discovery mechanism. Each slug in it gets a page at
+`/topics/<slug>/`, and the slug must already exist in
+[`src/data/tags.ts`](./src/data/tags.ts) — the vocabulary is closed, and the
+build check fails a note that uses a slug outside it.
+
+- Pick two or three. A note about React state is `['state']`; a note about
+  state that also teaches closures is `['state', 'closures']`.
+- Tags are cross-series on purpose: the same mistake often shows up in two
+  languages, and the topic page is where a reader sees that.
+- A note with no tags gets a warning from the build check and will not show
+  up on any topic page. That is why it is a warning and not an error — but
+  every note should have at least one.
+
+### Related
+
+`related` lists the notes this one connects to, by id (`<series>/<number>`).
+Cross-series links are encouraged: `react/06` → `typescript/14` is a more
+useful link than two notes in the same series. Every id must resolve to a
+note that exists, or the build check fails.
+
+### Source
+
+`source` is the evidence: a link to the file or commit the note came from,
+in one of the project repositories. It appears next to "view source" at the
+end of the note. Use it whenever the note is about a real bug or a real
+piece of code — it is what makes the note proof of work rather than an
+opinion.
 ```
 
 ---
@@ -202,7 +236,35 @@ Sources
 ## 5. Adding New Posts Workflow
 
 When creating a new post:
-1. Identify the series (`typescript`, `react`, or `javascript`).
-2. Update `src/data/series.ts` if marking a scheduled post as published (`published: true`).
-3. Create `src/content/blog/<series>/<number>.md` following the template above.
-4. Run `npm run build` to verify the static pages and sitemap build cleanly without errors.
+1. Identify the series (`typescript`, `react`, `javascript`, or `redux`).
+2. Update `src/data/series.ts` — add the title and date to the matching
+   series, at the right position. The position matters: `seriesOrder` is
+   the 1-based index in that list, so a note added out of order breaks the
+   series. `blurb`, `description` and `topics` are already filled in for
+   each series — leave them alone.
+3. Create `src/content/blog/<series>/<number>.md` following the template
+   above, with `tags` (at least one) and `related` (optional).
+4. `npm run build` must pass, and `npm run check` must pass. The check
+   fails a note that uses an unknown topic, points at a note that does not
+   exist, is not linked from its series page, or reuses another page's
+   title.
+5. Open a **draft** pull request from a `note/<series>-<number>` branch with
+   the title format above, and the bot publishes it on its date.
+
+## 6. The pages a note appears on
+
+Adding a note file adds it to more than one page. None of them need
+editing — they are built from the collection:
+
+| Page | Route | What it shows |
+| :--- | :--- | :--- |
+| The note | `/posts/<series>/<number>/` | The note itself |
+| The series page | `/posts/<series>/` | The series' notes in order, with the topics it covers |
+| The topic pages | `/topics/<slug>/` | Every note carrying that topic, grouped by series |
+| The learning path | `/path/` | Every note ever, in order, with the counters |
+| The homepage | `/` | The series timelines, with the note linked once it is published |
+| The feed | `/rss.xml` | The note, with the series and topics as categories |
+
+The series page, the topic pages, the path and the feed all read the
+collection at build time. Nothing there is hand-maintained, so a published
+note appears on all of them automatically.

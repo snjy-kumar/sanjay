@@ -3,6 +3,7 @@ import { getCollection, render } from 'astro:content';
 import { experimental_AstroContainer } from 'astro/container';
 import type { APIContext } from 'astro';
 import { series } from '../data/series';
+import { topicBySlug } from '../data/tags';
 import { withBase } from '../utils/base';
 
 const seriesName = (id: string) => series.find((s) => s.id === id)?.name ?? id;
@@ -26,7 +27,11 @@ export async function GET(context: APIContext) {
       pubDate: post.data.date,
       description: post.data.description,
       content,
-      categories: [seriesName(seriesId), post.data.readTime],
+      // The topics a reader can follow from a feed reader.
+      categories: [
+        seriesName(seriesId),
+        ...post.data.tags.map((tag) => topicBySlug(tag)?.label ?? tag),
+      ],
     });
   }
 

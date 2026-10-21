@@ -1,0 +1,131 @@
+---
+import { getCollection } from 'astro:content';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { topicBySlug } from '../../data/tags';
+import { withBase } from '../../utils/base';
+import {
+  byDateDesc,
+  noteHref,
+  notesWithTopic,
+  seriesName,
+  shortDate,
+  topicHref,
+  usedTopics,
+} from '../../utils/notes';
+
+// Only the topics a published note actually uses. A topic nobody has written
+// about yet does not deserve a page.
+export async function getStaticPaths() {
+  const posts = await getCollection('blog');
+  const slugs = usedTopics(posts);
+  return slugs.map((slug) => ({ params: { slug } }));
+}
+
+const slug = Astro.params.slug!;
+const topic = topicBySlug(slug)!;
+
+const posts = await getCollection('blog');
+const notes = notesWithTopic(posts, slug);
+
+// Grouped by the series the notes come from, so a reader can see that the
+// same subject shows up in more than one language.
+const grouped = new Map<string, typeof notes>();
+for (const note of [...notes].sort(byDateDesc)) {
+  const key = note.data.series;
+  const list = grouped.get(key) ?? [];
+  list.push(note);
+  grouped.set(key, list);
+}
+
+const seriesCount = grouped.size;
+
+// The topics that keep coming up beside this one.
+const neighbourCounts = new Map<string, number>();
+for (const note of notes) {
+  for (const tag of note.data.tags) {
+    if (tag === slug) continue;
+    neighbourCounts.set(tag, (neighbourCounts.get(tag) ?? 0) + 1);
+  }
+}
+const neighbours = [...neighbourCounts.entries()]
+  .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  .slice(0, 6)
+  .map(([tag]) => tag);
+
+const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
+const ogImageUrl = new URL(withBase(`/og/topics/${slug}.png`), siteOrigin).href;
+const pageUrl = new URL(withBase(`/topics/${slug}/`), siteOrigin).href;
+
+const description = `${topic.definition} ${notes.length} ${notes.length === 1 ? 'note' : 'notes'} on this topic across ${seriesCount} ${seriesCount === 1 ? 'series' : 'series'}.`;
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'CollectionPage',
+  name: topic.label,
+  description,
+  url: pageUrl,
+  inLanguage: 'en',
+  mainEntity: {
+    '@type': 'ItemList',
+    numberOfItems: notes.length,
+    itemListElement: notes.map((note, index) => ({
+      '@type': 'ListItem',
+      position: index + 1,
+      url: new URL(noteHref(note), siteOrigin).href,
+      name: note.data.title,
+    })),
+  },
+};
+---
+
+<SiteLayout
+  title={`${topic.label} — ${notes.length} notes`}
+  description={description}
+  ogImage={ogImageUrl}
+  ogImageAlt={`${topic.label} — ${notes.length} notes`}
+  jsonLd={jsonLd}
+>
+  <p class="crumb">
+    <a href={withBase('/')}>Home</a> / <a href={withBase('/topics/')}>Topics</a> /
+    <span>{topic.label}</span>
+  </p>
+  <h1>{topic.label}</h1>
+  <p class="lead">{topic.definition}</p>
+  <p class="span">
+    {notes.length} {notes.length === 1 ? 'note' : 'notes'} · across {seriesCount}{' '}
+    {seriesCount === 1 ? 'series' : 'series'}
+  </p>
+
+  {[...grouped.entries()].map(([seriesId, list]) => (
+    <section class="topic-group">
+      <h2>{seriesName(seriesId)}</h2>
+      <ul class="journey">
+        {list.map((note) => (
+          <li class="past">
+            <p class="when">
+              <time datetime={note.data.date.toISOString().slice(0, 10)}>
+                {shortDate(note.data.date)}
+              </time>
+              <span class="state">{note.data.readTime}</span>
+            </p>
+            <p class="post"><a href={noteHref(note)}>{note.data.title}</a></p>
+            <p class="desc">{note.data.description}</p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  ))}
+
+  {neighbours.length > 0 && (
+    <>
+      <h2>Topics that come up beside this one</h2>
+      <ul class="topic-list">
+        {neighbours.map((tag) => (
+          <li>
+            <a href={topicHref(tag)}>{topicBySlug(tag)?.label ?? tag}</a>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+</SiteLayout>

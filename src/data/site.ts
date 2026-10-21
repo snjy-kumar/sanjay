@@ -11,6 +11,12 @@ export interface SiteProfile {
   repo: string;
   /** Leave empty until there is a profile to point at. */
   linkedin: string;
+  /** The Buttondown username for the email list. Empty means no form is
+   *  rendered — the feed is the only way to follow until it is set. */
+  buttondown: string;
+  /** The Cloudflare Web Analytics site token. Empty means no beacon is
+   *  rendered, so nothing third-party is loaded by default. */
+  analytics: string;
 }
 
 export const profile: SiteProfile = {
@@ -21,6 +27,8 @@ export const profile: SiteProfile = {
   github: 'https://github.com/snjy-kumar',
   repo: 'https://github.com/snjy-kumar/sanjay',
   linkedin: '',
+  buttondown: '',
+  analytics: '',
 };
 
 export const profileLinks = [

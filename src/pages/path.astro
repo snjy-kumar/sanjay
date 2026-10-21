@@ -1,0 +1,216 @@
+---
+import { getCollection } from 'astro:content';
+import SiteLayout from '../layouts/SiteLayout.astro';
+import { series } from '../data/series';
+import { roadmap } from '../data/roadmap';
+import { topicBySlug } from '../data/tags';
+import { withBase } from '../utils/base';
+import {
+  counters,
+  noteHref,
+  notesByMonth,
+  notesInSeries,
+  publishedIn,
+  seriesName,
+  shortDate,
+  topicHref,
+  usedTopics,
+} from '../utils/notes';
+
+const posts = await getCollection('blog');
+const plans = await getCollection('plans');
+const notes = [...posts].sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+const stats = counters(posts);
+
+// Each series: how much of it is published, and what comes next.
+const tracks = series.map((s) => {
+  const published = publishedIn(posts, s.id);
+  const inSeries = notesInSeries(posts, s.id);
+  const planned = s.posts.length;
+  const done = new Set(inSeries.map((note) => note.data.seriesOrder));
+
+  // The next note in the plan that has no file yet.
+  let next: { title: string; date: string; dateShort: string } | null = null;
+  for (let index = 0; index < s.posts.length; index += 1) {
+    if (!done.has(index + 1)) {
+      next = s.posts[index];
+      break;
+    }
+  }
+
+  return {
+    series: s,
+    published,
+    planned,
+    percent: planned ? Math.round((published / planned) * 100) : 0,
+    next,
+    hasPage: published > 0,
+  };
+});
+
+// The subjects, counted. This is the skills map: what the notes actually
+// cover, as opposed to what I planned to cover.
+const topicRows = usedTopics(posts).map((slug) => {
+  const topic = topicBySlug(slug)!;
+  const count = posts.filter((note) => note.data.tags.includes(slug)).length;
+  const seriesIds = [
+    ...new Set(posts.filter((note) => note.data.tags.includes(slug)).map((note) => note.data.series)),
+  ];
+  return { topic, count, seriesIds };
+});
+
+const months = notesByMonth(posts);
+
+const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
+const ogImageUrl = new URL(withBase('/og/path.png'), siteOrigin).href;
+const pageUrl = new URL(withBase('/path/'), siteOrigin).href;
+
+const description = `The whole learning path in one page: ${stats.notes} notes across ${stats.series} series since ${stats.first ? stats.first.toISOString().slice(0, 10) : ''}, the subjects they cover, and what comes next.`;
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'ProfilePage',
+  name: 'The learning path',
+  description,
+  url: pageUrl,
+  inLanguage: 'en',
+  mainEntity: {
+    '@type': 'ItemList',
+    numberOfItems: stats.notes,
+    itemListElement: notes.map((note, index) => ({
+      '@type': 'ListItem',
+      position: index + 1,
+      url: new URL(noteHref(note), siteOrigin).href,
+      name: note.data.title,
+    })),
+  },
+};
+---
+
+<SiteLayout
+  title="The learning path — every note, in order"
+  description={description}
+  ogImage={ogImageUrl}
+  ogImageAlt="The learning path"
+  jsonLd={jsonLd}
+>
+  <p class="crumb"><a href={withBase('/')}>Home</a> / <span>Learning path</span></p>
+  <h1>The learning path</h1>
+  <p class="lead">
+    Everything I have written, in the order I wrote it. The notes are the
+    curriculum: each one starts from something that broke, and each series
+    ends where the next one begins.
+  </p>
+
+  <ul class="stat-row">
+    <li><span class="stat">{stats.notes}</span> notes</li>
+    <li><span class="stat">{stats.series}</span> series</li>
+    <li><span class="stat">{stats.days}</span> days</li>
+    <li><span class="stat">{stats.weeks}</span> weeks</li>
+    <li><span class="stat">{stats.streak}</span> day streak</li>
+    <li><span class="stat">{stats.thisWeek}</span> this week</li>
+  </ul>
+
+  <h2>The series</h2>
+  <div class="track-list">
+    {tracks.map(({ series: s, published, planned, percent, next, hasPage }) => (
+      <article class="track">
+        <header>
+          <h3>
+            {hasPage ? (
+              <a href={withBase(`/posts/${s.id}/`)}>{s.name}</a>
+            ) : (
+              s.name
+            )}
+          </h3>
+          <p class="meta">{s.dateRange}</p>
+        </header>
+        <p class="track-count">
+          {published} of {planned} notes published
+        </p>
+        <div class="bar" role="img" aria-label={`${percent}% of the ${s.name} series published`}>
+          <span class="bar-fill" style={`width:${percent}%`}></span>
+        </div>
+        {next && (
+          <p class="track-next">
+            Next: <strong>{next.title}</strong> — {next.dateShort}
+          </p>
+        )}
+      </article>
+    ))}
+  </div>
+
+  <h2>What the notes cover</h2>
+  <p class="series-note">
+    The subjects the notes actually reach, counted. Each one is a page of its
+    own with every note that mentions it.
+  </p>
+  <ul class="topic-list topic-list-wide">
+    {topicRows.map(({ topic, count, seriesIds }) => (
+      <li>
+        <a href={topicHref(topic.slug)}>{topic.label}</a>
+        <span class="topic-meta">
+          {count} · {seriesIds.map((id) => seriesName(id)).join(', ')}
+        </span>
+      </li>
+    ))}
+  </ul>
+
+  <h2>Everything, in order</h2>
+  {months.map(({ month, notes: monthNotes }) => (
+    <section class="month">
+      <h3>{month}</h3>
+      <ul class="journey">
+        {monthNotes.map((note) => (
+          <li class="past">
+            <p class="when">
+              <time datetime={note.data.date.toISOString().slice(0, 10)}>
+                {shortDate(note.data.date)}
+              </time>
+              <span class="state">{seriesName(note.data.series)}</span>
+            </p>
+            <p class="post"><a href={noteHref(note)}>{note.data.title}</a></p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  ))}
+
+  <h2>What is next</h2>
+  <p class="series-note">
+    These are planned, not written. Nothing here is published yet, so it is
+    listed as an intention rather than a promise.
+  </p>
+  <ul class="roadmap-list">
+    {roadmap.map((track) => (
+      <li>
+        <h3>{track.name}</h3>
+        <p class="meta">{track.size}</p>
+        <p>{track.why}</p>
+      </li>
+    ))}
+  </ul>
+
+  {plans.length > 0 && (
+    <>
+      <h2>The plans</h2>
+      <p class="series-note">
+        The curriculum behind a series, published before the notes are
+        written. A note is a plan that survived contact with a real failure.
+      </p>
+      <ul class="roadmap-list">
+        {plans.map((plan) => (
+          <li>
+            <h3><a href={withBase(`/plans/${plan.id}/`)}>{plan.data.title}</a></h3>
+            <p class="meta">
+              {plan.data.series
+                ? seriesName(plan.data.series)
+                : 'Plan'}
+            </p>
+            <p>{plan.data.description}</p>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+</SiteLayout>

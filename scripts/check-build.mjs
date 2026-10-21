@@ -16,6 +16,14 @@ const site = 'https://snjy-kumar.github.io';
 const problems = [];
 const note = (message) => problems.push(message);
 
+// A warning does not fail the build. It is printed so it is seen, but it
+// does not stop a note from publishing.
+const warnings = [];
+const warn = (message) => warnings.push(message);
+
+// Page titles, so two pages cannot quietly end up with the same one.
+const titlesSeen = new Map();
+
 async function exists(target) {
   try {
     await stat(target);
@@ -85,6 +93,102 @@ for (const file of htmlFiles) {
     const file = path.join(dist, decodeURIComponent(url.pathname.slice(base.length)));
     if (!(await exists(file))) note(`${rel}: share card "${ogImage}" is missing`);
   }
+
+  // Two pages with the same title is the quietest way to lose a ranking:
+  // the search engine picks one and the other never gets seen.
+  if (!isRedirect) {
+    const title = html.match(/<title>([^<]*)<\/title>/)?.[1]?.trim();
+    if (title) {
+      const seen = titlesSeen.get(title);
+      if (seen) note(`${rel}: the title "${title}" is already used by ${seen}`);
+      else titlesSeen.set(title, rel);
+    }
+  }
+}
+
+// The pages that hold the learning path together. Each one is a hub, so a
+// missing one breaks the links into it.
+for (const required of ['path/index.html', 'log/index.html', 'topics/index.html']) {
+  if (!(await exists(path.join(dist, required)))) note(`${required}: the page is missing`);
+}
+
+// Every note has to be reachable from its series' page, and every series
+// that has notes has to have that page. A note nothing links to is a page
+// nobody finds.
+const postsDir = path.join(dist, 'posts');
+if (await exists(postsDir)) {
+  for (const seriesId of await readdir(postsDir, { withFileTypes: true })) {
+    if (!seriesId.isDirectory()) continue;
+    const seriesDir = path.join(postsDir, seriesId.name);
+    const indexFile = path.join(seriesDir, 'index.html');
+
+    const notes = (await readdir(seriesDir, { withFileTypes: true })).filter(
+      (entry) => entry.isDirectory() && /^\d+$/.test(entry.name),
+    );
+    if (notes.length === 0) continue;
+
+    if (!(await exists(indexFile))) {
+      note(`posts/${seriesId.name}/: ${notes.length} notes but no series page`);
+      continue;
+    }
+
+    const seriesHtml = await readFile(indexFile, 'utf8');
+    for (const note of notes) {
+      const href = `${base}/posts/${seriesId.name}/${note.name}/`;
+      if (!seriesHtml.includes(href)) {
+        note(`posts/${seriesId.name}/${note.name}/: not linked from the series page`);
+      }
+    }
+  }
+}
+
+// The topic vocabulary is closed: a tag that is not in src/data/tags.ts has
+// no page of its own, and a "related" note that does not exist is a dead
+// link in the making.
+const tagSource = await readFile(path.join('src', 'data', 'tags.ts'), 'utf8').catch(() => null);
+const knownTags = new Set(
+  tagSource ? [...tagSource.matchAll(/slug:\s*'([^']+)'/g)].map((m) => m[1]) : [],
+);
+
+const contentDir = path.join('src', 'content', 'blog');
+if (await exists(contentDir)) {
+  const noteIds = new Set();
+  const noteFiles = [];
+  for (const seriesId of await readdir(contentDir, { withFileTypes: true })) {
+    if (!seriesId.isDirectory()) continue;
+    for (const file of await readdir(path.join(contentDir, seriesId.name))) {
+      if (!file.endsWith('.md') && !file.endsWith('.mdx')) continue;
+      noteFiles.push(path.join(contentDir, seriesId.name, file));
+      noteIds.add(`${seriesId.name}/${file.replace(/\.mdx?$/, '')}`);
+    }
+  }
+
+  for (const file of noteFiles) {
+    const source = await readFile(file, 'utf8');
+    const frontmatter = source.split('---')[1] ?? '';
+    const rel = path.relative('src/content/blog', file);
+
+    const tagLine = frontmatter.match(/^tags:\s*\[(.*)\]/m)?.[1];
+    const tags = tagLine
+      ? [...tagLine.matchAll(/'([^']+)'/g)].map((m) => m[1])
+      : [];
+    if (tags.length === 0) {
+      warn(`${rel}: the note has no topics, so it will not appear on a topic page`);
+    }
+    for (const tag of tags) {
+      if (knownTags.size > 0 && !knownTags.has(tag)) {
+        note(`${rel}: the topic "${tag}" is not in src/data/tags.ts`);
+      }
+    }
+
+    const relatedLine = frontmatter.match(/^related:\s*\[(.*)\]/m)?.[1];
+    const related = relatedLine
+      ? [...relatedLine.matchAll(/'([^']+)'/g)].map((m) => m[1])
+      : [];
+    for (const id of related) {
+      if (!noteIds.has(id)) note(`${rel}: the related note "${id}" does not exist`);
+    }
+  }
 }
 
 // The feed is what people subscribe with.
@@ -127,6 +231,11 @@ if (problems.length > 0) {
   console.error(`check: ${problems.length} problem(s) in the build`);
   for (const problem of problems) console.error(`  - ${problem}`);
   process.exit(1);
+}
+
+if (warnings.length > 0) {
+  console.warn(`check: ${warnings.length} warning(s)`);
+  for (const warning of warnings) console.warn(`  - ${warning}`);
 }
 
 console.log(`check: ${htmlFiles.length} pages, links, feed and sitemap all fine`);

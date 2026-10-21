@@ -8,6 +8,16 @@ export interface Series {
   id: string;
   name: string;
   dateRange: string;
+  /** The meta description for the series' own page. */
+  description: string;
+  /** One paragraph in my own words. This is the introduction on the series'
+   *  own page, and it is the reason that page is worth reading on its own
+   *  instead of being a list of links. */
+  blurb: string;
+  /** The topics this series covers. They link to the topic pages. */
+  topics: string[];
+  /** Where the code behind the series lives. */
+  repo?: string;
   posts: SeriesPost[];
 }
 
@@ -19,6 +29,14 @@ export const series: Series[] = [
     id: 'typescript',
     name: 'TypeScript',
     dateRange: '27 Sep – 12 Oct 2026',
+    description:
+      'Sixteen notes on the TypeScript type system, written in the order I needed them: unions, narrowing, generics, utility types, and the bugs that taught me each one.',
+    blurb:
+      'Sixteen notes on the type system, written in the order I needed them. Every one of them starts from a bug or a confusing error rather than from the handbook, because the features I kept are the ones a failure named. The last note is the same list as thirty cards, so the series can be read in one sitting.',
+    topics: [
+      'types', 'unions', 'narrowing', 'generics',
+      'utility-types', 'nullability', 'inference', 'readonly',
+    ],
     posts: [
       { date: '2026-09-27', dateShort: '27 Sep', title: 'Basic types treated too casually' },
       { date: '2026-09-28', dateShort: '28 Sep', title: 'interface vs type' },
@@ -42,6 +60,14 @@ export const series: Series[] = [
     id: 'react',
     name: 'React',
     dateRange: '15–30 Oct 2026',
+    description:
+      'Sixteen notes on React, written around the mistakes: derived state, effects used as event handlers, unstable list keys, stale closures, and the rules of hooks.',
+    blurb:
+      'Sixteen notes on React, written around the mistakes rather than the API. The recurring question in each one is the same: what should this component have known, and when? Most of the fixes are less code than the version they replace, which is usually the point.',
+    topics: [
+      'state', 'effects', 'hooks', 'lists',
+      'forms', 'composition', 'context', 'memoization',
+    ],
     posts: [
       { date: '2026-10-15', dateShort: '15 Oct', title: 'Derived state (store fullName vs derive)' },
       { date: '2026-10-16', dateShort: '16 Oct', title: 'useEffect used as an event handler' },
@@ -65,6 +91,14 @@ export const series: Series[] = [
     id: 'javascript',
     name: 'JavaScript',
     dateRange: '1 Nov – 1 Dec 2026',
+    description:
+      'Thirty-one notes on the language underneath React and TypeScript — values, functions, closures, the event loop, the DOM, and the trap in each.',
+    blurb:
+      'Thirty-one notes on the language underneath React and TypeScript. The order follows the language rather than the framework: values first, then functions, then the browser. By the end the parts React hides are no longer hidden.',
+    topics: [
+      'objects', 'arrays', 'functions', 'async', 'closures',
+      'dom', 'events', 'coercion', 'modules',
+    ],
     posts: [
       { date: '2026-11-01', dateShort: '1 Nov', title: 'var / let / const' },
       { date: '2026-11-02', dateShort: '2 Nov', title: '== vs ===' },
@@ -99,8 +133,40 @@ export const series: Series[] = [
       { date: '2026-12-01', dateShort: '1 Dec', title: 'JavaScript: 30 Wrong vs Right Cards' },
     ],
   },
+  {
+    id: 'redux',
+    name: 'Redux',
+    dateRange: '3–18 Dec 2026',
+    description:
+      'Sixteen notes that learn Redux the old way first — hand-built stores, action constants, switch reducers, a manually written async lifecycle — then let Redux Toolkit remove all of it.',
+    blurb:
+      'Sixteen notes that learn Redux the old way first — hand-built stores, action constants, switch statements, manually written async lifecycles — and only then let Redux Toolkit take all of it away. The plan is in the repository and was written before the first note; this series is that plan, condensed to the parts that changed how I write state.',
+    topics: [
+      'architecture', 'state', 'types', 'migration',
+      'performance', 'debugging',
+    ],
+    posts: [
+      { date: '2026-12-03', dateShort: '3 Dec', title: 'Why state management exists (prop drilling, counted)' },
+      { date: '2026-12-04', dateShort: '4 Dec', title: 'The three principles' },
+      { date: '2026-12-05', dateShort: '5 Dec', title: 'One-way data flow, drawn from memory' },
+      { date: '2026-12-06', dateShort: '6 Dec', title: 'createStore, dispatch, getState, subscribe' },
+      { date: '2026-12-07', dateShort: '7 Dec', title: 'Actions and action type constants' },
+      { date: '2026-12-08', dateShort: '8 Dec', title: 'Action creators' },
+      { date: '2026-12-09', dateShort: '9 Dec', title: 'Reducers and switch statements' },
+      { date: '2026-12-10', dateShort: '10 Dec', title: 'Immutability and spread' },
+      { date: '2026-12-11', dateShort: '11 Dec', title: 'combineReducers' },
+      { date: '2026-12-12', dateShort: '12 Dec', title: 'A hand-built store (checkpoint)' },
+      { date: '2026-12-13', dateShort: '13 Dec', title: 'Why reducers cannot be async' },
+      { date: '2026-12-14', dateShort: '14 Dec', title: 'redux-thunk' },
+      { date: '2026-12-15', dateShort: '15 Dec', title: 'The manual async lifecycle (the pain)' },
+      { date: '2026-12-16', dateShort: '16 Dec', title: 'createSlice and extraReducers' },
+      { date: '2026-12-17', dateShort: '17 Dec', title: 'useSelector, useDispatch, createSelector' },
+      { date: '2026-12-18', dateShort: '18 Dec', title: 'Migrating legacy Redux to RTK, one feature at a time' },
+    ],
+  },
 ];
 
 export const typescriptSeries = series.find(s => s.id === 'typescript')!;
 export const reactSeries = series.find(s => s.id === 'react')!;
 export const javascriptSeries = series.find(s => s.id === 'javascript')!;
+export const reduxSeries = series.find(s => s.id === 'redux')!;
