@@ -157,14 +157,9 @@ if (hasSeriesPages && (await exists(postsDir))) {
   }
 }
 
-// The topic vocabulary is closed: a tag that is not in src/data/tags.ts has
-// no page of its own, and a "related" note that does not exist is a dead
-// link in the making.
-const tagSource = await readFile(path.join('src', 'data', 'tags.ts'), 'utf8').catch(() => null);
-const knownTags = new Set(
-  tagSource ? [...tagSource.matchAll(/slug:\s*'([^']+)'/g)].map((m) => m[1]) : [],
-);
-
+// Every note in the collection has to have a page in the build. This also
+// catches a stale dist: if the build failed and left the previous output in
+// place, the note that was being written is missing from it.
 const contentDir = path.join('src', 'content', 'blog');
 if (await exists(contentDir)) {
   const noteIds = new Set();
@@ -177,6 +172,22 @@ if (await exists(contentDir)) {
       noteIds.add(`${seriesId.name}/${file.replace(/\.mdx?$/, '')}`);
     }
   }
+
+  for (const id of noteIds) {
+    const [seriesId, slug] = id.split('/');
+    const page = path.join(dist, 'posts', seriesId, slug, 'index.html');
+    if (!(await exists(page))) {
+      note(`posts/${seriesId}/${slug}/: the note has no page in the build`);
+    }
+  }
+
+  // The topic vocabulary is closed: a tag that is not in src/data/tags.ts has
+  // no page of its own, and a "related" note that does not exist is a dead
+  // link in the making.
+  const tagSource = await readFile(path.join('src', 'data', 'tags.ts'), 'utf8').catch(() => null);
+  const knownTags = new Set(
+    tagSource ? [...tagSource.matchAll(/slug:\s*'([^']+)'/g)].map((m) => m[1]) : [],
+  );
 
   for (const file of noteFiles) {
     const source = await readFile(file, 'utf8');
