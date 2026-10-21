@@ -108,15 +108,30 @@ for (const file of htmlFiles) {
 
 // The pages that hold the learning path together. Each one is a hub, so a
 // missing one breaks the links into it.
-for (const required of ['path/index.html', 'log/index.html', 'topics/index.html']) {
-  if (!(await exists(path.join(dist, required)))) note(`${required}: the page is missing`);
+//
+// A note branch may predate these pages — the JavaScript notes were
+// written before the series pages existed. The check only demands what the
+// branch can actually build, so an older branch still merges.
+const hasSeriesPages = await exists(path.join('src', 'pages', 'posts', '[series]', 'index.astro'));
+const hasPathPage = await exists(path.join('src', 'pages', 'path.astro'));
+const hasLogPage = await exists(path.join('src', 'pages', 'log.astro'));
+const hasTopicPages = await exists(path.join('src', 'pages', 'topics', 'index.astro'));
+
+if (hasPathPage && !(await exists(path.join(dist, 'path', 'index.html')))) {
+  note('path/index.html: the page is missing');
+}
+if (hasLogPage && !(await exists(path.join(dist, 'log', 'index.html')))) {
+  note('log/index.html: the page is missing');
+}
+if (hasTopicPages && !(await exists(path.join(dist, 'topics', 'index.html')))) {
+  note('topics/index.html: the page is missing');
 }
 
 // Every note has to be reachable from its series' page, and every series
 // that has notes has to have that page. A note nothing links to is a page
 // nobody finds.
 const postsDir = path.join(dist, 'posts');
-if (await exists(postsDir)) {
+if (hasSeriesPages && (await exists(postsDir))) {
   for (const seriesId of await readdir(postsDir, { withFileTypes: true })) {
     if (!seriesId.isDirectory()) continue;
     const seriesDir = path.join(postsDir, seriesId.name);

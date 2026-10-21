@@ -101,6 +101,29 @@ try {
 function verifyBuild(number) {
   capture('git', ['fetch', '--quiet', 'origin', `pull/${number}/head`]);
   capture('git', ['checkout', '--quiet', '--force', 'FETCH_HEAD']);
+
+  // Build the note on top of main, not on its own.
+  //
+  // A note branch may have been written weeks before the site changed — the
+  // RSS feed, the share cards, the series pages — and building the branch
+  // alone would fail a note that is perfectly good. Merging main in is also
+  // exactly what GitHub does when it merges the pull request, so this is the
+  // tree that is about to go live, not an approximation of it.
+  //
+  // A note branch only ever adds one file, so the merge does not conflict.
+  // If it somehow does, the merge is undone and the branch is built as it
+  // was, which is what happened before.
+  try {
+    capture('git', ['fetch', '--quiet', 'origin', 'main']);
+    capture('git', ['merge', '--quiet', '--no-edit', 'origin/main']);
+  } catch {
+    try {
+      capture('git', ['merge', '--abort']);
+    } catch {
+      // Nothing to abort: the merge never started.
+    }
+  }
+
   stream('npm', ['run', 'build']);
   // The same check the deploy runs: a note with a dead link or a missing
   // title never reaches main.
