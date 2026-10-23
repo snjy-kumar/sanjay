@@ -1,0 +1,1398 @@
+---
+book: the-devops-handbook
+number: 9
+title: "Create the Foundations of Our Deployment Pipeline"
+description: "The base of a deployment pipeline: on-demand production-like environments, one repository of truth for everything, rebuilding instead of repairing, and a stricter done."
+part: "Part III, The First Way: The Technical Practices of Flow"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Part III turns the First Way, fast flow from development to operations,
+into technical practices. Its centre is the deployment pipeline: the
+automated path that takes every change from version control to
+production. This first chapter lays the foundations the pipeline stands
+on. Before changes can flow quickly and safely, teams need environments
+they can create on demand that look like production, a single place where
+everything needed to build those environments is versioned, a habit of
+rebuilding infrastructure instead of repairing it by hand, and a
+definition of done that means "works in a production-like environment",
+not "works on my machine".
+
+## Before you start
+
+After this chapter I will be able to:
+
+- explain why environments must be creatable on demand and why they must resemble production;
+- describe what belongs in version control, and why "everything" includes environments, configuration and pipelines;
+- distinguish repairing a server by hand from rebuilding it from code, and explain immutable infrastructure;
+- detect configuration drift by comparing desired state in version control with actual state;
+- change a team's definition of done so it includes running in a production-like environment;
+- explain how these foundations support the deployment pipeline of the following chapters.
+
+What I should already know: the First Way and small batches from
+<a href={withBase('/books/the-devops-handbook/02-the-first-way-the-principles-of-flow/')}>chapter 2</a>,
+and basic git. Some exposure to servers, containers or cloud consoles helps,
+but the ideas are explained from the start.
+
+Reading time: about 65 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Layers caption="The foundations of a deployment pipeline. Read bottom to top: each layer depends on the ones below it, and the pipeline of later chapters sits on top." layers={[
+  { name: "Deployment pipeline", note: "chapters 10 to 12 build this" },
+  { name: "Definition of done", note: "done means working in a production-like environment" },
+  { name: "Rebuild, do not repair", note: "infrastructure recreated from code, not fixed by hand" },
+  { name: "On-demand environments", note: "production-like environments created by anyone, quickly" },
+  { name: "Single repository of truth", note: "code, configuration, environments and pipelines in version control" },
+]} />
+
+## Enable on-demand creation of development, test and production environments
+
+### In one sentence
+
+Anyone on the team should be able to create an environment that looks
+like production, quickly and automatically, instead of waiting for someone
+to build one by hand.
+
+### The idea
+
+In many organisations, environments are scarce and handmade. A team that
+needs a test environment files a request, waits days or weeks, and gets a
+machine set up by hand, slightly differently from the last one and quite
+differently from production. Developers work on laptops configured in
+their own way. Testing happens in an environment that shares little with
+production. Problems that only appear in production configuration,
+different versions, different settings, different scale, are discovered at
+release, when they are most expensive and most stressful to fix.
+
+The book traces many deployment failures to this gap. Code is written and
+tested in one kind of environment and run in another. The fix is to make
+environments **production-like** and **on demand**. Production-like means
+the same operating system, the same versions, the same configuration and
+the same deployment process as production, scaled down where necessary but
+not different in kind. On demand means anyone on the team can create one,
+quickly, through automation, without asking anyone.
+
+The book lists the kinds of automation that make this possible: copying a
+virtualised environment, building from a scripted template, using
+infrastructure as code tools that describe environments in configuration
+files, using container images that package an application with its
+dependencies, and creating environments in a public cloud through APIs.
+The specific technology matters less than the property: environments are
+described in code and created by running that code.
+
+When environments are on demand, developers can test their changes in
+production-like conditions every day, not once at the end. Testers can
+create as many environments as they need. Operations can rebuild
+production from the same definitions. And the same code that builds a
+developer's environment builds production, so they stay alike.
+
+<Compare left="Handmade environments" right="On-demand environments" caption="Two ways to get an environment. Read across each row: on-demand environments remove the wait and the differences that cause late surprises." rows={[
+  ["Requested by ticket, wait days or weeks", "Created by anyone in minutes"],
+  ["Set up by hand, each slightly different", "Built from the same code every time"],
+  ["Testing differs from production", "Testing in production-like conditions"],
+  ["Scarce, so shared and contended", "Plentiful, so each change can have one"],
+  ["Problems found at release", "Problems found during development"],
+]} />
+
+#### What "production-like" really means
+
+Production-like does not mean identical in every respect. A developer's
+environment does not need a hundred servers. It means alike in the ways
+that cause failures: the same operating system and versions, the same
+runtime and libraries, the same configuration structure, the same way of
+deploying, the same kinds of dependencies such as the database engine and
+message queue. Differences in scale are acceptable and usually necessary;
+differences in kind are where surprises come from.
+
+A useful check is to list every difference between a test environment and
+production and ask, for each, whether it could cause a bug that shows up
+in only one of them. A smaller database is usually harmless. A different
+database engine, or a different major version, is not.
+
+<Trace columns={["Difference from production", "Could it hide a bug?", "Action"]} rows={[
+  ["Fewer servers", "rarely, for most features", "acceptable; test scale separately"],
+  ["Smaller dataset", "sometimes, for slow queries", "use realistic sample data"],
+  ["Different database engine", "yes, often", "use the same engine and version"],
+  ["Different OS or runtime version", "yes", "use the same image"],
+  ["Settings set by hand", "yes", "generate from version-controlled config"],
+]} caption="Auditing a test environment against production. Read across each row: differences in scale are often acceptable; differences in kind should be removed." />
+
+#### What this means for the deployment pipeline
+
+On-demand environments are the first foundation because the deployment
+pipeline needs them constantly. Every change will be built, deployed to a
+test environment, tested, and promoted. If creating an environment takes a
+week, none of that can happen per change. If it takes minutes, the pipeline
+can create a fresh environment for every test run, which also means tests
+are never polluted by leftovers from earlier runs.
+
+#### Case: an environment per pull request
+
+A common modern implementation makes the idea concrete. Every time a
+developer opens a pull request, the pipeline creates a complete,
+short-lived copy of the application: its containers, a database seeded
+with sample data, and a unique web address. Reviewers click the link and
+try the change in a running system instead of reading the diff alone.
+Automated end-to-end tests run against the same environment. When the
+pull request is merged or closed, the environment is destroyed.
+
+The design choices behind this are worth noticing. The environment is
+built from the same definitions as production, so it is production-like.
+It is created by the pipeline, so nobody waits. It is isolated, so two
+pull requests never interfere. And it is cheap enough to throw away, which
+only works because creating it is automatic.
+
+<Flow caption="The life of a pull request environment. Read left to right: the environment exists only as long as the change is under review, and is built from the same definitions as production." steps={[
+  "Pull request opened",
+  "Pipeline builds images from the branch",
+  "Environment created from production definitions",
+  "Reviewers and tests use a unique address",
+  "Merge or close",
+  "Environment destroyed",
+]} />
+
+The costs are real: compute for many environments, sample data that must
+be realistic but safe, and external services that need sandboxes or
+simulators. Teams usually start with the application and its database, and
+add more of the system over time. Even a partial version removes most of
+the contention for shared test environments.
+
+#### Case: onboarding a new team member
+
+Onboarding is a quick, honest test of whether environments are truly on
+demand. In a team with handmade environments, a new developer spends their
+first days following a long, outdated setup document, asking colleagues
+which versions to install, and discovering steps nobody wrote down. Their
+environment ends up slightly different from everyone else's. In a team
+whose environments are defined in code, the new developer clones the
+repository, runs one command, and has a working, production-like
+environment within the hour; on the first day they make a small change and
+see it go through the pipeline.
+
+<Compare left="Onboarding with handmade environments" right="Onboarding with environments as code" caption="A new developer's first days. Read across each row: environments as code turn onboarding into running one command." rows={[
+  ["Follow a long, outdated setup document", "Clone the repository and run one command"],
+  ["Ask colleagues which versions to install", "Versions pinned in the definition"],
+  ["Days before the first working build", "A working environment within the hour"],
+  ["Environment slightly unlike everyone else's", "Environment identical in kind to production"],
+  ["First change after a week", "First change through the pipeline on day one"],
+]} />
+
+Teams often find that improving onboarding is a good first project for
+this chapter's ideas, because every gap a newcomer hits is a gap in the
+environment definition.
+
+### Worked example
+
+**Simple.** My project used to run on my laptop with whatever versions I
+had installed. When I deployed it, it broke because the server had an
+older runtime. I wrote a container definition that pins the runtime
+version and run the project in that container both locally and on the
+server. Since then, "works on my machine" has meant "works on the server".
+
+**Realistic.** A team waits two weeks for each new test environment, so
+four teams share two environments and constantly overwrite each other's
+deployments. The operations group writes infrastructure as code
+definitions for the application's environment and a pipeline job that
+creates a fresh copy on demand. Developers create an environment per
+feature branch, test in it, and destroy it when done. Contention
+disappears, and bugs caused by environment differences drop sharply
+because every environment comes from the same definition as production.
+
+**Deeper: tracing one bug through two kinds of environment.** It helps to
+follow a single bug through both worlds. A developer adds a query that
+sorts customer names. On their laptop the database uses one collation
+(the rules for comparing text), and the sort looks right. The shared test
+environment was set up by hand two years ago with the same collation, so
+tests pass. Production was rebuilt last year with a different default
+collation, and in production names with accented characters sort in a
+different order. A customer-facing report breaks on release day.
+
+<Trace columns={["Stage", "Handmade environments", "Environments from one definition"]} rows={[
+  ["Developer laptop", "local install, default collation A", "container from the shared image, collation set in config"],
+  ["Test environment", "built by hand years ago, collation A", "created from the same definition, collation set in config"],
+  ["Production", "rebuilt last year, collation B", "created from the same definition, collation set in config"],
+  ["Where the bug appears", "only in production, on release day", "in the developer's first test run"],
+  ["Cost to fix", "an incident, a rollback, a late night", "a one-line change before review"],
+]} caption="One sorting bug in two worlds. Read down each column: with handmade environments the difference hides until production; with one definition the bug shows up on the first run." />
+
+The bug was not in anyone's code review; it was in the gap between
+environments. That is why the book treats environment creation as part of
+the deployment pipeline's foundations rather than an operations detail.
+
+### Step by step
+
+1. **List what an environment contains**: operating system, runtime,
+   libraries, configuration, dependencies, data.
+2. **Describe each part in code**: a container image, infrastructure as code
+   definitions, configuration files.
+3. **Use the same definitions for production** and every other environment,
+   with parameters for scale.
+4. **Automate creation** so one command or pipeline step builds an
+   environment.
+5. **Make it self-service** for the whole team.
+6. **Audit the differences** from production and remove those that could
+   hide bugs.
+
+### Common mistake
+
+The common mistake is to automate test environments but leave production
+handmade, or the other way round. The two then drift apart, and the
+automation tests something that is not production. The fix is to build
+every environment, production included, from the same definitions.
+
+### In real systems
+
+Containers, infrastructure as code tools and cloud APIs are the common
+building blocks. Many teams create an ephemeral environment for each pull
+request, run tests in it, and destroy it afterwards, so environments are
+cheap, fresh and identical in kind to production.
+
+### Check yourself
+
+<details>
+<summary>1. What two properties should environments have?</summary>
+
+They should be production-like, alike in the ways that cause failures, and
+on demand, creatable quickly by anyone through automation.
+
+</details>
+
+<details>
+<summary>2. Is a test environment with fewer servers than production acceptable?</summary>
+
+Usually yes. Differences in scale are often acceptable; differences in kind,
+such as different versions or engines, are where bugs hide.
+
+</details>
+
+<details>
+<summary>3. Why does the deployment pipeline need on-demand environments?</summary>
+
+Because every change is deployed to a test environment and tested; that is
+only possible per change if environments take minutes, not weeks.
+
+</details>
+
+## Create a single repository of truth for the entire system
+
+### In one sentence
+
+Everything needed to build, test, deploy and run the system, not only the
+application code, belongs in version control, so the whole system can be
+recreated from one place and every change to it is recorded.
+
+### The idea
+
+Most developers already put application code in version control. The book
+asks for much more. Its list of what should be versioned includes:
+
+- application code and its dependencies, such as libraries and their exact versions;
+- scripts that create database schemas and reference data;
+- tools and scripts used to create environments, such as infrastructure as code, container definitions and configuration management;
+- files used to create containers;
+- automated tests and manual test scripts;
+- scripts that support packaging, deployment, database migration and environment provisioning;
+- supporting artefacts such as documentation, deployment procedures and release notes;
+- cloud configuration, such as security groups and network rules;
+- any other script or configuration needed to build the infrastructure that supports the services, such as DNS, firewall settings and monitoring.
+
+The goal behind the list is a single property: **anyone should be able to
+recreate the entire production environment, and every environment in the
+pipeline, from what is in version control**. Not from someone's memory,
+not from a wiki page last updated two years ago, and not from a server
+that has been carefully tended by hand.
+
+The book also notes a finding from the research behind its later State of
+DevOps work, which it reports as a qualitative conclusion: keeping
+environment and production configuration in version control turned out to
+be one of the stronger predictors of good delivery performance, stronger
+even than keeping application code in version control. The reason is
+intuitive. Almost everyone versions application code, so it does not
+distinguish teams. Versioning everything else is what lets a team rebuild,
+audit and reason about its system.
+
+Version control gives each of these artefacts the same benefits it gives
+code: a history of who changed what and why; the ability to compare any
+two versions; the ability to roll back; review before a change is applied;
+and one shared, authoritative copy instead of many slightly different
+ones.
+
+<Layers caption="What lives in the single repository of truth. Read top to bottom: application code is only the first layer; everything below it is what lets the whole system be recreated." layers={[
+  { name: "Application code and dependency versions", note: "what most teams already version" },
+  { name: "Database schemas and migrations", note: "how data structures change over time" },
+  { name: "Environment definitions", note: "infrastructure as code, container files, configuration" },
+  { name: "Tests and test data", note: "automated and manual test scripts" },
+  { name: "Pipeline and deployment scripts", note: "how changes are built, tested and released" },
+  { name: "Network, security and monitoring config", note: "DNS, firewall rules, alerts, dashboards" },
+]} />
+
+#### Desired state and configuration drift
+
+Once environment configuration lives in version control, the repository
+describes the **desired state**: what every environment should look like.
+Reality can still diverge, for example when someone changes a server by
+hand during an incident. That divergence is called **configuration
+drift**. Drift is dangerous because it is invisible: the repository says
+one thing, production does another, and the next deploy built from the
+repository may undo a fix nobody recorded, or the environment may behave
+in ways no test ever saw.
+
+Comparing desired state with actual state is simple in principle. Here is
+a small version, run with node, comparing a configuration from version
+control with what a server reports:
+
+```js
+// Desired state from version control versus what is actually running.
+const desired = { node: "22.4.0", nginx: "1.27.0", tlsMinVersion: "1.2", workers: 4 };
+const actual  = { node: "22.4.0", nginx: "1.25.3", tlsMinVersion: "1.0", workers: 4, debug: true };
+const keys = new Set([...Object.keys(desired), ...Object.keys(actual)]);
+for (const k of keys) {
+  if (!(k in desired)) console.log(`EXTRA    ${k}=${actual[k]} (not in version control)`);
+  else if (desired[k] !== actual[k]) console.log(`DRIFT    ${k}: want ${desired[k]}, have ${actual[k]}`);
+  else console.log(`ok       ${k}=${actual[k]}`);
+}
+```
+
+It prints:
+
+```text
+ok       node=22.4.0
+DRIFT    nginx: want 1.27.0, have 1.25.3
+DRIFT    tlsMinVersion: want 1.2, have 1.0
+ok       workers=4
+EXTRA    debug=true (not in version control)
+```
+
+Each line tells a story. The web server is two versions behind what the
+repository says, so someone skipped an upgrade on this server. The minimum
+TLS version was lowered, perhaps to fix a client during an incident, which
+is now a security weakness nobody approved. And a debug flag is on that the
+repository does not know about at all. Real drift detection tools work the
+same way at much larger scale: compute desired state from version control,
+read actual state from the systems, and report the differences.
+
+<Trace columns={["Line in the output", "What probably happened", "What to do"]} rows={[
+  ["DRIFT nginx 1.27.0 vs 1.25.3", "an upgrade was skipped on this server", "rebuild the server from the definition"],
+  ["DRIFT tlsMinVersion 1.2 vs 1.0", "a hand fix during an incident", "decide properly; if needed, change it in the repo"],
+  ["EXTRA debug=true", "a manual change nobody recorded", "remove it, or add it to the repo with a reason"],
+  ["ok node, ok workers", "matches the repository", "nothing"],
+]} caption="Reading the drift report. Read across each row: every difference is either fixed by rebuilding from the repository or brought into the repository on purpose." />
+
+The rule that comes out of this is: **changes go into the repository
+first, then into the environment**, never the other way round. If an
+emergency forces a hand change, it is followed immediately by the same
+change in the repository, or by rebuilding from the repository.
+
+#### One repository or many?
+
+"Single repository of truth" does not have to mean one physical
+repository. Some organisations keep everything in one large repository;
+others keep a repository per service plus repositories for shared
+infrastructure. What matters is that there is one authoritative,
+versioned source for each artefact, that it is easy to find, and that
+the pipeline builds from it. The anti-pattern is two sources for the same
+thing: a configuration file in the repository and a different one edited on
+the server.
+
+#### Case: rebuilding a forgotten service from the repository
+
+A useful drill shows whether the repository really is the truth. A team
+picks a small, rarely-changed internal service and tries to recreate it in
+an empty environment using only version control and the pipeline. The
+first attempt fails in instructive ways: a configuration value that
+existed only on the old server, a scheduled job set up by hand, a
+certificate installed years ago, a firewall rule nobody remembers adding.
+Each failure is a piece of the system that was not in the repository.
+
+<Trace columns={["Attempt", "What failed", "What was added to version control"]} rows={[
+  ["1", "service would not start: missing config value", "the value, as a referenced secret"],
+  ["2", "nightly cleanup never ran", "the scheduled job definition"],
+  ["3", "callers rejected the service's certificate", "certificate issuance in the environment code"],
+  ["4", "one caller could not connect", "the firewall rule"],
+  ["5", "service recreated and passing its tests", "nothing: the repository is complete"],
+]} caption="A rebuild drill. Read top to bottom: each failed attempt reveals something that lived outside version control, until the repository alone is enough." />
+
+The drill takes a day, and its value lasts. The service can now be
+recreated after any failure, and the team has a list of the kinds of
+things that tend to escape version control, which it checks for in its
+other services.
+
+#### Schemas as versioned migrations
+
+Database schemas are the part of the system most often changed by hand,
+and the part where hand changes hurt most. The standard fix is versioned
+migrations: each schema change is a numbered script in the repository,
+and a small tool records which scripts each database has already applied.
+Running the tool brings any database, empty or years old, to the same
+version. Here is the core idea, run with node:
+
+```js
+// Versioned migrations: apply, in order, only the ones this database has not seen.
+const migrations = [
+  { id: 1, sql: "CREATE TABLE customers (id INT, name TEXT)" },
+  { id: 2, sql: "ALTER TABLE customers ADD email TEXT" },
+  { id: 3, sql: "CREATE INDEX customers_email ON customers (email)" },
+];
+function migrate(db) {
+  for (const m of migrations) {
+    if (db.applied.includes(m.id)) continue;
+    db.applied.push(m.id);
+    console.log(`  ${db.name}: applied ${m.id} ${m.sql}`);
+  }
+  console.log(`  ${db.name}: now at version ${Math.max(...db.applied)}`);
+}
+const fresh = { name: "new test db", applied: [] };
+const prod = { name: "production", applied: [1, 2] };
+migrate(fresh);
+migrate(prod);
+migrate(prod); // running again changes nothing
+```
+
+It prints:
+
+```text
+  new test db: applied 1 CREATE TABLE customers (id INT, name TEXT)
+  new test db: applied 2 ALTER TABLE customers ADD email TEXT
+  new test db: applied 3 CREATE INDEX customers_email ON customers (email)
+  new test db: now at version 3
+  production: applied 3 CREATE INDEX customers_email ON customers (email)
+  production: now at version 3
+  production: now at version 3
+```
+
+Three properties make this a foundation. A brand-new test database is
+built from nothing to the current version, so on-demand environments get
+the right schema automatically. Production, which already had the first two
+changes, receives only the third, so the same scripts serve every
+environment. And running the tool a second time does nothing, which means
+the pipeline can run it on every deploy without fear. That last property,
+called idempotence, is what makes automated environment changes safe to
+repeat.
+
+### Worked example
+
+**Simple.** My site's hosting settings, redirects and build command used
+to live only in the hosting provider's web dashboard. When I moved hosts,
+I had to rediscover them by trial and error. I moved them into a
+configuration file in the repository. Now they are reviewed like code, and
+moving again would be a matter of pointing the new host at the file.
+
+**Realistic.** A team's production database schema has been changed by
+hand many times. Nobody is sure what the test databases should contain.
+The team starts using versioned migration scripts: every schema change is a
+numbered script in the repository, applied by the pipeline in order, in
+every environment. After a few months, test and production schemas match by
+construction, and a new environment's database can be built from scratch by
+running every migration.
+
+**In production: recovering from a lost environment.** An organisation
+loses a region of its cloud provider for a day. Teams whose environments
+are fully defined in version control recreate their services in another
+region by running their pipelines against a new target, because every
+piece, network rules, DNS, monitoring, is in code. A team whose load
+balancer and firewall rules were configured by hand in a console spends the
+day reconstructing them from screenshots and memory. The difference is not
+skill; it is what was in version control.
+
+<Compare left="Partly in version control" right="Everything in version control" caption="Recovering from a lost environment. Read across each row: what is in version control can be recreated by running code; what is not must be rediscovered by people." rows={[
+  ["Application code recovered from git", "Application code recovered from git"],
+  ["Network rules rebuilt from memory", "Network rules recreated from code"],
+  ["DNS entries guessed from old tickets", "DNS recreated from code"],
+  ["Monitoring set up again by hand", "Monitoring recreated from code"],
+  ["Recovery measured in days", "Recovery measured in hours"],
+]} />
+
+### Step by step
+
+1. **Inventory everything production needs** to run: code, dependencies,
+   schemas, infrastructure, configuration, network, monitoring.
+2. **Mark what is not in version control** today.
+3. **Move the highest-risk items first**: those that are changed often or
+   hard to recreate.
+4. **Change the rule**: every change goes into the repository first and is
+   applied from there.
+5. **Detect drift** by comparing desired and actual state regularly.
+6. **Test the claim**: recreate an environment from scratch using only the
+   repository, and note what was missing.
+
+### Common mistake
+
+The common mistake is to treat version control as a backup: changes are
+made by hand on servers and copied into the repository afterwards, when
+someone remembers. The repository then lags reality, and rebuilding from it
+produces something different from production. The fix is to reverse the
+direction: the repository is the source, and environments are built from it.
+
+A second mistake is storing secrets, such as passwords and keys, directly
+in the repository. The repository should hold references to secrets, with
+the secrets themselves in a secrets manager; chapter 23 returns to this.
+
+### In real systems
+
+Infrastructure as code, configuration management, versioned database
+migrations and "GitOps", where the desired state of environments is
+stored in git and automatically applied, are common implementations. Drift
+detection is built into many infrastructure tools.
+
+### Check yourself
+
+<details>
+<summary>1. What property is the single repository of truth meant to give?</summary>
+
+Anyone can recreate production and every other environment entirely from
+what is in version control.
+
+</details>
+
+<details>
+<summary>2. What is configuration drift, and why is it dangerous?</summary>
+
+A difference between the desired state in version control and the actual
+state of an environment. It is invisible, untested, and can be silently
+undone or cause surprises.
+
+</details>
+
+<details>
+<summary>3. Should secrets be stored in the repository?</summary>
+
+No. The repository holds references; the secrets live in a secrets manager.
+
+</details>
+
+## Make infrastructure easier to rebuild than to repair
+
+### In one sentence
+
+When it is quicker to recreate a server or environment from code than to
+fix it by hand, teams stop accumulating handmade changes, and every
+environment stays reproducible.
+
+### The idea
+
+The book uses a well-known metaphor, credited to Bill Baker and spread by
+Randy Bias: treat servers like **cattle, not pets**. A pet has a name, is
+cared for individually, and when it gets sick it is nursed back to health.
+Cattle are numbered, identical, and when one is sick it is replaced. In
+the old model, servers were pets: each was set up by hand, patched by
+hand, fixed by hand, and over the years became unique and irreplaceable.
+Nobody dared rebuild one, because nobody knew everything that had been done
+to it.
+
+In the model the book recommends, servers are cattle. They are built from
+code, identical for a given version, and when one misbehaves or needs
+changing, it is replaced with a fresh one built from the current
+definition. This is easier than ever with virtualisation, containers and
+cloud APIs, where creating a new server takes minutes.
+
+The book describes **immutable infrastructure** as the strongest form: once
+a server or container is created, it is never changed. To change anything,
+whether a configuration value, a package version or an application
+release, a new image is built from the updated definition and replaces the
+old one. Manual changes to production are not allowed at all, because
+there is no way to make them persist; the next replacement removes them.
+
+Rebuilding instead of repairing has several effects. Environments stay
+consistent with the repository, because every running server came from it.
+Drift cannot accumulate, because nothing lives long enough to drift.
+Recovery becomes routine: a failed server is replaced, not diagnosed at
+3am. And the build process is exercised constantly, so it keeps working,
+unlike a rarely-used rebuild procedure that fails the one time it is
+needed.
+
+<Compare left="Servers as pets" right="Servers as cattle" caption="Two ways to treat infrastructure. Read across each row: cattle are reproducible and replaceable, which keeps environments consistent and recovery routine." rows={[
+  ["Named, unique, cared for individually", "Numbered, identical, interchangeable"],
+  ["Fixed by hand when sick", "Replaced from code when sick"],
+  ["Accumulate undocumented changes", "Never changed after creation"],
+  ["Rebuilding is frightening", "Rebuilding is routine"],
+  ["Recovery is diagnosis", "Recovery is replacement"],
+]} />
+
+#### Rebuild versus repair in code
+
+The difference is easy to see in a tiny model. Here a "server" is an
+object built from a versioned specification. A hand repair adds state that
+nothing else knows about; a rebuild replaces the server with one made only
+from the specification, and doing it again gives exactly the same result.
+
+```js
+// Rebuild instead of repair: converge by replacing, so every run ends in the same state.
+function build(spec) {
+  return { ...spec, builtFrom: `image@${spec.version}` };
+}
+let server = { version: "1.4.2", builtFrom: "image@1.4.2" };
+server.hotfix = "edited by hand at 2am"; // a manual repair: now nobody can reproduce this server
+console.log("before:", JSON.stringify(server));
+server = build({ version: "1.4.3" }); // rebuild from the versioned spec
+console.log("after: ", JSON.stringify(server));
+console.log("same again:", JSON.stringify(build({ version: "1.4.3" })) === JSON.stringify(server));
+```
+
+It prints:
+
+```text
+before: {"version":"1.4.2","builtFrom":"image@1.4.2","hotfix":"edited by hand at 2am"}
+after:  {"version":"1.4.3","builtFrom":"image@1.4.3"}
+same again: true
+```
+
+The "before" server carries a hotfix that exists only on that machine. If
+it fails, the hotfix is lost, and if anyone builds a new server, it will
+not have it. After the rebuild, the server is exactly what the
+specification says, and building it again produces an identical result.
+That repeatability is the whole point: the same input always gives the same
+environment. If the 2am fix mattered, the right move is to put it into the
+specification, as version 1.4.3, so every server gets it.
+
+<Flow caption="The rebuild loop. Read left to right: a needed change goes into the definition first, a new image is built and tested, and it replaces the running servers." steps={[
+  "Change needed",
+  "Update the definition in version control",
+  "Build a new image",
+  "Test it in the pipeline",
+  "Replace running servers",
+  "Old servers discarded",
+]} />
+
+#### When repairing still happens
+
+The book is realistic: there are still moments when someone must change a
+running system by hand, typically during an incident when replacing a
+server would take longer than the outage can tolerate. The discipline is
+what happens next. The hand change is recorded, the same change is made in
+the definition, and the repaired server is replaced by a rebuilt one soon
+after, so the hand change never becomes the only copy of the fix.
+
+Stateful systems, such as databases, need extra thought. Their data cannot
+be thrown away, so "rebuild" means rebuilding the server software and
+configuration from code while keeping the data on separate, durable
+storage, or restoring it from backups. The principle still holds for
+everything except the data itself.
+
+#### Case: patching a fleet by replacement
+
+Security patching is where the rebuild habit pays off most visibly. When a
+serious vulnerability is announced in a common library, a team with
+handmade servers has to log in to each one, check what is installed, apply
+the patch, and hope nothing else breaks; servers that were configured
+differently behave differently. A team with immutable infrastructure
+updates the version in its image definition, lets the pipeline build and
+test a new image, and rolls it out by replacement, exactly as it rolls out
+any release.
+
+<Compare left="Patching handmade servers" right="Patching by replacement" caption="One security update in two models. Read across each row: replacement turns an emergency into an ordinary release." rows={[
+  ["Log in to each server", "Change one line in the image definition"],
+  ["Each server patched slightly differently", "One image, tested once, used everywhere"],
+  ["Hard to prove every server is done", "Inventory shows every instance runs the new image"],
+  ["Rollback means undoing by hand", "Rollback means redeploying the previous image"],
+  ["Days of careful work", "An ordinary pipeline run"],
+]} />
+
+The second column also gives a simple audit answer: which servers are
+patched? All of them that run the new image, which the orchestrator can
+list. That is a much stronger answer than a spreadsheet of hand-updated
+servers.
+
+### Worked example
+
+**Simple.** I had a small virtual server I had tweaked for a year:
+packages installed, files edited, a cron job added. When the provider
+retired its operating system version, I could not remember half of what I
+had done. I wrote a setup script, tested it on a fresh server until it
+reproduced the old one, and now when I need a change I edit the script and
+create a new server. Rebuilding takes ten minutes; I do it every month to
+pick up security updates.
+
+**Realistic.** A team's application servers have run for three years and
+have each been patched differently. A security update fails on two of them
+for reasons nobody can explain. The team builds a machine image from code
+with the application and all patches, tests it in the pipeline, and
+replaces servers one by one behind the load balancer. From then on, every
+change, including security updates, is a new image rolled out the same
+way. Unexplained differences between servers disappear.
+
+**In production: an incident without diagnosis.** At night, one of a
+service's containers starts returning errors because its disk has filled
+with temporary files from a bug. In the pet model, someone would log in,
+clean up, and investigate. In the cattle model, the orchestrator notices
+the failing health check and replaces the container with a fresh one from
+the same image; the service recovers within a minute, and the bug is
+investigated in daylight from the logs and the telemetry.
+
+<Trace columns={["Time", "Pets: repair by hand", "Cattle: replace from code"]} rows={[
+  ["02:00", "alert fires; on-call wakes up", "health check fails; orchestrator acts"],
+  ["02:10", "logs in, finds full disk", "fresh container from the same image is serving"],
+  ["02:40", "deletes files, restarts process", "on-call reads a summary, goes back to sleep"],
+  ["Next day", "nobody knows exactly what was deleted", "bug investigated from logs and telemetry"],
+  ["Next week", "the same server fails again", "fix shipped in a new image; all containers replaced"],
+]} caption="The same night-time failure handled two ways. Read down each column: replacement restores service quickly and leaves no undocumented changes behind." />
+
+### Step by step
+
+1. **Pick one class of server or container** and write its definition in
+   code.
+2. **Build a fresh instance from the definition** and check it matches the
+   existing one.
+3. **Replace existing instances** with built ones, one at a time.
+4. **Ban persistent hand changes**: changes go into the definition.
+5. **Rebuild regularly**, for example for every release and every security
+   update, so the process stays exercised.
+6. **Separate state**: keep data on durable storage so servers can be
+   replaced freely.
+
+### Common mistake
+
+The common mistake is to automate the initial build but keep repairing by
+hand afterwards. Servers start identical and drift apart over months. The
+fix is to make replacement the normal way of changing anything.
+
+A second mistake is to apply cattle thinking to data. Databases need
+backups, replication and tested restores; their servers can be cattle, but
+the data cannot.
+
+### In real systems
+
+Container orchestrators, auto-scaling groups and machine image pipelines
+make replacement routine. Many organisations rebuild every image weekly
+or on every release, and treat a server that has lived for months as a
+warning sign.
+
+### Check yourself
+
+<details>
+<summary>1. What does "cattle, not pets" mean for servers?</summary>
+
+Servers are identical, built from code and replaced when they misbehave,
+rather than unique machines nursed by hand.
+
+</details>
+
+<details>
+<summary>2. What is immutable infrastructure?</summary>
+
+Servers or containers that are never changed after creation; any change is
+made by building a new image and replacing them.
+
+</details>
+
+<details>
+<summary>3. What should happen after an emergency hand change?</summary>
+
+Record it, make the same change in the definition, and replace the
+repaired server with a rebuilt one soon after.
+
+</details>
+
+## Modify the definition of done to include running in production-like environments
+
+### In one sentence
+
+A piece of work is not done when the code is written or even when it
+passes tests on a laptop; it is done when it works, integrated with
+everything else, in a production-like environment.
+
+### The idea
+
+Teams have a **definition of done**: the conditions a piece of work must
+meet before it counts as finished. In many teams, done means "code
+complete" or "passed my tests". The book argues that this definition hides
+most of the risk. Code that works on a developer's machine may fail to
+integrate with other changes, fail to deploy, or fail under production
+configuration. If those problems are discovered weeks later, at an
+integration or release phase, they are expensive and the cause is hard to
+find, because many changes have been made since.
+
+The book's recommendation is to change the definition: at the end of each
+development interval, whether a sprint or a single change, the team should
+have integrated, tested and working code, demonstrated in a production-like
+environment, created from the trunk of version control by a one-click
+process, and validated with automated tests. In other words, the work is
+shown running somewhere that looks like production, built the same way
+production would be built.
+
+This moves integration and deployment problems from the end of a long
+cycle to every day. It ties together the foundations of this chapter:
+on-demand environments make a production-like environment available,
+the single repository of truth makes it buildable from trunk, and
+rebuilding from code makes it trustworthy. It also prepares for the next
+chapters: continuous integration makes "integrated with everyone else"
+true many times a day, and automated testing makes "validated" fast.
+
+The book also connects this to the role of operations. When done includes
+running in a production-like environment, developers see operational
+concerns, configuration, deployment, monitoring, as part of their work,
+not as something that happens after them. That supports the integration of
+operations into development from chapter 8.
+
+<Compare left="Done as code complete" right="Done as running in a production-like environment" caption="Two definitions of done. Read across each row: the stricter definition moves integration and deployment problems from the end to every day." rows={[
+  ["Code written, maybe unit tested", "Integrated with trunk and all other changes"],
+  ["Works on my machine", "Works in a production-like environment"],
+  ["Built by hand", "Built by a one-click process from version control"],
+  ["Deployment problems found at release", "Deployment problems found today"],
+  ["Operations work starts after done", "Operational concerns are part of done"],
+]} />
+
+#### Writing the definition down
+
+A definition of done is only useful if it is explicit and checked. A team
+might write it like this:
+
+- the change is merged to trunk;
+- the pipeline built it from version control, with no manual steps;
+- all automated tests passed;
+- it was deployed by the pipeline to a production-like environment;
+- it was demonstrated working there, by automated tests and, where useful, a person;
+- any configuration, schema or infrastructure changes it needs are in version control;
+- telemetry for the new behaviour exists, so its health in production can be seen.
+
+Several of these items, such as "built from version control" and "deployed
+by the pipeline", can be enforced by the pipeline itself rather than by
+anyone's memory. The more of the definition the pipeline checks, the less
+it depends on discipline.
+
+<Trace columns={["Definition item", "Checked by", "What it prevents"]} rows={[
+  ["Merged to trunk", "version control", "work that never integrates"],
+  ["Built from version control", "pipeline", "builds that depend on a laptop"],
+  ["Automated tests pass", "pipeline", "regressions reaching later stages"],
+  ["Deployed to production-like env", "pipeline", "deployment failures at release"],
+  ["Config and schema in version control", "review and pipeline", "drift and hand changes"],
+  ["Telemetry exists", "review, later automated", "blind spots in production"],
+]} caption="A definition of done and how each item is checked. Read across each row: the more items the pipeline checks automatically, the less done depends on memory." />
+
+#### Case: making done visible on the board
+
+One team made its new definition of done concrete by changing its board.
+The old board ended at "Done", which meant code merged. The new board
+added "Deployed to staging by pipeline" and "Demonstrated" before "Done",
+and a card could only move into each column when the pipeline reported
+the step. For the first fortnight, a pile of cards sat in the staging
+column: changes that had been merged but failed to deploy, or deployed but
+failed acceptance tests. Those were exactly the problems that used to
+surface in the release hardening phase. Seeing them every day, the team
+fixed the underlying causes, a missing configuration value here, a
+fragile test there, and within a month cards moved through the new columns
+in hours.
+
+<Trace columns={["Column", "Moved by", "What piled up at first"]} rows={[
+  ["In progress", "developer", "normal work"],
+  ["Merged", "version control", "nothing unusual"],
+  ["Deployed to staging", "pipeline", "changes that failed to deploy"],
+  ["Demonstrated", "pipeline tests and a person", "changes failing acceptance tests"],
+  ["Done", "team", "only work that truly runs"],
+]} caption="A board that encodes the stricter definition of done. Read top to bottom: the new columns made hidden integration problems visible daily." />
+
+#### How the four foundations reinforce each other
+
+The stricter definition of done is where the chapter's four practices
+meet, and it is worth tracing how each depends on the others. "Created
+from trunk by a one-click process" is only possible if everything the
+environment needs is in the single repository of truth. "Demonstrated in a
+production-like environment" is only practical if such environments can be
+created on demand; if each one takes a week, nobody can demonstrate every
+change in one. "Production-like" is only trustworthy if environments are
+rebuilt from code rather than repaired by hand, because a hand-repaired
+production has drifted away from what the definition builds. And the
+definition of done, in turn, keeps the other three honest: every change
+exercises the repository, the environment creation and the rebuild path,
+so any gap shows up the same day.
+
+<Trace columns={["Definition of done needs", "Which foundation provides it", "What breaks without it"]} rows={[
+  ["Built from trunk by one click", "single repository of truth", "builds depend on someone's machine"],
+  ["A production-like environment per change", "on-demand environments", "demonstrations queue for scarce environments"],
+  ["Confidence that the environment matches production", "rebuild, do not repair", "production has drifted; tests prove little"],
+  ["Every gap found the same day", "the definition itself, checked by the pipeline", "gaps surface at release"],
+]} caption="How the foundations support the definition of done. Read across each row: removing any one foundation weakens what done can promise." />
+
+This is why the book treats the four together as the base of the
+deployment pipeline rather than as separate good ideas. A team that
+adopts only one gets a fraction of the benefit; a team that adopts all
+four has a system where every change is built, deployed and checked the
+same way production will be, which is exactly what the next chapters
+automate further.
+
+### Worked example
+
+**Simple.** I used to call a feature of my site done when it worked in my
+local dev server. Twice it broke in the production build because of a
+difference between development and production modes. I changed my
+definition: done means the production build passed and the change was
+checked on a preview deployment built from the main branch. The surprises
+stopped.
+
+**Realistic.** A team's sprints end with "done" stories that then spend
+two weeks in an integration and hardening phase before release. The team
+changes its definition: a story is done only when it has been deployed by
+the pipeline to a production-like environment from trunk and passed
+automated acceptance tests there. The first sprints deliver fewer stories,
+because integration work that used to be hidden is now inside the sprint.
+After a few sprints the hardening phase disappears, and total time from
+start to release falls.
+
+**In production: a demo that caught a deployment bug.** A team demonstrates
+each finished story in its staging environment, deployed by the pipeline.
+In one demo, a feature that worked in every developer's environment fails
+because it depends on a configuration value that exists on laptops but was
+never added to the environment definitions. The fix, adding the value to
+the version-controlled configuration, takes minutes. Under the old
+definition, the same bug would have surfaced in production.
+
+<Timeline caption="What the stricter definition does to a team's cycle. Read top to bottom: the first sprints feel slower, then the hidden hardening phase disappears." items={[
+  { when: "Before", what: "Sprints end with code-complete stories; a two-week hardening phase precedes each release." },
+  { when: "Sprints 1 to 2", what: "Fewer stories finish, because integration and deployment are now inside the sprint." },
+  { when: "Sprints 3 to 5", what: "Deployment problems are found daily and fixed while small; automation improves." },
+  { when: "After", what: "No hardening phase; every sprint's work is releasable." },
+]} />
+
+### Step by step
+
+1. **Write down the current definition of done**, honestly.
+2. **Add integration**: merged to trunk.
+3. **Add a production-like environment**: deployed by the pipeline from
+   version control.
+4. **Add validation**: automated tests pass in that environment.
+5. **Add operability**: configuration in version control, telemetry exists.
+6. **Let the pipeline check as many items as possible.**
+7. **Expect a slower start**, and measure total lead time to release, not
+   stories per sprint.
+
+### Common mistake
+
+The common mistake is to adopt the stricter definition on paper while
+keeping a separate hardening phase "just in case". The team then has two
+definitions, and the stricter one is quietly ignored. The fix is to remove
+the hardening phase and let the definition carry the weight.
+
+A second mistake is to measure the team on stories completed per sprint
+during the change, which punishes the stricter definition. The fix is to
+measure lead time to release.
+
+### In real systems
+
+Teams practising continuous delivery often define done as "deployed to
+production", or at least "deployable to production at any moment". Preview
+environments per pull request make "demonstrated in a production-like
+environment" cheap.
+
+### Check yourself
+
+<details>
+<summary>1. What does the book's definition of done require?</summary>
+
+Integrated, tested, working code, demonstrated in a production-like
+environment created from trunk by a one-click process and validated by
+automated tests.
+
+</details>
+
+<details>
+<summary>2. Why might a team deliver fewer stories after adopting it?</summary>
+
+Integration and deployment work that used to happen in a later hardening
+phase now happens inside each sprint, so it becomes visible.
+
+</details>
+
+<details>
+<summary>3. Which definition-of-done items can a pipeline check automatically?</summary>
+
+For example: built from version control, tests passed, and deployed to a
+production-like environment.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 9, Create the Foundations of Our Deployment Pipeline">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that "works on my machine" is not
+good enough. The places where code is written, tested and run should be
+alike, and they should be created by running code, not by hand. Version
+control is not only for application code: the settings, scripts and
+environment descriptions that make the application run belong there too.
+
+A first example: I write a container file that pins my project's runtime
+version and use it both locally and on my server. The first time a
+deployment works exactly as it did locally, the idea clicks.
+
+The habit to build at this level is simple: whenever I change a setting in
+a web dashboard or on a server, I ask whether it could be a file in my
+repository instead.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can build an environment from a definition
+and audit how it differs from production, separating differences of scale
+(often fine) from differences of kind (where bugs hide). I keep schemas as
+versioned migrations, infrastructure as code, and configuration in the
+repository, with secrets referenced rather than stored. I can explain
+configuration drift and run a simple comparison between desired and actual
+state.
+
+An example at this level: I add database migrations to a project, delete
+my local database, and rebuild it from nothing by running them. If that
+works, my schema is truly in version control.
+
+I also change my own definition of done: a change is done when the
+production build passes and a preview deployment from the main branch
+works.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I treat infrastructure as cattle. Servers and
+containers are built from images, never changed after creation, and
+replaced to apply any change, including security updates. I rebuild
+regularly so the process stays exercised. I separate state from compute so
+servers can be replaced freely, and I have tested restores for the data.
+
+An example: I set up a pipeline that builds a machine image on every
+change to the environment definition, tests it, and rolls it out by
+replacing instances behind a load balancer one at a time.
+
+I also make the pipeline enforce the definition of done, so built from
+version control, tested and deployed to a production-like environment are
+checked automatically rather than remembered.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: third-party services that cannot be copied into test
+environments, which need contract tests, sandboxes or simulators;
+licensed software that limits how many environments can exist; very large
+production datasets that cannot be copied, which need realistic,
+anonymised samples; and hardware-specific systems, such as special
+network devices, that cannot be created on demand and must be shared
+carefully.
+
+For example, a payment provider may offer only one shared sandbox. The team
+then runs most tests against a local simulator that follows the provider's
+documented contract, and a smaller set against the real sandbox.
+
+Each edge case is a place where an environment differs in kind from
+production, so it deserves extra tests at the boundary.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: drift that comes from outside, such as a cloud
+provider changing a default, which only continuous drift detection
+catches; base images that change underneath a definition because a tag
+was moved, which pinning by digest prevents; an emergency hand change that
+is forgotten and later undone by a rebuild, reintroducing the incident;
+and migrations that work forwards but cannot be reversed, which makes
+rollbacks of schema changes much harder than rollbacks of code.
+
+An example: a team's image definition uses a "latest" tag for its base
+image. A rebuild months later silently picks up a new major version and
+breaks the application. Pinning the base image to an exact version, and
+updating it deliberately, removes the surprise.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, every environment, including production, is created
+from version control by the pipeline. Environments for each change are
+ephemeral and destroyed after use. Images are rebuilt and rolled out on a
+regular schedule and for every security update. Drift detection runs
+continuously and alerts on differences. Secrets live in a secrets manager.
+Recovery drills recreate an environment from scratch in another location
+to prove the repository is complete.
+
+For example, an organisation runs a quarterly exercise where a team
+recreates its service in an empty account using only the repository and
+the pipeline, and records every manual step it needed; each manual step
+becomes a ticket to automate.
+
+The definition of done is enforced by the pipeline and includes telemetry
+for new behaviour.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that anything done by hand is a liability: it is
+unrecorded, unrepeatable and untested. I would rather spend an hour
+writing a definition than ten minutes making a hand change I will have to
+rediscover later. I trust the repository more than any running server.
+And I see the test of my foundations as a simple question: if everything
+disappeared, could I rebuild it from version control alone?
+
+An example of the mindset in action: during an incident, I make the
+quickest safe hand fix to restore service, and before closing the
+incident I put the same change in the repository and schedule a rebuild.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, these foundations shape the architecture.
+Services that keep state on separate durable storage can be replaced
+freely; services that keep it on local disks cannot. Configuration that is
+read from the environment at start-up can be changed by rebuilding;
+configuration baked in by hand cannot. Designing for replaceability, with
+health checks, stateless processes and externalised configuration, is what
+makes the cattle model work.
+
+For example, a service designed to read all its settings from environment
+variables and keep no local state can be replaced, scaled or moved to
+another region without any special procedure.
+
+These design choices also make the deployment pipeline of later chapters
+simpler, because every deployment is just a replacement.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to build the foundations bottom up. First, put everything
+in version control and make changes flow from the repository to
+environments, never the reverse. Second, describe environments in code and
+make them available on demand, starting with the ones developers and
+testers wait for most. Third, move to rebuilding instead of repairing,
+starting with stateless servers. Fourth, raise the definition of done and
+let the pipeline enforce it. Measure progress by how long it takes to
+create a production-like environment and whether production can be
+recreated from the repository.
+
+Done when any team member can create a production-like environment from
+version control in minutes, production itself is built the same way, no
+server carries undocumented hand changes, and done means demonstrated in a
+production-like environment.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Do I need containers or the cloud to follow this chapter?</summary>
+
+No. The principle is that environments are described in code and created
+by running it. Containers and cloud APIs make that easier, but scripts,
+virtual machine templates and configuration management tools on physical
+servers can do the same.
+
+</details>
+
+<details>
+<summary>How production-like does a developer's laptop need to be?</summary>
+
+Alike in kind: the same runtime, versions, configuration structure and
+dependency types, often achieved by running the application in the same
+container image. Scale can be much smaller.
+
+</details>
+
+<details>
+<summary>Is it really worth putting network and DNS configuration in version control?</summary>
+
+Yes. Those are among the hardest things to recreate from memory after a
+failure, and among the most common sources of unrecorded hand changes.
+
+</details>
+
+<details>
+<summary>What about databases? They cannot be thrown away and rebuilt.</summary>
+
+The database server software and configuration can be rebuilt from code;
+the data lives on durable storage with backups and tested restores; and the
+schema changes through versioned migrations.
+
+</details>
+
+<details>
+<summary>What is the difference between infrastructure as code and immutable infrastructure?</summary>
+
+Infrastructure as code describes infrastructure in versioned files.
+Immutable infrastructure goes further: once created from those files, a
+server is never changed, only replaced.
+
+</details>
+
+<details>
+<summary>How do I start if nothing is in version control today?</summary>
+
+Start with what changes most and what is hardest to recreate. Move it into
+the repository, apply changes from there, and test by rebuilding one
+environment from scratch.
+
+</details>
+
+<details>
+<summary>Does the stricter definition of done slow teams down?</summary>
+
+At first it looks that way, because hidden integration work becomes
+visible. Total time to release usually falls, because the late hardening
+phase disappears.
+
+</details>
+
+<details>
+<summary>How do these foundations relate to the rest of Part III?</summary>
+
+The deployment pipeline needs environments it can create, a repository it
+can build from, infrastructure it can replace, and a definition of done it
+can check. Chapters 10 to 13 build on all four.
+
+</details>
+
+<details>
+<summary>How long should it take to create a production-like environment?</summary>
+
+The book does not set a number, and the right answer depends on the
+system. The useful target is "short enough that nobody waits for one and
+every change can have its own". For many web applications that means
+minutes; for large systems with big datasets it may be longer, in which
+case teams create smaller, realistic slices on demand and keep a few full
+copies for scale tests.
+
+</details>
+
+<details>
+<summary>What if operations does not want developers creating environments?</summary>
+
+The concern is usually cost, security or consistency. Environments built
+from operations' own definitions, with guardrails such as quotas,
+automatic expiry and safe defaults, address all three, and they remove the
+ticket queue that slows everyone down. Starting with test environments
+only, and showing the result, often wins the argument.
+
+</details>
+
+<details>
+<summary>Is a wiki page describing the setup enough?</summary>
+
+No. A document describes what someone intended at the time it was written;
+a definition in code is what actually builds the environment, so it cannot
+drift from reality without someone noticing. Documentation is still useful
+for explaining why, but the how belongs in code.
+
+</details>
+
+## Key takeaways
+
+- Environments should be production-like (alike in kind, not necessarily in scale) and creatable on demand by anyone through automation.
+- Build every environment, production included, from the same definitions.
+- Put everything needed to recreate the system in version control: code, dependencies, schemas, environments, tests, pipelines, network and monitoring configuration.
+- Changes flow from the repository to environments, never the reverse; detect drift between desired and actual state.
+- Treat servers as cattle: build from code, never change after creation, replace to apply changes.
+- After an emergency hand change, put the change in the repository and rebuild.
+- Done means integrated, tested and demonstrated in a production-like environment built from version control, and the pipeline should check as much of that as possible.
+
+## Glossary
+
+- **Deployment pipeline**: the automated path a change takes from version control through build, test and deployment to production.
+- **Production-like environment**: an environment alike in kind to production: same versions, configuration and deployment process.
+- **On-demand environment**: an environment anyone can create quickly through automation.
+- **Ephemeral environment**: a short-lived environment created for one change or test run, then destroyed.
+- **Infrastructure as code**: describing infrastructure in versioned files that tools apply.
+- **Single repository of truth**: the authoritative, versioned source for everything needed to build and run the system.
+- **Desired state**: what version control says an environment should look like.
+- **Configuration drift**: differences between desired state and the actual state of an environment.
+- **Pets and cattle**: unique, hand-tended servers versus identical, replaceable ones.
+- **Immutable infrastructure**: servers or containers never changed after creation, only replaced.
+- **Database migration**: a versioned script that changes a database schema, applied in order.
+- **Definition of done**: the explicit conditions work must meet to count as finished.
+- **Trunk**: the main shared branch in version control.
+
+## Exercises and self-check
+
+**Warm-up.** List every setting, script and configuration my project needs
+to run in production. Mark which are in version control and which live in a
+dashboard, a server or my memory.
+
+**Build.** Move the three riskiest items into the repository. Write or
+update a container or setup definition, then delete my local environment
+and rebuild it from the repository alone. Note every manual step I needed,
+and automate one.
+
+**Stretch.** Adapt the drift script to compare a real configuration file in
+my repository with the settings my host reports, and set up a pipeline step
+that deploys a preview environment from the main branch, so my definition
+of done can include it.
+
+### Self-check
+
+<details>
+<summary>1. Name two differences between a test environment and production that could hide bugs.</summary>
+
+For example, a different database engine or major version, a different
+runtime version, or settings set by hand rather than from version control.
+
+</details>
+
+<details>
+<summary>2. What goes in the single repository of truth beyond application code?</summary>
+
+Dependencies, schemas and migrations, environment definitions, tests,
+pipeline and deployment scripts, and network, security and monitoring
+configuration.
+
+</details>
+
+<details>
+<summary>3. Why rebuild regularly even when nothing is broken?</summary>
+
+So the build process stays exercised and working, drift cannot accumulate,
+and updates are applied consistently.
+
+</details>
+
+<details>
+<summary>4. A drift report shows a setting that exists on the server but not in the repository. What are the options?</summary>
+
+Remove it by rebuilding from the repository, or, if it is needed, add it
+to the repository deliberately with a reason.
+
+</details>
+
+<details>
+<summary>5. Why should the pipeline check the definition of done?</summary>
+
+Automated checks do not depend on memory or discipline, so done means the
+same thing every time.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter by trying to rebuild my own project from nothing.
+The gaps that appear, settings I forgot, steps I did by hand, are exactly
+the chapter's lessons, and fixing them builds the foundation for the
+pipeline chapters that follow.
+
+<Timeline caption="Three sessions for chapter 9." items={[
+  { when: "Session 1", what: "Read the chapter. Inventory everything my project needs; mark what is not in version control." },
+  { when: "Session 2", what: "Move the riskiest items into the repo. Write a container or setup definition. Rebuild locally from scratch." },
+  { when: "Session 3", what: "Run the drift and rebuild scripts. Set up a preview deploy from main. Rewrite my definition of done." },
+  { when: "Monthly", what: "Rebuild my server or environment from the repository, whether or not anything changed." },
+]} />
+
+This chapter starts the pipeline phase of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+The next chapter builds the automated tests that the pipeline runs on every
+change.
+
+Done when I can delete my development environment and server and recreate
+both from the repository alone, and my definition of done includes a
+preview deployment built from the main branch.
