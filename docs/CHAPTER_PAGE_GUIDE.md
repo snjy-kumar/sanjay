@@ -198,15 +198,24 @@ can check. Link the plan phase that cites the book.
 
 | | Floor (the build fails below it) | Target |
 |---|---|---|
-| Words in the chapter body | 3,000 | 4,000–6,000+, more for big chapters |
-| Diagrams (`Flow`, `Layers`, `Compare`, `Timeline`, `Figure`, `Trace`) | 3 | 5 or more |
+| Words in the chapter body | 8,000 | 10,000–15,000+, more for big chapters |
+| Diagrams (`Flow`, `Layers`, `Compare`, `Timeline`, `Figure`, `Trace`) | 6 | 10 or more |
 | Nine-level blocks | 1, complete | 1 per chapter, or 1 per major section |
 | Sections | every section the book's chapter has | |
 
-The word floor is a floor, not a goal. A 3,000-word page that skips a
+The word floor is a floor, not a goal. An 8,000-word page that skips a
 section of the chapter is not done. A big chapter (a long proof-heavy
 algorithms chapter, a chapter that introduces a whole subsystem) should run
-well past 6,000 words.
+well past 15,000 words.
+
+Deeper means more teaching, not padding. Every subsection of the book's
+chapter gets its own `###` with: the idea from first principles, why it
+matters, at least two worked examples (one simple, one realistic), a
+step-by-step trace or derivation where the book has one (proofs walked line
+by line in plain words), the common mistake and its fix, and how it shows up
+in real production systems. Add a short FAQ of the questions a reader would
+actually ask. Each of the nine levels runs several paragraphs with its own
+example, never a one-liner.
 
 The check counts the words between the lead and the closing note, code
 included, and the diagram components (`<figure class="dia ...">`).
@@ -278,7 +287,7 @@ npm run check
 ```
 
 `npm run check` fails a chapter page with: a broken or missing nine-level
-block, fewer than 3 diagrams, fewer than 3,000 words, no "Exercises and
+block, fewer than 6 diagrams, fewer than 8,000 words, no "Exercises and
 self-check" section, no "How I'd study this chapter" section, an in-page
 link that lands on no heading, a duplicate title, no canonical, more than
 one h1, or a missing sitemap entry or share card. Then open

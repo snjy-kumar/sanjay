@@ -143,11 +143,11 @@ for (const file of htmlFiles) {
 
 // One chapter page (docs/CHAPTER_PAGE_GUIDE.md). A chapter is written like
 // a textbook chapter, so the check holds it to the guide's floor: the nine
-// levels, at least three diagrams, the two closing sections, and at least
+// levels, at least six diagrams, the two closing sections, and at least
 // CHAPTER_MIN_WORDS words of the chapter itself.
 function checkChapterPage(rel, html, levelBlocks) {
-  const CHAPTER_MIN_WORDS = 3000;
-  const CHAPTER_MIN_DIAGRAMS = 3;
+  const CHAPTER_MIN_WORDS = 8000;
+  const CHAPTER_MIN_DIAGRAMS = 6;
   if (levelBlocks === 0) note(`${rel}: a chapter page with no nine-level progression`);
   const start = html.indexOf('data-chapter-body');
   const end = html.indexOf('class="note-end"', start);
