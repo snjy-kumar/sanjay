@@ -1,0 +1,809 @@
+---
+title: "Forms: validation, errors and submission feedback"
+series: "ui"
+seriesOrder: 5
+undated: true
+readTime: "about 30 min"
+description: "Building a form people can finish: labels and hints that stay visible, validation rules with useful messages, when to show an error, and a submit that cannot be sent twice and explains what happened."
+tags: ['forms', 'accessibility']
+related: ['ui/04']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+A form is where a person hands over something they cannot easily give
+again: the time it took to type, a payment, an application. Every flaw in a
+form costs them that time. A label that vanishes when they start typing, an
+error that appears before they finished, a message that says "invalid"
+without saying why, a submit button that sends the order twice: each one is
+small to fix and expensive to ship. This note works through a form from its
+markup to its submit, with code for the validation rules, the timing of
+errors, and a submit that cannot be sent twice.
+
+## Before you start
+
+After this note you will be able to:
+
+- mark up a field with a label, a hint and an error that assistive
+  technology connects to the input;
+- write validation as small rules that return a message, and write messages
+  that say how to fix the problem;
+- choose when an error appears, and explain the "reward early, punish late"
+  pattern with a simulation;
+- show submission progress, block a double submit on the client, and make
+  the server safe against it anyway;
+- handle a failed submit with an error summary and focus moved to it.
+
+What you should already know: HTML form elements, events in JavaScript, and
+the idea of state from the [previous note](/sanjay/posts/ui/04/), since a
+submit is a fetch with all its states. The
+[React note on controlled inputs](/sanjay/posts/react/05/) covers how an
+input's value is held in React.
+
+Reading time: about 30 minutes, plus ten for the scripts.
+
+## Note map
+
+<Flow steps={[
+  "Structure: label, hint, input and error, all connected",
+  "Rules: small checks that return a message, or nothing",
+  "Timing: when an error appears and when it goes away",
+  "Submit: pending, guarded, idempotent",
+  "Failure: an error summary, focus moved, input kept",
+]} caption="The note in one line, in the order a person meets a form: they read it, fill it, get feedback, submit, and sometimes have to fix something." />
+
+## Structure: labels, hints and errors
+
+### In one sentence
+
+Every input needs a visible label tied to it, any hint or error tied to it
+too, so a screen reader announces all three when the field is focused.
+
+### The idea
+
+A field has up to four parts: the **label** that names it, a **hint** that
+explains a format or constraint, the **input** itself, and an **error**
+when something is wrong. A sighted user connects them by position. A screen
+reader connects them only through markup:
+
+- `<label for="email">` names the input whose `id` is `email`. Clicking the
+  label also focuses the input, which makes small checkboxes much easier to
+  hit.
+- `aria-describedby="email-hint email-error"` on the input points at the
+  hint and the error by id. Their text is read after the name, as the
+  field's description.
+- `aria-invalid="true"` marks the input as currently invalid, which screen
+  readers announce.
+
+Placeholder text is not a label. It disappears as soon as the user types,
+so they lose the instruction exactly when they need it, and its default
+contrast is often low. Use a real label, always visible, and put format
+examples in a hint.
+
+### Worked example
+
+The simple example is one field with all four parts:
+
+```html
+<div class="field">
+  <label for="email">Email address</label>
+  <p id="email-hint" class="hint">We send the receipt here.</p>
+  <input id="email" name="email" type="email" autocomplete="email"
+         aria-describedby="email-hint email-error" aria-invalid="true" />
+  <p id="email-error" class="error">Enter an email address like name@example.com</p>
+</div>
+```
+
+Focusing the input, a screen reader announces something like "Email
+address, edit text, invalid entry, We send the receipt here. Enter an email
+address like name@example.com". The exact wording varies by screen reader,
+but every part is there.
+
+`type="email"` brings up the email keyboard on phones, and
+`autocomplete="email"` lets the browser fill it. Those two attributes are
+the cheapest usability improvement in any form.
+
+The realistic example is a group of radio buttons, such as a delivery
+option. The individual radios have labels, but the question ("Delivery
+speed") needs a label for the group. That is a `fieldset` with a `legend`:
+
+```html
+<fieldset aria-describedby="speed-error">
+  <legend>Delivery speed</legend>
+  <label><input type="radio" name="speed" value="standard" /> Standard, 3 to 5 days</label>
+  <label><input type="radio" name="speed" value="express" /> Express, next day</label>
+  <p id="speed-error" class="error">Choose a delivery speed</p>
+</fieldset>
+```
+
+<Layers layers={[
+  { name: "error: what is wrong and how to fix it", note: "aria-describedby, shown when invalid" },
+  { name: "hint: format or constraint", note: "aria-describedby, always shown" },
+  { name: "input: type, name, autocomplete", note: "the control itself" },
+  { name: "label: what the field is", note: "for and id, always visible" },
+]} caption="A field's parts, from the always-present label to the sometimes-present error. Each one above the input is connected to it by an id, so the connection survives any layout." />
+
+### Step by step
+
+What each piece of markup contributes to what is announced:
+
+<Trace
+  columns={["markup", "contributes", "if missing"]}
+  rows={[
+    ["label for=email", "the name: Email address", "the field is announced as just 'edit text'"],
+    ["type=email", "the role and the right phone keyboard", "a text keyboard, no format hint"],
+    ["aria-invalid=true", "'invalid entry'", "no signal that this field is the problem"],
+    ["aria-describedby", "hint and error read after the name", "error visible but silent"],
+    ["autocomplete=email", "browser autofill", "the user types it again"],
+  ]}
+  caption="One input, five attributes. Each one either says something to assistive technology or saves the user typing, and each is missing from a lot of real forms."
+/>
+
+### Common mistake
+
+The common mistake is an error message that is visible but not connected.
+It appears in red under the field, and a sighted user sees it. A
+screen-reader user tabs back to the field and hears only the label, with no
+idea what is wrong. The fix is the `aria-describedby` link, plus an
+`aria-invalid` flag that is set and cleared with the error.
+
+A second common mistake is relying on colour alone: a red border and
+nothing else. People who do not see red, and anyone in bright sunlight,
+miss it. The error needs text, and ideally an icon.
+
+### In real systems
+
+Design systems ship a `Field` component that takes a label, a hint and an
+error and wires the ids itself, so no screen has to remember. That is the
+composition pattern from note three: the field owns the structure and the
+ids, the caller passes the input. It is one of the highest-value
+components in any system, because forms are everywhere and the wiring is
+easy to forget.
+
+### Check yourself
+
+<details>
+<summary>1. Why is a placeholder not a substitute for a label?</summary>
+
+It disappears as soon as the user types, so the instruction is gone when
+they need it, and it often has low contrast. A label is always visible and
+names the field for assistive technology.
+
+</details>
+
+<details>
+<summary>2. An error is shown in red under the input. What connects it for a screen reader?</summary>
+
+`aria-describedby` on the input pointing at the error's id, plus
+`aria-invalid="true"` while it is invalid.
+
+</details>
+
+## Rules and messages
+
+### In one sentence
+
+Write validation as a list of small rules per field, each returning a
+message that says how to fix the problem, or nothing when the value is
+fine.
+
+### The idea
+
+Validation is two jobs that are easy to blur: deciding **whether** a value
+is acceptable, and telling the person **what to do** when it is not. A rule
+that returns `false` does the first job only. A rule that returns a message
+does both, and keeps the message next to the check it explains.
+
+A good message has three properties:
+
+- **It says what to do**, not only what went wrong. "Enter an email address
+  like name@example.com" rather than "Invalid email".
+- **It is specific to the failure.** An empty field and a malformed field
+  are different problems. "Enter your email address" for empty, the format
+  message for malformed.
+- **It uses the person's words**, not the code's. "Use at least 12
+  characters (you have 5)" rather than "Password does not meet length
+  requirement".
+
+Order rules from the most basic to the most specific, and stop at the first
+failure per field. Showing "required" and "too short" and "must contain a
+number" all at once for an empty field is noise.
+
+The browser has built-in validation: `required`, `type="email"`,
+`minlength`, `pattern`. It is useful as a baseline, and it works with no
+JavaScript. Its default messages and timing are hard to control, though,
+so many forms add `novalidate` to the form and run their own rules, while
+keeping the attributes so the constraints are still expressed in the
+markup.
+
+### Worked example
+
+```js
+// validate.mjs
+const rules = {
+  email: [
+    (v) => (v.trim() === '' ? 'Enter your email address' : null),
+    (v) => (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? null : 'Enter an email address like name@example.com'),
+  ],
+  password: [
+    (v) => (v.length === 0 ? 'Enter a password' : null),
+    (v) => (v.length < 12 ? `Use at least 12 characters (you have ${v.length})` : null),
+  ],
+};
+
+export function validate(values) {
+  const errors = {};
+  for (const [field, checks] of Object.entries(rules)) {
+    for (const check of checks) {
+      const message = check(values[field] ?? '');
+      if (message) { errors[field] = message; break; }
+    }
+  }
+  return errors;
+}
+```
+
+Three submissions, empty, half-typed and correct:
+
+```text
+{"email":"","password":""} -> {"email":"Enter your email address","password":"Enter a password"}
+{"email":"sanjay@","password":"short"} -> {"email":"Enter an email address like name@example.com","password":"Use at least 12 characters (you have 5)"}
+{"email":"sanjay@example.com","password":"a long enough passphrase"} -> {}
+```
+
+Each field gets at most one message, the first that applies, and an empty
+object means the form is valid.
+
+The email pattern here is deliberately loose: something, an at sign,
+something, a dot, something. Email addresses allow far more than most
+strict patterns accept, and the only real test of an address is sending
+mail to it. A loose check catches typos; a confirmation email catches the
+rest.
+
+The realistic version shares rules between client and server. The same
+module runs in the browser for instant feedback and on the server for
+safety, because the client cannot be trusted: anyone can send a request
+without the form. Schema libraries such as Zod express the rules as a
+schema and produce both a type and a validator from it.
+
+<Compare left="Message that reports" right="Message that helps" caption="The same failures, worded for the code and worded for the person. The right column tells them what to type next." rows={[
+  ["Invalid email", "Enter an email address like name@example.com"],
+  ["Field required", "Enter your email address"],
+  ["Password too short", "Use at least 12 characters (you have 5)"],
+  ["Invalid date", "Enter a date in the past, like 14 03 1998"],
+  ["Error", "Choose a delivery speed"],
+]} />
+
+### Step by step
+
+`validate` on the half-typed submission:
+
+<Trace
+  columns={["field", "rule", "value", "result"]}
+  rows={[
+    ["email", "not empty", "sanjay@", "pass"],
+    ["email", "looks like an address", "sanjay@", "fail: format message, stop"],
+    ["password", "not empty", "short", "pass"],
+    ["password", "12 characters or more", "short (5)", "fail: length message with the count, stop"],
+  ]}
+  caption="Rules run in order and stop at the first failure per field. The length message includes the current count, which turns a refusal into a progress bar."
+/>
+
+### Common mistake
+
+The common mistake is validating only on the client. The form looks safe,
+and the API behind it accepts anything a script sends. Client validation is
+for the person's convenience; server validation is for correctness. They
+should agree, which is easiest when they share rules.
+
+The second mistake is over-strict rules: names that must be two words,
+phone numbers that must match one country's format, postcodes that reject
+valid ones. Each rule is a way to refuse a real person. Validate what the
+system actually needs.
+
+### In real systems
+
+Production forms keep messages in one place for review and translation, and
+test them with the same care as the rules. A server returns field errors in
+a shape the client can map back to fields, such as an object keyed by field
+name, so a server-side failure ("this email is already registered") appears
+next to the field exactly like a client-side one.
+
+### Check yourself
+
+<details>
+<summary>1. Why stop at the first failing rule per field?</summary>
+
+Because later rules usually depend on earlier ones passing. Listing every
+failure for an empty field is noise; the first message is the next step.
+
+</details>
+
+<details>
+<summary>2. The client validates. Why validate again on the server?</summary>
+
+Anyone can send a request without using the form. The client check is for
+the person's convenience; only the server check protects the data.
+
+</details>
+
+## When to show an error
+
+### In one sentence
+
+Do not show an error while someone is still typing a value for the first
+time, show it when they leave the field, and once it is shown, update it on
+every keystroke so it disappears the moment the value is fixed.
+
+### The idea
+
+The rules decide whether a value is valid. A separate decision is **when**
+to tell the person. There are three common strategies:
+
+1. **On every keystroke.** The error appears as soon as the value is
+   invalid, which is almost immediately: "s" is not an email address. The
+   person is told they are wrong before they had a chance to be right.
+2. **On blur only.** The field is checked when the person leaves it. That
+   fixes the premature error, but once an error is shown, it stays until
+   they leave the field again, even after they fixed it. They cannot tell
+   whether the fix worked.
+3. **Reward early, punish late.** Wait for blur before showing a new error
+   (punish late). Once an error is showing, re-check on every keystroke and
+   remove it as soon as the value is valid (reward early).
+
+The third combines the good half of each. It is a widely used pattern, and
+a simulation makes the difference concrete.
+
+### Worked example
+
+The simulation types an email address one character at a time, counts
+how often each strategy shows an error during that first pass, then leaves
+the field with a typo and comes back to fix it:
+
+```js
+// timing.mjs
+const ok = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+const strategies = {
+  'on every keystroke': (s) => !ok(s.value),
+  'on blur only': (s) => (s.blurred ? !ok(s.value) : s.wasShown),
+  'reward early, punish late': (s) => (s.blurred || s.wasShown) && !ok(s.value),
+};
+```
+
+Its output:
+
+```text
+on every keystroke         errors while first typing: 15/18 | after blur with typo: shown | while fixing: shown, hidden
+on blur only               errors while first typing:  0/18 | after blur with typo: shown | while fixing: shown, shown
+reward early, punish late  errors while first typing:  0/18 | after blur with typo: shown | while fixing: shown, hidden
+```
+
+Reading the three rows: the keystroke strategy shows an error for 15 of the
+18 characters of a perfectly good address. The blur strategy is quiet while
+typing, but after a fix it still shows the error, because it only re-checks
+on blur. Reward early, punish late is quiet while typing, shows the error on
+blur, and clears it on the keystroke that fixes it.
+
+### Step by step
+
+Reward early, punish late, through the typo and the fix:
+
+<Trace
+  columns={["moment", "value", "error showing before", "rule applied", "error after"]}
+  rows={[
+    ["typing", "sanjay@ex", "no", "not blurred, never shown: stay quiet", "no"],
+    ["leave field", "sanjay@example", "no", "blurred and invalid: show", "yes"],
+    ["return, type .", "sanjay@example.", "yes", "shown before: re-check now, still invalid", "yes"],
+    ["type c", "sanjay@example.c", "yes", "shown before: re-check now, valid", "no"],
+  ]}
+  caption="The pattern in four moments. The person is never told they are wrong before they finish, and never told they are still wrong after they fixed it."
+/>
+
+### Common mistake
+
+The common mistake is validating the whole form on submit only, with no
+per-field feedback, and then showing every error at once at the top. The
+person has to map messages back to fields, often by scrolling. Submit-time
+validation is still needed, for fields they never touched, but it should
+mark each field as well as summarise.
+
+The opposite mistake is showing errors for untouched fields when the page
+loads, because the form state starts invalid. A required field nobody has
+reached yet is not an error.
+
+### In real systems
+
+Form libraries track exactly the state the simulation tracks: whether a
+field has been **touched** (blurred at least once), whether it is
+**dirty** (changed from its initial value), and whether the form has been
+**submitted**. Their "mode" settings, such as validate on blur, on change
+or on submit, with a separate re-validate mode, are these strategies. Knowing
+the strategy makes their configuration a two-minute decision.
+
+### Check yourself
+
+<details>
+<summary>1. What goes wrong with validating on every keystroke?</summary>
+
+The error appears before the person has finished typing a value that will
+be valid, so they are told they are wrong for most of the time they are
+typing it.
+
+</details>
+
+<details>
+<summary>2. What goes wrong with validating only on blur?</summary>
+
+Once shown, the error stays until the person leaves the field again, even
+after they fixed the value, so they cannot tell when it is right.
+
+</details>
+
+## Submitting: pending, guarded, idempotent
+
+### In one sentence
+
+A submit is a request with all the states of the previous note, plus one
+more hazard: being sent twice, which the client should prevent and the
+server should survive.
+
+### The idea
+
+When the person presses submit, three things should happen at once: the
+button shows that work is in progress, further submits are ignored until
+this one finishes, and the request goes out. When it comes back, the form
+either moves on (a success page, a confirmation) or shows what failed.
+
+Double submits come from double clicks, impatient second clicks on a slow
+network, the Enter key pressed twice, and retries after a timeout where
+the first request actually succeeded. The last one is why a client-side
+guard alone is not enough: the client cannot tell "the server never got
+it" from "the server got it and the answer was lost".
+
+Two guards, one on each side:
+
+- **Client guard.** While a submit is pending, a second submit returns the
+  same pending promise instead of starting a new request.
+- **Idempotency key.** The client generates one random key per form
+  instance and sends it with the request. The server records keys it has
+  processed, and a repeated key returns the original result instead of
+  doing the work again.
+
+### Worked example
+
+A fake server that takes 50 ms per request, and a form that double-clicks,
+with no guard, with the client guard, and with an idempotency key:
+
+```js
+// submit.mjs
+const server = { orders: new Map(), seen: new Set() };
+async function createOrder(body, key) {
+  await new Promise((r) => setTimeout(r, 50));
+  if (key && server.seen.has(key)) return { status: 200, replay: true };
+  if (key) server.seen.add(key);
+  const id = server.orders.size + 1;
+  server.orders.set(id, body);
+  return { status: 201, id };
+}
+
+function makeForm({ guard, idempotency }) {
+  let pending = null;
+  const key = idempotency ? 'form-7f3a' : null; // one key per form instance
+  return () => {
+    if (guard && pending) return pending; // second click joins the first
+    pending = createOrder({ item: 'notebook' }, key).finally(() => { pending = null; });
+    return pending;
+  };
+}
+```
+
+Output:
+
+```text
+{"guard":false,"idempotency":false} -> orders created: 2 [{"status":201,"id":1},{"status":201,"id":2}]
+{"guard":true,"idempotency":false} -> orders created: 1 [{"status":201,"id":1},{"status":201,"id":1}]
+{"guard":false,"idempotency":true} -> orders created: 1 [{"status":201,"id":1},{"status":200,"replay":true}]
+```
+
+No guard: two orders. Client guard: one request, and both clicks get the
+same answer. Idempotency key: two requests reach the server, and the second
+is recognised as a replay. In a real system the key would be random, such
+as `crypto.randomUUID()`, and the server would store it with the result for
+some hours. This toy server records the key after its delay, which is fine
+for a single-threaded demo; a real one must claim the key atomically,
+such as with a unique constraint in the database, or two concurrent
+requests can both pass the check.
+
+<Compare left="Client guard" right="Idempotency key" caption="The two guards protect against different failures. Use both: the client guard for the common double click, the key for the retry the client cannot reason about." rows={[
+  ["stops a double click", "stops a double click"],
+  ["cannot stop a retry after a lost response", "returns the first result on retry"],
+  ["lives in one browser tab", "lives on the server, any client"],
+  ["no server changes", "server stores keys and results"],
+]} />
+
+### Step by step
+
+When the submit fails, the form should help the person fix it:
+
+<Trace
+  columns={["step", "what happens", "why"]}
+  rows={[
+    ["1", "button returns to normal, all input kept", "never make them type it again"],
+    ["2", "each field error shown next to its field", "fix where the problem is"],
+    ["3", "an error summary appears above the form", "one place listing every problem"],
+    ["4", "focus moves to the summary heading", "a screen reader announces it, keyboard users start there"],
+    ["5", "each summary item links to its field", "one click or Enter to get to the fix"],
+  ]}
+  caption="A failed submit, handled. The summary and the focus move are what make it usable without seeing the whole page at once."
+/>
+
+### Common mistake
+
+The common mistake is disabling the submit button while pending, with the
+`disabled` attribute, and moving on. It does stop clicks, but a disabled
+button loses focus for keyboard users, and some screen readers skip it, so
+nothing is announced. A gentler approach keeps the button enabled and
+focusable, sets `aria-disabled="true"` and ignores repeat submits in the
+handler, and shows "Saving…" in the button text.
+
+Another mistake is clearing the form on a server error. Everything they
+typed is gone, and the error message is the last thing they read before
+leaving.
+
+### In real systems
+
+Payment providers and other APIs that move money commonly accept an
+idempotency key header for exactly the lost-response case. Frameworks with
+server actions and form helpers expose a pending status for the button.
+Error summaries are a recognised pattern in public-sector design systems,
+which test forms with a wide range of people and assistive technology, and
+are worth reading as a reference for form design in general.
+
+### Check yourself
+
+<details>
+<summary>1. Why is a client-side submit guard not enough on its own?</summary>
+
+It cannot handle a retry after the response was lost: the client does not
+know whether the server already did the work. An idempotency key lets the
+server recognise the repeat.
+
+</details>
+
+<details>
+<summary>2. Where should focus go after a failed submit, and why?</summary>
+
+To the error summary heading, so a screen reader announces the problems
+and a keyboard user starts from the list of links to each field.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Forms: validation, errors and submission feedback">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, get the structure right. Every input has a visible
+`label` with a matching `for`. Every input has the right `type` and an
+`autocomplete` value where one applies. Required fields say so in the label
+or hint, not only with an asterisk.
+
+A worked example: a sign-up form with three fields built from placeholders.
+Replacing each placeholder with a label and a hint, and adding
+`type="email"` and `autocomplete="new-password"`, takes ten minutes and
+fixes the form for screen readers, phones and password managers at once.
+
+The mistake at this level is building custom inputs from `div` elements
+before the native ones are understood. The native ones handle focus,
+labels, keyboards and autofill for free.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, write rules that return messages, share them
+with the server, and use reward early, punish late. Connect errors with
+`aria-describedby` and `aria-invalid`, and add an error summary on submit.
+
+A worked example: a checkout address form. Rules check required fields and
+a loose postcode format. The server re-runs them and adds one the client
+cannot know: whether delivery is possible to that postcode. Its error comes
+back keyed by field and appears next to the postcode exactly like a client
+error.
+
+The mistake at this level is writing messages last, in a hurry. They are
+the part of the form people read most closely, usually when they are
+already frustrated.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, the submit is robust. A client guard joins repeat
+submits, an idempotency key protects against retries, the button shows
+progress without losing focus, and focus moves to the summary on failure
+and to the result on success.
+
+A worked example: an order form on a slow network. The first request times
+out on the client after ten seconds, but the server completed it. The
+person presses submit again. With the same idempotency key, the server
+returns the original order instead of creating a second.
+
+The mistake at this level is generating the idempotency key per click
+instead of per form instance. A new key on each click makes every retry
+look new, and the guard does nothing.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries:
+
+- **Autofill.** The browser fills fields without keystrokes, and in some
+  cases without change events firing as expected. Validate on submit
+  regardless of what events fired.
+- **Pasted values with spaces.** An email pasted with a trailing space
+  fails a strict check. Trim where it is safe (emails, codes), never in
+  passwords.
+- **A field that becomes required.** Choosing "company" makes "company
+  name" required. Show the new field and its rule only when it applies, and
+  do not show its error until it has been touched or the form submitted.
+- **A server error with no field.** "Payment provider unavailable" belongs
+  to no field. Show it in the summary, keep the input, and offer a retry.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **A double submit plus a validation error.** The first submit returns
+  field errors; the second, already in flight, also returns them. The
+  client guard prevents the second request, and the errors appear once.
+- **Async validation plus fast typing.** Checking "is this username taken"
+  on every keystroke is a search box with all its races. Use the request-id
+  guard from the previous note, and debounce.
+- **A multi-step form plus the back button.** The person goes back to step
+  one to fix something. Their answers on steps two and three should
+  survive, and step-two validation should not fire on step one.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, measure forms. Track which fields produce the most errors
+and where people abandon. A field with a high error rate usually has a
+rule or a label that does not match how people think about their own data,
+such as a date format or a phone number.
+
+Keep rules in a shared schema used by client and server, messages in one
+reviewed place, idempotency keys on every endpoint that creates something,
+and end-to-end tests that cover a double click, a server error and a
+keyboard-only fill.
+
+The mistake in production is a form that only ever gets tested by the team
+that built it, on fast laptops with autofill and a mouse.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that a form is a conversation where the other side cannot
+ask what I meant. Every label, hint and error is my half of that
+conversation, written in advance. If a message would sound rude or
+confusing said out loud across a desk, it is wrong on the screen too.
+
+So I write the messages first, read them aloud, and ask whether each one
+says what to do next. Then I make the code produce them at the right
+moment.
+
+The mistake in mindset is treating validation as defence against the user.
+Server-side validation defends the data; client-side validation exists to
+help the person finish.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, a form is the front of a write path. The write path
+needs a schema shared across client and server, an idempotency mechanism
+for creates, a consistent error shape that maps to fields, and a decision
+about what happens on partial failure, such as an order created but a
+confirmation email not sent.
+
+A concrete design: the API accepts an `Idempotency-Key` header on creates
+and stores key, request hash and response for a day. Field errors come
+back as a `422` with an object keyed by field. Non-field errors come back
+with a code and a human message. The client maps the first to fields and
+the second to the summary.
+
+The mistake at this level is an API that returns errors as free text in
+one string. The client cannot place them, so every error ends up at the
+top, unconnected.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+How I learn this and how I know I have. I take a form I built and use it
+three ways: keyboard only, with a screen reader, and on a phone with
+autofill. I write down every moment of confusion. Then I fix structure
+first, messages second, timing third and submit last, in the order of this
+note.
+
+I build the three scripts here: rules with messages, the timing
+simulation, and the double-submit test. Then I wire a real form with a
+shared schema and an idempotency key, and break it on purpose: throttle
+the network, double-click, kill the response.
+
+Done when: every field is announced with its label, hint and error, errors
+follow reward early, punish late, a double click creates one record, and a
+failed submit keeps every value and moves focus to a summary.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I disable the submit button until the form is valid?** Usually
+not. A disabled button gives no reason, and people cannot find out what is
+missing. Let them submit and show the errors.
+
+**Is the browser's built-in validation good enough?** As a baseline, it is
+good, and it works without JavaScript. Its timing and messages are hard to
+control, so many forms run their own rules and keep the attributes for the
+constraints.
+
+**How do I mark required fields?** Say it in words. Either mark the
+required fields, or, if most are required, mark the optional ones with
+"(optional)". An asterisk alone needs a legend and is easy to miss.
+
+**Should errors appear above or below the input?** Either works if it is
+consistent and connected with `aria-describedby`. Above the input keeps it
+visible when an on-screen keyboard covers the lower half of a phone screen.
+
+**What about inline success messages?** Use them sparingly. A green tick on
+every valid field is noise; a confirmation that a username is available is
+useful.
+
+## Key takeaways
+
+- Every input needs a visible label, and hints and errors connected with
+  `aria-describedby`.
+- Write rules that return a message saying what to do, and stop at the
+  first failure per field.
+- Validate on the server too; share rules so both sides agree.
+- Reward early, punish late: show a new error on blur, clear it on the
+  keystroke that fixes it.
+- Guard the submit on the client and make creates idempotent on the server.
+- On a failed submit, keep every value, show a summary and move focus to
+  it.
+
+## Glossary
+
+- **Label**: the visible name of a field, connected to its input with
+  `for` and `id`.
+- **Hint**: text that explains a field's format or purpose, always shown.
+- **`aria-describedby`**: an attribute pointing at elements whose text
+  describes a control.
+- **`aria-invalid`**: an attribute marking a control's current value as
+  invalid.
+- **Touched**: a field that has been focused and left at least once.
+- **Reward early, punish late**: show a new error on blur, and once shown,
+  re-check on every change.
+- **Error summary**: a list of all errors at the top of a form, each
+  linking to its field.
+- **Idempotency key**: a client-generated id that lets a server recognise
+  and safely ignore a repeated request.
+- **Double submit**: the same form sent twice by repeated clicks, keys or
+  retries.
+
+## Practice
+
+**Warm-up.** Pick any sign-up form and fill it using only the keyboard.
+Note every field whose label, hint or error you could not find.
+
+**Build.** Implement the rules, the timing strategy and the submit guard in
+a small form with three fields. Add an error summary that receives focus
+on a failed submit, with links to each field.
+
+**Stretch.** Add a server with an idempotency key store and a random delay.
+Simulate a timeout where the server succeeds but the client never gets the
+response, retry, and show that one record is created.
