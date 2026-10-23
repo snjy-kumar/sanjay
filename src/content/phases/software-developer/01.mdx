@@ -424,103 +424,130 @@ and fix a stale closure on sight.
 
 #### Phase 1: `this`
 
-<Flow
-  caption="How JavaScript decides this for a normal function call. Arrow functions skip the chart and use the surrounding this."
-  steps={['Called with new? the new object', 'Called with call, apply or bind? the given object', 'Called as obj.method()? obj', 'Otherwise: undefined in strict mode (window in sloppy scripts)']}
-/>
+<Figure art={`
+  how was the function CALLED?                      this is ...
+  -------------------------------------------------------------------------
+  obj.method()                 (dot call)          obj
+  fn()                         (plain call)        undefined in strict mode / modules
+  new Fn()                     (constructor)       the new object
+  fn.call(x) / fn.apply(x)     (explicit)          x
+  const g = fn.bind(x); g()    (bound)             x, forever
+  arrow function               (any call)          this of the surrounding code
+  addEventListener(fn)         (DOM callback)      the element (not for arrows)
+`} caption="this is decided by how a function is called, not where it is written, except for arrow functions, which have no this of their own." />
 
 <Levels label="Phase 1, this">
 
 <Level name="Beginner">
 
-`this` is a hidden parameter: for a regular function it is set by how the function is called, not where
-it is written. Called as a method, `this` is the object before the dot.
+`this` is a hidden parameter every normal function gets, set by how the function is called. The most common case is a method call: in
+`obj.method()`, `this` is `obj`.
 
 ```js
-const user = { name: 'Sanjay', hi() { return `Hi, ${this.name}`; } };
-console.log(user.hi()); // Hi, Sanjay
+const counter = {
+  count: 0,
+  increment() { this.count++; return this.count; },
+};
+counter.increment();     // 1, this === counter
 ```
 
-Mistake: expecting `this` to mean the function or the file. Fix: look at the call site.
+The proof asks me to explain `this` without notes; the table in the figure is the whole explanation, and the rest is examples of it.
+
+Mistake: pulling a method off its object and calling it plainly:
+
+```js
+const inc = counter.increment;
+inc();
+```
+
+```text
+TypeError: Cannot read properties of undefined (reading 'count')
+```
+
+The call `inc()` has no dot, so `this` is `undefined` (in modules and strict code). Where the function was written does not matter; how it was
+called does.
 
 </Level>
 
 <Level name="Intermediate">
 
-Pulling a method off its object loses `this`. Passing it as a callback does the same. Arrow functions
-do not have their own `this`; they use the one from the code around them, which is why they fix the
-callback case.
+Callbacks are where this bites, because I hand the function to someone else, who calls it plainly:
 
 ```js
-const hi = user.hi;
-hi(); // TypeError: Cannot read properties of undefined (reading 'name') in a module
-setTimeout(user.hi, 0);          // same loss
-setTimeout(() => user.hi(), 0);  // keeps the call site
-const bound = user.hi.bind(user); bound(); // Hi, Sanjay
+class Timer {
+  seconds = 0;
+  start() {
+    setInterval(function () { this.seconds++; }, 1000);   // this is not the Timer
+  }
+}
 ```
+
+Three fixes, each a row of the table. An arrow function, which uses the `this` of `start`:
+
+```js
+start() { setInterval(() => { this.seconds++; }, 1000); }
+```
+
+`bind`, which returns a function with `this` fixed: `setInterval(this.tick.bind(this), 1000)`. Or a class field arrow, `tick = () => { this.seconds++; }`,
+which is bound per instance. Arrows are the usual answer.
 
 </Level>
 
 <Level name="Advanced">
 
-The rules in order of priority: `new` binds a fresh object; `call`, `apply` and `bind` set it
-explicitly; a method call uses the receiver; a plain call gets `undefined` in strict mode (modules and
-classes are strict). Class methods are not auto-bound. In DOM listeners, a regular function's `this` is
-the element (`event.currentTarget`), an arrow's is not.
+Arrows have no `this` of their own, so they are wrong where a dynamic `this` is wanted: as object methods and as DOM listeners that use the element.
 
 ```js
-class Timer { constructor() { this.ticks = 0; } tick() { this.ticks++; } }
-const t = new Timer();
-button.addEventListener('click', t.tick);          // this is the button, ticks is NaN on it
-button.addEventListener('click', () => t.tick());   // correct
+const obj = { name: 'A', hi: () => this?.name };
+obj.hi();                         // undefined: the arrow took this from the module, not obj
+
+button.addEventListener('click', function () { this.classList.toggle('on'); });   // this = button
+button.addEventListener('click', (e) => { e.currentTarget.classList.toggle('on'); }); // arrow: use the event
 ```
+
+`call` and `apply` set `this` for one call: `fn.call(obj, a, b)`, `fn.apply(obj, [a, b])`. `new` creates an object, sets `this` to it, runs the function and
+returns it, which is all a constructor is.
 
 </Level>
 
 <Level name="Edge cases">
 
-An arrow function used as an object method: `{ name: 'A', hi: () => this.name }` reads the outer `this`,
-usually `undefined` in a module, so the property read throws. `bind` is permanent: binding a bound
-function again does nothing. Destructuring a method `const { hi } = user` loses `this` the same way
-assignment does.
+Outside strict mode and modules, a plain call sets `this` to the global object (`window`), so the inc example silently creates `window.count` as `NaN`
+instead of throwing. Modules are always strict, one more reason to use them. `bind` twice does nothing the second time: the first binding wins.
 
 </Level>
 
 <Level name="Corner cases">
 
-`array.forEach(obj.method)` plus a method that uses `this`: `forEach` accepts a `thisArg` second
-argument that most people never pass. `removeEventListener` with `fn.bind(obj)` fails silently because
-each `bind` creates a new function, so the listener was never the same reference; store the bound
-function once.
+Destructuring a method loses its `this`: `const { increment } = counter; increment()` fails just like `inc`. Passing `obj.method` as a React prop or a
+`.then` callback is the same mistake in disguise.
 
 </Level>
 
 <Level name="Production level">
 
-Modern code uses `this` mostly inside classes, and passes methods as arrows or binds them in the
-constructor. React function components avoid it entirely. Libraries that still use it (some DOM APIs,
-older code) are where it bites, so the rule set matters for reading code more than writing it.
+Modern code avoids most `this` problems by using modules of functions instead of classes for logic, and arrows for callbacks. Where classes are used, methods
+passed as callbacks are class field arrows or bound in the constructor.
 
 </Level>
 
 <Level name="Mindset">
 
-Hidden inputs are dangerous. `this` is an argument I did not write; when code behaves differently from
-two call sites, look for hidden inputs.
+Do not ask "where is this function?" Ask "how is it being called right now?"
 
 </Level>
 
 <Level name="System design">
 
-Design APIs that do not depend on how they are called: plain functions and closures over explicit
-arguments are easier to pass around than methods relying on `this`.
+Code that depends on implicit context (`this`, globals) is harder to move and test than code that receives everything as parameters. Prefer explicit inputs.
 
 </Level>
 
 <Level name="Strategy">
 
-Ten call sites, predict `this` for each, run them. Done when I can explain the four rules and the
-arrow exception without notes, as the plan's proof asks, and fix a lost-`this` callback in one line.
+I write the figure's seven rows as seven runnable examples, predict each output, run them, and fix the Timer three ways.
+
+Done when I can explain `this` for any call site from the table without notes, as the proof requires, and predict all seven examples correctly.
 
 </Level>
 
@@ -648,101 +675,123 @@ shallow copies.
 #### Phase 1: Destructuring
 
 <Figure art={`
-  const { id, text: label, done = false, ...rest } = todo;
-            |     |            |              |
-   todo.id -+     |            |              +-- every other property
-   todo.text, renamed to label |
-                  todo.done, or false when it is undefined
-`} caption="Destructuring is pattern-matching on shape: pick fields, rename them, default them, gather the rest." />
+  const { id, text: title, tags = [], ...rest } = todo;
+
+  todo = { id: 'a1', text: 'Buy milk', done: false, due: '2026-10-30' }
+           |          |                |              |
+           v          v                v              v
+          id       title         tags = [] (missing)  rest = { done: false, due: '2026-10-30' }
+
+  const [first, , third = 'none', ...others] = ['a', 'b'];
+           'a'   skip   'none' (missing)      []
+`} caption="Destructuring unpacks by name for objects and by position for arrays, with renames, defaults and a rest collector." />
 
 <Levels label="Phase 1, destructuring">
 
 <Level name="Beginner">
 
-Destructuring unpacks values from arrays and objects into variables in one line.
+Destructuring pulls values out of objects and arrays into variables in one line.
 
 ```js
-const todo = { id: 1, text: 'Deploy', done: false };
-const { text, done } = todo;
-const [first, second] = ['a', 'b'];
-console.log(text, done, first); // Deploy false a
+const todo = { id: 'a1', text: 'Buy milk', done: false };
+const { id, text } = todo;               // by name
+console.log(id, text);                   // a1 Buy milk
+
+const [first, second] = ['a', 'b', 'c']; // by position
+console.log(first, second);              // a b
 ```
 
-Mistake: destructuring a name that does not exist gives `undefined`, not an error. Fix: check the
-spelling against the actual object, or add a default.
+It shines in function parameters, where it documents what a function uses:
+
+```js
+function label({ text, done }) { return done ? `✓ ${text}` : text; }
+label(todo);    // 'Buy milk'
+```
+
+Mistake: destructuring something that might be `undefined`: `const { text } = undefined` throws
+`Cannot destructure property 'text' of 'undefined' as it is undefined.` Give a default: `function f({ text } = {})`.
 
 </Level>
 
 <Level name="Intermediate">
 
-Rename, default, nest, and use it in parameters. Swap two variables without a temporary.
+Renames, defaults and rest:
 
 ```js
-const { text: label, priority = 'normal' } = todo;
-function render({ id, text, done = false }) { return `${id}:${text}:${done}`; }
-let x = 1, y = 2; [x, y] = [y, x];
-const { user: { name } } = { user: { name: 'S' } };
+const { text: title, priority = 'normal', ...rest } = { text: 'Ship', done: true };
+// title = 'Ship', priority = 'normal', rest = { done: true }
 ```
 
-Rest gathers the remainder: `const { id, ...withoutId } = todo` is a clean way to drop a field.
+Swapping without a temporary: `[a, b] = [b, a]`. Entries in loops:
+
+```js
+for (const [key, value] of Object.entries({ all: 3, done: 1 })) console.log(key, value);
+// all 3
+// done 1
+```
+
+Rest in objects is the clean way to remove a field without mutating: `const { password, ...safeUser } = user;`.
 
 </Level>
 
 <Level name="Advanced">
 
-Defaults apply only when the value is `undefined`, not `null`. Destructuring an object pattern runs
-property gets, so getters run. Array destructuring works on any iterable (a `Map`'s entries, a
-`Set`), which is why `for (const [key, value] of map)` works.
+Nested destructuring follows the shape:
 
 ```js
-const { a = 1 } = { a: null }; console.log(a); // null
-for (const [k, v] of new Map([['x', 1]])) console.log(k, v); // x 1
+const { author: { name }, tags: [firstTag] } = { author: { name: 'Ana' }, tags: ['js', 'ts'] };
+// name = 'Ana', firstTag = 'js'   (author and tags themselves are not variables)
 ```
+
+Options objects with defaults are a common API pattern:
+
+```js
+function fetchTodos({ limit = 20, sort = 'created', signal } = {}) { /* ... */ }
+fetchTodos({ sort: 'due' });
+```
+
+Named options are readable at the call site, can be added without breaking callers, and replace long positional argument lists.
 
 </Level>
 
 <Level name="Edge cases">
 
-Destructuring `null` or `undefined` throws: `const { a } = null` gives `TypeError: Cannot destructure
-property 'a' of 'null' as it is null.` Guard with `= {}` as a parameter default:
-`function f({ a } = {})`.
+Defaults apply only for `undefined`, not `null`: `const { a = 1 } = { a: null }` gives `null`. Destructuring a missing nested object throws: `const { author: { name } } = {}`
+fails because `author` is undefined; add a default, `{ author: { name } = {} }`.
 
 </Level>
 
 <Level name="Corner cases">
 
-A parameter default `= {}` plus a caller passing `null`: the default does not apply (only `undefined`
-triggers it), so the destructure still throws. Nested destructuring plus a missing middle object
-(`{ user: { name } }` when `user` is absent) throws as well. Optional chaining reads safely where
-destructuring cannot.
+Destructuring assignment to existing variables needs parentheses around an object pattern, or the braces are read as a block:
+`({ a, b } = obj);`. A line starting with `[` or `(` after a line with no semicolon can join the previous line; that is one place semicolons matter.
 
 </Level>
 
 <Level name="Production level">
 
-Destructured parameters make function signatures self-documenting and are the standard way React
-components receive props. Avoid deep nested destructuring of API data; it throws on the first missing
-level, which is exactly what real APIs produce.
+Parameter destructuring with defaults for options, rest to omit sensitive fields before logging or returning, and shallow patterns only; deep patterns are hard
+to read and fragile when data is missing.
 
 </Level>
 
 <Level name="Mindset">
 
-Name what I use at the top of a function. It doubles as a list of the function's real dependencies.
+Destructuring states what I need from a value. If the pattern is long, the function probably needs less.
 
 </Level>
 
 <Level name="System design">
 
-Options objects with destructured defaults are the standard shape for configurable functions and
-components; they let an API grow without breaking callers.
+Options objects with defaults are how stable APIs evolve: new options arrive without breaking anyone. The same idea appears in config files and HTTP query parameters.
 
 </Level>
 
 <Level name="Strategy">
 
-Rewrite the app's functions to take destructured options. Done when I can predict what each pattern
-does with `null`, `undefined` and missing nested fields.
+I refactor the vanilla app's functions to destructure their parameters, use rest to strip fields, and convert one three-argument function to an options object.
+
+Done when no function takes more than two positional arguments, defaults handle missing options, and I can predict the edge-case outputs above.
 
 </Level>
 
@@ -752,96 +801,149 @@ does with `null`, `undefined` and missing nested fields.
 
 <Figure art={`
   index.html
-    <script type="module" src="main.js">
-           |
-        main.js ----import----> store.js     (load, save, the list)
-           |                       |
-           +------import---------> render.js (DOM only)
-                                   |
-                                   +--import--> format.js (pure helpers)
-  Each file is evaluated once; every importer shares the same instance.
-`} caption="The vanilla app split into modules. Arrows are imports; the graph has no cycles." />
+    <script type="module" src="./main.js">
+                 |
+  main.js        |  import { addTodo, todos } from './store.js'
+                 |  import { render } from './view.js'
+        +--------+---------+
+        v                  v
+  store.js              view.js
+  export const todos    import { escapeHtml } from './util.js'
+  export function addTodo   export function render
+        |                  |
+        +------> util.js <-+    evaluated once, shared by both importers
+                 export function escapeHtml
+`} caption="ES modules form a graph. Each file is loaded and evaluated once, and every importer shares the same live bindings." />
 
 <Levels label="Phase 1, modules">
 
 <Level name="Beginner">
 
-A module is a file with its own scope that exports what others may use and imports what it needs. In
-the browser, `<script type="module">` turns them on.
+A module is a file with its own scope. Nothing in it is visible outside unless it is exported, and nothing from outside is visible
+inside unless it is imported. That fixes the oldest JavaScript problem: every script sharing one global scope, where two files that
+both declare `count` overwrite each other.
 
 ```js
-// format.js
-export function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
+// util.js
+export function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
 // main.js
-import { plural } from './format.js';
-console.log(plural(2, 'task')); // 2 tasks
+import { escapeHtml } from './util.js';
+console.log(escapeHtml('<b>hi</b>'));     // &lt;b&gt;hi&lt;/b&gt;
 ```
 
-Mistake: opening the HTML by double-click gives a CORS error for modules on `file://`. Fix: serve it
-with `npx serve .`.
+In the browser, the entry script needs `type="module"`: `<script type="module" src="./main.js"></script>`. Module scripts are deferred
+automatically (they run after the HTML is parsed) and always run in strict mode.
+
+Mistake: opening `index.html` by double-clicking. The page loads from `file://`, and the browser blocks module imports:
+
+```text
+Access to script at 'file:///.../main.js' from origin 'null' has been blocked by CORS policy
+```
+
+Serve the folder instead: `python3 -m http.server 8000` or `npx serve`.
 
 </Level>
 
 <Level name="Intermediate">
 
-Named exports for most things, a default export rarely. Import paths in the browser need the extension
-(`./format.js`). Modules are strict mode and deferred automatically. Split by responsibility: data,
-rendering, helpers.
+Named exports versus a default export:
+
+```js
+// store.js
+export const todos = [];
+export function addTodo(text) { todos.push({ id: crypto.randomUUID(), text, done: false }); }
+export default function createStore() { /* ... */ }
+
+// main.js
+import createStore, { addTodo, todos as allTodos } from './store.js';
+import * as store from './store.js';     // namespace object: store.addTodo, store.todos
+```
+
+Named exports are easier to search for and rename, and editors auto-import them reliably; I prefer them. Browser import paths must be
+full: `./util.js` with the extension. A bare name like `import { x } from 'lodash'` only works with a bundler or an import map.
 
 </Level>
 
 <Level name="Advanced">
 
-ES module imports are live bindings, read-only to the importer, resolved before any code runs (static),
-and each module runs once no matter how many files import it. `import()` loads a module lazily and
-returns a promise. CommonJS (`require`) is Node's older system: synchronous, copied values, and still
-common in packages.
+Imports are live bindings, not copies. If `store.js` reassigns an exported `let`, importers see the new value; but importers cannot assign
+to it:
 
 ```js
-const { heavy } = await import('./heavy.js'); // loaded only when needed
+// counter.js
+export let count = 0;
+export function inc() { count++; }
+// main.js
+import { count, inc } from './counter.js';
+inc();
+console.log(count);     // 1, the live value
+count = 5;              // TypeError: Assignment to constant variable.
+```
+
+Each module is evaluated once, the first time anything imports it; later imports get the same instance. That makes a module a natural
+singleton (one store shared by every file), and it is why a module's top-level code should not do surprising work like network calls.
+
+Dynamic `import()` loads a module on demand and returns a promise, the basis of code splitting:
+
+```js
+button.addEventListener('click', async () => {
+  const { openEditor } = await import('./editor.js');
+  openEditor();
+});
 ```
 
 </Level>
 
 <Level name="Edge cases">
 
-A circular import (a imports b, b imports a) can read a binding before it is initialised and throw
-`ReferenceError: Cannot access 'x' before initialization`. Mixing `require` and `import` in Node
-depends on `"type": "module"` in `package.json` and file extensions `.mjs` and `.cjs`.
+Circular imports (a imports b, b imports a) work, but one of them sees the other's exports before they are initialised:
+
+```text
+ReferenceError: Cannot access 'helper' before initialization
+```
+
+Move the shared piece into a third module both import. Top-level `this` in a module is `undefined`, not `window`.
 
 </Level>
 
 <Level name="Corner cases">
 
-A module with side effects at the top level (adding listeners) plus a test that imports it: the side
-effect runs in the test. Keep top-level code to declarations, and do work in exported functions.
+Node supports both ES modules and the older CommonJS (`require`, `module.exports`). A `.js` file is treated as ESM only if `package.json`
+has `"type": "module"`, or the file is `.mjs`. Mixing them produces errors like `require is not defined in ES module scope` or
+`Cannot use import statement outside a module`. Pick ESM for new code and set `"type": "module"`.
 
 </Level>
 
 <Level name="Production level">
 
-Bundlers read the static import graph to split code and remove unused exports (tree shaking), which
-only works when imports are static and modules have no hidden side effects.
+Bundlers (Vite, esbuild) follow the import graph, drop unused exports (tree shaking) and split chunks at dynamic imports. That only works
+when modules have no side effects at the top level and use named exports; both are habits worth having from the start.
 
 </Level>
 
 <Level name="Mindset">
 
-A module boundary is a promise about what is public. Export less.
+A module's exports are its public API. Export as little as possible; everything else can change freely.
 
 </Level>
 
 <Level name="System design">
 
-Module graphs become package boundaries, then service boundaries. Cycles at any level are the same
-smell.
+The import graph is the app's dependency structure. Arrows should point one way, from features toward shared utilities, never from
+`util.js` back to a feature. A cycle in the graph is a design smell before it is a runtime error.
 
 </Level>
 
 <Level name="Strategy">
 
-Split the app into four modules with no cycles. Done when each module's exports fit on one line and a
-change to rendering touches only `render.js`.
+I split the vanilla app into `store.js`, `view.js`, `util.js` and `main.js`, serve it locally, draw its import graph, and make one feature
+load with dynamic `import()`.
+
+Done when no file uses a global, the graph has no cycles, the app runs from a local server, and I can explain live bindings with the counter
+example.
 
 </Level>
 
@@ -849,124 +951,133 @@ change to rendering touches only `render.js`.
 
 #### Phase 1: Promises and `async`/`await`
 
-<Figure art={`
-                 +-----------+
-   new Promise ->|  pending  |
-                 +-----+-----+
-            resolve(v) |  reject(e)
-             +---------+---------+
-             v                   v
-      +-------------+     +-------------+
-      | fulfilled v |     | rejected e  |   settled: never changes again
-      +------+------+     +------+------+
-             |  .then(f)         |  .catch(g)   (await gives v, or throws e)
-`} caption="A promise is a placeholder for one future result. It settles once, to a value or to an error." />
+<Timeline
+  caption="A promise's life. It settles once, and every then or await registered on it runs after settling."
+  items={[
+    { when: 'created', what: 'pending: the work (a timer, a request) has started' },
+    { when: 'resolve(value)', what: 'fulfilled with value: then callbacks and awaiters resume with it' },
+    { when: 'reject(error)', what: 'rejected with error: catch callbacks run; await throws it' },
+    { when: 'afterwards', what: 'settled forever: later resolve or reject calls are ignored' },
+  ]}
+/>
 
 <Levels label="Phase 1, promises and async/await">
 
 <Level name="Beginner">
 
-Some work finishes later: a network request, a timer, reading a file. A promise represents that future
-result. `await` pauses an `async` function until the promise settles and gives me the value.
+A promise is an object standing for a value that will exist later: the result of a request, a timer, a file read. `await` pauses an `async` function until
+the promise settles and gives back its value, so asynchronous code reads top to bottom:
 
 ```js
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function main() {
   console.log('start');
-  await wait(500);
+  await sleep(500);
   console.log('half a second later');
 }
 main();
+console.log('main has returned a promise; this runs first');
 ```
 
-Mistake: forgetting `await`, so the variable holds `Promise { <pending> }` instead of the data. Fix:
-`await` it, inside an `async` function.
+```text
+start
+main has returned a promise; this runs first
+half a second later
+```
+
+An `async` function always returns a promise. It runs synchronously until the first `await`, then gives control back to the caller.
+
+Mistake: forgetting `await`. `const data = getJson(url)` gives a pending `Promise`, and `data.items` is `undefined`.
 
 </Level>
 
 <Level name="Intermediate">
 
-Errors: a rejected promise makes `await` throw, so `try`/`catch` works. Run independent work in
-parallel with `Promise.all`; it rejects as soon as any one rejects. `Promise.allSettled` waits for all
-and reports each outcome.
+Errors: a rejected promise makes `await` throw, so `try`/`catch` works:
 
 ```js
-async function loadBoth() {
+async function load() {
   try {
-    const [users, posts] = await Promise.all([getJSON('/users'), getJSON('/posts')]);
-    return { users, posts };
+    const todos = await getJson('/api/todos');
+    render(todos);
   } catch (err) {
-    console.error('load failed:', err.message);
-    return { users: [], posts: [] };
+    showError(err instanceof Error ? err.message : 'Unknown error');
   }
 }
 ```
 
-Mistake: `await` inside a loop for independent requests, making them sequential. Fix: build an array of
-promises and `await Promise.all(...)`.
+A rejection nobody handles shows up as `Uncaught (in promise) Error: ...` in the console, and in Node it crashes the process by default.
+
+Sequential versus parallel: two independent awaits in a row take the sum of their times; started together they take the longer of the two:
+
+```js
+const a = await getJson('/a');     // 300 ms
+const b = await getJson('/b');     // + 300 ms = 600 ms
+
+const [c, d] = await Promise.all([getJson('/a'), getJson('/b')]);   // about 300 ms
+```
 
 </Level>
 
 <Level name="Advanced">
 
-`then` callbacks always run asynchronously, as microtasks, even for an already-resolved promise.
-Returning a promise from `then` chains it; throwing inside `then` rejects the chain. An `async` function
-always returns a promise. `Promise.race` settles with the first to settle and `Promise.any` with the
-first to fulfil. A promise that rejects with no handler triggers an `unhandledrejection` event in the
-browser and crashes Node by default.
+The combinators: `Promise.all` (all succeed, or reject with the first error), `Promise.allSettled` (wait for all, report each outcome), `Promise.race` (first to
+settle wins, used for timeouts), `Promise.any` (first success). A timeout with race:
 
 ```js
-Promise.resolve(1).then((v) => console.log('then', v));
-console.log('sync');
-// sync
-// then 1
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out after ${ms} ms`)), ms))]);
+}
 ```
+
+The race only stops waiting; the original work continues. Real cancellation needs an `AbortSignal` passed into the work.
+
+`await` in a `for` loop runs iterations one after another, which is right when order or rate matters and slow otherwise; `items.forEach(async ...)` does not
+wait at all, which is almost always a bug.
 
 </Level>
 
 <Level name="Edge cases">
 
-`Promise.all([])` resolves immediately with `[]`. `await` on a non-promise just wraps it. A `forEach`
-with an `async` callback does not wait for anything: the loop finishes and the function returns before
-any callback completes. Use `for...of` with `await`, or `Promise.all` with `map`.
+`return await` inside `try` matters: `return promise` from inside a `try` block skips the `catch` if the promise rejects, because the rejection happens after the
+function returned. `await` on a non-promise value just wraps it.
 
 </Level>
 
 <Level name="Corner cases">
 
-A timeout race plus a slow request: `Promise.race([fetch(url), timeout(5000)])` returns on time, but the
-fetch keeps running in the background; only an `AbortController` actually cancels it. Two rapid
-searches plus out-of-order responses: the older, slower response arrives last and overwrites the newer
-results. Track the latest request id, or abort the previous request.
+`Promise.all` with one rejection does not cancel the others; they keep running and their results are ignored. An `async` event handler's rejection is unhandled
+unless caught inside it, because the event system ignores the returned promise.
 
 </Level>
 
 <Level name="Production level">
 
-Every async call needs three states in the UI (loading, success, error), a timeout, and a decision on
-retries. Unhandled rejections are monitored in production; a `.catch` that swallows errors silently is
-worse than a crash because nobody knows.
+Every promise chain ends in handling (a `catch`, a `try`, or a framework that reports it), independent work runs in parallel, loops over remote calls use a
+concurrency limit, and a global `unhandledrejection` listener reports misses to error tracking.
 
 </Level>
 
 <Level name="Mindset">
 
-Ask "what if this never comes back, comes back late, or comes back twice?" for every await.
+`await` is a pause point where the rest of the program may run. Any state I read before it may have changed after it.
 
 </Level>
 
 <Level name="System design">
 
-Concurrency limits, retries with backoff and cancellation recur in the backend (Phase 3 jobs and email),
-in Phase 4 timeouts, and in Phase 5 model calls. The promise is the unit they all compose.
+Concurrency is a design decision: what can run in parallel, what must be ordered, what limit protects the server. Promises make those decisions explicit in code.
 
 </Level>
 
 <Level name="Strategy">
 
-Exercises 16–17: a sleep, a timeout wrapper with `AbortController`, and a concurrency-limited
-downloader. Done when I can say the output order of mixed sync, promise and timer code, and the app
-never shows stale search results.
+I write `sleep`, `withTimeout`, a parallel loader and a sequential loader, time each with `performance.now()`, and convert one `forEach(async)` bug into a working
+`for...of`.
+
+Done when every async function in the app handles its errors, independent requests run in parallel, and I can predict the order and timing of logs in mixed
+async code.
 
 </Level>
 
@@ -975,106 +1086,141 @@ never shows stale search results.
 #### Phase 1: The event loop
 
 <Figure art={`
-   +---------------+     empty?     +--------------------+
-   |  call stack   | -------------> | run ALL microtasks |  (promise callbacks,
-   | (sync code)   |                | until queue empty  |   queueMicrotask)
-   +---------------+                +---------+----------+
-          ^                                   |
-          |                                   v
-          |                         +--------------------+
-          +------ take ONE task ----|  render if needed  |
-                 (timers, clicks,   +--------------------+
-                  network events)
-`} caption="The loop: run the stack to empty, drain every microtask, maybe render, then take one task. Repeat." />
+   CALL STACK            WEB APIs (browser)          QUEUES
+  +-----------+        +------------------+        microtasks: [ then-callback ]
+  | main()    | -----> | setTimeout 0ms   | ---->  tasks:      [ timeout-callback ]
+  +-----------+        | fetch            |
+                       | click listener   |
+                       +------------------+
+   loop, forever:
+   1. run the current task until the stack is empty
+   2. run ALL microtasks (promise callbacks, queueMicrotask), including new ones
+   3. maybe render (style, layout, paint) about once per frame
+   4. take the next task (timer, event, message) and go to 1
+`} caption="One thread, one stack. Timers, network and events wait in queues; promise callbacks jump the line as microtasks after each task." />
 
 <Levels label="Phase 1, the event loop">
 
 <Level name="Beginner">
 
-JavaScript in a page runs on one thread: one thing at a time. Slow work (timers, network) is handed to
-the browser, and its callback is queued for later. The event loop runs queued callbacks when the
-current code finishes.
+JavaScript in a page runs on one thread. It does one thing at a time, and while it is running, nothing else in the page runs: no clicks
+are handled, no rendering happens. Slow work like timers and network requests is handed to the browser, which calls back later through a
+queue. The event loop is the rule for when those callbacks run: only when the call stack is empty.
+
+The classic first trace:
 
 ```js
 console.log('A');
 setTimeout(() => console.log('B'), 0);
 console.log('C');
-// A C B
 ```
 
-Mistake: thinking `setTimeout(f, 0)` runs immediately. Fix: it runs after the current code and after
-promise callbacks.
+```text
+A
+C
+B
+```
+
+`setTimeout(..., 0)` does not mean "now"; it means "queue this as a task after at least 0 ms". `C` runs first because the current script
+must finish before any queued task.
+
+Mistake: a long loop in a click handler. While it runs, the page freezes; the browser cannot paint or respond. The proof asks me to explain
+this without notes.
 
 </Level>
 
 <Level name="Intermediate">
 
-Two queues matter: tasks (timers, events, messages) and microtasks (promise reactions). After each task,
-all microtasks run before the next task.
+Promises add a second queue. Promise callbacks (`then`, `catch`, code after `await`) are microtasks, and all microtasks run after the current
+task, before the next task and before rendering:
 
 ```js
-console.log(1);
-setTimeout(() => console.log(2));
-Promise.resolve().then(() => console.log(3));
-queueMicrotask(() => console.log(4));
-console.log(5);
-// 1 5 3 4 2
+console.log('1 script');
+setTimeout(() => console.log('5 timeout'), 0);
+Promise.resolve().then(() => console.log('3 microtask'));
+queueMicrotask(() => console.log('4 microtask'));
+console.log('2 script');
 ```
 
-A long loop blocks everything, including clicks and painting: the page freezes.
+```text
+1 script
+2 script
+3 microtask
+4 microtask
+5 timeout
+```
+
+Step by step: the script is one task; it logs 1, schedules a timer task, queues two microtasks, logs 2. The stack empties, so all microtasks
+run (3, 4). Only then does the loop take the timer task (5).
+
+`await` splits a function: everything after it is a microtask that runs when the awaited promise settles.
+
+```js
+async function f() { console.log('b'); await null; console.log('d'); }
+console.log('a'); f(); console.log('c');
+// a b c d
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Rendering happens between tasks, at most once per frame (about every 16 ms at 60 Hz), and
-`requestAnimationFrame` callbacks run just before it. Because microtasks drain fully, a microtask that
-queues another microtask forever starves rendering just like an infinite loop. Node's loop has phases
-(timers, I/O poll, check for `setImmediate`) with `process.nextTick` running even before promise
-microtasks.
+Rendering happens between tasks, roughly once per display frame (about every 16 ms at 60 Hz), and only after microtasks are drained. So a DOM
+change followed by a long computation in the same task is not visible until the computation ends:
+
+```js
+status.textContent = 'Working…';
+heavyComputation();                   // 2 seconds
+status.textContent = 'Done';          // the user never sees "Working…"
+```
+
+Fixes: yield to the loop so a frame can paint (`await new Promise(r => setTimeout(r, 0))` before the heavy work, or
+`await scheduler.yield()` where supported), split work into chunks, or move it to a Web Worker, which has its own thread and event loop.
+`requestAnimationFrame` schedules a callback just before the next paint, the right place for visual updates.
 
 </Level>
 
 <Level name="Edge cases">
 
-Timers are clamped: nested timeouts get at least about 4 ms, and background tabs throttle timers to
-once a second or less. A 0 ms delay is a minimum, not a promise.
+Nested timers are clamped to at least about 4 ms after a few levels, and background tabs throttle timers to once a second or less, so
+`setTimeout` is never a precise clock. Measure elapsed time with `performance.now()` instead of counting ticks.
 
 </Level>
 
 <Level name="Corner cases">
 
-Updating the DOM in a loop and reading layout (`offsetHeight`) in the same loop forces a synchronous
-layout every iteration (layout thrashing). Batch reads, then writes. A heavy JSON parse after a fetch
-blocks input for that whole duration even though the fetch itself was async.
+Because the loop drains all microtasks before moving on, a microtask that queues another microtask forever starves the page: no timers, no
+events, no rendering, the tab hangs exactly like an infinite loop. A recursive `setTimeout` does not, because each round is a separate task with
+rendering possible in between.
 
 </Level>
 
 <Level name="Production level">
 
-Long tasks over 50 ms hurt responsiveness, which Phase 4 measures as Interaction to Next Paint. Split
-work into chunks, defer non-urgent work, or move it to a Web Worker.
+Long tasks (over 50 ms) are what make pages feel sluggish, and the Interaction to Next Paint metric measures exactly that. The Performance panel
+in DevTools shows long tasks as red-cornered blocks; finding and splitting them is Phase 4 work.
 
 </Level>
 
 <Level name="Mindset">
 
-Async is not parallel. One thread, many waits; the skill is never holding the thread.
+Asynchronous does not mean parallel. My code still runs one piece at a time; the loop only decides the order.
 
 </Level>
 
 <Level name="System design">
 
-Node servers use the same model: one slow synchronous operation blocks every request on that process.
-That is why Phase 3 uses async database drivers and pushes CPU work to jobs.
+Node uses the same model on the server: one thread for JavaScript, a pool for I/O. That is why a CPU-heavy request in Phase 3 blocks every other
+user's request, and why heavy work goes to workers or queues.
 
 </Level>
 
 <Level name="Strategy">
 
-Write ten ordering puzzles mixing logs, timers, promises and `await`, predict, run. Done when I can
-explain the event loop without notes, as the plan's proof requires, and draw the diagram above from
-memory.
+I predict the output of ten ordering puzzles (timers, promises, `await`, nested combinations) on paper, then run them, and record a long task in the
+Performance panel and fix it by chunking.
+
+Done when I can draw the figure and explain the 1-to-5 trace without notes, as the proof requires, and get the puzzles right before running them.
 
 </Level>
 
@@ -1083,102 +1229,134 @@ memory.
 #### Phase 1: The DOM and events
 
 <Flow
-  caption="A click's journey. Delegation listens once at the list and reads event.target."
-  steps={['Capture: window down to the target', 'Target: the button itself', 'Bubble: back up through li, ul, body', 'Listener on ul runs', 'Read event.target.closest(li)', 'Update state, re-render']}
+  caption="A click on a delete button inside a list, traced through capture, target and bubble"
+  steps={['Capture: window to document to ul', 'Target: the button', 'Bubble: button to li to ul', 'Listener on ul runs (delegation)', 'event.target.closest("[data-id]") finds the row', 'State updated, list re-rendered']}
 />
 
 <Levels label="Phase 1, the DOM and events">
 
 <Level name="Beginner">
 
-The DOM is the browser's live tree of the page, as objects JavaScript can read and change. Select
-elements, change text, create new ones, and listen for events.
+The DOM (Document Object Model) is the page as a tree of objects that JavaScript can read and change. The browser builds it from the HTML;
+changing it changes the screen.
 
 ```js
-const list = document.querySelector('#todos');
+const list = document.querySelector('#todos');          // first match, or null
+const items = document.querySelectorAll('#todos li');   // a static NodeList
+
 const li = document.createElement('li');
-li.textContent = 'Write tests';
+li.textContent = 'Buy milk';
 list.append(li);
-document.querySelector('#add').addEventListener('click', () => console.log('clicked'));
 ```
 
-Mistake: running the script before the element exists, so `querySelector` returns `null` and the next
-line throws `Cannot read properties of null`. Fix: `type="module"` or `defer`, which run after parsing.
+Events are how the page tells my code something happened:
+
+```js
+const form = document.querySelector('#add-form');
+form.addEventListener('submit', (event) => {
+  event.preventDefault();                  // stop the full-page form submission
+  const text = form.elements.text.value.trim();
+  if (text) addTodo(text);
+});
+```
+
+Mistake: building HTML with user text through `innerHTML`: `li.innerHTML = text`. A todo named `<img src=x onerror=alert(1)>` runs script.
+Use `textContent` for text, and create elements for structure. The plan's trap here is reaching for React before I can do this by hand.
 
 </Level>
 
 <Level name="Intermediate">
 
-Forms: listen to `submit` on the form, call `event.preventDefault()` to stop the page reload, and read
-values from the form. Event delegation: one listener on the list handles clicks for all items,
-including future ones.
+Events travel: from the window down to the target (capture), then back up (bubble). Most listeners run in the bubble phase, so a single listener
+on a parent can handle events from every child, including children added later. That is event delegation:
 
 ```js
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  const text = new FormData(form).get('text').trim();
-  if (text) addTodo(text);
-  form.reset();
-});
-list.addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-action="delete"]');
-  if (btn) removeTodo(Number(btn.closest('li').dataset.id));
+list.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-action]');
+  if (!button) return;
+  const id = button.closest('li').dataset.id;
+  if (button.dataset.action === 'delete') removeTodo(id);
+  if (button.dataset.action === 'toggle') toggleTodo(id);
 });
 ```
+
+```html
+<li data-id="a1">Buy milk <button data-action="toggle">Done</button> <button data-action="delete">Delete</button></li>
+```
+
+`event.target` is the element actually clicked (maybe an icon inside the button); `event.currentTarget` is the element the listener is on.
+`closest` walks up from the target to find what I care about.
 
 </Level>
 
 <Level name="Advanced">
 
-Events travel in three phases: capture down, target, bubble up. `event.target` is where it started,
-`event.currentTarget` is the element whose listener is running. `stopPropagation` halts the journey;
-`preventDefault` cancels the default action. Listener options: `{ once: true }`, `{ passive: true }`
-for scroll performance, and `signal` from an `AbortController` to remove many listeners at once.
-`textContent` sets text safely; `innerHTML` parses HTML.
+Rendering from state: instead of patching the DOM in many places, keep the data in an array, and write one `render()` that rebuilds the list from
+it. Every change updates the array, then calls `render()`. This is the idea React automates, and doing it by hand once makes React obvious later.
+
+```js
+function render() {
+  const visible = todos.filter(t => matches(t, filter, query));
+  list.replaceChildren(...visible.map(t => {
+    const li = document.createElement('li');
+    li.dataset.id = t.id;
+    li.className = t.done ? 'done' : '';
+    li.append(t.text, ' ', button('toggle', t.done ? 'Undo' : 'Done'), ' ', button('delete', 'Delete'));
+    return li;
+  }));
+  count.textContent = `${visible.length} of ${todos.length}`;
+}
+```
+
+Reading layout (`offsetHeight`, `getBoundingClientRect`) right after writing styles forces the browser to compute layout immediately; doing it in
+a loop (write, read, write, read) causes layout thrashing. Batch reads, then writes.
 
 </Level>
 
 <Level name="Edge cases">
 
-`focus` and `blur` do not bubble (use `focusin` and `focusout`). Pressing Enter in a single-input form
-submits it. A `button` inside a form defaults to `type="submit"`, so a "Clear" button submits the form
-unless it says `type="button"`.
+`querySelector` returns `null` when nothing matches, and the next line fails with `Cannot read properties of null (reading 'addEventListener')`,
+usually because the script ran before the element existed (put scripts at the end, use `defer` or `type="module"`) or the selector has a typo.
+`querySelectorAll` returns a static list; `getElementsByClassName` returns a live one that changes as the DOM changes, which surprises loops that
+remove items.
 
 </Level>
 
 <Level name="Corner cases">
 
-`innerHTML` plus user input is an XSS hole: a todo titled with an `img` tag carrying an `onerror`
-attribute runs script. Use `textContent`, which Phase 4 returns to. Re-rendering the whole list with
-`innerHTML` plus a focused input inside it destroys the input and the user's cursor position.
+Adding a listener inside `render()` adds another one on every render, so one click deletes three items after three renders. Delegation on a parent
+that is never re-rendered avoids it. `event.stopPropagation()` in one component silently breaks delegated listeners and analytics elsewhere; avoid it
+unless there is no other way.
 
 </Level>
 
 <Level name="Production level">
 
-Keep one source of truth (an array in memory), render the DOM from it, and never read state back from
-the DOM. This is the core idea React automates. Accessible events: buttons, not clickable divs, so
-keyboard users can act.
+Event handlers are cheap and few (delegation), user text is always inserted as text, forms work with Enter and without JavaScript where possible, and
+focus is managed after changes (after deleting an item, move focus somewhere sensible).
 
 </Level>
 
 <Level name="Mindset">
 
-The DOM is a view of my data, not the data. When they disagree, the data is right.
+The DOM is just a tree of objects. Everything a framework does to it, I can do by hand; frameworks only make it less tedious.
 
 </Level>
 
 <Level name="System design">
 
-State, then render, then events that change state: the loop of every UI framework. The plan's trap,
-reaching for React before manipulating the DOM, skips learning the loop React hides.
+State, a render function from state to DOM, and events that update state: this loop is the architecture of every UI framework. Building it by hand is
+the best preparation for Phase 2.
 
 </Level>
 
 <Level name="Strategy">
 
-Exercises 10–12: a counter, a tab widget, a delegated list. Done when the app renders entirely from
-an array, uses one delegated listener, and contains no `innerHTML` with user data.
+I build the vanilla app with one state array, one `render()`, one delegated click listener, a submit listener and a search input, with no `innerHTML`
+for user data.
+
+Done when adding, deleting, filtering and searching all go through state and `render()`, there is exactly one listener per event type, and a todo
+containing HTML shows as literal text.
 
 </Level>
 
@@ -1186,96 +1364,141 @@ an array, uses one delegated listener, and contains no `innerHTML` with user dat
 
 #### Phase 1: `fetch`
 
-<Flow
-  caption="A fetch that cannot lie to the UI: every exit leads to a visible state."
-  steps={['Set loading', 'fetch(url, { signal })', 'Network error? show error', 'response.ok false? show error with status', 'Parse JSON', 'Validate shape', 'Empty? show empty state', 'Render data']}
-/>
+<Figure art={`
+  const res = await fetch(url)          resolves when HEADERS arrive
+        |                               rejects ONLY on network failure
+        v                               (offline, DNS, CORS, abort)
+  res.ok? (status 200-299)
+     no  --> throw new Error('HTTP ' + res.status)    404 and 500 do NOT reject
+     yes
+        |
+  const data = await res.json()         reads the BODY; rejects if not valid JSON
+        |
+  validate the shape, then use it
+`} caption="fetch has two awaits and two kinds of failure. Most bugs come from treating a 404 as success or parsing an HTML error page as JSON." />
 
 <Levels label="Phase 1, fetch">
 
 <Level name="Beginner">
 
-`fetch` makes an HTTP request from JavaScript and returns a promise for the response. Read the body with
-`response.json()`, which is another promise.
+`fetch` makes an HTTP request from JavaScript and returns a promise of a `Response`:
 
 ```js
-const res = await fetch('https://jsonplaceholder.typicode.com/todos?_limit=3');
-const todos = await res.json();
-console.log(todos.length); // 3
+const res = await fetch('https://jsonplaceholder.typicode.com/todos/1');
+console.log(res.status, res.headers.get('content-type'));
+const todo = await res.json();
+console.log(todo);
 ```
 
-Mistake: assuming `fetch` rejects on a 404. It does not; it resolves with `res.ok === false`. Fix: check
-`res.ok`.
+```text
+200 application/json; charset=utf-8
+{ userId: 1, id: 1, title: 'delectus aut autem', completed: false }
+```
+
+Two awaits: the first waits for the response headers, the second reads and parses the body.
+
+Mistake: assuming `fetch` rejects on errors. It only rejects when the request could not complete at all. A `404` or `500` resolves normally with
+`res.ok === false`, so code that does not check carries on with an error body.
 
 </Level>
 
 <Level name="Intermediate">
 
-A helper that handles status, JSON and errors in one place, with a POST example.
+A small helper I use everywhere, with the status check, a timeout and a clear error:
 
 ```js
-async function getJSON(url, options = {}) {
-  const res = await fetch(url, options);
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+export async function getJson(url, { timeout = 8000, ...options } = {}) {
+  const res = await fetch(url, { ...options, signal: AbortSignal.timeout(timeout) });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`GET ${url} failed: ${res.status} ${res.statusText} ${body.slice(0, 200)}`);
+  }
   return res.json();
 }
-await getJSON('/api/todos', {
+```
+
+Sending JSON needs a method, a header and a string body:
+
+```js
+await fetch('/api/todos', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ text: 'Ship' }),
+  body: JSON.stringify({ text: 'Buy milk' }),
 });
 ```
+
+Forgetting `JSON.stringify` sends the string `[object Object]`; forgetting the header makes many servers ignore the body.
 
 </Level>
 
 <Level name="Advanced">
 
-`fetch` rejects only for network failures, CORS blocks and aborts. The body is a stream readable once:
-calling `json()` twice throws `body stream already read`. Cancellation uses `AbortController`;
-`AbortSignal.timeout(5000)` gives a timeout. Cookies are sent cross-origin only with `credentials:
-'include'` and a server that allows it.
+Cancellation: an `AbortController` cancels a request, which matters for search-as-you-type, where an old slow response must not overwrite a newer one:
+
+```js
+let controller;
+input.addEventListener('input', async () => {
+  controller?.abort();
+  controller = new AbortController();
+  try {
+    const results = await getJson(`/api/search?q=${encodeURIComponent(input.value)}`, { signal: controller.signal });
+    renderResults(results);
+  } catch (err) {
+    if (err.name !== 'AbortError') showError(err);
+  }
+});
+```
+
+Parallel requests with `Promise.all` (fail fast if any fails) or `Promise.allSettled` (collect each result or error):
+
+```js
+const [user, todos] = await Promise.all([getJson('/api/me'), getJson('/api/todos')]);
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-A 204 response has no body; `res.json()` throws `Unexpected end of JSON input`. An HTML error page from
-a proxy makes `json()` throw `Unexpected token '<'`. Check `Content-Type` before parsing.
+`res.json()` on an HTML error page throws `Unexpected token '<'`; check `res.ok` and the content type first. `res.json()` on a `204 No Content`
+throws on the empty body. The body can be read only once; a second `res.json()` throws `body used already`; use `res.clone()` if two readers need it.
+Query strings need `encodeURIComponent` or `URLSearchParams`, or a search for `a&b` breaks the URL.
 
 </Level>
 
 <Level name="Corner cases">
 
-A CORS failure plus a successful server: the server did the work (even wrote to the database), but the
-browser hides the response, so the UI reports failure for an action that happened. Retries on top of
-that create duplicates. Only retry idempotent requests.
+Cross-origin requests the server does not allow fail with a CORS error, which `fetch` reports as a generic `TypeError: Failed to fetch` with no status,
+indistinguishable in code from being offline; the console shows the real reason. Cookies are only sent cross-origin with `credentials: 'include'` and a
+server that allows it.
 
 </Level>
 
 <Level name="Production level">
 
-Every fetch has a timeout, a loading state, an error message a person can act on, and an empty state.
-The plan's first-30-days list asks for exactly these three states in week 4.
+Every request has a timeout, every response is checked and validated (TypeScript cannot see what a server sends at runtime; see `unknown` below),
+retries happen only for safe requests with backoff, and the UI shows loading, error and empty states.
 
 </Level>
 
 <Level name="Mindset">
 
-The network is unreliable by default. Write the failure path first.
+The network is unreliable and the server is someone else's code. Every `fetch` should answer: what if it is slow, fails, or returns something unexpected?
 
 </Level>
 
 <Level name="System design">
 
-A single API client module is where auth headers, base URLs, error mapping and retries live, so the
-rest of the app calls functions, not URLs.
+A thin, typed API client module (one place for base URL, headers, errors, timeouts) is the seam between the UI and the backend, and the place to add auth,
+logging and caching later.
 
 </Level>
 
 <Level name="Strategy">
 
-Exercise 18: a search box backed by a public API, with abort on new input. Done when I can unplug the
-network, return a 500 and return an empty list, and the UI handles each clearly.
+I add a public API to the vanilla app (fetching a quote or a list of tasks), write `getJson`, then break it: a wrong URL, offline mode in DevTools, a slow
+network, a fast typist.
+
+Done when a 404, a network failure, a timeout and an out-of-order response each produce the right UI, and no `fetch` in my code lacks a status check.
 
 </Level>
 
@@ -1284,12 +1507,12 @@ network, return a 500 and return an empty list, and the UI handles each clearly.
 #### Phase 1: Errors
 
 <Layers
-  caption="Where an error should be handled: low layers throw with context, the top layer decides what the user sees."
+  caption="Where errors come from in the vanilla app, and where each is handled"
   layers={[
-    { name: 'UI', note: 'show a message, offer retry, keep the app usable' },
-    { name: 'Feature logic', note: 'catch what it can recover from, add context, rethrow the rest' },
-    { name: 'Helpers (fetch, storage, parse)', note: 'throw specific errors with a cause' },
-    { name: 'Global handler', note: 'window error and unhandledrejection: log what slipped through' },
+    { name: 'Input', note: 'empty text, too long: validated in the handler, shown next to the field' },
+    { name: 'Storage', note: 'corrupt JSON, quota: caught in load and save, fall back and warn' },
+    { name: 'Network', note: 'offline, 404, 500, timeout: caught around fetch, error state with retry' },
+    { name: 'Bugs', note: 'TypeError and friends: not caught locally; reported by a global handler' },
   ]}
 />
 
@@ -1297,91 +1520,114 @@ network, return a 500 and return an empty list, and the UI handles each clearly.
 
 <Level name="Beginner">
 
-When something goes wrong, JavaScript throws an error object with a `name`, a `message` and a `stack`.
-`try`/`catch` handles it. Reading the error is the first debugging skill.
+An error is an object with a `name`, a `message` and a `stack`. `throw` stops the current function and every caller until a `try`/`catch` handles it:
 
 ```js
+function parsePrice(text) {
+  const n = Number(text);
+  if (Number.isNaN(n) || n < 0) throw new Error(`Invalid price: "${text}"`);
+  return n;
+}
+
 try {
-  JSON.parse('{bad');
+  parsePrice('abc');
 } catch (err) {
-  console.log(err.name, '-', err.message);
-  // SyntaxError - Expected property name or '}' in JSON at position 1
+  console.error(err.message);     // Invalid price: "abc"
+} finally {
+  console.log('runs either way');
 }
 ```
 
-Mistake: `catch (e) {}` with nothing inside. Fix: handle, log, or rethrow; never swallow.
+The built-in types tell me what went wrong: `TypeError` (wrong kind of value, often `undefined`), `ReferenceError` (a name that does not exist), `SyntaxError`
+(code or JSON that does not parse), `RangeError` (a number out of range).
+
+Mistake: an empty `catch {}`. The error vanishes, the app does nothing, and nobody knows why.
 
 </Level>
 
 <Level name="Intermediate">
 
-Throw your own errors with useful messages, and use `finally` for cleanup that must always run. Custom
-error classes let callers tell kinds apart.
+Catch only what I can handle, where I can handle it. A storage loader can recover (fall back to an empty list), so it catches. A function in the middle that
+cannot do anything useful should let the error pass up. Throw `Error` objects, never strings, so there is a stack:
 
 ```js
-class ValidationError extends Error {
-  constructor(field, message) { super(message); this.name = 'ValidationError'; this.field = field; }
-}
-function addTodo(text) {
-  if (!text.trim()) throw new ValidationError('text', 'A todo needs some text');
-}
-try { addTodo('  '); } catch (e) { if (e instanceof ValidationError) showFieldError(e.field, e.message); else throw e; }
+throw 'not found';             // no stack, no name
+throw new Error('Todo not found: a1');
+```
+
+Wrapping keeps the original with `cause`:
+
+```js
+try { await saveRemote(todos); }
+catch (err) { throw new Error('Could not sync todos', { cause: err }); }
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-The stack trace lists the call chain, newest first; the top frame in my own file is usually where to
-look. `new Error(msg, { cause })` wraps a lower error without losing it. Errors thrown in callbacks or
-promises escape a surrounding synchronous `try`; they need their own handling.
+Custom error classes let callers handle kinds of failure:
 
 ```js
-try { setTimeout(() => { throw new Error('later'); }); } catch { /* never runs */ }
+class ValidationError extends Error {
+  constructor(field, message) { super(message); this.name = 'ValidationError'; this.field = field; }
+}
+
+try { validate(form); }
+catch (err) {
+  if (err instanceof ValidationError) showFieldError(err.field, err.message);
+  else throw err;                          // not mine to handle
+}
 ```
+
+A global safety net reports what nobody caught:
+
+```js
+window.addEventListener('error', (e) => report(e.error));
+window.addEventListener('unhandledrejection', (e) => report(e.reason));
+```
+
+An alternative style returns errors as values (`{ ok: false, error }`), which TypeScript can check; the typed `Result` from the generics topic is that pattern.
 
 </Level>
 
 <Level name="Edge cases">
 
-`throw 'oops'` throws a string with no stack; always throw `Error` objects. In TypeScript, a caught
-value is `unknown`, because anything can be thrown. An error in `finally` replaces the original error.
+`finally` runs even after `return` inside `try`, and a `return` inside `finally` overrides the original return or swallows the thrown error. Keep `finally` for cleanup
+only. Errors thrown inside a `setTimeout` callback are not caught by a `try` around the `setTimeout` call, because the callback runs later in a different task.
 
 </Level>
 
 <Level name="Corner cases">
 
-A `catch` that shows "Network error" for every failure, plus a bug in my own parsing code: the real
-cause is hidden under a misleading message. Catch narrowly and include the original as `cause`.
+Anything can be thrown, including `null` or a number, so `err.message` in a `catch` can itself throw. In TypeScript the `catch` variable is `unknown` under strict mode;
+narrow with `instanceof Error` first.
 
 </Level>
 
 <Level name="Production level">
 
-Users see a short, actionable message; logs get the full error with context. Global handlers
-(`window.onerror`, `unhandledrejection`) catch the rest, and Phase 4's error tracking reports them.
+User-facing messages say what happened and what to do; technical detail goes to logs and error tracking with the stack and context. Errors are never shown raw to users.
 
 </Level>
 
 <Level name="Mindset">
 
-An error message is a letter to the person debugging. Write it for them: what failed, with which
-input, and what to try.
+For every operation, decide in advance what failure looks like, who handles it, and what the user sees.
 
 </Level>
 
 <Level name="System design">
 
-Decide per layer: recover, translate or propagate. The API in Phase 3 uses the same decision to map
-domain errors to status codes.
+Error boundaries (where a failure stops spreading) are an architecture decision: a widget, a page, a request, a process. Phase 2 and Phase 3 each draw these lines.
 
 </Level>
 
 <Level name="Strategy">
 
-The plan's proof asks me to debug a broken app from the console. Done when I can read any stack trace
-to the line that caused it, and every error path in the app shows the user something and logs the
-cause.
+I list every failure in the vanilla app by the four layers in the figure, add handling at the right layer for each, and add the global handlers.
+
+Done when no `catch` is empty, every handled error shows a useful message, unhandled ones are reported by the global listener, and I can cause each failure on purpose.
 
 </Level>
 
@@ -1390,87 +1636,106 @@ cause.
 #### Phase 1: JSON and `localStorage`
 
 <Flow
-  caption="Persistence for the vanilla app, with the failure paths that matter."
-  steps={['State changes', 'JSON.stringify(state)', 'localStorage.setItem(key, text)', 'Reload', 'getItem(key)', 'null? start empty', 'JSON.parse in try', 'Wrong shape? reset with a warning']}
+  caption="Persisting app state: serialise on every change, parse and validate once on load"
+  steps={['State changes (add, delete, toggle)', 'JSON.stringify(todos)', 'localStorage.setItem("todos:v1", text)', 'Page reload', 'localStorage.getItem returns text or null', 'JSON.parse in try/catch, validate, fall back to []']}
 />
 
 <Levels label="Phase 1, JSON and localStorage">
 
 <Level name="Beginner">
 
-`localStorage` stores strings per site, and survives reloads. Store objects by converting to JSON.
+`localStorage` stores strings by key in the browser, per origin, and keeps them across reloads and restarts. Since it only holds strings, objects go
+through JSON:
 
 ```js
-const KEY = 'todos:v1';
-const save = (todos) => localStorage.setItem(KEY, JSON.stringify(todos));
-const load = () => JSON.parse(localStorage.getItem(KEY) ?? '[]');
+function save(todos) {
+  localStorage.setItem('todos:v1', JSON.stringify(todos));
+}
+function load() {
+  const raw = localStorage.getItem('todos:v1');
+  return raw === null ? [] : JSON.parse(raw);
+}
 ```
 
-Mistake: `localStorage.setItem('todos', todos)` stores `"[object Object]"`. Fix: `JSON.stringify`.
+In DevTools, Application, Local Storage shows the stored value, which I can edit by hand to test odd data.
+
+Mistake: `localStorage.setItem('todos', todos)` without stringify stores `"[object Object],[object Object]"`, and loading it fails.
 
 </Level>
 
 <Level name="Intermediate">
 
-Wrap load in `try` because the stored text may be corrupt or from an older version; validate the shape
-before trusting it.
+Loading must survive bad data, because stored data outlives code: an old format, a manual edit, a bug from last week.
 
 ```js
 function load() {
   try {
-    const data = JSON.parse(localStorage.getItem(KEY) ?? '[]');
-    return Array.isArray(data) ? data.filter((t) => typeof t.text === 'string') : [];
-  } catch { return []; }
+    const raw = localStorage.getItem('todos:v1');
+    if (raw === null) return [];
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    return data.filter(t => typeof t?.id === 'string' && typeof t?.text === 'string' && typeof t?.done === 'boolean');
+  } catch {
+    return [];
+  }
 }
 ```
+
+The `:v1` in the key is a version. When the shape changes, `v2` can migrate `v1` data once and delete the old key.
 
 </Level>
 
 <Level name="Advanced">
 
-`localStorage` is synchronous and blocks the thread; it holds a few megabytes per origin. The `storage`
-event fires in other tabs when one tab writes, which lets tabs stay in sync. A versioned key
-(`todos:v1`) allows migrations.
+What JSON loses: `Date` becomes a string, `undefined` properties vanish, `Map` and `Set` become `{}`, class instances lose their methods. Store plain
+data (ISO date strings, arrays) and rebuild richer objects after parsing. `JSON.stringify(value, null, 2)` pretty-prints for debugging.
+
+The `storage` event fires in other tabs of the same origin when one tab writes, which keeps two open tabs in sync:
+
+```js
+window.addEventListener('storage', (e) => { if (e.key === 'todos:v1') { todos = load(); render(); } });
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-Private browsing modes or full storage make `setItem` throw a `QuotaExceededError`. `getItem` for a
-missing key returns `null`, and `JSON.parse(null)` returns `null`, not an error.
+Storage is limited (around 5 MB per origin in most browsers); `setItem` throws `QuotaExceededError` when full, so wrap writes too. Private browsing
+modes may clear it on close. `localStorage` is synchronous; writing large values on every keystroke can stutter.
 
 </Level>
 
 <Level name="Corner cases">
 
-Two tabs open plus both saving: last write wins and the other tab's todos vanish. Listen to `storage`
-and reload state. Dates stored as strings plus code that calls `.getTime()` on them after reload throws.
+Anything in `localStorage` is readable by every script on the page, including a successful XSS payload or a compromised third-party script. Never store
+tokens or secrets there; that is why Phase 3 uses httpOnly cookies. Two tabs writing at once can overwrite each other's changes (last write wins).
 
 </Level>
 
 <Level name="Production level">
 
-Never store secrets or tokens in `localStorage`: any script on the page (including an XSS payload) can
-read it. Phase 3 uses `httpOnly` cookies instead.
+Real apps keep durable data on a server; `localStorage` holds preferences, drafts and caches, always versioned and validated on load.
 
 </Level>
 
 <Level name="Mindset">
 
-Data from my past self is still external input. Validate it.
+Data read back from storage is input, as untrusted as anything a user types.
 
 </Level>
 
 <Level name="System design">
 
-Versioned storage and migrations here are the same idea as database migrations in Phase 3.
+Serialise, version, validate, migrate: the same four steps apply to every persisted format, from a browser key to a database schema to an API payload.
 
 </Level>
 
 <Level name="Strategy">
 
-Exercises 13–15. Done when I can corrupt the stored value by hand in DevTools and the app recovers with
-a message instead of a blank page.
+The vanilla app persists todos with a versioned key and a validating loader. I then corrupt the stored value three ways by hand in DevTools and check that
+the app still loads.
+
+Done when the app survives corrupted, missing and old-format data, writes are wrapped for quota errors, and two tabs stay in sync.
 
 </Level>
 
@@ -1588,96 +1853,126 @@ each annotation protects against.
           idle --load--> loading --ok----> success
                             |
                             +--fail--> error --retry--> loading
-`} caption="A union lists every value a thing can be. A string-literal union is a small state machine the compiler can check." />
+
+  type State =
+    | { status: 'loading' }
+    | { status: 'success'; data: Todo[] }      data exists ONLY here
+    | { status: 'error'; message: string }     message exists ONLY here
+`} caption="A union lists every value a thing can be. A discriminated union attaches the right data to each state, so impossible combinations cannot be written." />
 
 <Levels label="Phase 1, unions">
 
 <Level name="Beginner">
 
-A union type says a value is one of several types: `string | number`, or one of several exact strings.
-The site's note on <a href={withBase('/posts/typescript/03/')}>union types</a> is the deep dive.
+A union type says a value is one of several types: `string | number`, or one of several exact strings. The site's note on
+<a href={withBase('/posts/typescript/03/')}>union types</a> is the deep dive.
 
 ```ts
-type Filter = 'all' | 'open' | 'done';
-let f: Filter = 'open';
-f = 'archived';
-// error TS2322: Type '"archived"' is not assignable to type 'Filter'.
+type Filter = 'all' | 'active' | 'done';
+let filter: Filter = 'all';
+filter = 'archived';
 ```
 
-Mistake: `filter: string`, which lets any typo through. Fix: a literal union.
+```text
+error TS2322: Type '"archived"' is not assignable to type 'Filter'.
+```
+
+The compiler now knows every valid value, and the editor autocompletes them. Compare with `filter: string`, which accepts any typo.
+
+Mistake: using a union value as if it were one specific member without checking. `function len(x: string | number) { return x.length; }` fails with
+`Property 'length' does not exist on type 'number'`; I must narrow first (next topic).
 
 </Level>
 
 <Level name="Intermediate">
 
-On a union, I can only use what every member has, until I narrow it. Discriminated unions put a shared
-literal field on each member, which is the clean way to model fetch state.
+A discriminated union is a union of object types that share one literal field, the discriminant, so TypeScript can tell which member it has:
 
 ```ts
-type Load =
+type State =
   | { status: 'loading' }
-  | { status: 'error'; message: string }
-  | { status: 'success'; todos: Todo[] };
-function view(s: Load) {
-  if (s.status === 'error') return s.message;   // message exists only here
-  if (s.status === 'success') return s.todos.length;
-  return 'Loading...';
+  | { status: 'success'; data: Todo[] }
+  | { status: 'error'; message: string };
+
+function view(s: State): string {
+  switch (s.status) {
+    case 'loading': return 'Loading…';
+    case 'success': return `${s.data.length} todos`;     // data is available here
+    case 'error':   return `Failed: ${s.message}`;       // message is available here
+  }
 }
 ```
+
+Compare the loose version, `{ loading: boolean; data?: Todo[]; error?: string }`, which allows `loading: true` with an error and data at once, and
+forces `?` checks everywhere.
 
 </Level>
 
 <Level name="Advanced">
 
-Exhaustiveness: in a `switch` over the discriminant, assigning the leftover to `never` makes adding a
-new member a compile error everywhere it is not handled. See the
-<a href={withBase('/posts/typescript/11/')}>discriminated unions</a> note.
+Exhaustiveness: in a `switch` over the discriminant, assigning the leftover to `never` makes adding a new member a compile error everywhere it is not
+handled. See the <a href={withBase('/posts/typescript/11/')}>discriminated unions</a> note.
 
 ```ts
 function assertNever(x: never): never { throw new Error(`Unhandled: ${JSON.stringify(x)}`); }
-switch (s.status) { case 'loading': ...; case 'error': ...; case 'success': ...; default: assertNever(s); }
+
+function view(s: State): string {
+  switch (s.status) {
+    case 'loading': return 'Loading…';
+    case 'success': return `${s.data.length} todos`;
+    case 'error':   return `Failed: ${s.message}`;
+    default:        return assertNever(s);
+  }
+}
+```
+
+Add `| { status: 'empty' }` to `State` and the compiler points at the `default`:
+
+```text
+error TS2345: Argument of type '{ status: "empty"; }' is not assignable to parameter of type 'never'.
 ```
 
 </Level>
 
 <Level name="Edge cases">
 
-`string | 'open'` collapses to `string`, losing autocompletion. A union of arrays `string[] | number[]`
-is not the same as `(string | number)[]`; methods like `map` on the former can be awkward to call.
+A literal assigned to a `const` keeps its literal type, but in an object it widens: `const f = { filter: 'all' }` has `filter: string`, which is not
+assignable to `Filter`. Annotate the object, or use `as const` (`{ filter: 'all' } as const`) or `satisfies`.
 
 </Level>
 
 <Level name="Corner cases">
 
-Separate booleans `isLoading` and `isError` allow impossible combinations (both true, or loading with
-stale data and an error). Two flags meeting is the corner; a single union removes it.
+`string | 'all'` collapses to `string`, losing autocomplete; a union with a wide member absorbs the narrow ones. Optional properties already include
+`undefined` in the union, which shows up in narrowing as a member to handle.
 
 </Level>
 
 <Level name="Production level">
 
-Modelling states as unions removes a whole class of UI bugs, and the compiler points at every screen
-that must handle a new state.
+Status fields, API results, events and actions are modelled as discriminated unions; every `switch` over them has an exhaustiveness check, so adding a
+case is a guided change, not a hunt.
 
 </Level>
 
 <Level name="Mindset">
 
-Make impossible states impossible to write.
+Make invalid states unrepresentable. If the type cannot express it, no code path can produce it.
 
 </Level>
 
 <Level name="System design">
 
-The same unions describe API responses, event types in logs, and database enums. They are the
-vocabulary of the domain.
+Unions are how a type system models state machines and protocols. The same shapes reappear in reducers (Phase 2) and API responses (Phase 3).
 
 </Level>
 
 <Level name="Strategy">
 
-Replace every boolean flag pair in the app with a union. Done when the fetch state is a discriminated
-union and the `switch` is exhaustive.
+I convert the vanilla app's filter and request status to unions, add exhaustiveness checks, then add a new member and follow the compiler's errors to
+every place that needs it.
+
+Done when no status is a plain string or a set of booleans, and adding a union member produces errors in exactly the places that must change.
 
 </Level>
 
@@ -1686,36 +1981,54 @@ union and the `switch` is exhaustive.
 #### Phase 1: Narrowing
 
 <Flow
-  caption="Each check removes possibilities. After the last one, only one type is left."
-  steps={['value: string | number | null', 'if value === null: return', 'typeof value === string?', 'yes: string here', 'else: number here']}
+  caption="How TypeScript narrows a value inside one function, step by step"
+  steps={['x: string | number | null', 'if (x === null) return', 'x: string | number', 'if (typeof x === "number") ...', 'inside: x is number', 'after: x is string']}
 />
 
 <Levels label="Phase 1, narrowing">
 
 <Level name="Beginner">
 
-Narrowing is TypeScript following my checks: inside `if (typeof x === 'string')`, `x` is a string. The
+Narrowing is how TypeScript works out a more specific type from checks I write. After a check, the type inside that branch is smaller. The
 <a href={withBase('/posts/typescript/08/')}>narrowing note</a> walks the real bugs.
 
 ```ts
-function label(x: string | number) {
-  if (typeof x === 'string') return x.toUpperCase();
-  return x.toFixed(2);
+function format(x: string | number | null): string {
+  if (x === null) return '-';
+  // x: string | number
+  if (typeof x === 'number') return x.toFixed(2);
+  // x: string
+  return x.trim();
 }
 ```
 
-Mistake: casting with `as string` instead of checking. Fix: check, and let the compiler narrow.
+Hovering over `x` in the editor at each line shows the narrowed type; doing that is the fastest way to learn it.
+
+Mistake: reaching for `as` to silence an error (`(x as string).trim()`) instead of narrowing. `as` is a promise to the compiler with no check; if it
+is wrong, the crash happens at runtime.
 
 </Level>
 
 <Level name="Intermediate">
 
-Narrowing tools: `typeof`, `instanceof`, `in`, equality with literals, truthiness, `Array.isArray`, and
-the discriminant of a union. Custom type guards return `x is T`.
+The checks TypeScript understands: `typeof` for primitives (`'string'`, `'number'`, `'boolean'`, `'object'`, `'function'`, `'undefined'`),
+`instanceof` for classes (`err instanceof Error`), `in` for properties (`'data' in result`), equality with literals (`s.status === 'error'`),
+`Array.isArray`, and truthiness (`if (user)`).
 
 ```ts
-function isTodo(v: unknown): v is Todo {
-  return typeof v === 'object' && v !== null && 'id' in v && 'text' in v;
+function message(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  return 'Unknown error';
+}
+```
+
+Early returns narrow for the rest of the function, which keeps code flat:
+
+```ts
+function title(todo: Todo | undefined) {
+  if (!todo) return 'Not found';
+  return todo.text;            // todo: Todo
 }
 ```
 
@@ -1723,57 +2036,67 @@ function isTodo(v: unknown): v is Todo {
 
 <Level name="Advanced">
 
-Control-flow analysis tracks assignments and early returns. Narrowing is reset across function
-boundaries: a callback does not know that a `let` variable was checked outside, because it might run
-later after a reassignment. `const` keeps narrowing in callbacks.
+Custom type guards teach TypeScript a check it cannot infer:
 
 ```ts
-let current: Todo | undefined = find();
-if (current) items.forEach(() => current.text);
-// error TS18048: 'current' is possibly 'undefined'.
+type Todo = { id: string; text: string; done: boolean };
+
+function isTodo(x: unknown): x is Todo {
+  return typeof x === 'object' && x !== null
+    && typeof (x as Record<string, unknown>).id === 'string'
+    && typeof (x as Record<string, unknown>).text === 'string'
+    && typeof (x as Record<string, unknown>).done === 'boolean';
+}
+
+const parsed: unknown = JSON.parse(raw);
+const todos = Array.isArray(parsed) ? parsed.filter(isTodo) : [];   // Todo[]
 ```
+
+The `x is Todo` return type is a promise: if the function returns true, `x` is a `Todo`. A wrong guard lies to the compiler, so guards need tests.
+Assertion functions (`asserts x is Todo`) throw instead of returning false.
 
 </Level>
 
 <Level name="Edge cases">
 
-Truthiness narrowing drops `0` and `''` along with `null`: `if (count)` skips a real zero. Use
-`count !== undefined`. `typeof null === 'object'`, so an object check needs `&& v !== null`.
+`typeof null === 'object'`, so `typeof x === 'object'` does not exclude null; check `x !== null` too. Truthiness narrowing drops `0` and `''`:
+`if (count)` treats zero as missing. Use `count !== undefined` when zero is valid.
 
 </Level>
 
 <Level name="Corner cases">
 
-A custom type guard that lies (returns true without checking every field) plus later code trusting it:
-the compiler believes the guard, so the bug is invisible to it. Guards must be tested.
+Narrowing does not survive callbacks: after `if (user)`, a `setTimeout(() => user.name)` may still be an error with a `let` variable, because the
+callback runs later when `user` may have changed. Copy to a `const` first. Narrowing a property (`obj.x`) is lost after any function call that could
+have mutated `obj`.
 
 </Level>
 
 <Level name="Production level">
 
-Narrowing at the boundary, once, then passing a precise type inward keeps the rest of the code free of
-defensive checks.
+Code has no unexplained `as` (part of the proof), external data is narrowed through guards or a schema library, and guards have unit tests with
+both valid and invalid inputs.
 
 </Level>
 
 <Level name="Mindset">
 
-The compiler is a reader of my `if` statements. If it cannot follow my reasoning, a human reviewer
-probably cannot either.
+The compiler is asking a question: how do you know? Answer it with a check, not with `as`.
 
 </Level>
 
 <Level name="System design">
 
-Validation libraries (Zod in Phase 3) are generated type guards; the boundary pattern scales from a
-function to an API.
+Narrowing at the boundary (where data enters) means the inside of the program can trust its types. That one rule removes most runtime type errors.
 
 </Level>
 
 <Level name="Strategy">
 
-Remove every `as` cast from the ported app by adding checks. Done when I can name the narrowing tool for
-any union I meet and explain the callback reset.
+I remove every `as` from the typed module, replacing each with a narrowing check or a guard with tests, and hover through three functions to watch the
+types change.
+
+Done when the code has no `as` without a comment explaining why it is safe, and each guard has tests for at least one valid and three invalid inputs.
 
 </Level>
 
@@ -1784,91 +2107,123 @@ any union I meet and explain the callback reset.
 <Figure art={`
   function first<T>(items: T[]): T | undefined
 
-  first([1, 2, 3])        T = number   ->  number | undefined
-  first(['a', 'b'])       T = string   ->  string | undefined
-  first(todos)            T = Todo     ->  Todo | undefined
-`} caption="A generic is a type parameter: the same function, with the type filled in at each call." />
+  first([1, 2, 3])            T = number   ->  returns number | undefined
+  first(['a', 'b'])           T = string   ->  returns string | undefined
+  first(todos)                T = Todo     ->  returns Todo | undefined
+
+  T is a type parameter: a blank the caller's argument fills in,
+  linking the input type to the output type
+`} caption="A generic is a function over types. The type parameter carries information from what goes in to what comes out." />
 
 <Levels label="Phase 1, generics">
 
 <Level name="Beginner">
 
-A generic lets a function or type work for many types while keeping the link between input and output.
-The <a href={withBase('/posts/typescript/09/')}>generics note</a> sticks to the ones I actually use.
+A generic function works for many types while keeping track of which one it was given. The
+<a href={withBase('/posts/typescript/09/')}>generics note</a> sticks to the ones I actually use.
 
 ```ts
-function first<T>(items: T[]): T | undefined { return items[0]; }
-const n = first([1, 2]);   // number | undefined
+function first<T>(items: T[]): T | undefined {
+  return items[0];
+}
+const n = first([10, 20]);        // n: number | undefined
+const t = first(todos);           // t: Todo | undefined
 ```
 
-Mistake: `function first(items: any[]): any`, which forgets everything. Fix: a type parameter.
+Without generics I would choose between `first(items: any[]): any`, which loses the type, and one function per type. `Array<T>`, `Promise<T>`
+and `Map<K, V>` are generics I already use.
+
+Mistake: writing `<T>` and then not using it to connect anything, like `function log<T>(x: T): void`. A type parameter that appears once is just a
+complicated `unknown`.
 
 </Level>
 
 <Level name="Intermediate">
 
-Constraints restrict what `T` can be; `keyof` links a key to its object.
+Constraints limit what `T` can be, so the function can use its properties:
 
 ```ts
-function byId<T extends { id: number }>(items: T[], id: number): T | undefined {
-  return items.find((i) => i.id === id);
+function byId<T extends { id: string }>(items: T[], id: string): T | undefined {
+  return items.find(item => item.id === id);
 }
+byId(todos, 'a1');              // Todo | undefined
+byId([1, 2], 'x');
+```
+
+```text
+error TS2322: Type 'number' is not assignable to type '{ id: string; }'.
+```
+
+`keyof` and indexed access link keys and values:
+
+```ts
 function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
-  return items.map((i) => i[key]);
+  return items.map(item => item[key]);
 }
-pluck(todos, 'text');  // string[]
-pluck(todos, 'nope');  // error TS2345: Argument of type '"nope"' is not assignable to parameter of type 'keyof Todo'.
+pluck(todos, 'text');           // string[]
+pluck(todos, 'done');           // boolean[]
+pluck(todos, 'colour');         // error: not a key of Todo
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-Generic types (`type Result<T, E = Error> = { ok: true; value: T } | { ok: false; error: E }`),
-defaults, inference from arguments, and generic React components later. TypeScript infers `T` from the
-call; explicit `first<number>(...)` is rarely needed.
+Generic types describe shapes with a blank:
+
+```ts
+type Result<T, E = string> = { ok: true; value: T } | { ok: false; error: E };
+
+async function getJson<T>(url: string, isT: (x: unknown) => x is T): Promise<Result<T>> {
+  const res = await fetch(url);
+  if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+  const data: unknown = await res.json();
+  return isT(data) ? { ok: true, value: data } : { ok: false, error: 'unexpected shape' };
+}
+```
+
+The guard parameter is what makes `T` honest: the caller supplies proof that the data is a `T`, instead of the function claiming it with `as T`.
 
 </Level>
 
 <Level name="Edge cases">
 
-A type parameter used only once is pointless: `function f<T>(x: T): void` is just `unknown`. Inference
-from an empty array gives `never[]`, so `first([])` is `undefined`-typed oddly.
+Inference picks the best common type: `first([1, 'a'])` gives `string | number`. Passing an empty array gives `never[]` or `unknown`; specify the
+type explicitly, `first<Todo>([])`. A generic that only appears in the return type (`function parse<T>(s: string): T`) is a disguised cast; avoid it.
 
 </Level>
 
 <Level name="Corner cases">
 
-`T extends object` plus a `null` argument fails, which is right; `T extends {}` allows primitives,
-which surprises people. Two inferred candidates for `T` (`pair(1, 'a')`) produce `string | number` or an
-error depending on positions.
+In `.tsx` files, an arrow function `<T>(x: T) => x` is read as a JSX tag; write `<T,>(x: T) => x` or use a `function`. Conditional types and
+`infer` are powerful but rarely needed in app code; reach for them only after the simple version fails.
 
 </Level>
 
 <Level name="Production level">
 
-Use generics for containers and helpers (results, caches, API clients), not to show off. A generic
-signature that needs a paragraph to read is a smell.
+Generics live mostly in shared utilities and API clients; application code uses them more than it defines them. Each generic has a test that checks
+inferred types (with `expectTypeOf` in Vitest).
 
 </Level>
 
 <Level name="Mindset">
 
-A generic preserves information the caller already has. If it is not preserving anything, remove it.
+Use a generic when a type must flow from input to output. If nothing flows, I do not need one.
 
 </Level>
 
 <Level name="System design">
 
-A typed API client `getJSON<T>(url)` is only as honest as the validation behind it; generics carry
-types, they do not check data.
+Generic building blocks (a typed fetch, a typed store, a `Result` type) let the rest of the codebase stay specific and simple.
 
 </Level>
 
 <Level name="Strategy">
 
-Write `groupBy`, `byId` and `pluck` generically, with tests. Done when each generic's parameters are
-inferred at every call site.
+I write `first`, `byId`, `pluck`, `groupBy` and a typed `getJson` in the utility module, with type tests for each.
+
+Done when each generic's parameter links input to output, the type tests pass, and none of them uses `as` or `any` internally without a comment.
 
 </Level>
 
@@ -1877,91 +2232,116 @@ inferred at every call site.
 #### Phase 1: Utility types
 
 <Compare
-  left="Utility"
-  right="What it makes from Todo"
+  left="Utility type"
+  right="What it builds from Todo = { id; text; done; createdAt }"
+  caption="The built-in utility types derive new types from one source, so the shapes cannot drift apart."
   rows={[
-    ['Partial of Todo', 'every field optional: a patch'],
-    ['Pick of Todo, text and done', 'only those fields: a form'],
-    ['Omit of Todo, id', 'everything but id: a new item'],
-    ['Readonly of Todo', 'no field can be reassigned'],
-    ['Record of Filter to number', 'an object with a count per filter'],
+    ['Partial<Todo>', 'every field optional: an update patch'],
+    ['Pick<Todo, "text">', 'only text: the add form'],
+    ['Omit<Todo, "id" | "createdAt">', 'everything the server does not generate'],
+    ['Readonly<Todo>', 'no field may be reassigned'],
+    ['Record<Filter, number>', 'one count for each filter value'],
+    ['ReturnType<typeof load>', 'whatever load returns, kept in sync'],
   ]}
-  caption="Derive related shapes from one source type instead of copying it."
 />
 
 <Levels label="Phase 1, utility types">
 
 <Level name="Beginner">
 
-Utility types build new types from existing ones, so one definition stays the source of truth. See the
-<a href={withBase('/posts/typescript/10/')}>Partial, Pick and Omit note</a>.
+Utility types are built-in generics that transform one type into another. The point is a single source of truth: define `Todo` once and derive the
+rest. The <a href={withBase('/posts/typescript/10/')}>Partial, Pick and Omit note</a> covers the three I use most.
 
 ```ts
-type NewTodo = Omit<Todo, 'id'>;
-type TodoPatch = Partial<Pick<Todo, 'text' | 'done'>>;
-function update(id: number, patch: TodoPatch) { /* ... */ }
+type Todo = { id: string; text: string; done: boolean; createdAt: string };
+
+type NewTodo = Omit<Todo, 'id' | 'createdAt'>;       // { text: string; done: boolean }
+type TodoPatch = Partial<Pick<Todo, 'text' | 'done'>>; // { text?: string; done?: boolean }
+
+function updateTodo(id: string, patch: TodoPatch) { /* ... */ }
+updateTodo('a1', { done: true });                    // ok
+updateTodo('a1', { id: 'b2' });                      // error: 'id' does not exist in type TodoPatch
 ```
 
-Mistake: copying the `Todo` type into a `TodoForm` type that drifts. Fix: derive it.
+Mistake: copying the fields into a second hand-written type. When `Todo` gains a field, the copy silently goes stale.
 
 </Level>
 
 <Level name="Intermediate">
 
-`Record<K, V>`, `ReturnType<typeof f>`, `Parameters<typeof f>`, `Awaited<T>`, `NonNullable<T>`, `Required<T>`.
+`Record<K, V>` builds an object type with keys `K`; with a union of keys, the compiler requires every one:
 
 ```ts
-const counts: Record<Filter, number> = { all: 3, open: 2, done: 1 };
-type Loaded = Awaited<ReturnType<typeof loadTodos>>; // Todo[]
+type Filter = 'all' | 'active' | 'done';
+const labels: Record<Filter, string> = { all: 'All', active: 'Active', done: 'Done' };
+const missing: Record<Filter, string> = { all: 'All', active: 'Active' };
 ```
+
+```text
+error TS2741: Property 'done' is missing in type '{ all: string; active: string; }' but required in type 'Record<Filter, string>'.
+```
+
+`ReturnType` and `Parameters` read types from functions, and `Awaited` unwraps promises: `type Loaded = Awaited<ReturnType<typeof loadTodos>>`.
 
 </Level>
 
 <Level name="Advanced">
 
-They are mapped and conditional types under the hood: `Partial<T>` maps each key to optional. Writing
-one shows how: `type Mutable<T> = { -readonly [K in keyof T]: T[K] }`. The
+Utility types are mapped types underneath. `Partial<T>` is `{ [K in keyof T]?: T[K] }`. Writing my own is occasionally useful; the
 <a href={withBase('/posts/typescript/13/')}>mapped types note</a> goes further.
+
+```ts
+type Nullable<T> = { [K in keyof T]: T[K] | null };
+type FormErrors<T> = Partial<Record<keyof T, string>>;
+const errors: FormErrors<NewTodo> = { text: 'Required' };
+```
+
+`satisfies` checks a value against a type without widening it, so literal types survive:
+
+```ts
+const routes = { home: '/', todos: '/todos' } satisfies Record<string, string>;
+routes.home;      // type '/' kept, and typos in keys still error
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-`Omit` with a key that does not exist is allowed (its key parameter is not constrained to `keyof T`), so
-a typo silently omits nothing. `Partial` is shallow: nested objects stay required.
+`Readonly` is shallow: `Readonly<{ tags: string[] }>` stops reassigning `tags` but not `tags.push`. Use `readonly string[]` or `ReadonlyArray` for the
+inner array. `Omit` does not check that the omitted key exists, so a typo omits nothing.
 
 </Level>
 
 <Level name="Corner cases">
 
-`Partial<Todo>` used as an update plus `{ text: undefined }` passed in: the type allows it, and the
-update erases the text. Strip `undefined` before applying a patch.
+`Partial` on an update means `{}` is a valid patch, and `{ text: undefined }` is too, which might erase a field. Handle explicit `undefined` in the update
+function, or enable `exactOptionalPropertyTypes` to distinguish missing from undefined.
 
 </Level>
 
 <Level name="Production level">
 
-DTOs (create, update, response) derived from one domain type keep the API and the UI in step when a
-field changes.
+Domain types are defined once (often inferred from a schema, as with Zod in Phase 3) and every input, patch and view type is derived from them.
 
 </Level>
 
 <Level name="Mindset">
 
-One source of truth for a shape; everything else is a view of it.
+Describe each shape once and derive the rest; let the compiler keep them in sync.
 
 </Level>
 
 <Level name="System design">
 
-In Phase 3, the database schema becomes that source, and Prisma generates the types the rest derive
-from.
+Derived types make the type graph mirror the data model: one change at the root propagates to forms, patches and API types automatically.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the app has one `Todo` type and every other shape is derived from it.
+I find every hand-copied type in the vanilla app and the utility module and replace each with a derivation from the root type.
+
+Done when every type is either a root domain type or derived from one, and adding a field to `Todo` produces compile errors only where it genuinely needs handling.
 
 </Level>
 
@@ -1972,40 +2352,59 @@ Done when the app has one `Todo` type and every other shape is derived from it.
 <Compare
   left="any"
   right="unknown"
+  caption="Both accept any value. Only one forces me to check before using it."
   rows={[
-    ['Anything goes in', 'Anything goes in'],
-    ['Anything goes out: x.foo.bar() compiles', 'Nothing goes out until narrowed'],
-    ['Errors move to runtime', 'Errors stay at compile time'],
-    ['Spreads silently through the code', 'Forces a check at the boundary'],
+    ['data.user.name compiles, crashes at runtime', 'data.user.name is a compile error until narrowed'],
+    ['Spreads: any infects everything it touches', 'Contained: stays unknown until checked'],
+    ['Turns the type checker off', 'Asks for proof'],
+    ['JSON.parse returns any by default', 'Assign the result to unknown, then validate'],
   ]}
-  caption="Both accept any value. Only unknown makes me prove what it is before using it."
 />
 
 <Levels label="Phase 1, unknown">
 
 <Level name="Beginner">
 
-`unknown` is the honest type for data I have not checked yet: JSON from an API, `localStorage`, a caught
-error. I cannot use it until I narrow it. The <a href={withBase('/posts/typescript/07/')}>any trap
-note</a> shows what `any` costs instead.
+`unknown` is the type for "I do not know what this is yet". Any value can be assigned to it, but I cannot use it until I narrow it. The
+<a href={withBase('/posts/typescript/07/')}>any trap</a> note is about the opposite type, `any`, which turns checking off.
 
 ```ts
-const data: unknown = JSON.parse(text);
+const data: unknown = JSON.parse(raw);
 data.length;
-// error TS18046: 'data' is of type 'unknown'.
 ```
+
+```text
+error TS18046: 'data' is of type 'unknown'.
+```
+
+```ts
+if (Array.isArray(data)) console.log(data.length);   // fine: narrowed to any[]
+```
+
+The proof asks for code with no `any`. `unknown` is what replaces it at every boundary: parsed JSON, `fetch` responses, `catch` variables, messages
+from other windows.
 
 </Level>
 
 <Level name="Intermediate">
 
-Parse, then validate, then use. A small hand-written validator is enough for the vanilla app; the
-<a href={withBase('/posts/typescript/12/')}>unknown and validation note</a> covers the library route.
+`any` spreads silently:
 
 ```ts
-function parseTodos(v: unknown): Todo[] {
-  if (!Array.isArray(v)) return [];
-  return v.filter(isTodo);
+const data: any = JSON.parse('{"user": null}');
+const name: string = data.user.name;      // compiles
+```
+
+```text
+TypeError: Cannot read properties of null (reading 'name')
+```
+
+With `unknown`, the same code does not compile until each step is checked. In `catch` blocks, strict mode makes the error `unknown` too
+(`useUnknownInCatchVariables`), because anything can be thrown:
+
+```ts
+try { risky(); } catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
 }
 ```
 
@@ -2013,48 +2412,62 @@ function parseTodos(v: unknown): Todo[] {
 
 <Level name="Advanced">
 
-With `useUnknownInCatchVariables` (part of `strict`), `catch (e)` gives `e: unknown`, so
-`e.message` needs `e instanceof Error` first. `JSON.parse` and `response.json()` are typed `any` by
-default; wrap them to return `unknown`.
+Hand-written guards work for small shapes; a schema library scales. The
+<a href={withBase('/posts/typescript/12/')}>unknown and validation note</a> covers the library route:
+
+```ts
+import { z } from 'zod';
+const TodoSchema = z.object({ id: z.string(), text: z.string().min(1), done: z.boolean() });
+type Todo = z.infer<typeof TodoSchema>;
+
+const result = z.array(TodoSchema).safeParse(JSON.parse(raw));
+if (!result.success) console.warn(result.error.issues);
+const todos: Todo[] = result.success ? result.data : [];
+```
+
+One schema gives both the runtime check and the static type, so they cannot disagree.
 
 </Level>
 
 <Level name="Edge cases">
 
-`unknown` narrowed with `typeof v === 'object'` is still `object | null`. An array of unknown is
-`unknown[]`, and each element still needs checking.
+`Array.isArray` narrows `unknown` to `any[]`, which reintroduces `any` for the elements; validate elements too. `res.json()` returns `Promise<any>`;
+annotate the result as `unknown` immediately: `const data: unknown = await res.json()`.
 
 </Level>
 
 <Level name="Corner cases">
 
-A validator that checks the outer shape but not nested arrays plus an API that changes a nested field:
-the type says `Todo[]`, the data disagrees, and the crash happens three components later.
+Libraries with poor types return `any` and it leaks into my code without any warning. The lint rules `@typescript-eslint/no-unsafe-assignment` and
+`no-unsafe-member-access` catch `any` flowing in from outside.
 
 </Level>
 
 <Level name="Production level">
 
-Every external input enters as `unknown` and leaves the boundary function typed and validated. No
-unexplained casts, as the plan's proof requires.
+Every external input (HTTP, storage, messages, environment variables) enters as `unknown` and is validated once at the boundary; `any` is banned by lint
+with rare, commented exceptions.
 
 </Level>
 
 <Level name="Mindset">
 
-Types describe what I have proven, not what I hope.
+Types describe what I have proved, not what I hope. `unknown` is honest about the moment before proof.
 
 </Level>
 
 <Level name="System design">
 
-Server-side validation in Phase 3 is the same pattern on the other side of the wire.
+Validation at the edges, trusted types inside: the same boundary pattern as Phase 3's API validation, applied to every input the program has.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when `grep -rn "any" src` finds nothing I cannot justify and every parse goes through a validator.
+I search the codebase for `any` (explicit and from `JSON.parse` and `res.json()`), replace each with `unknown` plus a guard or a schema, and turn on the
+no-unsafe lint rules.
+
+Done when `grep -rn "any" src` finds no `any` types, the lint rules pass, and corrupted input produces a handled error instead of a crash.
 
 </Level>
 
@@ -2063,14 +2476,14 @@ Done when `grep -rn "any" src` finds nothing I cannot justify and every parse go
 #### Phase 1: Strict mode
 
 <Layers
-  caption="What strict turns on. Each flag closes a door JavaScript leaves open."
+  caption="What strict: true turns on, and the bug each flag catches"
   layers={[
-    { name: 'strictNullChecks', note: 'null and undefined are separate types you must handle' },
-    { name: 'noImplicitAny', note: 'no silent any where inference fails' },
-    { name: 'strictFunctionTypes', note: 'callback parameter types are checked properly' },
-    { name: 'useUnknownInCatchVariables', note: 'caught errors are unknown' },
-    { name: 'strictPropertyInitialization', note: 'class fields must be set' },
-    { name: 'and more', note: 'noUncheckedIndexedAccess is extra, and worth adding' },
+    { name: 'strictNullChecks', note: 'null and undefined are their own types: no more cannot read properties of undefined' },
+    { name: 'noImplicitAny', note: 'an untyped parameter is an error, not a silent any' },
+    { name: 'strictFunctionTypes', note: 'callbacks must accept what they will be given' },
+    { name: 'useUnknownInCatchVariables', note: 'catch (err) gives unknown, not any' },
+    { name: 'strictPropertyInitialization', note: 'class fields must be set in the constructor' },
+    { name: 'Beyond strict', note: 'noUncheckedIndexedAccess: arr[i] may be undefined' },
   ]}
 />
 
@@ -2078,73 +2491,101 @@ Done when `grep -rn "any" src` finds nothing I cannot justify and every parse go
 
 <Level name="Beginner">
 
-`"strict": true` in `tsconfig.json` turns on the checks that make TypeScript worth using. Without it,
-`null` hides inside every type.
+TypeScript's `strict` option turns on a family of checks that catch the most common runtime errors. Without it, TypeScript lets many unsafe things
+through. Every new project starts strict:
 
 ```json
-{ "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true, "target": "ES2022", "module": "ESNext", "noEmit": true } }
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true
+  }
+}
 ```
 
-Mistake: starting non-strict "to learn" and never switching. Fix: strict from day one on new code.
+The biggest single win is `strictNullChecks`:
+
+```ts
+const todo = todos.find(t => t.id === id);
+todo.text;
+```
+
+```text
+error TS18048: 'todo' is possibly 'undefined'.
+```
+
+Without strict mode this compiles and crashes at runtime when the ID is not found.
 
 </Level>
 
 <Level name="Intermediate">
 
-The errors strict surfaces in the ported app are real bugs: `document.querySelector` returns
-`Element | null`, so the missing-element crash from the DOM topic becomes a compile error.
+`noImplicitAny` stops untyped parameters from silently becoming `any`:
 
 ```ts
-const list = document.querySelector('#todos');
-list.append(li);
-// error TS18047: 'list' is possibly 'null'.
+function total(items) { return items.reduce((s, i) => s + i.price, 0); }
 ```
+
+```text
+error TS7006: Parameter 'items' implicitly has an 'any' type.
+```
+
+`noUncheckedIndexedAccess` (not part of `strict`, but worth it) makes `arr[0]` and `record[key]` include `undefined`, which matches reality: an index
+may be out of range.
+
+Running `npx tsc --noEmit` checks the whole project without producing files; it goes in a script (`"typecheck": "tsc --noEmit"`) and later in CI.
 
 </Level>
 
 <Level name="Advanced">
 
-`noUncheckedIndexedAccess` makes `items[0]` typed `T | undefined`, matching runtime truth.
-`exactOptionalPropertyTypes` separates "missing" from "set to undefined".
+Turning strict on in an existing JavaScript-to-TypeScript project produces hundreds of errors at once. The path: enable flags one at a time, fix the errors
+each one reports, commit, repeat. `strictNullChecks` first, since it catches the most real bugs. The non-null assertion `todo!.text` silences the null
+check without a runtime check; each use needs a comment, or better, a narrowing check.
 
 </Level>
 
 <Level name="Edge cases">
 
-The non-null assertion `!` silences a null error without checking; it is a cast in disguise.
+`// @ts-ignore` suppresses the next line's error forever, even after it is fixed; `// @ts-expect-error` fails when there is no longer an error, so stale
+suppressions get noticed. Prefer the second, with a reason.
 
 </Level>
 
 <Level name="Corner cases">
 
-A strict project importing an untyped library gets `any` from it anyway. Write a small declaration
-file, or wrap the library in a typed module.
+Strict mode in TypeScript is not the same as JavaScript's `'use strict'`. The JavaScript one changes runtime behaviour (no implicit globals, `this` undefined
+in plain functions); modules and classes have it automatically. TypeScript's `strict` only changes type checking.
 
 </Level>
 
 <Level name="Production level">
 
-Migrating an existing codebase is done file by file with `// @ts-expect-error` comments that carry a
-reason, tracked down to zero.
+Strict is on in every project, the typecheck runs in CI, and suppressions are counted and reviewed.
 
 </Level>
 
 <Level name="Mindset">
 
-Each strict error is a question about a value I never answered.
+Each strict error is a runtime crash found early. I treat them as free bug reports, not obstacles.
 
 </Level>
 
 <Level name="System design">
 
-The same `tsconfig` runs in the editor and in CI (Phase 4), so strictness is enforced, not optional.
+The compiler is a teammate that checks every line on every change. Strict settings decide how much it is allowed to catch.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the app compiles under strict with `noUncheckedIndexedAccess`, with zero `!` assertions I
-cannot defend.
+I convert the vanilla app to TypeScript with strict on from the start and `noUncheckedIndexedAccess` added, fixing each error with a real check, not `!` or `as`.
+
+Done when `tsc --noEmit` passes with strict, there are no `ts-ignore` comments, and every `!` and `as` has a written reason.
 
 </Level>
 
@@ -2154,83 +2595,90 @@ cannot defend.
 
 <Compare
   left="Over-annotated"
-  right="Annotated where it helps"
+  right="Annotate the boundaries, infer the rest"
+  caption="Annotations belong where they add information the compiler cannot infer, or where they form a contract."
   rows={[
-    ['const n: number = 5', 'const n = 5'],
-    ['const xs: string[] = names.map((s: string): string => s.trim())', 'const xs = names.map((s) => s.trim())'],
-    ['function f(a) returning implicitly', 'function f(a: string): Todo'],
-    ['const t = data as Todo', 'const t = parseTodo(data)'],
+    ['const count: number = 0', 'const count = 0'],
+    ['const names: string[] = todos.map((t: Todo): string => t.text)', 'const names = todos.map(t => t.text)'],
+    ['export function load() { ... }  (return type inferred)', 'export function load(): Todo[] { ... }'],
+    ['const filter = "all"  then reassigned to other values', 'let filter: Filter = "all"'],
   ]}
-  caption="Inference handles the inside; annotations belong at boundaries and public signatures."
 />
 
 <Levels label="Phase 1, when not to annotate">
 
 <Level name="Beginner">
 
-TypeScript infers most local types. Annotating them adds noise and can make types wider than inference
-would.
+TypeScript infers types from values, so most local variables need no annotation. `const count = 0` is already `number`; writing `: number` adds noise and
+nothing else. Callback parameters are inferred from context: in `todos.map(t => t.text)`, `t` is already `Todo`.
 
-```ts
-const filter: string = 'open';  // widened to string
-const f = 'open';               // literal 'open'
-```
+Annotate where inference cannot help or where a contract matters: function parameters (they have no value to infer from), exported function return types,
+empty collections (`const todos: Todo[] = []`, or it becomes `never[]`), and variables that start as one value and will hold others of a union.
+
+Mistake: annotating every line "to be safe". The noise hides the annotations that matter, and a wrong annotation can widen a type and lose information.
 
 </Level>
 
 <Level name="Intermediate">
 
-Annotate parameters, exported function return types, and empty collections. Let callbacks infer their
-parameters from the array.
+Where an annotation loses information:
+
+```ts
+const config: Record<string, string> = { home: '/', todos: '/todos' };
+config.hme;            // no error: any string key is allowed
+
+const config2 = { home: '/', todos: '/todos' };
+config2.hme;           // error: Property 'hme' does not exist
+```
+
+The inferred type is more precise. When I want a check against a type and the precise type, `satisfies` does both.
 
 </Level>
 
 <Level name="Advanced">
 
-`satisfies` checks a value against a type without widening it, keeping literal keys for autocomplete.
-
-```ts
-const labels = { all: 'All', open: 'Open', done: 'Done' } satisfies Record<Filter, string>;
-labels.open; // type is string, keys checked against Filter
-```
+Return types on exported functions are worth writing even when inferable: they document the contract, speed up the compiler in big projects, and catch a
+change inside the function that would silently alter what callers receive. Internal helpers can rely on inference.
 
 </Level>
 
 <Level name="Edge cases">
 
-An explicit return type that is wider than the real one hides information (`: object`). A missing
-return type on a recursive function is an error.
+`let x = null` infers `any` in some settings or `null` in others; annotate when a variable starts empty. `const` with a literal infers the literal type
+(`'all'`), `let` widens it (`string`), which matters for unions.
 
 </Level>
 
 <Level name="Corner cases">
 
-`as` used as an annotation (`{} as Todo`) compiles an empty object into a `Todo`, which then crashes.
+An annotation on a destructured parameter goes on the whole pattern, not inside it: `function f({ id }: { id: string })`, not `function f({ id: string })`,
+which renames `id` to a variable called `string`.
 
 </Level>
 
 <Level name="Production level">
 
-Explicit return types on exported functions keep public APIs stable and speed up type checking.
+Lint rules (`no-inferrable-types`, `explicit-module-boundary-types`) encode the policy: no redundant annotations on locals, explicit types on exports.
 
 </Level>
 
 <Level name="Mindset">
 
-Type the contract, trust inference for the implementation.
+Types are for readers and the compiler. Write the ones that tell either of them something new.
 
 </Level>
 
 <Level name="System design">
 
-Public module boundaries are annotated; internals are free to change.
+Annotated boundaries and inferred interiors mirror the validate-at-the-edge rule: contracts where modules meet, freedom inside.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when every annotation in the app is at a boundary or explains intent, and there are no `as` casts
-without a comment.
+I review the utility module and delete every annotation the editor's hover shows is redundant, and add return types to every export.
+
+Done when every annotation in my code either types a parameter, an export, an empty collection or a widened variable, and nothing else.
 
 </Level>
 
@@ -2368,68 +2816,128 @@ deployed and I can explain every function in it.
 
 <Level name="Beginner">
 
-Small exercises are reps: each takes under an hour and drills one idea. I write them in a `drills/`
-folder, one file each, with a comment at the top saying what it practises.
+Small exercises are reps: each takes under an hour and drills one idea. I write them in a `drills/` folder, one file each, with a comment at the
+top saying what it practises and a few `console.assert` lines at the bottom so the file checks itself when run with `node`.
 
 ```js
-// drills/07-memoize.js: closures and Map
-const memoize = (fn) => { const cache = new Map(); return (x) => cache.has(x) ? cache.get(x) : (cache.set(x, fn(x)), cache.get(x)); };
+// drills/06-once.js: closures. once(fn) runs fn the first time only, then returns the first result.
+export function once(fn) {
+  let called = false;
+  let result;
+  return (...args) => {
+    if (!called) { called = true; result = fn(...args); }
+    return result;
+  };
+}
+
+let n = 0;
+const init = once(() => ++n);
+console.assert(init() === 1 && init() === 1 && n === 1, 'once should run fn exactly once');
 ```
+
+```sh
+$ node drills/06-once.js
+$                     # silence means every assert passed
+```
+
+The plan's first trap is tutorial hell: watching someone else write code feels like learning, and the first blank file proves it was not. These
+twenty files are the antidote.
 
 </Level>
 
 <Level name="Intermediate">
 
-Each exercise gets a few `console.assert` checks or a tiny test, so "done" is checkable.
+The method that makes them stick: read the one-line spec, write it from a blank file without looking anything up, run the asserts, and only then
+compare with a reference or ask for a review. Where I got stuck goes in the bug log. A week later I delete the file and write it again from the
+spec; if I cannot, the idea is not mine yet. That is the second trap, copy-pasting code I cannot rewrite.
+
+A worked one, exercise 8, `groupBy`, drilling arrays and objects:
 
 ```js
-console.assert(memoize((n) => n * 2)(4) === 8, 'memoize doubles');
+// drills/08-group-by.js
+export function groupBy(items, keyFn) {
+  return items.reduce((groups, item) => {
+    const key = keyFn(item);
+    (groups[key] ??= []).push(item);
+    return groups;
+  }, {});
+}
+
+const todos = [{ text: 'a', done: true }, { text: 'b', done: false }, { text: 'c', done: true }];
+console.log(groupBy(todos, t => (t.done ? 'done' : 'active')));
 ```
+
+```text
+{ done: [ { text: 'a', done: true }, { text: 'c', done: true } ], active: [ { text: 'b', done: false } ] }
+```
+
+The fourth trap, avoiding arrays because `map` feels clever, ends here: half the drills are `map`, `filter` and `reduce`.
 
 </Level>
 
 <Level name="Advanced">
 
-Interleave: mix topics in one session (an async drill, a DOM drill, a types drill) rather than finishing
-a topic block. It feels slower and sticks better, which is technique 4 in the plan.
+Exercise 17, a concurrency-limited fetch, combines promises, closures and the event loop:
+
+```js
+// drills/17-limit.js: run at most `limit` async tasks at once, keep result order
+export async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+```
+
+`next++` is safe without locks because JavaScript runs one piece at a time; the increment and the read happen in the same synchronous step. Explaining
+why is a good test of the event loop topic.
 
 </Level>
 
 <Level name="Edge cases">
 
-Each exercise includes its edge inputs: empty array, zero, negative, very large, unicode.
+Each drill gets asserts for an edge: `groupBy([])` returns `{}`; `once` with a function that throws (should the second call retry?); `mapLimit` with a
+limit larger than the list, or zero. Deciding the behaviour is half the exercise.
 
 </Level>
 
 <Level name="Corner cases">
 
-`memoize` plus an argument that is an object: two equal objects are different keys, so the cache never
-hits. The exercise's write-up says so.
+`console.assert` only logs on failure and does not stop the script, so a failing drill can look like a passing one in a long output. Once the typed module
+exists, move the drills to Vitest so failures are counted and the run exits non-zero.
 
 </Level>
 
 <Level name="Production level">
 
-Several drills become the typed utility module below, so practice turns into reusable code.
+The drills are not production code, but the habits are: a spec first, tests alongside, edge cases decided on purpose, small files.
 
 </Level>
 
 <Level name="Mindset">
 
-Reps over reading. Rebuilding from memory is practice; watching is not.
+Reps beat reading. Twenty small things written from blank files teach more than a long course watched.
 
 </Level>
 
 <Level name="System design">
 
-Small, single-purpose functions with tests are the bricks of every larger module.
+Several drills (`once`, `memoize`, `mapLimit`, the event emitter) are small versions of real infrastructure: initialisation guards, caches, worker pools,
+pub-sub. Recognising them later in big systems starts here.
 
 </Level>
 
 <Level name="Strategy">
 
-Two or three a week. Done when all twenty pass their checks and I can redo any five, chosen at random,
-from a blank file.
+Two or three drills a week alongside the app, in the order of the timeline, each written cold, then rewritten a week later.
+
+Done when all twenty exist with asserts, I can rewrite any of them from its one-line spec in under an hour, and each place I got stuck is in the bug log.
 
 </Level>
 
@@ -2438,93 +2946,142 @@ from a blank file.
 #### Phase 1: One typed utility module with tests
 
 <Flow
-  caption="From drills to a module: pick, type, test, document."
-  steps={['Pick 5 drills worth keeping', 'Port to strict TS', 'Write Vitest tests with edge inputs', 'Run in watch mode', 'Export a small public API', 'README with examples']}
+  caption="Building the module test-first, one function at a time"
+  steps={['Write the signature and a doc comment', 'Write failing tests: normal, edge, invalid', 'npx vitest: red', 'Implement until green', 'npx tsc --noEmit: no errors, no any', 'Refactor with the tests as a net', 'Commit']}
 />
 
-<Levels label="Phase 1, a typed utility module with tests">
+<Levels label="Phase 1, one typed utility module with tests">
 
 <Level name="Beginner">
 
-A single file `utils.ts` with a few functions and a test file beside it. Vitest runs TypeScript tests
-with almost no setup.
+The build asks for one typed utility module with tests. Mine is `src/todos.ts`: the pure functions behind the vanilla app (filter, search, sort, add,
+toggle, load), with no DOM, so they can be tested without a browser. Vitest runs TypeScript tests directly:
+
+```sh
+$ npm init -y && npm install -D typescript vitest
+$ npx tsc --init --strict
+```
 
 ```ts
-// utils.ts
-export function groupBy<T, K extends PropertyKey>(items: T[], key: (t: T) => K): Record<K, T[]> {
-  const out = {} as Record<K, T[]>;
-  for (const item of items) (out[key(item)] ??= []).push(item);
-  return out;
+// src/todos.ts
+export type Todo = { id: string; text: string; done: boolean };
+export type Filter = 'all' | 'active' | 'done';
+
+export function visible(todos: readonly Todo[], filter: Filter, query: string): Todo[] {
+  const q = query.trim().toLowerCase();
+  return todos.filter(t =>
+    (filter === 'all' || (filter === 'done') === t.done) && t.text.toLowerCase().includes(q));
 }
-// utils.test.ts
-import { describe, it, expect } from 'vitest';
-import { groupBy } from './utils';
-describe('groupBy', () => {
-  it('groups by the key', () => {
-    expect(groupBy([1, 2, 3], (n) => (n % 2 ? 'odd' : 'even'))).toEqual({ odd: [1, 3], even: [2] });
-  });
-  it('returns an empty object for no items', () => {
-    expect(groupBy([], () => 'x')).toEqual({});
-  });
+```
+
+```ts
+// src/todos.test.ts
+import { describe, expect, test } from 'vitest';
+import { visible, type Todo } from './todos';
+
+const todos: Todo[] = [
+  { id: '1', text: 'Buy milk', done: false },
+  { id: '2', text: 'Book tickets', done: true },
+];
+
+describe('visible', () => {
+  test('filters by status', () => { expect(visible(todos, 'done', '').map(t => t.id)).toEqual(['2']); });
+  test('searches case-insensitively', () => { expect(visible(todos, 'all', 'MILK')).toHaveLength(1); });
+  test('trims the query', () => { expect(visible(todos, 'all', '  book ')).toHaveLength(1); });
 });
 ```
 
-Running `npx vitest run` prints the passing tests; break the function and it prints the expected and
-received values side by side.
+```text
+ ✓ src/todos.test.ts (3 tests) 4ms
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+```
 
 </Level>
 
 <Level name="Intermediate">
 
-Test behaviour through the public function, one idea per test, with names that read as sentences.
-Include the edge inputs from the drills.
+Test-first, traced: I write `toggle(todos, id)` tests before the function exists, including "returns a new array" and "leaves the original unchanged",
+watch them fail with `toggle is not a function`, then implement:
+
+```ts
+export function toggle(todos: readonly Todo[], id: string): Todo[] {
+  return todos.map(t => (t.id === id ? { ...t, done: !t.done } : t));
+}
+```
+
+```ts
+test('does not mutate', () => {
+  const before = structuredClone(todos);
+  toggle(todos, '1');
+  expect(todos).toEqual(before);
+});
+```
+
+`readonly Todo[]` in the parameter makes `todos.push` a compile error inside the function, so immutability is enforced twice, by types and by tests.
 
 </Level>
 
 <Level name="Advanced">
 
-Type-level tests: `expectTypeOf(groupBy(todos, (t) => t.done ? 'done' : 'open')).toEqualTypeOf<Record<'done' | 'open', Todo[]>>()`
-checks that inference stays precise.
+The proof says ship with no `any` and no unexplained casts. The loader is where that is tested: it takes `unknown` and uses a guard, and its tests feed it
+garbage:
+
+```ts
+test.each([
+  ['null', 'null'],
+  ['not json', '{oops'],
+  ['wrong shape', '[{"id": 1}]'],
+  ['object not array', '{"id": "1"}'],
+])('load returns [] for %s', (_name, raw) => {
+  expect(parseTodos(raw)).toEqual([]);
+});
+```
+
+Coverage (`npx vitest --coverage`) shows untested branches; I aim for every branch of the module, which is realistic for pure functions.
 
 </Level>
 
 <Level name="Edge cases">
 
-The `{}` cast inside `groupBy` is the one justified cast, commented. Keys that are numbers become
-strings on a plain object; the test documents it.
+Tests that depend on the current time or random IDs are flaky; inject them (`add(todos, text, { id, now })`) or use `vi.useFakeTimers()` and a fixed ID
+function in tests.
 
 </Level>
 
 <Level name="Corner cases">
 
-A test that passes because it asserts nothing (no `expect`, or `expect(x)` with no matcher). Break the
-function on purpose and check the test goes red.
+`toEqual` ignores `undefined` properties, so `{ a: 1, b: undefined }` equals `{ a: 1 }`; `toStrictEqual` does not. Pick deliberately when the
+difference matters (for example in JSON output).
 
 </Level>
 
 <Level name="Production level">
 
-The module has no `any`, its tests run in CI later, and the app imports it. Phase 4 builds on these
-first tests.
+Pure logic in modules with unit tests, the UI as a thin layer over it, `npm test` and `npm run typecheck` as scripts, both run before every commit and
+later in CI.
 
 </Level>
 
 <Level name="Mindset">
 
-Tests are how I know, not how I feel: rule 5.
+Pull logic out of the DOM and it becomes easy to test. Code that is hard to test is usually telling me its responsibilities are tangled.
 
 </Level>
 
 <Level name="System design">
 
-A pure, tested module is the safest place to put logic; the UI just calls it.
+Pure core, thin shell: the module is the core, the DOM code the shell. The same split makes the Phase 2 port to React mostly a new shell around the same
+module.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when five functions are typed, each has edge-case tests, and deliberately breaking any one turns a
-test red.
+I extract every pure function from the vanilla app into the module, write tests first for each, then rewire the app to use it.
+
+Done when the module has tests for normal, edge and invalid input for every export, `tsc --noEmit` and lint pass with no `any`, and the app uses only the
+module for its logic.
 
 </Level>
 
@@ -2533,86 +3090,103 @@ test red.
 #### Phase 1: Debugging from the console, and the bug log
 
 <Flow
-  caption="The debugging loop the plan asks for, and the log entry it produces."
-  steps={['Read the error and the stack', 'Reproduce it reliably', 'Form one hypothesis', 'Test it: breakpoint or log', 'Fix the cause', 'Log: error, cause, fix, rule']}
+  caption="Debugging a broken app from the console, in order"
+  steps={['Reproduce it reliably', 'Read the first red error fully', 'Click through to the file and line', 'Set a breakpoint just before', 'Inspect values; step', 'Form one hypothesis and test it', 'Fix, then write the bug-log entry']}
 />
 
-<Levels label="Phase 1, debugging from the console and the bug log">
+<Levels label="Phase 1, debugging from the console, and the bug log">
 
 <Level name="Beginner">
 
-The proof says: debug a broken app from the console. Start with the red error, click the file and line,
-and look at the values there. `console.log` with labels, `console.table` for arrays of objects.
+The proof asks me to debug a broken app from the console. The first habit is reading the error properly. Every error has a type, a message and a stack:
 
-```js
-console.table(todos);
-console.log({ filter, query, visibleCount: visible.length });
+```text
+Uncaught TypeError: Cannot read properties of undefined (reading 'text')
+    at renderItem (view.js:14:22)
+    at Array.map (<anonymous>)
+    at render (view.js:8:31)
+    at HTMLFormElement.<anonymous> (main.js:21:5)
 ```
 
-The bug log is one markdown file with four fields per bug.
+Read bottom to top for the story (the submit handler called `render`, which mapped items through `renderItem`), top line for the crash site: line 14,
+column 22 of `view.js`, something was `undefined` where a todo was expected. Clicking `view.js:14` opens the Sources panel at that line.
 
-```md
-## 2026-10-23: deleting one todo deleted two
-Error: no error; two items vanished.
-Cause: ids from Date.now() collided on a double add.
-Fix: crypto.randomUUID().
-Rule: ids come from a generator meant for ids, never from time.
-```
+Mistake: changing code at random until the error disappears. The error says exactly where to look.
 
 </Level>
 
 <Level name="Intermediate">
 
-Breakpoints beat logs for "why is this value wrong": add `debugger;` or click a line number in Sources,
-then step over, into and out, and watch variables. Conditional breakpoints pause only when, say,
-`id === 3`.
+Breakpoints beat `console.log` for anything non-trivial. In Sources, click a line number to set one, reproduce the bug, and execution pauses there. The
+Scope pane shows every variable; hovering shows values; the Console runs in the paused scope, so I can type `todos.length` or `todos[i]` and see them.
+Step over (F10) runs the next line, step into (F11) enters a function call.
+
+Writing `debugger;` in code pauses there when DevTools is open. Conditional breakpoints (right-click the line number) pause only when an expression is true,
+for example `todo === undefined`.
+
+The console itself has more than `log`: `console.table(todos)` shows an array of objects as a table, `console.dir(el)` shows an element's properties, and
+`console.trace()` prints how the current line was reached.
 
 </Level>
 
 <Level name="Advanced">
 
-Bisect the cause: comment out half, or `git bisect` across commits, to find where it broke. Event
-listener breakpoints pause on any click. "Pause on caught exceptions" finds errors swallowed by a
-`catch`.
+Hard bugs have a method. Make the reproduction smaller until it is minimal. Bisect: comment out half, see which half has the bug, repeat (or `git bisect`
+across commits). Check assumptions one at a time, writing each down: "I believe `todos` is an array here", then verify. Use the Network panel when data
+comes from outside and the Application panel when it comes from storage.
+
+Pause on exceptions (the stop-sign icon in Sources) stops at the throw, with all the state that caused it still in scope, even for errors that are caught.
 
 </Level>
 
 <Level name="Edge cases">
 
-A bug that disappears when DevTools is open (timing or cache). A bug only on the deployed site (base
-path, case-sensitive file names, from Phase 0).
+The error may come from a line far from the cause: a bad value written to storage on Monday crashes rendering on Tuesday. Follow the value back to where it
+was created. Minified production code shows meaningless names; source maps map it back to my files.
 
 </Level>
 
 <Level name="Corner cases">
 
-`console.log(obj)` shows the object live: expanding it later shows current values, not values at log
-time. Log `structuredClone(obj)` or `JSON.stringify(obj)` to freeze it.
+`console.log(obj)` shows the object live, not as it was when logged, so expanding it later shows the current state. Log `structuredClone(obj)` or
+`JSON.stringify(obj)` to capture the moment. Bugs that disappear when DevTools is open often involve timing or focus.
 
 </Level>
 
 <Level name="Production level">
 
-The log becomes the source of notes on this site, which is how this whole blog started.
+Error tracking (Phase 4) captures stacks from users' browsers with source maps; the bug log becomes postmortems and runbooks; the method stays the same.
 
 </Level>
 
 <Level name="Mindset">
 
-Fix the cause, not the symptom: rule 6. The rule line in the log is the part that prevents the next bug.
+A bug is a gap between what I believe the code does and what it does. Debugging is finding which belief is wrong.
 
 </Level>
 
 <Level name="System design">
 
-The same loop runs on production incidents in Phase 4, with logs and traces instead of a console.
+Observable code is debuggable code: clear errors with context, small functions, state in one place. Design choices from earlier topics are what make this
+topic easy or hard.
 
 </Level>
 
 <Level name="Strategy">
 
-Have someone (or a script) break my app in three ways I do not know. Done when I find all three from the
-console alone and the log has at least twenty entries.
+The AI-era note asks for a bug log: the error, the cause, the fix, and the rule I keep so it does not happen again. Mine is a Markdown file with one entry
+per bug:
+
+```md
+## 2026-10-12: Cannot read properties of undefined (reading 'text')
+Cause: delete used the index from the filtered list on the full list.
+Fix: delete by id, not index.
+Rule: never pass an index across a filter; pass ids.
+```
+
+Someone (or a model) plants five bugs in a copy of my app; I find each from the console with breakpoints, no reading the diff.
+
+Done when I can find planted bugs from the console alone, the bug log has an entry for every real bug this phase, and the rules column has changed how I write code.
 
 </Level>
 
@@ -2621,77 +3195,89 @@ console alone and the log has at least twenty entries.
 #### Phase 1: The gate, the traps and the AI-era note
 
 <Compare
-  left="The trap"
+  left="The plan's trap"
   right="The habit that replaces it"
+  caption="Phase 1's four traps, each paired with the evidence that I avoided it."
   rows={[
-    ['Tutorial hell', 'One app that grows each week'],
-    ['Copy-pasting code I cannot rewrite', 'Retype from memory the next day'],
-    ['React before the DOM', 'Vanilla app first, framework in Phase 2'],
-    ['Avoiding array methods', 'map, filter and reduce every day in drills'],
-    ['Asking AI for every first draft', 'Ask AI to review what I wrote'],
+    ['Tutorial hell', 'Twenty drills written from blank files, rewritten a week later'],
+    ['Copy-pasting code I cannot rewrite', 'Every drill and the module rewritable from the spec'],
+    ['Reaching for React before I can manipulate the DOM', 'The vanilla app: state, render, delegated events by hand'],
+    ['Avoiding arrays because map feels clever', 'map, filter and reduce in half the drills and all the module'],
   ]}
-  caption="The plan's four traps and its AI rule, each with its replacement."
 />
 
-<Levels label="Phase 1, the gate">
+<Levels label="Phase 1, the gate, the traps and the AI-era note">
 
 <Level name="Beginner">
 
-Gate 1: build a todo app from scratch, no framework. Pass: it works, persists, and I can explain every
-function. Ship: a vanilla app, no framework. I start from an empty folder, with no notes open.
+The proof for this phase has three parts: explain closures, `this` and the event loop without notes; debug a broken app from the console; ship code with no
+`any` and no unexplained casts. I take it as a gate, cold: a blank page for the explanations, a planted-bug app, and `grep` plus lint on my repository.
+
+For the explanations, each one gets a short written answer and a code example I can run: a counter factory for closures, the same method called four ways
+for `this`, the 1-to-5 ordering trace for the event loop.
 
 </Level>
 
 <Level name="Intermediate">
 
-Timebox it to one sitting. Afterwards I write a short explanation per function: what it takes, what it
-returns, what side effects it has.
+The AI-era note: use AI for code review, not for the first draft of every function. A review prompt that teaches rather than replaces:
+
+```text
+Prompt: What is wrong with this function? List bugs, edge cases it mishandles, and
+anything that would fail TypeScript strict mode. Do not rewrite it.
+```
+
+Then I fix the problems myself and add each real bug to the log. The model's review is a second pair of eyes; the fix stays mine.
 
 </Level>
 
 <Level name="Advanced">
 
-The AI-assisted half of the gate: ask a model "what is wrong with this function?" for each module, then
-verify every point it raises and reject the wrong ones with a reason.
+I also use the model as an examiner: ask it for five event-loop ordering puzzles of increasing difficulty and five `this` puzzles, answer them on paper, then
+run them. Wrong answers point to exactly which part of the model in my head is wrong.
 
 </Level>
 
 <Level name="Edge cases">
 
-The rebuilt app must handle the edge inputs from the build topic without looking them up.
+A model's explanation of `this` or the event loop can be subtly wrong (for example about when rendering happens). I check claims against running code or MDN,
+not against another model answer.
 
 </Level>
 
 <Level name="Corner cases">
 
-Explaining a function I wrote but cannot justify a line of means I copied it from memory without
-understanding; that line goes in the bug log as a gap.
+Passing the `any` check by hiding types behind `as unknown as T` is a cast in disguise; the gate counts those as unexplained casts unless commented.
 
 </Level>
 
 <Level name="Production level">
 
-The deployed app, the tested utility module and the strict TypeScript port are linked from the README.
+The checks that prove "no any" (lint rules, `tsc --noEmit`) stay in the repository's scripts, so the property holds after the gate.
 
 </Level>
 
 <Level name="Mindset">
 
-If I cannot pass the gate, the next phase will not fix it. Go back.
+The gate is not a test to pass once; it is a check that the model in my head matches the machine.
 
 </Level>
 
 <Level name="System design">
 
-Phase 2 rebuilds this app's ideas in React; anything shaky here becomes a React bug there.
+Everything later, React's renders, Node's request handling, async jobs, rests on closures, `this` and the event loop. A gap here shows up as mystery bugs in
+every later phase.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when I pass the gate cold, explain closures, `this` and the event loop without notes, debug a
-broken app from the console, and the code has no `any` and no unexplained casts.
+At the end of week 10, take the gate cold: write the three explanations without notes, fix the planted-bug app from the console, and run the `any` and cast audit.
+
+Done when all three explanations are correct on first writing, every planted bug is found from the console, the audit is clean, and each trap in the table has
+evidence in the repository. If not, the plan's advice holds: go back, because the next phase will not fix it.
 
 </Level>
 
 </Levels>
+
