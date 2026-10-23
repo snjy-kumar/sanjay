@@ -238,28 +238,18 @@ developer reading the network panel knows what to do instead.
 ### Step by step
 
 <Figure art={`
-                     did the server understand the request?
-                      /                                \\
-                    no                                 yes
-                    |                                   |
-            400 (syntax)                  is the caller identified?
-                                           /                \\
-                                         no                 yes
-                                         |                   |
-                                        401          is the caller allowed?
-                                                      /            \\
-                                                    no             yes
-                                                    |               |
-                                              403 / 404     does the input pass the rules?
-                                                              /            \\
-                                                            no             yes
-                                                            |               |
-                                                      422 / 409     did the server manage it?
-                                                                      /          \\
-                                                                    no           yes
-                                                                    |             |
-                                                              500 / 503    200 / 201 / 204
-`} caption="A decision tree for picking a status code. Walk it top to bottom; the first 'no' decides the code. 5xx only appears once the request itself was fine." />
+  1. Could the server parse the request?        no  -> 400
+     | yes
+  2. Is the caller identified?                  no  -> 401
+     | yes
+  3. Is the caller allowed to touch this?       no  -> 403 or 404
+     | yes
+  4. Does the input pass the rules?             no  -> 422 or 409
+     | yes
+  5. Did the server manage the work?            no  -> 500, 502, 503
+     | yes
+  6. Success                                        -> 200, 201, 204
+`} caption="A decision ladder for picking a status code. Walk it top to bottom; the first 'no' decides the code. 5xx only appears once the request itself was fine."  />
 
 ### Common mistake
 
@@ -435,6 +425,46 @@ calls the card network first and crashes before writing the row, the retry
 charges again. The fix is to record the key and a "started" state first,
 then do the external call with the provider's own idempotency key derived
 from yours, then record the result.
+
+#### A retry policy that follows the contract
+
+Putting the method table and the status classes together gives a client a
+retry rule it can apply without knowing anything about the endpoint. Retry
+only when repeating is harmless (an idempotent method, or a `POST` carrying
+an idempotency key), and only when a retry can help (a network error, 429,
+502, 503 or 504). I wrote it as one function and ran it over six cases:
+
+```ts
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const IDEMPOTENT = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']);
+function shouldRetry(method: string, status: number | 'network', hasKey: boolean) {
+  const repeatable = IDEMPOTENT.has(method) || hasKey;
+  if (!repeatable) return false;
+  return status === 'network' || RETRYABLE_STATUS.has(status) || status === 429;
+}
+const delay = (attempt: number) =>
+  Math.min(8000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2);
+```
+
+```text
+GET    503     no key -> retry
+POST   network no key -> give up
+POST   network key    -> retry
+PUT    422     no key -> give up
+DELETE network no key -> retry
+PATCH  504     no key -> give up
+waits (ms): 497, 553, 1866, 3335, 7054
+```
+
+The `POST` without a key gives up even on a network error, because the
+client cannot know whether the first attempt landed; it should tell the
+user instead of guessing. The same `POST` with a key retries freely. The
+`PUT` that got 422 gives up because the same body will fail the same way.
+The waits double each time up to a cap of eight seconds, and the random
+factor between one half and one spreads clients out, so a server that just
+recovered is not hit by every client in the same instant. That spread is
+called **jitter**, and without it a short outage tends to end in a second,
+self-inflicted one.
 
 ### In real systems
 
