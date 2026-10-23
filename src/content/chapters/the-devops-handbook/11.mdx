@@ -1,0 +1,1420 @@
+---
+book: the-devops-handbook
+number: 11
+title: "Enable and Practice Continuous Integration"
+description: "Continuous integration in depth: why long-lived branches cause merge pain, small batches on trunk, trunk-based development, gated commits and feature flags."
+part: "Part III, The First Way: The Technical Practices of Flow"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A fast, reliable test suite tells a team whether a change works. But it
+can only check the code it is given. If developers work on separate
+branches for days or weeks, the tests check each branch alone, and nobody
+knows whether the branches work together until they are merged. That
+merge is where many of the worst surprises in software live. This chapter
+explains continuous integration: merging everyone's work into one shared
+trunk at least daily, with the pipeline checking every merge. It covers
+why integration gets harder the longer it is delayed, the trade-off
+between individual and team productivity in branching, what small batches
+mean for code, and the trunk-based practices that make frequent merging
+safe.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- explain what continuous integration means, and what it does not mean;
+- show, with a simulation, why merge conflicts grow faster than branch age;
+- describe the trade-off between optimising branching for individuals and for the team;
+- apply small-batch thinking to code changes and explain what happens when commits to trunk are rare;
+- practise trunk-based development with gated commits, feature flags and branch by abstraction;
+- keep a shared trunk releasable while many people merge to it every day.
+
+What I should already know: the deployment pipeline foundations in
+<a href={withBase('/books/the-devops-handbook/09-create-the-foundations-of-our-deployment-pipeline/')}>chapter 9</a>,
+the fast, reliable test suite in
+<a href={withBase('/books/the-devops-handbook/10-enable-fast-and-reliable-automated-testing/')}>chapter 10</a>,
+and basic version control with branches and merges, for example in git.
+All code examples on this page are JavaScript run with node.
+
+Reading time: about 70 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Flow caption="The chapter as a path. Read left to right: see why late integration hurts, choose to optimise for the team, shrink the batch, then adopt the trunk-based practices that make daily merging safe." steps={[
+  "Why late merges hurt",
+  "Individual versus team productivity",
+  "Small batches and rare commits",
+  "Trunk-based development practices",
+  "Keep trunk releasable every day",
+  "From beginner to strategy",
+]} />
+
+## Why integration gets harder the longer it waits
+
+### In one sentence
+
+When developers work apart on branches, their changes drift away from each
+other, and the cost of bringing them back together grows faster than the
+time they were apart.
+
+### The idea
+
+Version control lets each developer work on a **branch**, a private copy of
+the code where they can change things without affecting anyone else. This
+is useful: it isolates unfinished work. But isolation has a cost. While I
+work on my branch, my colleagues are changing the same codebase on theirs.
+Every day, our copies drift further apart. When we finally merge, we must
+reconcile all the differences at once.
+
+The book describes the result as **merge hell**: a painful period, often
+just before a release, when long-lived branches are brought together, and
+the team discovers conflicting changes, broken assumptions and tests that
+pass on each branch but fail on the combination. Fixing these takes time,
+and because the changes were made days or weeks ago, the authors no longer
+remember the details. The work is slow, risky and stressful, and it often
+introduces new defects.
+
+There are two kinds of integration problem. **Textual conflicts** happen
+when two branches change the same lines; version control can detect these,
+though a person must resolve them. **Semantic conflicts** are worse: two
+changes that touch different lines but break each other's assumptions. For
+example, one developer renames a function's meaning while another adds a
+new caller relying on the old meaning. The merge succeeds with no
+conflict reported, and the bug only appears when the combined code runs.
+Only tests on the integrated code catch semantic conflicts, which is why
+integration must be followed by the pipeline.
+
+**Continuous integration** is the practice of merging every developer's
+work into a shared trunk frequently, at least daily, with every merge
+built and tested automatically. It is a practice, not a tool: a team that
+runs a build server on long-lived branches is not doing continuous
+integration, because the code is still not being integrated.
+
+<Compare left="Textual conflict" right="Semantic conflict" caption="Two kinds of integration problem. Read across each row: version control finds textual conflicts for us, but only tests on integrated code find semantic ones." rows={[
+  ["Same lines changed on two branches", "Different lines, incompatible assumptions"],
+  ["Version control reports it at merge time", "Merge succeeds silently"],
+  ["A person resolves it by reading both changes", "Found only when combined code runs"],
+  ["Annoying but visible", "Dangerous because invisible"],
+  ["Smaller with frequent merges", "Caught early only by testing every merge"],
+]} />
+
+#### Simulating merge conflicts against branch age
+
+Why does the cost grow faster than branch age? Because conflicts need
+overlap. The longer I am apart, the more files I have changed and the more
+files others have changed, and the chance of overlap grows with both. Here
+is a simulation, run with node: five developers each change three random
+files out of two hundred per day; a conflict is a file I changed that
+someone else also changed while I was on my branch.
+
+```js
+// How merge conflicts grow with branch age.
+// 5 developers each change 3 random files (of 200) per day on their own branch.
+// A conflict = a file changed on my branch AND by someone else since I branched.
+let seed = 11;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+const FILES = 200, DEVS = 5, PER_DAY = 3, TRIALS = 2000;
+for (const days of [1, 2, 5, 10, 20]) {
+  let totalConflicts = 0;
+  for (let t = 0; t < TRIALS; t++) {
+    const mine = new Set(), theirs = new Set();
+    for (let d = 0; d < days; d++) {
+      for (let k = 0; k < PER_DAY; k++) mine.add(Math.floor(rand() * FILES));
+      for (let o = 1; o < DEVS; o++)
+        for (let k = 0; k < PER_DAY; k++) theirs.add(Math.floor(rand() * FILES));
+    }
+    for (const f of mine) if (theirs.has(f)) totalConflicts++;
+  }
+  console.log(`merge every ${String(days).padStart(2)} day(s): ${(totalConflicts / TRIALS).toFixed(1).padStart(5)} conflicting files per merge, ${(totalConflicts / TRIALS / days).toFixed(2)} per day of work`);
+}
+```
+
+It prints:
+
+```text
+merge every  1 day(s):   0.2 conflicting files per merge, 0.16 per day of work
+merge every  2 day(s):   0.6 conflicting files per merge, 0.32 per day of work
+merge every  5 day(s):   3.7 conflicting files per merge, 0.74 per day of work
+merge every 10 day(s):  12.5 conflicting files per merge, 1.25 per day of work
+merge every 20 day(s):  36.3 conflicting files per merge, 1.82 per day of work
+```
+
+The last column is the key. Merging daily, there is a conflicting file
+about one day in six. Merging every twenty days, there are almost two per
+day of work, more than ten times as many, and they all arrive at once,
+about work done weeks ago. The model is simple, real code has hot files
+that everyone touches, which makes it worse, but the shape holds: the
+total conflict cost grows faster than the time apart.
+
+<Trace columns={["Merge interval", "Conflicts per merge", "Conflicts per day of work", "How it feels"]} rows={[
+  ["1 day", "0.2", "0.16", "rare, small, remembered"],
+  ["5 days", "3.7", "0.74", "a messy afternoon"],
+  ["10 days", "12.5", "1.25", "a day or more of untangling"],
+  ["20 days", "36.3", "1.82", "merge hell before release"],
+]} caption="The simulation's output as experience. Read top to bottom: conflict cost per day of work rises with branch age, and every conflict arrives in one painful batch." />
+
+#### Resolving one conflict: a trace
+
+What does a conflict actually cost? Here is the sequence for one textual
+conflict, resolved the same day and resolved a month later. The steps are
+the same; what changes is how much each one costs.
+
+<Trace columns={["Step", "Same day", "A month later"]} rows={[
+  ["See the conflict", "one file, a few lines", "one of many files"],
+  ["Understand my change", "I remember it", "I reread my own code"],
+  ["Understand their change", "ask them; they remember", "they have moved on; read history"],
+  ["Decide the combined behaviour", "obvious from context", "may need a meeting"],
+  ["Test the result", "fast tests on a small merge", "full suite on a large merge, failures mixed"],
+]} caption="One conflict, two timings. Read across each row: every step is cheap when the change is fresh and expensive when it is old, and old conflicts never arrive alone." />
+
+The table shows why conflict count alone understates the cost of delay.
+Each late conflict is also more expensive to resolve, because the context
+that made it easy has gone. Multiply more conflicts by higher cost per
+conflict and the total grows far faster than time.
+
+### Worked example
+
+**Simple.** I once kept a redesign of my site on a branch for three weeks
+while still publishing posts on trunk. When I merged, the layout files
+conflicted in a dozen places, and two posts rendered wrongly because the
+redesign had renamed a component the new posts used. That rename was a
+semantic conflict: no merge error, just broken pages. Had I merged the
+redesign in small steps, each rename would have shown up the same day.
+
+**Realistic.** A team of six works on feature branches that each live for
+two to three weeks. Before each release, they spend several days on a
+"merge week" combining branches and fixing what breaks. The team switches
+to merging to trunk at least daily, with unfinished work hidden behind
+flags. Merge week disappears; conflicts become small daily events resolved
+in minutes by people who remember what they changed.
+
+**In production: the hidden semantic conflict.** Two developers on
+different branches work on a billing service. One changes a function that
+returns an amount so it returns paise instead of rupees, updating all
+existing callers. The other, on a separate branch, adds a new report that
+calls the function and assumes rupees. Each branch passes its tests. The
+merge reports no conflict. In production, the report shows amounts a
+hundred times too large. With daily integration and a test for the report
+on trunk, the mismatch would have failed the pipeline the day the second
+change landed.
+
+### Step by step
+
+1. **Measure branch age**: how long, on average, does work stay off trunk?
+2. **List recent merge problems** and note how old the branches were.
+3. **Set a target**: every developer merges to trunk at least daily.
+4. **Run the pipeline on every merge**, not just on branches.
+5. **Write tests for interactions** between components, to catch semantic
+   conflicts.
+6. **Watch the trend**: branch age and merge pain should both fall.
+
+### Common mistake
+
+The common mistake is to think continuous integration means having a build
+server. A server that builds feature branches in isolation checks each
+branch, not their combination. The integration is still delayed. The fix is
+to merge to the shared trunk frequently, so the server checks the combined
+code.
+
+A second mistake is to merge trunk into a long-lived branch daily and call
+it integration. That keeps the branch up to date with trunk, which helps,
+but other developers do not see the branch's changes until it lands, so
+the integration is still one-sided.
+
+### In real systems
+
+Version control hosts show branch age and pull request age, and many teams
+track them as health signals. Teams practising continuous integration
+typically have pull requests that live hours, not weeks.
+
+### Check yourself
+
+<details>
+<summary>1. What is a semantic conflict, and why is it more dangerous than a textual one?</summary>
+
+Two changes on different lines with incompatible assumptions. Version
+control does not detect it, so only tests on the integrated code reveal it.
+
+</details>
+
+<details>
+<summary>2. Is running a build server on feature branches continuous integration?</summary>
+
+No. The code is still not integrated; continuous integration means merging
+to a shared trunk frequently and testing the combination.
+
+</details>
+
+<details>
+<summary>3. In the simulation, why do conflicts per day of work rise with branch age?</summary>
+
+Because conflicts need overlap, and the number of files changed by me and
+by others both grow with time, so the chance of overlap grows faster than
+time.
+
+</details>
+
+## Optimise branching for team productivity, not individual productivity
+
+### In one sentence
+
+Branching strategies sit on a spectrum from protecting each individual's
+work to maximising the whole team's ability to integrate and release, and
+the book argues for choosing team productivity.
+
+### The idea
+
+The book describes two ends of a spectrum.
+
+**Optimising for individual productivity.** Each developer works in their
+own branch, undisturbed. Nobody's half-finished changes interfere with
+anyone else's. This feels efficient: I can work at my own pace and merge
+when I am ready. The cost is that integration is delayed, so merge hell
+grows, and the trunk rarely reflects what the team is building.
+
+**Optimising for team productivity.** Everyone works in a shared trunk,
+merging small changes often. Each developer must keep their changes small
+and safe, and must deal with others' changes every day. This feels more
+constrained: I cannot leave things broken, and I must think about how to
+merge unfinished work safely. The benefit is that integration is
+continuous, merges are small, and the trunk is always close to
+releasable.
+
+The book's position is that the team end is better for the organisation's
+goals, because the work that matters is not any single developer's branch
+but the working, integrated system that reaches customers. Time saved by
+individuals working undisturbed is lost many times over in merge pain,
+late defects and delayed releases.
+
+This is the same lesson as chapter 2's local versus global optimisation:
+optimising one step, individual coding, can make the whole flow slower.
+
+<Figure caption="The branching spectrum. Read left to right: moving toward the team end shortens branches and makes integration a daily event instead of a release-time crisis." art={`
+ optimise for the INDIVIDUAL                       optimise for the TEAM
+ |-------------------------------------------------------------------|
+ long-lived       feature branches     short-lived        trunk-based
+ personal         merged at release    branches,          development,
+ branches                              merged in a day    daily or more
+
+ + undisturbed work                     + continuous integration
+ - merge hell                           + trunk always near releasable
+ - late defects                         - must keep changes small and safe
+`} />
+
+#### What team productivity asks of each developer
+
+Moving toward the team end does not come free; it changes how each
+developer works.
+
+- **Small changes.** Work is broken into pieces that can be merged safely
+  within a day, even when the feature takes weeks.
+- **Hidden unfinished work.** Incomplete features are merged but switched
+  off, so they do not affect users.
+- **Running tests before merging.** A developer checks their change against
+  current trunk locally or in a gated build before it lands.
+- **Fixing breakage first.** If my merge breaks trunk, fixing it is my top
+  priority, as chapter 10's andon cord describes.
+- **Reading others' changes.** Small, frequent merges mean reviewing small,
+  frequent changes, which is faster per change.
+
+<Compare left="Individual-optimised branching" right="Team-optimised branching" caption="What changes for a developer. Read across each row: the team end asks for more discipline per change, and repays it with far less pain at integration." rows={[
+  ["Merge when the feature is done", "Merge every day, feature done or not"],
+  ["Unfinished work lives on a branch", "Unfinished work lives on trunk, switched off"],
+  ["Big reviews, rarely", "Small reviews, often"],
+  ["Conflicts at release time", "Conflicts in minutes, every day"],
+  ["Trunk lags the real work", "Trunk is the real work"],
+]} />
+
+#### When a private branch is reasonable
+
+The book's argument is not that branches are always wrong. Some work is
+genuinely exploratory: a spike to see whether a library fits, a prototype
+to show a stakeholder, an experiment that will probably be thrown away.
+Keeping such work on a private branch is reasonable, because it is not
+meant to be integrated. The rule of thumb is about intent. If the code is
+meant to ship, it should reach trunk within a day, flagged if unfinished.
+If it is meant to be thrown away, it can live apart, and if it turns out
+to be worth keeping, it is rewritten or sliced into small merges, not
+merged as a lump.
+
+<Compare left="Throwaway spike" right="Code meant to ship" caption="Where a branch is fine and where it is not. Read across each row: the difference is whether the code will ever be integrated." rows={[
+  ["Purpose is learning", "Purpose is delivering"],
+  ["May never be merged", "Will be merged"],
+  ["Can live on a private branch", "Reaches trunk within a day"],
+  ["If kept, sliced and redone", "Flagged off until ready"],
+]} />
+
+### Worked example
+
+**Simple.** When I work alone, branches feel harmless. When I collaborated
+with one other person on a small project, we each kept a branch for a
+week, and merging took an evening of confusion. We switched to merging to
+trunk twice a day, and the confusion stopped, at the small cost of keeping
+our changes tidy.
+
+**Realistic.** A team argues about branching. Some developers like
+feature branches because they can work without interruption. The team
+tries a two-week experiment with trunk-based development: every developer
+merges at least daily, unfinished work behind flags. At the end, the team
+compares: time spent on merges fell sharply, the trunk was releasable on
+most days, and the interruptions people feared turned out to be small. The
+team keeps the practice.
+
+**In production: release branches done safely.** Some teams need release
+branches, for example to support an older version customers still run.
+Team-optimised branching still allows this: all development happens on
+trunk, and a release branch is cut from trunk only to stabilise and
+support a release, receiving only small, specific fixes that are also
+merged to trunk. Development never lives on the release branch, so it never
+drifts far.
+
+### Step by step
+
+1. **Name where the team sits** on the spectrum today.
+2. **Agree the goal**: integration at least daily.
+3. **Learn the techniques** for merging unfinished work safely: flags,
+   branch by abstraction.
+4. **Run a timeboxed experiment** with trunk-based development.
+5. **Compare** merge time, defects and releasability before and after.
+6. **Keep release branches** only for support, never for development.
+
+### Common mistake
+
+The common mistake is to compare branching strategies by how comfortable
+they feel to individuals. Long-lived branches always feel comfortable to
+the person on them; the pain arrives later and lands on the team. The fix
+is to measure the whole flow: merge time, late defects and how often trunk
+is releasable.
+
+### In real systems
+
+Many teams use short-lived branches with pull requests that merge within a
+day, which sits close to the team end. Release branches cut from trunk are
+common for products with supported versions.
+
+A pattern often seen in open-source projects is worth noting too.
+Contributors work on forks, which are branches by another name, but
+healthy projects keep contributions small, review them quickly and run the
+full checks on every proposed change before it lands. The forks exist for
+permission reasons, not to delay integration, and the projects that
+handle many contributors well are the ones where a typical contribution
+lives days, not months. The same principle applies inside a team: whatever
+the mechanics, the measure is how long work stays apart from the shared
+line.
+
+### Check yourself
+
+<details>
+<summary>1. Why does optimising for individual productivity often hurt the team?</summary>
+
+It delays integration, so merges become large and painful, defects appear
+late, and the trunk rarely reflects the real work.
+
+</details>
+
+<details>
+<summary>2. How can a team use release branches and still optimise for the team?</summary>
+
+Develop only on trunk; cut release branches from trunk for stabilisation and
+support, receiving only small fixes that also go to trunk.
+
+</details>
+
+## Small batch development, and what happens when commits to trunk are rare
+
+### In one sentence
+
+Committing to trunk rarely makes every batch of code larger, and large
+batches of code carry the same costs chapter 2 described for large batches
+of any work: slow feedback, hard diagnosis and high risk.
+
+### The idea
+
+Chapter 2 explained why small batches flow better than large ones: they
+move through the system faster, give earlier feedback and make problems
+easier to find. The book applies the same idea to code. A commit to trunk
+is a batch. If I commit once a month, my batch is a month of changes; if I
+commit several times a day, each batch is a few hours of changes.
+
+The book describes what happens when commits to trunk are rare. Each merge
+brings in many changes at once, so when something breaks, there are many
+suspects. Developers postpone merging because merging is painful, which
+makes the next merge larger and more painful, a vicious cycle. Trunk rarely
+works, because it is always absorbing big merges, so the team cannot
+release on demand. And the pipeline, the system built in chapters 9 and
+10, is only as useful as the code fed into it: a pipeline that sees code
+once a month gives feedback once a month.
+
+The reverse cycle is virtuous. Small, frequent commits mean each merge is
+small, each failure has one or two suspects, fixing is quick, merging stops
+being scary, and people merge even more often. Trunk stays healthy because
+it absorbs small changes continuously.
+
+<Figure caption="Two cycles around merging. Read each loop clockwise: rare merges make merging painful, which makes merges rarer; frequent merges make merging easy, which makes them more frequent." art={`
+   VICIOUS CYCLE                         VIRTUOUS CYCLE
+
+   merges are rare                       merges are frequent
+        |                                      |
+        v                                      v
+   each merge is big  <-----+            each merge is small  <-----+
+        |                   |                  |                    |
+        v                   |                  v                    |
+   merging is painful       |            merging is easy            |
+        |                   |                  |                    |
+        v                   |                  v                    |
+   people postpone ---------+            people merge more ---------+
+`} />
+
+#### Diagnosing a failure: one suspect or fifty
+
+The cost of a large batch shows up most clearly when something breaks. If
+the pipeline goes red after a merge of one small commit, the cause is in
+that commit, and its author knows what they changed an hour ago. If it
+goes red after a merge of fifty commits from three weeks of work, the cause
+could be any commit, or an interaction between two of them. Bisecting, the
+technique of testing halfway points to narrow down the culprit, helps, but
+each step needs a build and test run, and interactions between commits can
+make bisecting misleading.
+
+<Trace columns={["Batch merged", "Suspects", "Bisect runs to narrow to one", "Author memory"]} rows={[
+  ["1 commit", "1", "0", "fresh: written this morning"],
+  ["8 commits", "8", "3", "fair: written this week"],
+  ["50 commits", "50", "about 6, if no interactions", "poor: written weeks ago"],
+]} caption="Finding the cause of a red build by batch size. Read top to bottom: bisect runs grow slowly, but each run costs a full pipeline, and memory of the changes fades much faster." />
+
+The bisect column is the base-two logarithm, rounded up: halving 8 suspects
+reaches one in three steps, and 50 in six. That growth is gentle; what is
+not gentle is that each step costs a pipeline run, interactions can mislead
+the search, and the authors have long since moved on.
+
+#### Slicing a feature: a worked trace
+
+Slicing is the skill that makes small batches possible, and it is easier
+to see than to describe. Here is a feature, "let users export their order
+history as a spreadsheet", sliced into daily merges. Each slice is on
+trunk, tested and releasable; the flag keeps the feature hidden until the
+last slice.
+
+<Trace columns={["Day", "Slice merged to trunk", "Visible to users?", "Tests added"]} rows={[
+  ["1", "flag 'orderExport', default off; empty export endpoint", "no", "endpoint returns empty file when flag on"],
+  ["2", "query that fetches a user's orders", "no", "unit tests for the query on sample data"],
+  ["3", "format orders as rows with headers", "no", "unit tests for formatting, dates and currency"],
+  ["4", "export button in the interface, behind the flag", "no", "one browser test with the flag on"],
+  ["5", "flag on for internal users", "staff only", "monitor errors and timings"],
+  ["6", "flag on for everyone", "yes", "remove the old 'coming soon' text"],
+  ["Later", "remove the flag and its off path", "yes", "delete flag tests"],
+]} caption="A feature as daily slices. Read top to bottom: every day leaves trunk releasable, and the feature becomes visible only when it is ready." />
+
+Notice that the slices follow the system's layers, data, logic, interface,
+which is a common and easy pattern. Another pattern slices by user
+journey: the simplest version of the whole feature first, for example
+exporting only the last month, then extensions. Either works; the test is
+that each slice can merge within a day without breaking anything.
+
+#### Why small batches review better
+
+Code review is where large batches hurt in a less obvious way. A reviewer
+reading a change of twenty lines can hold all of it in mind, ask about
+each decision and spot a missing case. A reviewer reading two thousand
+lines cannot; attention fades, and review becomes a skim that approves
+almost anything. So large batches are not only slower to review, they are
+reviewed worse, and the defects they contain are more likely to slip
+through to trunk.
+
+<Compare left="Small change under review" right="Large change under review" caption="The same reviewer, two batch sizes. Read across each row: small changes get real scrutiny; large ones get a skim." rows={[
+  ["Read in minutes", "Read over days, in pieces"],
+  ["Every line considered", "Attention fades partway through"],
+  ["Questions answered while fresh", "Questions pile up; answers are vague"],
+  ["Defects spotted", "Defects approved in the skim"],
+  ["Merged the same day", "Waits, drifts, conflicts"],
+]} />
+
+Small batches therefore improve quality twice: once because each merge
+gets better review, and again because each merge is tested on integrated
+code sooner.
+
+### Worked example
+
+**Simple.** I write a long post in one sitting and commit it at the end.
+The build fails with an error in the post, but the post is long and the
+error message is vague, so it takes a while to find. When I commit each
+section as I finish it, a failure points at the section I just wrote.
+
+**Realistic.** A developer builds a new export feature over two weeks and
+merges it in one pull request with forty files changed. Review takes days
+because nobody can hold it all in their head, and reviewers skim. After
+merging, a performance problem appears; nobody can tell which of the forty
+files caused it. On the next feature, the developer merges a slice every
+day behind a flag: the data query one day, the formatting the next, the
+user interface after. Each review takes minutes, and when a slice slows a
+test, the cause is obvious.
+
+**In production: a large shared codebase.** The book describes a large
+team building embedded software for a range of devices, which had been
+spending much of its time on integrating branches, porting code between
+them and manual testing, leaving little for new features. The team moved
+to a single trunk with continuous integration and extensive automated
+testing. The book reports, qualitatively, that integration work fell
+sharply and the team could spend far more time on new features. The lesson
+I take is that continuous integration pays off even, perhaps especially, in
+large, complex codebases where branching felt necessary.
+
+### Step by step
+
+1. **Measure batch size**: commits and lines per merge to trunk.
+2. **Measure merge frequency** per developer.
+3. **Slice work** so each slice can be merged within a day.
+4. **Hide incomplete slices** behind flags.
+5. **Review small changes quickly**, so small batches do not queue.
+6. **Watch the cycle**: as merges get smaller, they should get more frequent.
+
+### Common mistake
+
+The common mistake is to keep batches large because review is slow, and
+review slow because batches are large. The fix is to break both together:
+agree on small pull requests and fast reviews, often within hours, so
+merging little and often becomes the easy path.
+
+### In real systems
+
+Many teams set soft limits on pull request size and target review times of
+hours. Version control hosts provide bisect tools, and some pipelines run
+bisect automatically to find the commit that broke trunk.
+
+### Check yourself
+
+<details>
+<summary>1. Why does rare merging tend to make merging rarer still?</summary>
+
+Rare merges are big and painful, so people postpone them, which makes the
+next merge bigger and more painful.
+
+</details>
+
+<details>
+<summary>2. Bisecting 50 suspects needs about six steps. Why is that still costly?</summary>
+
+Each step needs a full build and test run, interactions between commits
+can mislead the search, and the authors no longer remember the changes.
+
+</details>
+
+## Adopt trunk-based development practices
+
+### In one sentence
+
+Trunk-based development means everyone merges small changes into one
+shared trunk at least daily, using gated commits to keep trunk green and
+feature flags or branch by abstraction to merge unfinished work safely.
+
+### The idea
+
+The book's recommendation is **trunk-based development**: all developers
+commit to the trunk, or to very short-lived branches merged into trunk,
+at least once a day. Several practices make this safe.
+
+**Gated commits.** Instead of merging straight to trunk and finding out
+afterwards whether it broke, a change is first built and tested against
+current trunk; it lands only if it passes. If it fails, it is rejected
+back to its author and trunk stays green. Pull requests with required
+checks and merge queues are common forms of this.
+
+**Feature flags.** Unfinished work is merged to trunk but switched off by a
+configuration flag, so it is invisible to users until it is ready. This
+separates merging code from releasing a feature, an idea developed in
+chapter 12.
+
+**Branch by abstraction.** For large changes, such as replacing a
+component, the developer first adds an abstraction, an interface, in front
+of the old component, then builds the new component behind the same
+interface step by step on trunk, switches callers over when it is ready,
+and finally removes the old one. The change happens in many small, safe
+merges instead of one huge branch.
+
+**Daily merging as a definition of done.** The book suggests making
+"merged to trunk" part of the definition of done from chapter 9. Work that
+is still on a branch is not done.
+
+<Layers caption="The practices that make trunk-based development safe. Read top to bottom: each layer removes a reason to keep work on a long-lived branch." layers={[
+  { name: "Merge at least daily", note: "small batches; integration is continuous" },
+  { name: "Gated commits", note: "a change lands only if it passes against current trunk" },
+  { name: "Feature flags", note: "unfinished features merged but switched off" },
+  { name: "Branch by abstraction", note: "large replacements done in small steps behind an interface" },
+  { name: "Fast pipeline and andon cord", note: "feedback in minutes; red is fixed first" },
+]} />
+
+#### A feature flag in code
+
+A feature flag can be as simple as a configuration value checked at the
+point where old and new behaviour diverge. Here is a sketch, run with node,
+of a new tax calculation merged to trunk but switched off:
+
+```js
+// Branch by abstraction / feature flag: new code merged to trunk but switched off.
+const flags = { newTaxEngine: false };
+const oldTax = (amount) => Math.round(amount * 0.18);
+const newTax = (amount) => Math.round(amount * 0.18 * 100) / 100; // keeps paise
+const tax = (amount) => (flags.newTaxEngine ? newTax(amount) : oldTax(amount));
+
+console.log("flag off:", tax(999.5));
+flags.newTaxEngine = true;
+console.log("flag on: ", tax(999.5));
+// Both paths live on trunk and are tested; release = flipping the flag.
+for (const f of [false, true]) {
+  flags.newTaxEngine = f;
+  console.log(`test with flag ${f ? "on " : "off"}:`, tax(100) === 18 ? "pass" : "FAIL");
+}
+```
+
+It prints:
+
+```text
+flag off: 180
+flag on:  179.91
+test with flag off: pass
+test with flag on : pass
+```
+
+The new code is on trunk, integrated and tested with the flag both off and
+on, while users still see the old behaviour. Releasing it is a
+configuration change, not a merge. The `tax` function is the abstraction:
+callers do not know which engine is behind it, so the old one can later be
+deleted without touching them. The output also shows why both paths must
+be tested: on this input the two engines give different answers, which is
+the intended change, and a test would catch it if it were not.
+
+#### Gated commits keep trunk green
+
+How much does gating help? Here is a simple model, run with node: forty
+commits a day for twenty days, one in twenty breaking the build, and each
+break on trunk costing thirty minutes of red before it is fixed or
+reverted.
+
+```js
+// Direct push vs gated commit: how long trunk stays red in a working day.
+let seed = 3;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+const COMMITS = 40, BREAK_RATE = 0.05, MINUTES_RED_PER_BREAK = 30, DAYS = 20;
+let directRed = 0, gatedRed = 0, rejected = 0;
+for (let d = 0; d < DAYS; d++)
+  for (let c = 0; c < COMMITS; c++)
+    if (rand() < BREAK_RATE) { directRed += MINUTES_RED_PER_BREAK; rejected++; }
+console.log(`over ${DAYS} days, ${COMMITS} commits/day, ${BREAK_RATE * 100}% break the build`);
+console.log(`direct to trunk: trunk red ${directRed} min total, ${(directRed / DAYS).toFixed(0)} min/day`);
+console.log(`gated commits:   trunk red ${gatedRed} min total; ${rejected} commits sent back to their authors`);
+```
+
+It prints:
+
+```text
+over 20 days, 40 commits/day, 5% break the build
+direct to trunk: trunk red 1200 min total, 60 min/day
+gated commits:   trunk red 0 min total; 40 commits sent back to their authors
+```
+
+With direct pushes, trunk is red an hour a day on average, and during that
+hour everyone else is blocked or merging onto a broken base. With gating,
+the same forty broken commits are caught before landing, and only their
+authors are affected. The model is generous to gating, since a gate tests
+against trunk as it was a moment ago and two changes can still clash
+after both pass, which is why merge queues test changes in the order they
+will land. But the effect is real: gating moves the cost of a mistake from
+the whole team to the one person who made it.
+
+<Trace columns={["Step", "Direct push", "Gated commit"]} rows={[
+  ["Developer submits", "change lands on trunk", "change is built against current trunk"],
+  ["Build fails", "trunk is red for everyone", "change is rejected; trunk stays green"],
+  ["Who is blocked", "the whole team", "only the author"],
+  ["Fix", "under pressure, or revert", "calmly, then resubmit"],
+]} caption="One broken change, two paths. Read across each row: gating contains the breakage to its author instead of spreading it to the team." />
+
+#### Kinds of flags
+
+Not all flags are the same, and treating them the same leads to trouble.
+A useful way to think about them is by purpose and expected lifetime.
+
+<Compare left="Kind of flag" right="Purpose and lifetime" caption="Four kinds of feature flag. Read across each row: release flags should be short-lived, while operational and permission flags may be long-lived by design." rows={[
+  ["Release flag", "hide unfinished work; remove within weeks of release"],
+  ["Experiment flag", "split users for an A/B test, as in chapter 17; remove when decided"],
+  ["Operational flag", "switch off a costly feature under load; may live long"],
+  ["Permission flag", "turn features on for some customers or plans; long-lived"],
+]} />
+
+The flags this chapter is about are release flags, which exist only to let
+unfinished work merge safely. They should be cheap to add and cheap to
+remove, and the team should notice when one outlives its purpose. A simple
+practice is to record each flag's owner and expected removal date where
+it is defined, and to list overdue flags on the team's dashboard.
+
+#### A merge queue, step by step
+
+When many changes land each hour, two changes that each pass the gate can
+still break trunk together, because each was tested against trunk as it
+was before the other landed. A merge queue closes that gap by testing each
+change on top of the ones ahead of it.
+
+<Trace columns={["Queue position", "Change", "Tested on top of", "Result"]} rows={[
+  ["1", "A: rename a helper", "trunk", "pass; lands"],
+  ["2", "B: new caller of the old helper name", "trunk plus A", "FAIL; removed from queue, author told"],
+  ["3", "C: unrelated copy change", "trunk plus A", "pass; lands"],
+  ["Later", "B, updated to the new name", "trunk plus A and C", "pass; lands"],
+]} caption="A merge queue catching a clash between two changes. Read top to bottom: change B passed alone but fails on top of A, so it is sent back instead of breaking trunk." />
+
+Change B is a small semantic conflict of exactly the kind the first
+section described. Without the queue, A and B would both have passed their
+own gates and trunk would have gone red after both landed. With the
+queue, B's author learns about the clash within minutes, while the change
+is fresh, and nobody else is blocked.
+
+### Worked example
+
+**Simple.** I turn on required checks for my site's repository: a pull
+request cannot be merged until the build and link check pass. I still
+merge several times a day, but trunk has not been red since.
+
+**Realistic.** A team needs to replace its search component, a job of
+several weeks. Instead of a long branch, the developer adds a search
+interface in front of the old component on day one, merged. Over the next
+weeks, they build the new component behind the interface in daily merges,
+with a flag routing a small share of internal traffic to it. When it is
+ready, the flag routes all traffic to the new component; a week later, the
+old one is deleted. No merge was ever larger than a day's work.
+
+**In production: a merge queue.** A busy repository receives many merges
+an hour, and occasionally two changes that each pass alone break trunk
+together. The team adopts a merge queue: approved changes join a queue, and
+each is tested on top of the changes ahead of it before landing. Trunk
+stays green, and developers no longer need to rebase repeatedly by hand.
+
+### Step by step
+
+1. **Require checks** before any change lands on trunk.
+2. **Add a flag mechanism**, even a simple configuration file.
+3. **Merge unfinished work** behind flags, at least daily.
+4. **Use branch by abstraction** for large replacements.
+5. **Add a merge queue** when merges are frequent enough to clash.
+6. **Clean up flags** once features are fully released, so they do not
+   accumulate.
+
+### Common mistake
+
+The common mistake is to let feature flags pile up. Each flag doubles the
+possible code paths, and old flags become confusing dead code. The fix is
+to give every flag an owner and removal date, and to remove it once the
+feature is fully released.
+
+A second mistake is gating with a slow pipeline, so developers wait an hour
+to merge and start batching changes to avoid the wait. The fix is chapter
+10's fast commit stage: gates must be quick to keep batches small.
+
+### In real systems
+
+Required status checks on pull requests, merge queues, and feature flag
+services or configuration files are widely used. Many large organisations
+develop on a single trunk with these practices.
+
+### Check yourself
+
+<details>
+<summary>1. What does a gated commit do differently from a direct push?</summary>
+
+It builds and tests the change against current trunk before landing it,
+and rejects it if it fails, so trunk stays green and only the author is
+affected.
+
+</details>
+
+<details>
+<summary>2. How does branch by abstraction let a large replacement happen on trunk?</summary>
+
+An interface is added in front of the old component; the new one is built
+behind it in small merges; callers are switched when ready; the old one is
+then removed.
+
+</details>
+
+<details>
+<summary>3. Why must flags be removed after release?</summary>
+
+Each flag multiplies code paths and becomes confusing dead code, raising
+the cost and risk of change.
+
+</details>
+
+## Keep trunk releasable every day
+
+### In one sentence
+
+Continuous integration's real goal is a trunk that could be released at
+any moment, which needs not only frequent merging but shared habits that
+keep every merge safe.
+
+### The idea
+
+Merging daily is the mechanism; a releasable trunk is the outcome. The book
+connects continuous integration to everything that follows in Part III:
+low-risk releases in chapter 12 depend on a trunk that is always in a known,
+working state. If trunk is often broken, or full of half-finished work that
+affects users, frequent merging just spreads the problems faster.
+
+Keeping trunk releasable rests on a few habits, most of which earlier
+chapters introduced.
+
+**Run the tests before merging.** Each developer runs at least the fast
+tests locally against current trunk, and the gate runs the commit stage
+before landing. Pushing untested code and letting the pipeline find out is
+a cost paid by everyone.
+
+**Keep the commit stage fast.** If gates are slow, people batch; if people
+batch, merges grow; if merges grow, they break more. Speed of feedback is
+what keeps batches small.
+
+**Fix or revert red immediately.** The andon cord from chapter 10 applies
+here with extra force, because with many merges a day, a red trunk blocks
+many people quickly.
+
+**Hide unfinished work.** Anything that is not ready for users is behind a
+flag or an abstraction, so a release from trunk at any moment would show
+users only finished features.
+
+**Integrate everything, not just application code.** Chapter 9 put
+environment definitions, database schemas and configuration in version
+control. These belong on trunk too, integrated and tested with the code
+that depends on them, so that a schema change and the code that uses it
+are checked together.
+
+**Review small changes quickly.** Code review is valuable, chapter 18
+discusses it in depth, but a review queue that takes days defeats
+continuous integration. Small changes reviewed within hours, or pair
+programming that reviews continuously, keep integration flowing.
+
+<Flow caption="One change through a team that keeps trunk releasable. Read left to right: every step is small and fast, so the change reaches trunk within hours and leaves it working." steps={[
+  "Small change, flagged if unfinished",
+  "Fast tests run locally",
+  "Quick review or pairing",
+  "Gate: commit stage against trunk",
+  "Lands on trunk; pipeline continues",
+  "Red? fix or revert within minutes",
+]} />
+
+#### Measuring whether continuous integration is real
+
+How does a team know whether it is really practising continuous
+integration, rather than only calling it that? A few simple questions,
+asked regularly, are a useful test.
+
+<Trace columns={["Question", "Healthy answer", "Warning sign"]} rows={[
+  ["Does every developer merge to trunk at least daily?", "yes, most days", "some branches live for weeks"],
+  ["When trunk goes red, how long until green?", "minutes", "hours, or 'someone is looking'"],
+  ["Could we release trunk right now?", "yes, unfinished work is flagged off", "no, trunk has half-done work showing"],
+  ["How long does a pull request wait for review?", "hours", "days"],
+  ["How long does the commit stage take?", "within its budget, minutes", "creeping up, people batch to avoid it"],
+]} caption="A quick self-test for continuous integration. Read each row across: a team with healthy answers is integrating continuously; warning signs show where integration is still being delayed." />
+
+#### Continuous integration and the definition of done
+
+Chapter 9 widened the definition of done to "working in a production-like
+environment". This chapter adds "merged to trunk". Putting the two
+together, a piece of work is done when it is on trunk, has passed the
+pipeline, and runs in a production-like environment, possibly behind a
+flag. A feature can take weeks, but its slices are each done within a day
+by this definition, which keeps the flow of finished, integrated work
+visible on the team's board.
+
+#### A day on a trunk-based team
+
+To make the habits concrete, here is a single developer's day on a team
+that keeps trunk releasable. Nothing in it is heroic; it is a rhythm of
+small steps.
+
+<Timeline caption="One developer's day with continuous integration. Read top to bottom: several small merges, each gated, each leaving trunk releasable." items={[
+  { when: "09:30", what: "Pull trunk. Pick today's slice from the board: the export query." },
+  { when: "10:30", what: "Test first, then the query. Fast tests pass locally. Open a small pull request." },
+  { when: "11:00", what: "A teammate reviews in ten minutes. Gate passes. Merged." },
+  { when: "13:30", what: "Formatting slice. Gate fails on a date test; fix in five minutes; merged." },
+  { when: "15:00", what: "Trunk goes red from someone else's change; team pauses merges; it is reverted in eight minutes." },
+  { when: "16:30", what: "Review two teammates' small pull requests. Merge a tidy-up of my own." },
+  { when: "17:30", what: "Before stopping: nothing left unmerged except a throwaway spike." },
+]} />
+
+The day has four merges by this developer and a short red period handled
+by the team. That is what continuous integration looks like in practice:
+not a big event, but a steady pulse of small, checked changes.
+
+#### Landing a branch that has already lived too long
+
+Teams moving to continuous integration usually start with some long-lived
+branches already in flight. Merging each one as a lump recreates merge
+hell; abandoning them wastes work. A gentler path is to land them in
+pieces.
+
+<Flow caption="Bringing an old branch home in slices. Read left to right: refresh it, carve off independent pieces, land them behind a flag, and shrink the branch until nothing is left." steps={[
+  "Merge trunk into the branch; fix conflicts once",
+  "List the branch's changes by theme",
+  "Carve off a piece that stands alone",
+  "Land it on trunk, flagged if user-visible",
+  "Repeat until the branch is empty",
+  "Delete the branch",
+]} />
+
+The first step, merging trunk into the branch, pays the accumulated
+conflict cost once, while the author still owns the problem. After that,
+each carved-off piece is small and lands through the normal gate, so
+reviewers can actually review it and the pipeline can test it on
+integrated code. Pieces that do not stand alone, such as a refactoring
+that other changes depend on, go first. The branch shrinks day by day,
+and the team learns the slicing habit on real work rather than in theory.
+
+A useful rule while this is happening is that no new work starts on the
+old branch. New work starts from trunk, so the problem gets smaller
+instead of being renewed.
+
+### Worked example
+
+**Simple.** I keep my site releasable by a simple rule: anything merged to
+trunk can go live at once. Drafts are marked as drafts in their
+frontmatter, so they are on trunk, built and checked, but not published.
+That draft flag is a feature flag in miniature.
+
+**Realistic.** A team notices that trunk is red for a couple of hours most
+days and pull requests wait two days for review. It adopts three changes:
+required checks before merge, a ten-minute timebox then revert for red
+trunk, and a review rotation with a goal of review within four working
+hours. Within a month, red periods are short and rare, pull requests are
+smaller because people know they will be reviewed quickly, and the team
+starts releasing from trunk whenever it wants.
+
+**In production: schema and code together.** A team adds a column to a
+table and code that reads it. Because both live on trunk, the gate runs
+the migration on a production-like database and then the tests against
+the new code in one pipeline run. A mistake in the migration fails the
+gate instead of failing in production when the code is deployed before the
+schema is ready. Chapter 12 develops this further with migrations designed
+so old and new code can run side by side.
+
+### Step by step
+
+1. **Agree that trunk must always be releasable.**
+2. **Gate every merge** with the commit stage.
+3. **Flag unfinished work** and default every flag to off.
+4. **Put schemas, configuration and environments on trunk** with the code.
+5. **Set a review time goal**, or pair to review as you go.
+6. **Ask the self-test questions** in each retrospective.
+
+### Common mistake
+
+The common mistake is to merge frequently but leave trunk full of
+half-finished, user-visible work, so the team still cannot release on
+demand and starts a release branch to stabilise, recreating the old
+problem. The fix is flags off by default for anything unfinished.
+
+### In real systems
+
+Teams that release on demand typically gate every merge, release from
+trunk, flag unfinished work and measure review time. Pair or ensemble
+programming is used by some teams to make review continuous.
+
+### Check yourself
+
+<details>
+<summary>1. What is the outcome continuous integration aims for?</summary>
+
+A trunk that is releasable at any moment: working, tested and with
+unfinished work hidden.
+
+</details>
+
+<details>
+<summary>2. Why does slow review undermine continuous integration?</summary>
+
+Changes wait for days before merging, so they grow and drift, recreating
+large batches and late integration.
+
+</details>
+
+<details>
+<summary>3. Why should a schema change live on trunk with the code that uses it?</summary>
+
+So the pipeline tests them together and a mismatch fails the gate, not
+production.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 11, Enable and Practice Continuous Integration">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that integration should happen often,
+not at the end. I learn what a branch is, what trunk is, and what
+continuous integration means: merging to a shared trunk at least daily,
+with every merge built and tested. I learn the difference between textual
+and semantic conflicts, and that only tests on integrated code catch the
+second kind.
+
+An example: I make a small change, open a pull request, watch the checks
+run, and merge it the same day, instead of letting it sit on a branch for a
+week.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can explain, with the simulation, why merge
+conflicts grow faster than branch age, and I slice my work so each slice
+merges within a day. I use simple feature flags to merge unfinished work,
+defaulting them off. I run fast tests locally before pushing. I review
+others' small changes quickly, because I know slow review makes batches
+grow.
+
+An example: a two-week feature becomes six daily slices, each merged
+behind a flag, each reviewed in under an hour.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I use branch by abstraction to replace large
+components on trunk in small steps. I set up gated commits and, where
+merges are frequent, a merge queue. I put schemas and environment
+definitions on trunk with the code, and design changes so each merge is
+releasable. I manage flags as a lifecycle, with owners and removal dates.
+I measure branch age, review time, red trunk duration and commit stage
+time.
+
+An example: I replace a payment provider's client behind an interface over
+three weeks of daily merges, routing a small share of traffic to the new
+client before the full switch.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: changes that cannot be hidden behind a flag, such as a
+dependency upgrade that affects everything, which need extra testing and a
+quick, single merge; very large monorepos where a full build per merge is
+too slow, which need build tools that test only what a change affects; and
+open-source style contributions from outside the team, where forks are
+normal and the gate becomes even more important.
+
+An example: a framework upgrade touches hundreds of files. The team does
+it in one focused day, merges once, and freezes other large changes for
+that day to keep the merge small in everything else.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: two changes that each pass the gate but break trunk
+together, which a merge queue addresses; flags that interact, so a
+combination never tested together fails; database migrations that cannot
+be reverted, which need the expand-and-contract approach from chapter 12;
+and long-running experiments behind flags that turn into permanent forks of
+the code, which need a decision to keep or delete.
+
+An example: flag A and flag B were each tested on and off, but never both
+on. Turning both on in production breaks checkout. The team adds tests for
+the combinations that can occur in production.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, every developer merges to trunk at least daily
+through a gate that runs the commit stage against current trunk, with a
+merge queue when needed. Trunk is releasable at all times; unfinished work
+is behind flags that default off, with owners and removal dates. Schemas,
+configuration and environments are on trunk. Red trunk is fixed or
+reverted within minutes. Branch age, review time, red duration and commit
+stage time are tracked and reviewed.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that my work is not done until it is integrated, and that
+the team's ability to release matters more than my comfort on a branch. I
+treat merging as a daily habit, not an event. I would rather deal with a
+small conflict today than a large one next month. And I keep my changes
+small so that others can review, integrate and trust them.
+
+An example of the mindset: at the end of each day I ask, "what can I merge
+now, safely?", and I merge it.
+
+The same mindset applies to other people's work. When a teammate's small
+pull request is waiting, reviewing it promptly is part of keeping the
+team's integration continuous, so I treat review as real work, not an
+interruption to it.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, continuous integration rewards code with clear
+seams: interfaces where a new implementation can be placed beside an old
+one, configuration points for flags, and modules that can be built and
+tested independently. These are the same properties of loose coupling
+that chapter 7 linked to team design and that chapter 13 develops for
+architecture. A codebase where every change touches everything makes
+frequent merging painful; a modular one makes it easy.
+
+An example: a codebase where each module has its own tests and a clear
+interface lets the build tool test only affected modules, keeping gates
+fast even as the codebase grows.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to make integration continuous, then make it safe, then
+make it fast. Start by agreeing that everyone merges to trunk at least
+daily. Add gated commits so trunk stays green. Teach slicing, feature
+flags and branch by abstraction so unfinished work can merge safely. Put
+everything, including schemas and environments, on trunk. Speed up gates
+and reviews so small batches stay easy. And measure the self-test
+questions so drift back to long branches is visible.
+
+Done when every developer merges to trunk at least daily, trunk is
+releasable at any moment, red trunk lasts minutes, pull requests are
+reviewed within hours, and no development happens on long-lived branches.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Do pull requests conflict with continuous integration?</summary>
+
+Not if they are small and merged within a day. Long-lived pull requests are
+long-lived branches by another name; short-lived ones with fast review and
+required checks fit continuous integration well.
+
+</details>
+
+<details>
+<summary>How often is "frequently"?</summary>
+
+The book's guidance is at least daily for every developer. Many teams merge
+several times a day.
+
+</details>
+
+<details>
+<summary>What about work that takes weeks?</summary>
+
+Slice it into pieces that can merge daily, and hide unfinished pieces
+behind flags or abstractions. The feature takes weeks; each merge takes a
+day.
+
+</details>
+
+<details>
+<summary>Are feature flags just another kind of branch?</summary>
+
+In a sense they are a branch in the code rather than in version control,
+but the difference matters: the flagged code is integrated and tested with
+everything else every day. They need lifecycle management so they do not
+pile up.
+
+</details>
+
+<details>
+<summary>Does trunk-based development work for large teams?</summary>
+
+The book argues that it does, and that large codebases benefit most,
+because their integration costs are highest. It needs a fast pipeline,
+gating and often a merge queue and build tools that test only what changed.
+
+</details>
+
+<details>
+<summary>What if our tests are not good enough to trust daily merging?</summary>
+
+Then integration is risky either way; delaying it only hides the risk until
+later. Improve the tests, following chapter 10, while moving toward daily
+merging, starting with the most-used paths.
+
+</details>
+
+<details>
+<summary>Should release branches be banned?</summary>
+
+No. Release branches cut from trunk for stabilising and supporting releases
+are fine. What the book argues against is doing development on long-lived
+branches.
+
+</details>
+
+<details>
+<summary>How does this chapter connect to the next?</summary>
+
+Chapter 12 builds on a releasable trunk to make deployments and releases
+automatic and low risk, separating deploying code from releasing features.
+
+</details>
+
+<details>
+<summary>Is rebasing better than merging for continuous integration?</summary>
+
+Either works. What matters is how long work stays off trunk, not how the
+history is shaped. Some teams prefer rebasing for a straight history;
+others prefer merge commits. Both are fine if branches live hours.
+
+</details>
+
+<details>
+<summary>How do I persuade a team that likes long branches?</summary>
+
+Measure the current cost: time spent on merges, defects found after merge,
+and how often trunk is releasable. Then run a short, timeboxed experiment
+with daily merging and compare. Evidence from the team's own work tends
+to be more convincing than argument.
+
+</details>
+
+<details>
+<summary>Does continuous integration apply to infrastructure code?</summary>
+
+Yes. Environment definitions, pipeline configuration and database schemas
+on trunk should be integrated and tested as often as application code,
+because they change together.
+
+</details>
+
+<details>
+<summary>What if a teammate keeps breaking trunk?</summary>
+
+Treat it as a system problem first, not a person problem. Ask what made it
+easy to break: missing local tests, a slow gate people skip, unclear
+ownership of a fragile area. Fixing the system helps everyone; blaming one
+person makes everyone more cautious and batches larger.
+
+</details>
+
+<details>
+<summary>Can a solo developer benefit from continuous integration?</summary>
+
+Yes. Even alone, merging small changes to trunk often, with checks on
+every merge, keeps the project releasable and makes every failure easy to
+diagnose. Long personal branches create merge pain with my own past work.
+
+</details>
+
+## Key takeaways
+
+- Continuous integration means merging everyone's work to a shared trunk at least daily, with every merge built and tested.
+- Merge conflicts grow faster than branch age; merge hell is the result of delay.
+- Semantic conflicts merge silently; only tests on integrated code find them.
+- Optimise branching for team productivity, not individual comfort.
+- Rare commits mean large batches, many suspects and a vicious cycle; small commits create a virtuous one.
+- Trunk-based development relies on gated commits, feature flags and branch by abstraction.
+- Gating moves the cost of a broken change from the whole team to its author.
+- The goal is a trunk that is releasable at any moment.
+
+## Glossary
+
+- **Branch**: a separate line of development in version control.
+- **Trunk**: the shared main line that everyone integrates into.
+- **Continuous integration**: merging all developers' work to trunk frequently, at least daily, with automated build and tests on every merge.
+- **Merge hell**: the painful period of integrating long-lived branches.
+- **Textual conflict**: two changes to the same lines, detected by version control.
+- **Semantic conflict**: two compatible-looking changes that break each other's assumptions.
+- **Trunk-based development**: all development on trunk or very short-lived branches merged at least daily.
+- **Gated commit**: a change built and tested against trunk before it is allowed to land.
+- **Merge queue**: a queue that tests each approved change on top of those ahead of it before landing.
+- **Feature flag**: a configuration switch that hides unfinished or unreleased code paths.
+- **Branch by abstraction**: replacing a component behind an interface in small steps on trunk.
+- **Bisecting**: testing halfway points in a range of commits to find which one introduced a problem.
+- **Release branch**: a branch cut from trunk to stabilise and support a release, receiving only small fixes.
+
+## Exercises and self-check
+
+**Warm-up.** Look at my last ten merges to trunk. How long did each branch
+live, and how many files did each change? Run the conflict simulation with
+my team size and file count.
+
+**Build.** Add required checks to a repository so nothing merges without
+passing the build and tests. Add a simple flag mechanism, merge one
+unfinished feature behind a flag set to off, and test both flag states.
+
+**Stretch.** Replace one component of a project using branch by
+abstraction in at least three separate merges, keeping trunk releasable
+after each. Answer the self-test questions for my project and fix the worst
+warning sign.
+
+### Self-check
+
+<details>
+<summary>1. What is the difference between continuous integration and having a build server?</summary>
+
+Continuous integration is the practice of merging to trunk frequently with
+automated checks; a build server alone may only test isolated branches.
+
+</details>
+
+<details>
+<summary>2. In the simulation, about how many times more conflicts per day of work did 20-day branches have than daily merges?</summary>
+
+About eleven times: 1.82 against 0.16.
+
+</details>
+
+<details>
+<summary>3. What are the two ends of the branching spectrum?</summary>
+
+Optimising for individual productivity, with long-lived personal branches,
+and optimising for team productivity, with trunk-based development.
+
+</details>
+
+<details>
+<summary>4. How does a feature flag separate merging from releasing?</summary>
+
+The code is merged and tested on trunk but switched off; releasing it is a
+configuration change.
+
+</details>
+
+<details>
+<summary>5. What does gating move, compared with direct pushes?</summary>
+
+The cost of a broken change, from the whole team, blocked by red trunk, to
+the author, whose change is rejected.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter by changing my own habits on a real repository. The
+ideas are easy to agree with and easy to drift away from, so I measure
+branch age and merge size before and after.
+
+<Timeline caption="Three sessions and a habit for chapter 11." items={[
+  { when: "Session 1", what: "Read the chapter. Run the three scripts. Measure branch age and merge size on my repository." },
+  { when: "Session 2", what: "Add required checks and a flag mechanism. Merge one unfinished feature behind a flag." },
+  { when: "Session 3", what: "Do one branch-by-abstraction replacement in small merges. Answer the self-test questions." },
+  { when: "Every day", what: "Before stopping work, merge what can safely be merged." },
+]} />
+
+This chapter is part of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+The next chapter builds on a releasable trunk to automate deployments and
+make releases low risk.
+
+Done when I merge to trunk at least daily, every merge passes a gate, and
+my trunk could be released at any moment with unfinished work hidden.
