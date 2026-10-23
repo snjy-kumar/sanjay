@@ -1,0 +1,1330 @@
+---
+title: "Use The Index, Luke, chapter by chapter"
+description: "Markus Winand's free guide to SQL indexing, all eight chapters from beginner to strategy: B-trees, where clauses, joins, clustering, sorting, paging, writes."
+edition: "web edition, use-the-index-luke.com (also published as the book SQL Performance Explained)"
+tocVerified: true
+tocSources:
+  - "https://use-the-index-luke.com/sql/table-of-contents"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import Compare from '../../components/book/Compare.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the indexing guide for phase 8 of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core</a>,
+databases, and it is also cited in phase 4 of <a href={withBase('/plans/books-that-still-matter/')}>the books that still matter</a>
+and phase 4 of the <a href={withBase('/plans/software-ai-developer/')}>software and AI developer plan</a>. The phase 8
+gate asks me to read a query plan and explain why an index is or is not used. This guide is exactly that skill,
+and it is free to read online.
+
+Its premise is that indexing is a development task, not something to leave to an administrator later: the
+person who writes the query knows how the data is accessed, so they should design the index. It covers every
+major database, but I work through it in PostgreSQL and note where others differ.
+
+## How I would learn it
+
+I read each chapter with a Postgres database open and a table of a few million generated rows. For every claim
+I write the query, guess the plan, run `EXPLAIN (ANALYZE, BUFFERS)`, and write down where my guess was wrong.
+The examples below use my own tables, not the guide's example schema.
+
+<Timeline items={[
+  { when: 'week 38', what: 'Chapters 1 and 2: how a B-tree index works, and every way a where clause uses or misses it.' },
+  { when: 'week 39', what: 'Chapters 3 and 4: data volume, load and scalability; nested loops, hash and merge joins.' },
+  { when: 'week 40', what: 'Chapters 5 to 7: clustering and index-only scans, indexed order by and group by, paging.' },
+  { when: 'week 41', what: 'Chapter 8 and the execution plan appendix: the cost of indexes on writes. Then the gate.' },
+]} caption="When I read each chapter, matched to the phase 8 weeks." />
+
+Every chapter below climbs the same nine levels, each with a worked query, what I would see, and the common
+mistake with its fix. Plan output is shown in its PostgreSQL shape; costs, row counts and timings will differ
+on my machine.
+
+## The book's layers
+
+The guide has a preface, eight chapters and four appendices. The annotated table of contents names chapter 3
+"Testing and Scalability" and chapter 8 "Insert, Delete and Update"; the site's sidebar calls them "Performance
+and Scalability" and "Modifying Data". I use the annotated names.
+
+<Layers layers={[
+  { name: 'How an index works', note: 'chapter 1: leaf nodes, the B-tree, why indexes can be slow' },
+  { name: 'Using it for reads', note: 'chapters 2 to 7: where clauses, scalability, joins, clustering, sorting, paging' },
+  { name: 'Paying for it on writes', note: 'chapter 8: insert, delete and update' },
+  { name: 'Reference', note: 'appendices: execution plans per database, myth directory, example schema, glossary' },
+]} caption="From the structure of an index to its cost." />
+
+## How an index works
+
+### 1. Anatomy of an Index
+**Covers:** The leaf nodes as a doubly linked list, the B-tree as a balanced search tree over them, and the two ingredients that make an index lookup slow: following the leaf node chain and accessing the table.
+
+<Figure art={`
+                 [ root: 'k' ]
+                /             \\
+     [ branch: 'd','h' ]   [ branch: 'p','t' ]
+      /     |      \\          ...
+ [a b c]<->[d e f g]<->[h i j]<->[k l m n o]<->...   leaf nodes: sorted, doubly linked
+    |  |       |
+    v  v       v
+  table rows (heap) in no particular order          each leaf entry points to a row
+`} caption="An index: a tree to find the first leaf, a linked list to walk the rest, pointers into the table." />
+
+<Levels label="Chapter 1, Anatomy of an Index">
+
+<Level name="Beginner">
+
+An index is a separate structure, kept sorted by the indexed columns, that points to rows in the table. The table itself (a heap in Postgres) is in no particular order. Without an index, finding rows by a value means reading the whole table. With one, the database walks a small tree to the right place and follows pointers.
+
+```sql
+CREATE TABLE customer (id bigint PRIMARY KEY, email text NOT NULL, city text, created_at timestamptz);
+INSERT INTO customer
+SELECT g, 'user' || g || '@example.com', (ARRAY['Pune','Delhi','Mumbai','Chennai'])[1 + g % 4],
+       now() - (g || ' minutes')::interval
+FROM generate_series(1, 2000000) g;
+ANALYZE customer;
+EXPLAIN SELECT * FROM customer WHERE email = 'user42@example.com';
+```
+
+```text
+Gather  (cost=1000.00..30000.00 rows=1 width=...)
+  ->  Parallel Seq Scan on customer  (...)
+        Filter: (email = 'user42@example.com'::text)
+```
+
+Common mistake: assuming the primary key index helps a search on another column. Fix: an index helps only queries on the columns it is built on.
+
+</Level>
+
+<Level name="Intermediate">
+
+The leaf nodes hold the index entries in order and are linked to their neighbours in both directions, so the database can walk forward or backward from any point. Because inserts would be too slow if every entry had to shift, the order is kept logically: each leaf is a page, and pages are linked, not physically contiguous. The tree above the leaves (branch nodes and a root) lets the database find the right leaf in a few steps.
+
+```sql
+CREATE INDEX customer_email ON customer (email);
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM customer WHERE email = 'user42@example.com';
+```
+
+```text
+Index Scan using customer_email on customer  (cost=0.43..8.45 rows=1 width=...)
+  Index Cond: (email = 'user42@example.com'::text)
+  Buffers: shared hit=4
+```
+
+Four pages: about three for the tree, one for the table row.
+
+Common mistake: thinking an index is a sorted copy of the table. Fix: it is a sorted copy of the indexed columns plus pointers; the rest of the row is in the table.
+
+</Level>
+
+<Level name="Advanced">
+
+The B-tree is balanced: every leaf is at the same depth, so every lookup costs the same number of steps, and the depth grows logarithmically. With hundreds of entries per page, a tree of depth four can index millions of rows. Each branch node entry holds the largest (or smallest) value of the child it points to, which is how the descent picks its way down.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT level FROM bt_metap('customer_email');     -- tree height above the leaves
+SELECT pg_size_pretty(pg_relation_size('customer_email'));
+```
+
+With two million emails I would expect a level of 2 or 3. The guide's point: the tree traversal is not the slow part; it is bounded and small.
+
+Common mistake: worrying that "the index has gotten too deep". Fix: the depth grows extremely slowly; look elsewhere for the slowness.
+
+</Level>
+
+<Level name="Edge cases">
+
+"Slow indexes, part I": the two ingredients that make an index lookup slow are walking the leaf node chain (when many entries match) and fetching each matching row from the table (each fetch can be a separate page). A lookup that matches one row is fast; a lookup that matches a hundred thousand rows scattered across the table can be slower than a full scan.
+
+```sql
+CREATE INDEX customer_city ON customer (city);
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM customer WHERE city = 'Pune';
+```
+
+```text
+Seq Scan on customer  (...rows=500000...)
+  Filter: (city = 'Pune'::text)
+```
+
+A quarter of the table matches, so the planner ignores the index: reading the whole table sequentially is cheaper than half a million random fetches.
+
+Common mistake: "the database isn't using my index, it must be broken". Fix: check how many rows match; the planner may be right.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: the same index can be fast for one value and slow for another. If 99 percent of rows have status 'done' and 1 percent 'pending', an index on status is great for 'pending' and useless for 'done'. Postgres keeps statistics on the most common values, so it can pick different plans for different constants.
+
+```sql
+CREATE TABLE job (id bigserial PRIMARY KEY, status text NOT NULL);
+INSERT INTO job (status) SELECT CASE WHEN g % 100 = 0 THEN 'pending' ELSE 'done' END FROM generate_series(1, 1000000) g;
+CREATE INDEX job_status ON job (status); ANALYZE job;
+EXPLAIN SELECT * FROM job WHERE status = 'pending';   -- Bitmap Index Scan or Index Scan
+EXPLAIN SELECT * FROM job WHERE status = 'done';      -- Seq Scan
+```
+
+Common mistake: judging an index by one test query. Fix: test the frequent and the rare values.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the slow part is usually table access for many rows. The `BUFFERS` option shows how many pages a query touched; `shared read` means they came from disk (or the OS cache), `shared hit` from Postgres's buffer cache. A query that is fast on a warm cache and slow after a restart is reading too many pages.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM customer WHERE created_at > now() - interval '1 day';
+-- look at: rows, actual time, and Buffers: shared hit=... read=...
+```
+
+Common mistake: measuring a query twice and trusting the second, cached, timing. Fix: look at buffers, not only time.
+
+</Level>
+
+<Level name="Mindset">
+
+Count pages. Every question in this guide reduces to how many index pages and how many table pages a query touches. Tree depth is a small constant; leaf walks and table fetches are where time goes.
+
+<Flow steps={['tree traversal (few pages, cheap)', 'leaf chain walk (pages = matches / entries per page)', 'table access (up to one page per match)']} caption="The three steps of an index lookup, cheapest first." />
+
+Common mistake: optimising for "uses an index" rather than for pages touched. Fix: read `Buffers` in every plan.
+
+</Level>
+
+<Level name="System design">
+
+When I design an index, I estimate how many rows a typical query matches and whether those rows are close together in the table. Few matches: a plain index is enough. Many matches: I need the rows clustered, the index to contain all needed columns (chapter 5), or a different query.
+
+```text
+query                                   matches   design
+login by email                          1         unique index on email
+orders for one customer, last 20        20        index (customer_id, created_at)
+all orders in a city this year          200k      probably a scan, or a summary table
+```
+
+Common mistake: indexing for queries that return a large fraction of the table. Fix: summaries or partitioning for those.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: generate the customer table above, create the email index, and use `pageinspect` to look at the metapage, a branch page and a leaf page. Then run the city query with and without `SET enable_seqscan = off` and compare buffers and time to see why the planner chose the scan.
+
+Exercise: find the selectivity at which the planner switches from index to sequential scan on my machine, by querying ranges of ids of increasing size.
+
+Done when I can explain the three steps of an index lookup and predict, from the number of matching rows, whether the planner will use an index.
+
+</Level>
+</Levels>
+
+## Using it for reads
+
+### 2. The Where Clause
+**Covers:** The equals operator (primary keys, concatenated keys, slow indexes part II), functions (case-insensitive search, user-defined functions, over-indexing), bind variables, searching for ranges (greater, less and between; LIKE filters; index combine), partial indexes, NULL in indexes (including Oracle's behaviour, NOT NULL constraints, emulating partial indexes), and obfuscated conditions (dates, numeric strings, combining columns, smart logic, math).
+
+<Compare left="index can be used (access predicate)" right="index cannot be used, or only as a filter" rows={[
+  ['WHERE email = $1', 'WHERE lower(email) = $1 (without a function index)'],
+  ['index (a, b): WHERE a = $1', 'index (a, b): WHERE b = $1'],
+  ['WHERE name LIKE \'abc%\'', 'WHERE name LIKE \'%abc\''],
+  ['WHERE created_at >= $1 AND created_at < $2', 'WHERE date(created_at) = $1 (without a function index)'],
+  ['WHERE id = $1 (id is bigint, $1 bigint)', 'WHERE code = 42 (code is text)'],
+]} caption="The same intent written two ways: one the index serves, one it cannot." />
+
+<Levels label="Chapter 2, The Where Clause">
+
+<Level name="Beginner">
+
+The equals operator is the simplest case: `WHERE col = value` on an indexed column becomes a tree traversal to the first match. A primary key always has a unique index, so lookups by id are always fast. The guide's habit: check every query's plan, even the obvious ones, so you know what "fast" looks like.
+
+```sql
+EXPLAIN SELECT * FROM customer WHERE id = 42;
+```
+
+```text
+Index Scan using customer_pkey on customer  (cost=0.43..8.45 rows=1 width=...)
+  Index Cond: (id = 42)
+```
+
+Common mistake: never looking at plans until something is slow. Fix: `EXPLAIN` the main queries when writing them.
+
+</Level>
+
+<Level name="Intermediate">
+
+Concatenated (multi-column) indexes are sorted by the first column, then by the second within equal first values, and so on, like a phone book sorted by surname then first name. The index can be used for searches on a leading prefix of its columns. Column order matters: put the column you always filter on first.
+
+```sql
+CREATE TABLE orders (id bigserial PRIMARY KEY, customer_id bigint NOT NULL, status text NOT NULL,
+                     created_at timestamptz NOT NULL, total numeric NOT NULL);
+CREATE INDEX orders_cust_created ON orders (customer_id, created_at);
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7;                 -- uses the index
+EXPLAIN SELECT * FROM orders WHERE created_at > now() - interval '1 day';   -- cannot seek on the second column
+```
+
+Common mistake: one index per column, expecting the database to combine them as efficiently. Fix: a concatenated index in the right order for the queries that filter on both.
+
+</Level>
+
+<Level name="Advanced">
+
+Functions: an index on `email` cannot serve `WHERE lower(email) = ...` because the index is sorted by `email`, not by `lower(email)`. A function-based (expression) index stores the function's result. User-defined functions can be indexed only if they are deterministic (immutable in Postgres): an index on a function of `now()` is impossible because its value changes. Over-indexing: if you add `lower(email)`, you may not need the plain `email` index any more.
+
+```sql
+EXPLAIN SELECT * FROM customer WHERE lower(email) = 'user42@example.com';   -- Seq Scan
+CREATE INDEX customer_email_lower ON customer (lower(email));
+EXPLAIN SELECT * FROM customer WHERE lower(email) = 'user42@example.com';   -- Index Scan using customer_email_lower
+CREATE FUNCTION age_days(t timestamptz) RETURNS int AS $$ SELECT extract(day FROM now() - t)::int $$ LANGUAGE sql;
+CREATE INDEX bad ON customer (age_days(created_at));
+```
+
+```text
+ERROR:  functions in index expression must be marked IMMUTABLE
+```
+
+Common mistake: marking a function `IMMUTABLE` to get past that error when it is not. Fix: index the stored column and move the volatile part to the query.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: ranges. For `BETWEEN` and inequalities on a concatenated index, the column order rule changes: put equality columns first and the range column last. The index can only seek on the columns before (and including) the first range; columns after it are filters inside the leaf walk. `LIKE 'abc%'` is a range; `LIKE '%abc'` cannot use a B-tree at all.
+
+```sql
+-- index (created_at, customer_id): range first, equality second -> walks every row in the date range
+-- index (customer_id, created_at): equality first, range second -> walks only that customer's rows in the range
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 7 AND created_at >= '2026-10-01' AND created_at < '2026-11-01';
+```
+
+```text
+Index Scan using orders_cust_created on orders
+  Index Cond: ((customer_id = 7) AND (created_at >= ...) AND (created_at < ...))
+```
+
+Both conditions are access predicates. With the columns reversed, `customer_id = 7` would appear as a filter.
+
+Common mistake: `LIKE '%term%'` for search. Fix: full-text search or a trigram index (`pg_trgm`); a B-tree cannot help a leading wildcard.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: NULL. Oracle does not put rows in an index if all indexed columns are NULL, which makes `WHERE col IS NULL` unable to use a single-column index there; PostgreSQL does index NULLs. A `NOT NULL` constraint tells the planner more about the data. Partial indexes index only the rows matching a condition, which is ideal for the small slice queries actually look at.
+
+```sql
+CREATE INDEX job_pending ON job (id) WHERE status = 'pending';
+SELECT pg_size_pretty(pg_relation_size('job_pending')), pg_size_pretty(pg_relation_size('job_status'));
+EXPLAIN SELECT id FROM job WHERE status = 'pending' ORDER BY id LIMIT 10;
+```
+
+The partial index is around a hundredth of the full one's size, because only 1 percent of rows qualify.
+
+Common mistake: a partial index whose condition the query does not repeat exactly (or imply). Fix: the query must contain `status = 'pending'` for the planner to use it.
+
+</Level>
+
+<Level name="Production level">
+
+Obfuscated conditions are the common production bugs: wrapping a date column in a function (`date(created_at) = '2026-10-23'`), comparing a text column with a number (`code = 42`, which may cast the column), smart logic (`WHERE ($1 IS NULL OR city = $1) AND ...` in one catch-all query), and math on the column (`WHERE total * 1.18 > 1000`). Each hides the column from the index. Bind variables (parameters) are for security (no SQL injection) and plan caching; with skewed data they can occasionally lead to a generic plan that is wrong for some values.
+
+```sql
+-- obfuscated
+SELECT * FROM orders WHERE date(created_at) = '2026-10-23';
+-- index friendly: an explicit range on the raw column
+SELECT * FROM orders WHERE created_at >= '2026-10-23' AND created_at < '2026-10-24';
+-- obfuscated math
+SELECT * FROM orders WHERE total * 1.18 > 1000;
+-- rewritten
+SELECT * FROM orders WHERE total > 1000 / 1.18;
+```
+
+```ts
+// building SQL by string concatenation: injection and no plan reuse
+const unsafe = (city: string) => `SELECT * FROM customer WHERE city = '${city}'`;
+console.log(unsafe("x' OR '1'='1"));
+// with a driver: client.query('SELECT * FROM customer WHERE city = $1', [city])
+```
+
+Output: `SELECT * FROM customer WHERE city = 'x' OR '1'='1'`. Every row comes back.
+
+Common mistake: one "smart" query with optional filters for a search form. Fix: build the where clause dynamically from the filters actually given, still with bind parameters.
+
+</Level>
+
+<Level name="Mindset">
+
+The person writing the where clause decides whether an index can be used. Write conditions on the raw column, equality before range, and design the index for the query, not the table.
+
+<Flow steps={['list the where conditions', 'equality columns first', 'then the one range column', 'then columns only needed for filtering or covering', 'check access versus filter predicates in the plan']} caption="Designing a concatenated index from a where clause." />
+
+Common mistake: letting an ORM generate conditions nobody reads. Fix: log and explain the generated SQL.
+
+</Level>
+
+<Level name="System design">
+
+For a feature, I list the queries and their where clauses, then design the fewest indexes that serve them all, sharing leading columns. Each extra index costs writes (chapter 8), so I prefer one index with good column order over three single-column ones.
+
+```text
+queries on orders:
+  WHERE customer_id = ? ORDER BY created_at DESC LIMIT 20
+  WHERE customer_id = ? AND status = ?
+  WHERE status = 'pending' ORDER BY created_at LIMIT 100
+indexes:
+  (customer_id, created_at)                       serves 1; 2 via customer_id prefix + filter
+  (created_at) WHERE status = 'pending'           serves 3 (partial)
+```
+
+Common mistake: an index per query without looking for shared prefixes. Fix: merge indexes that share leading columns.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: for each section, write the slow form and the fast form of a query against my generated tables, and record both plans and buffer counts. The obfuscated conditions are the most useful: I search my own past code for `date(`, `lower(`, and string-built SQL.
+
+Exercise: take a search form with five optional filters and write it three ways (smart logic, dynamic SQL with parameters, and one index per filter), and compare plans.
+
+Done when I can look at any where clause and say which conditions are access predicates and which are filters for a given index, and confirm it in the plan.
+
+</Level>
+</Levels>
+
+### 3. Testing and Scalability
+**Covers:** Data volume (sloppy indexing bites back as data grows), system load (production load affects response time), and response time and throughput (horizontal scalability).
+
+<Figure art={`
+ response
+ time
+   |                                       / sloppy index (filter in leaf walk)
+   |                                   /
+   |                              /
+   |                        /
+   |                 /
+   |        _____________________________ good index (access predicates only)
+   |_______/
+   +------------------------------------------------ rows in table
+`} caption="Both queries are fast on a small test database; only one stays fast as data grows." />
+
+<Levels label="Chapter 3, Testing and Scalability">
+
+<Level name="Beginner">
+
+A query that is fast on a development database with a thousand rows may be slow with ten million. The guide's point is that indexing mistakes often hide until data volume grows: an index used only partly (some conditions are filters) still looks fast when there is little data.
+
+```sql
+-- test with realistic volume, not ten rows
+INSERT INTO orders (customer_id, status, created_at, total)
+SELECT 1 + (g % 100000), (ARRAY['new','paid','shipped','done'])[1 + g % 4],
+       now() - (g % 365 || ' days')::interval, (g % 5000) / 10.0
+FROM generate_series(1, 5000000) g;
+ANALYZE orders;
+```
+
+Common mistake: performance testing on an empty or tiny database. Fix: generate production-scale data, with realistic distributions.
+
+</Level>
+
+<Level name="Intermediate">
+
+The guide shows two indexes that both serve a query, one using all conditions as access predicates and one leaving a condition as a filter. With little data they are equally fast; as data grows, the filtered one walks more and more leaf entries and slows down linearly. The difference is visible in the plan before it is visible in timings.
+
+```sql
+CREATE INDEX orders_status_cust ON orders (status, customer_id);
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 7 AND created_at > now() - interval '30 days';
+-- with orders_cust_created: Index Cond on both columns
+-- if only an index on (customer_id, status, created_at) existed: Index Cond: customer_id, then created_at only as a filter after status
+```
+
+Common mistake: accepting a plan because the query took 2 ms on a laptop. Fix: read predicate information: `Index Cond` versus `Filter`, and `Rows Removed by Filter`.
+
+</Level>
+
+<Level name="Advanced">
+
+System load: response time depends on everything else the database is doing. A query that reads many pages competes for disk and cache with every other query, so its response time rises under load and it slows down others. Good indexing reduces work per query, which is the main lever for both response time and throughput.
+
+```bash
+# load test a query with pgbench at increasing concurrency
+cat > q.sql <<'SQL'
+\set c random(1, 100000)
+SELECT * FROM orders WHERE customer_id = :c ORDER BY created_at DESC LIMIT 20;
+SQL
+for c in 1 8 32; do pgbench -n -f q.sql -c $c -T 20 shop | grep -E "latency average|tps"; done
+```
+
+Common mistake: measuring one query alone and extrapolating to production load. Fix: load tests at realistic concurrency.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: hardware does not fix bad indexing. More CPUs increase throughput for parallel work but do not make one query's leaf walk shorter; faster disks help, but a query that reads a million pages is still slow. The guide's argument against relying on horizontal scalability: it adds capacity, but response time of an individual inefficient query stays the same, and distributing data adds latency.
+
+```text
+query reads 200,000 pages
+  on SSD at ~0.1 ms per random read      -> ~20 s
+  on faster SSD at ~0.05 ms               -> ~10 s
+  with a correct index reading 5 pages    -> well under 1 ms
+```
+
+(Order-of-magnitude arithmetic, not a benchmark.)
+
+Common mistake: scaling up the database instance to fix one slow query. Fix: fix the access path first.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: a query whose plan changes when statistics change. After a large import, the planner's estimates may be stale; Postgres autovacuum runs `ANALYZE` eventually, but a query in between can get a bad plan. Also, a plan that is right for a small customer can be wrong for the largest one.
+
+```sql
+-- after a big load, refresh statistics explicitly
+ANALYZE orders;
+-- compare estimated and actual rows in EXPLAIN ANALYZE: a big gap means bad statistics
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 7;
+```
+
+Common mistake: ignoring "rows=10 ... actual rows=100000" mismatches. Fix: analyse, raise statistics targets for skewed columns, or create extended statistics for correlated columns.
+
+</Level>
+
+<Level name="Production level">
+
+In production I track query performance with `pg_stat_statements`: total time, calls and mean time per normalised query. The queries to fix are the ones with the highest total time, not necessarily the slowest single call.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+SELECT round(total_exec_time) AS total_ms, calls, round(mean_exec_time, 2) AS mean_ms, left(query, 60)
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5;
+```
+
+Common mistake: optimising the query someone complained about while a fast but very frequent query uses most of the database's time. Fix: sort by total time.
+
+</Level>
+
+<Level name="Mindset">
+
+Test with production-like data and load, and read plans for predicate types rather than trusting timings on a small database.
+
+<Compare left="testing that misleads" right="testing that predicts" rows={[
+  ['tiny dataset', 'production-scale generated data'],
+  ['one query alone', 'concurrent load'],
+  ['timing only', 'plan, predicates, buffers, timing'],
+  ['warm cache once', 'cold and warm, repeated'],
+]} caption="What makes a performance test worth trusting." />
+
+Common mistake: "it's fast on staging". Fix: make staging data volume match production.
+
+</Level>
+
+<Level name="System design">
+
+I add a performance check to the delivery process: a seeded database at production scale, a script that runs `EXPLAIN` on the main queries and fails if a sequential scan appears where an index was expected, and a periodic look at `pg_stat_statements`.
+
+```text
+ci step "plans":
+  for each query in queries/*.sql:
+    run EXPLAIN (FORMAT JSON)
+    fail if a node type is "Seq Scan" on a table marked large
+    fail if "Rows Removed by Filter" exceeds the threshold in EXPLAIN ANALYZE
+```
+
+Common mistake: no performance check until production. Fix: plan checks in CI on realistic data.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: build the five-million-row orders table, take one query, and compare two candidate indexes at 10 thousand, 1 million and 5 million rows. Plot response time against rows, as in the figure. Then load test with pgbench at 1, 8 and 32 clients.
+
+Exercise: set up `pg_stat_statements`, run a mixed workload for ten minutes, and fix the top query by total time.
+
+Done when I can show, with my own numbers, an index that looks fine on small data and degrades on large data, and explain why from the plan.
+
+</Level>
+</Levels>
+
+### 4. The Join Operation
+**Covers:** Joins are not slow if done right: nested loops (and the N+1 selects problem in ORMs), hash join (which requires an entirely different indexing approach), and sort-merge join (like a zipper on two sorted sets).
+
+<Compare left="join algorithm" right="what to index" rows={[
+  ['nested loops', 'the join column of the inner table (and its where clause)'],
+  ['hash join', 'the independent where clauses of each table; not the join columns'],
+  ['sort-merge join', 'both sides in join order, or let it sort'],
+]} caption="Each join algorithm wants different indexes." />
+
+<Levels label="Chapter 4, The Join Operation">
+
+<Level name="Beginner">
+
+A join combines rows from two tables. The database picks one of three algorithms. Nested loops: for each row of the outer table, look up matching rows in the inner table, ideally through an index. Hash join: build a hash table from one side, probe it with the other. Sort-merge: sort both sides by the join key and walk them together.
+
+```sql
+CREATE INDEX orders_customer ON orders (customer_id);
+EXPLAIN SELECT c.email, o.total FROM customer c JOIN orders o ON o.customer_id = c.id WHERE c.id = 7;
+```
+
+```text
+Nested Loop
+  ->  Index Scan using customer_pkey on customer c  (Index Cond: (id = 7))
+  ->  Index Scan using orders_customer on orders o  (Index Cond: (customer_id = 7))
+```
+
+Common mistake: believing joins are inherently slow and denormalising to avoid them. Fix: index for the join algorithm in use.
+
+</Level>
+
+<Level name="Intermediate">
+
+Nested loops in application code: the N+1 selects problem. An ORM loads a list of customers, then lazily loads each customer's orders with one query per customer. The database does the same work as a nested loop join, but with a network round trip per iteration.
+
+```ts
+// simulated round trips: N+1 versus one join
+const roundTripMs = 1;
+const customers = Array.from({ length: 200 }, (_, i) => i + 1);
+const nPlusOne = (1 + customers.length) * roundTripMs;
+const oneJoin = 1 * roundTripMs;
+console.log(`N+1: ${nPlusOne} ms of round trips, join: ${oneJoin} ms`);
+```
+
+Output: `N+1: 201 ms of round trips, join: 1 ms`.
+
+Common mistake: lazy loading in a loop. Fix: eager loading (a join or a single `WHERE customer_id = ANY($1)` query).
+
+</Level>
+
+<Level name="Advanced">
+
+Hash join: the database reads the smaller input (after its where clause), builds a hash table in memory on the join key, then scans the larger input and probes. An index on the join column does not help a hash join; indexes on each table's independent where conditions do, because they shrink the inputs. Selecting fewer columns shrinks the hash table.
+
+```sql
+EXPLAIN (ANALYZE) SELECT c.city, sum(o.total) FROM customer c JOIN orders o ON o.customer_id = c.id
+WHERE o.created_at > now() - interval '7 days' GROUP BY c.city;
+```
+
+```text
+HashAggregate
+  ->  Hash Join  (Hash Cond: (o.customer_id = c.id))
+        ->  Index Scan using ... on orders o  (Index Cond: (created_at > ...))   -- needs an index on created_at
+        ->  Hash
+              ->  Seq Scan on customer c
+```
+
+Common mistake: adding indexes on foreign keys and expecting every join to get faster. Fix: for hash joins, index the filters.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: the hash table does not fit in memory. Postgres then splits it into batches written to disk (`Batches: 8` in the plan), which is slower. `work_mem` controls the limit per operation.
+
+```sql
+SET work_mem = '1MB';
+EXPLAIN (ANALYZE) SELECT c.*, o.* FROM customer c JOIN orders o ON o.customer_id = c.id;
+-- Hash ... Buckets: ... Batches: 64 ... Memory Usage: ...
+RESET work_mem;
+```
+
+Common mistake: `SELECT *` in a large join, so the hash table carries every column. Fix: select only needed columns; raise `work_mem` for that session if justified.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: sort-merge join is chosen when both inputs are already sorted by the join key (for example, read through indexes in that order) or when the result must be sorted anyway. Like a zipper, it walks both sorted lists once. It also handles some non-equality joins that hash joins cannot.
+
+```ts
+function mergeJoin(a: [number, string][], b: [number, string][]) {
+  const out: string[] = []; let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i][0] < b[j][0]) i++; else if (a[i][0] > b[j][0]) j++;
+    else { let k = j; while (k < b.length && b[k][0] === a[i][0]) out.push(`${a[i][1]}-${b[k++][1]}`); i++; }
+  }
+  return out;
+}
+console.log(mergeJoin([[1, 'A'], [2, 'B'], [4, 'D']], [[1, 'x'], [1, 'y'], [3, 'z'], [4, 'w']]));
+```
+
+Output: `[ 'A-x', 'A-y', 'D-w' ]`.
+
+Common mistake: forcing a join method with planner settings in production. Fix: fix statistics or indexes and let the planner choose.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the ORM is where join problems come from: N+1 queries, or one enormous eager query loading everything. I log queries per request and alert when a request issues more than a threshold.
+
+```ts
+// per-request query counter (middleware sketch)
+let queries = 0;
+const db = { query: async (sql: string) => { queries++; return []; } };
+async function handler() { const users = [1, 2, 3]; for (const u of users) await db.query(`SELECT ... ${u}`); }
+await handler();
+console.log(queries > 2 ? `warning: ${queries} queries in one request` : 'ok');
+```
+
+Output: `warning: 3 queries in one request`.
+
+Common mistake: discovering N+1 only in production traces. Fix: a query-count assertion in integration tests.
+
+</Level>
+
+<Level name="Mindset">
+
+Joins are fine when the indexes match the algorithm. I read which join the planner chose, and then index accordingly.
+
+<Flow steps={['read the plan: which join node?', 'nested loops: index inner join column', 'hash join: index each side\'s filters, select fewer columns', 'merge join: provide sorted inputs or accept the sort']} caption="Indexing for the join the planner picked." />
+
+Common mistake: one indexing rule for all joins. Fix: one per algorithm.
+
+</Level>
+
+<Level name="System design">
+
+In a design, I keep the data normalised and plan the main joins: which side is filtered, how many rows each side has, and therefore which algorithm will be used. For list pages I avoid N+1 at the data access layer.
+
+```text
+page: customer list with order counts (50 per page)
+  query 1: 50 customers (index on sort column)
+  query 2: SELECT customer_id, count(*) FROM orders WHERE customer_id = ANY($1) GROUP BY 1
+           -> nested loop on orders_customer, 50 probes
+  never: 1 + 50 queries
+```
+
+Common mistake: denormalising order counts into the customer table on day one. Fix: measure the join first; denormalise only with a reason and a way to keep it consistent.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write the same report three ways (ORM lazy loading, ORM eager loading, hand-written SQL), count queries and time each. Then produce each join algorithm on purpose by changing filters and indexes, and read the plans.
+
+Exercise: make a hash join spill to disk with a small `work_mem`, then fix it by selecting fewer columns.
+
+Done when I can predict the join algorithm from the query and indexes, and index correctly for each.
+
+</Level>
+</Levels>
+
+### 5. Clustering Data
+**Covers:** Clustering data to reduce IO: index filter predicates used intentionally (to tune LIKE), the index-only scan (avoiding table access), and index-organized tables (clustered indexes without a separate table).
+
+<Figure art={`
+ index on (customer_id)            table pages
+  7 -> page 12                     page 12: ... cust 7 ...
+  7 -> page 980                    page 980: ... cust 7 ...
+  7 -> page 44                     page 44: ... cust 7 ...      3 pages for 3 rows (poorly clustered)
+
+ index on (customer_id, created_at, total)
+  7, 2026-10-01, 120.00            all needed columns are in the index:
+  7, 2026-10-09,  80.00            no table pages at all (index-only scan)
+`} caption="Clustering: how many table pages the matching rows are spread over, and how to avoid the table entirely." />
+
+<Levels label="Chapter 5, Clustering Data">
+
+<Level name="Beginner">
+
+The clustering factor describes how well the table's row order matches the index order. If rows with nearby index values sit on the same table pages, fetching them reads few pages; if they are scattered, each row costs a page. Clustering is the second power of indexing in the guide's terms: reducing table access by keeping related data together.
+
+```sql
+SELECT attname, correlation FROM pg_stats WHERE tablename = 'orders' AND attname IN ('id', 'customer_id', 'created_at');
+```
+
+A correlation near 1 or -1 means the table is physically ordered by that column; near 0 means scattered.
+
+Common mistake: assuming two indexes with the same selectivity cost the same. Fix: look at correlation; the scattered one reads far more pages.
+
+</Level>
+
+<Level name="Intermediate">
+
+Index filter predicates used intentionally: adding a column to an index only to filter in the leaf walk (not to seek) can save table accesses, because non-matching entries are discarded before the row is fetched. A `LIKE '%term%'` on a column inside the index can be checked on index entries. How much this helps depends on the database: some apply such filters during the index walk, while a plain PostgreSQL Index Scan applies them after fetching the row, so in Postgres the benefit appears when the scan is index-only.
+
+```sql
+CREATE INDEX orders_cust_status ON orders (customer_id, status);
+-- every needed column is in the index, so the LIKE filter runs without visiting the table
+EXPLAIN (ANALYZE, BUFFERS) SELECT customer_id, status FROM orders WHERE customer_id = 7 AND status LIKE '%ship%';
+-- Index Only Scan using orders_cust_status   Index Cond: (customer_id = 7)   Filter: (status ~~ '%ship%')
+```
+
+Common mistake: assuming the filter saves table pages in Postgres when the query selects other columns. Fix: check `Buffers` and whether the node is an Index Only Scan.
+
+</Level>
+
+<Level name="Advanced">
+
+The index-only scan: if every column the query needs is in the index, the database never reads the table. In Postgres this also depends on the visibility map: pages recently modified must still be checked in the heap. `INCLUDE` columns add payload to the leaves without making them part of the sort key.
+
+```sql
+CREATE INDEX orders_cust_cover ON orders (customer_id, created_at) INCLUDE (total);
+VACUUM orders;
+EXPLAIN (ANALYZE, BUFFERS) SELECT created_at, total FROM orders WHERE customer_id = 7;
+```
+
+```text
+Index Only Scan using orders_cust_cover on orders
+  Index Cond: (customer_id = 7)
+  Heap Fetches: 0
+```
+
+Common mistake: `SELECT *` defeating an index-only scan. Fix: select only the columns you need.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: `Heap Fetches` is not zero after heavy writes, because the visibility map has not been updated by vacuum. The index-only scan then visits the table for those pages and loses most of its benefit.
+
+```sql
+UPDATE orders SET total = total WHERE customer_id = 7;
+EXPLAIN (ANALYZE) SELECT created_at, total FROM orders WHERE customer_id = 7;   -- Heap Fetches: (number of updated rows)
+VACUUM orders;
+EXPLAIN (ANALYZE) SELECT created_at, total FROM orders WHERE customer_id = 7;   -- Heap Fetches: 0
+```
+
+Common mistake: benchmarking an index-only scan right after a bulk load. Fix: vacuum first, and keep autovacuum tuned for write-heavy tables.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: index-organized tables (clustered indexes, as in SQL Server and MySQL's InnoDB) store the rows in the primary key index itself. Lookups by primary key need no separate table access, but secondary indexes then point to the primary key, not a physical location, so a secondary index lookup traverses two trees. Postgres has no index-organized tables; `CLUSTER` reorders a table once but does not maintain the order.
+
+```sql
+CLUSTER orders USING orders_cust_created;   -- one-time physical reorder; locks the table
+ANALYZE orders;
+SELECT correlation FROM pg_stats WHERE tablename = 'orders' AND attname = 'customer_id';   -- now close to 1
+```
+
+Common mistake: running `CLUSTER` on a live production table. Fix: it takes an exclusive lock; use it in maintenance windows or with a tool that rebuilds online.
+
+</Level>
+
+<Level name="Production level">
+
+In production I use covering indexes for the hottest read paths (a list page's query), keep them narrow, and monitor `Heap Fetches`. Wide covering indexes cost write performance and memory, so each one has to earn its place.
+
+```sql
+SELECT relname, indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'orders' ORDER BY idx_scan;
+-- an index with idx_scan = 0 after weeks is a candidate for removal
+```
+
+Common mistake: covering indexes for every query. Fix: only for frequent queries where table access dominates.
+
+</Level>
+
+<Level name="Mindset">
+
+Think about where the rows are, not only whether an index exists. Fewer table pages is the goal; covering indexes and clustering are two ways to reach it.
+
+<Flow steps={['how many rows match?', 'how scattered are they? (correlation)', 'can the index cover the columns?', 'otherwise: can related rows be stored together?']} caption="Reducing table access, step by step." />
+
+Common mistake: adding columns to indexes without checking that table access was the cost. Fix: read buffers first.
+
+</Level>
+
+<Level name="System design">
+
+A design example: a customer's order history page shows date and total for the last 50 orders. A covering index on `(customer_id, created_at DESC) INCLUDE (total)` serves it entirely from the index, in order, with no sort and no table access.
+
+```sql
+CREATE INDEX orders_history ON orders (customer_id, created_at DESC) INCLUDE (total);
+EXPLAIN SELECT created_at, total FROM orders WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 50;
+-- Limit -> Index Only Scan using orders_history
+```
+
+Common mistake: adding a column to the select list later and silently losing the index-only scan. Fix: a plan check for the hot query in CI.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: measure buffers for the same query on a well-correlated column (`id`) and a scattered one (`customer_id`) with the same number of matches. Then build a covering index, watch `Heap Fetches` after updates and after vacuum.
+
+Exercise: rebuild the orders table ordered by customer_id and measure the difference in buffers for a customer's orders.
+
+Done when I can explain, with buffer counts, how clustering and covering indexes reduce table access.
+
+</Level>
+</Levels>
+
+### 6. Sorting and Grouping
+**Covers:** Indexed order by (the third power of indexing: pipelined order by), ASC/DESC and NULLS FIRST/LAST (changing index order), and indexed group by (pipelining group by).
+
+<Flow steps={['index already in ORDER BY order', 'read entries in that order', 'return the first rows immediately (pipelined)', 'no sort step, no need to read everything']} caption="A pipelined order by: the index provides the order, so results stream out." />
+
+<Levels label="Chapter 6, Sorting and Grouping">
+
+<Level name="Beginner">
+
+Sorting a large result is expensive: the database must read every row before it can return the first one. If an index is already in the order the query asks for, the database can read the index in that order and skip the sort. The guide calls this the third power of indexing: pipelining.
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 ORDER BY created_at;
+```
+
+```text
+Index Scan using orders_cust_created on orders
+  Index Cond: (customer_id = 7)
+```
+
+No Sort node: the index on (customer_id, created_at) already returns this customer's rows in date order.
+
+Common mistake: an index on (created_at, customer_id) for this query. Fix: equality columns first, then the order by columns.
+
+</Level>
+
+<Level name="Intermediate">
+
+The index order must match the order by for all columns, or be its exact reverse (indexes can be read backwards). Mixing directions (one column ascending, another descending) needs an index created with those directions.
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 ORDER BY created_at DESC;     -- Index Scan Backward: fine
+EXPLAIN SELECT * FROM orders ORDER BY customer_id ASC, created_at DESC LIMIT 10;  -- needs a Sort, or:
+CREATE INDEX orders_cust_asc_created_desc ON orders (customer_id ASC, created_at DESC);
+```
+
+Common mistake: creating a separate descending index when the query is a plain reverse. Fix: the same index read backwards serves it.
+
+</Level>
+
+<Level name="Advanced">
+
+Indexed group by: grouping can be done by hashing (read everything, build a hash table of groups) or by sorting (if rows arrive sorted by the group key, each group finishes as soon as the key changes). With an index in group order, the sort-based group by is pipelined.
+
+```sql
+EXPLAIN SELECT customer_id, count(*) FROM orders WHERE customer_id BETWEEN 1 AND 100 GROUP BY customer_id;
+-- GroupAggregate -> Index Only Scan using orders_customer (pipelined)
+-- versus HashAggregate -> Seq Scan (must read everything first)
+```
+
+Common mistake: expecting `GROUP BY` output to be sorted. Fix: add `ORDER BY` if order matters; a hash aggregate returns groups in no particular order.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: NULLS FIRST and LAST. In Postgres, NULL sorts as larger than any value by default: ascending puts NULLs last, descending puts them first. An order by with a different NULL placement than the index cannot use it for ordering.
+
+```sql
+CREATE TABLE task (id serial PRIMARY KEY, due date);
+INSERT INTO task (due) VALUES ('2026-10-25'), (NULL), ('2026-10-24');
+SELECT due FROM task ORDER BY due DESC;
+```
+
+```text
+    due
+------------
+
+ 2026-10-25
+ 2026-10-24
+```
+
+The NULL comes first in descending order. `ORDER BY due DESC NULLS LAST` changes it, and an index for that order needs `(due DESC NULLS LAST)`.
+
+Common mistake: a "most urgent first" list showing tasks with no due date at the top. Fix: specify NULLS LAST and index to match.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: a where clause with a range on one column and an order by on another cannot be pipelined from one index: the index sorts by the range column first. The database must either read the range and sort, or read in order by the second column and filter. Which is cheaper depends on how selective the range is.
+
+```sql
+-- range on created_at, order by total: no single B-tree gives both
+EXPLAIN SELECT * FROM orders WHERE created_at > now() - interval '1 day' ORDER BY total DESC LIMIT 10;
+-- likely: Limit -> Sort -> Index Scan on created_at range
+```
+
+Common mistake: adding (created_at, total) and expecting the sort to vanish. Fix: accept the sort for a small range, or precompute a top list.
+
+</Level>
+
+<Level name="Production level">
+
+In production, sorts that spill to disk appear in plans as `Sort Method: external merge  Disk: ...kB`. Either the result is too big, `work_mem` too small, or the query should be pipelined from an index.
+
+```sql
+EXPLAIN (ANALYZE) SELECT * FROM orders ORDER BY total DESC;
+-- Sort Method: external merge  Disk: 300000kB   (illustrative)
+```
+
+Common mistake: raising `work_mem` globally to stop spills. Fix: it is per sort operation per query; raise it per session or fix the query.
+
+</Level>
+
+<Level name="Mindset">
+
+An index gives three things: fast lookup (where), fewer table accesses (clustering and covering), and order (pipelining). The best indexes do all three for one hot query.
+
+<Compare left="sorted after reading" right="pipelined from the index" rows={[
+  ['reads every matching row first', 'returns the first rows immediately'],
+  ['memory or disk for the sort', 'no sort'],
+  ['time grows with matches', 'time grows with rows returned'],
+]} caption="Why pipelining matters most when combined with LIMIT." />
+
+Common mistake: optimising the where clause and ignoring the order by. Fix: design the index for both.
+
+</Level>
+
+<Level name="System design">
+
+For a feed or list page, the index is designed from the full query: equality filters, then order by columns in the requested directions, then covering columns. This one index makes the page's cost independent of how much history the user has.
+
+```sql
+-- notifications page: unread first is a filter; newest first is the order
+CREATE INDEX notif_user_unread ON notification (user_id, created_at DESC) WHERE read_at IS NULL;
+SELECT id, created_at, title FROM notification WHERE user_id = $1 AND read_at IS NULL ORDER BY created_at DESC LIMIT 20;
+```
+
+Common mistake: sorting in application code after fetching everything. Fix: order and limit in the database with a matching index.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write a query with `ORDER BY ... LIMIT 10` and compare the plan and time with and without a matching index, at 5 million rows. Then try every combination of ASC, DESC and NULLS placement to see which indexes serve which order.
+
+Exercise: produce a GroupAggregate and a HashAggregate for the same query by changing indexes and settings.
+
+Done when I can design an index that removes the Sort node from any single-table query with equality filters and an order by.
+
+</Level>
+</Levels>
+
+### 7. Partial Results
+**Covers:** Selecting top-N rows (when you need the first few rows only), fetching the next page (the offset and seek methods compared), and window functions (pagination using analytic queries).
+
+<Compare left="offset paging" right="seek (keyset) paging" rows={[
+  ['LIMIT 20 OFFSET 100000', 'WHERE (created_at, id) < ($1, $2) LIMIT 20'],
+  ['reads and discards 100,000 rows', 'starts exactly after the last seen row'],
+  ['slower for every later page', 'same speed on every page'],
+  ['rows shift if data changes between pages', 'stable: no skipped or repeated rows'],
+  ['can jump to page 500', 'only next and previous'],
+]} caption="Two ways to fetch the next page." />
+
+<Levels label="Chapter 7, Partial Results">
+
+<Level name="Beginner">
+
+Top-N queries ask for the first few rows in some order: the latest 20 orders, the 10 best-selling products. With a pipelined order by (chapter 6), the database stops after N rows; without it, it sorts everything first and then takes N.
+
+```sql
+EXPLAIN (ANALYZE) SELECT * FROM orders WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 20;
+-- Limit -> Index Scan Backward using orders_cust_created   (stops after 20 rows)
+```
+
+Common mistake: fetching all rows and slicing in application code. Fix: `LIMIT` in SQL, with an index matching the order.
+
+</Level>
+
+<Level name="Intermediate">
+
+Offset paging (`LIMIT 20 OFFSET 40`) is simple but the database still reads and discards the skipped rows, so page 5000 is slow. Seek paging (keyset pagination) uses the last row of the previous page as a starting point in the where clause, so every page costs the same.
+
+```sql
+-- page 1
+SELECT id, created_at FROM orders ORDER BY created_at DESC, id DESC LIMIT 20;
+-- next page: pass the last row's (created_at, id)
+SELECT id, created_at FROM orders
+WHERE (created_at, id) < ('2026-10-20 10:00:00+05:30', 81234)
+ORDER BY created_at DESC, id DESC LIMIT 20;
+-- index: (created_at DESC, id DESC) or (created_at, id) read backwards
+```
+
+Common mistake: seek paging on `created_at` alone when it is not unique, which skips rows with the same timestamp. Fix: add a unique tiebreaker (id) to both the order and the comparison.
+
+</Level>
+
+<Level name="Advanced">
+
+Row value comparison `(a, b) < (x, y)` is the clean way to express "after this position" across two columns, and Postgres can use a matching index for it. Databases without row values need the expanded form `a < x OR (a = x AND b < y)`, which some planners optimise poorly.
+
+```ts
+// seek paging over an in-memory sorted list, the same logic as the SQL
+type Row = { createdAt: number; id: number };
+const rows: Row[] = [{ createdAt: 5, id: 9 }, { createdAt: 5, id: 8 }, { createdAt: 4, id: 7 }, { createdAt: 3, id: 6 }];
+const after = (last: Row | null, n: number) =>
+  rows.filter(r => !last || r.createdAt < last.createdAt || (r.createdAt === last.createdAt && r.id < last.id)).slice(0, n);
+const p1 = after(null, 1), p2 = after(p1[0], 2);
+console.log(p1.map(r => r.id), p2.map(r => r.id));
+```
+
+Output: `[ 9 ] [ 8, 7 ]`. The row with the same timestamp (id 8) is not skipped.
+
+Common mistake: the expanded OR form without the equality branch. Fix: test with duplicate timestamps.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: with offset paging, if a new row is inserted while the user reads page 1, page 2 starts one row later than intended and repeats the last row of page 1. Seek paging does not have this problem.
+
+```ts
+let data = [10, 9, 8, 7, 6, 5];
+const page1 = data.slice(0, 3);            // [10, 9, 8]
+data = [11, ...data];                      // a new item arrives
+const page2 = data.slice(3, 6);            // offset 3
+console.log(page1, page2);
+```
+
+Output: `[ 10, 9, 8 ] [ 8, 7, 6 ]`. Item 8 appears twice.
+
+Common mistake: infinite scroll built on offsets. Fix: seek paging with a cursor.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: window functions let you page with analytic queries (`ROW_NUMBER() OVER (ORDER BY ...)`), and a good planner can stop early when filtering on the row number. Postgres's support for pipelining this is more limited than with `LIMIT`, so I check the plan; for simple paging, `LIMIT` with seek is safer.
+
+```sql
+SELECT * FROM (
+  SELECT id, created_at, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS rn FROM orders
+) t WHERE rn BETWEEN 21 AND 40;
+-- check whether the plan reads the whole table before filtering rn
+```
+
+Window functions are better used for top-N per group: the three latest orders per customer.
+
+Common mistake: assuming window-function paging is as cheap as LIMIT. Fix: read the plan.
+
+</Level>
+
+<Level name="Production level">
+
+In an API, I expose seek paging as an opaque cursor: the encoded (created_at, id) of the last item. Clients cannot jump to arbitrary pages, which is fine for feeds and logs. Where page numbers are a product requirement (search results), I cap the maximum offset.
+
+```ts
+const encode = (createdAt: string, id: number) => Buffer.from(JSON.stringify([createdAt, id])).toString('base64url');
+const decode = (c: string) => JSON.parse(Buffer.from(c, 'base64url').toString()) as [string, number];
+const cursor = encode('2026-10-20T10:00:00+05:30', 81234);
+console.log(cursor.length > 0, decode(cursor));
+```
+
+Output: `true [ '2026-10-20T10:00:00+05:30', 81234 ]`.
+
+Common mistake: exposing `?offset=` publicly, letting crawlers request page 100000 and load the database. Fix: cursors, or a maximum offset.
+
+</Level>
+
+<Level name="Mindset">
+
+Do as little work as the user needs: the first page, now. Partial results are where indexing pays off most visibly.
+
+<Flow steps={['user asks for a page', 'cursor gives the start position', 'index seeks to it', 'read N rows in order', 'return next cursor']} caption="Seek paging end to end." />
+
+Common mistake: counting all results (`count(*)`) for "page X of Y" on every request. Fix: drop exact totals or cache an estimate.
+
+</Level>
+
+<Level name="System design">
+
+For a feed API I specify: order (created_at desc, id desc), the cursor format, the index, and the page size limit. The design keeps p99 latency flat regardless of how deep a client scrolls.
+
+```text
+GET /orders?limit=20&cursor=...
+index: (customer_id, created_at DESC, id DESC)
+query: WHERE customer_id = $1 AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4
+max limit: 100
+```
+
+Common mistake: allowing arbitrary sort columns, each needing its own index. Fix: support a fixed set of sorts, each indexed.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: build both paging styles over the 5-million-row table and time page 1, 100, 10000 and 100000. Then simulate inserts between page fetches and show offset paging repeating rows.
+
+Exercise: implement a cursor-paged API endpoint in TypeScript with tests for duplicate timestamps.
+
+Done when my paging is constant time per page, never skips or repeats rows under concurrent inserts, and I can explain why.
+
+</Level>
+</Levels>
+
+## Paying for it on writes
+
+### 8. Insert, Delete and Update
+**Covers:** Indexing impacts on DML statements: insert cannot take direct benefit from indexes, delete uses indexes for the where clause, and update does not affect all indexes of the table.
+
+<Figure art={`
+ INSERT one row into a table with 5 indexes:
+   heap page        +1 row
+   index 1 (pkey)   +1 entry  (find leaf, maybe split)
+   index 2          +1 entry
+   index 3          +1 entry
+   index 4          +1 entry
+   index 5          +1 entry
+   WAL              records for all of the above
+ more indexes = more pages written per insert
+`} caption="The write cost of indexes: every index must be maintained on every insert." />
+
+<Levels label="Chapter 8, Insert, Delete and Update">
+
+<Level name="Beginner">
+
+Indexes speed up reads and slow down writes. An insert has no where clause, so no index helps it; every index on the table must be updated with the new entry. The more indexes, the slower inserts get.
+
+```sql
+CREATE TABLE ins_test (id bigint, a int, b int, c int, d int);
+\timing on
+INSERT INTO ins_test SELECT g, g, g, g, g FROM generate_series(1, 1000000) g;   -- no indexes
+TRUNCATE ins_test;
+CREATE INDEX ON ins_test (a); CREATE INDEX ON ins_test (b); CREATE INDEX ON ins_test (c); CREATE INDEX ON ins_test (d);
+INSERT INTO ins_test SELECT g, g, g, g, g FROM generate_series(1, 1000000) g;   -- noticeably slower
+```
+
+Common mistake: "indexes are free, add one for every column". Fix: each index has a write cost; keep the ones queries use.
+
+</Level>
+
+<Level name="Intermediate">
+
+Delete has a where clause, so it uses indexes to find the rows like a select does; then it must remove (in Postgres, mark dead) entries in every index. Update uses indexes for its where clause, and must update only the indexes that contain changed columns. In Postgres, if no indexed column changes and the page has room, a HOT (heap-only tuple) update avoids touching indexes at all.
+
+```sql
+SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relname = 'orders';
+UPDATE orders SET total = total + 1 WHERE id = 42;        -- total is in a covering index's INCLUDE: not HOT
+-- an update to a column in no index can be HOT
+```
+
+Common mistake: adding a frequently updated column to an index (even as INCLUDE), losing HOT updates. Fix: keep hot-update columns out of indexes unless reads need them.
+
+</Level>
+
+<Level name="Advanced">
+
+Bulk loading: for a large initial import, it can be faster to drop indexes, load, then create them, because building an index from sorted data is cheaper than inserting entries one by one. `COPY` is far faster than row-by-row inserts.
+
+```ts
+// batching inserts: one statement per row versus one multi-row statement
+const rows = Array.from({ length: 1000 }, (_, i) => [i, `name${i}`]);
+const perRow = rows.length;                                    // statements
+const placeholders = rows.map((_, i) => `($${i * 2 + 1}, $${i * 2 + 2})`).join(', ');
+console.log(perRow, 'statements vs 1;', placeholders.slice(0, 20));
+```
+
+Output: `1000 statements vs 1; ($1, $2), ($3, $4),`.
+
+Common mistake: dropping indexes on a live table to speed up a load. Fix: only for initial loads or into a new table that is swapped in.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: deleting many rows. A huge `DELETE` holds locks for a long time, generates lots of WAL, and leaves dead tuples for vacuum. Deleting in batches, or dropping a whole partition for time-based data, avoids this.
+
+```sql
+-- batch delete old rows
+DELETE FROM orders WHERE id IN (
+  SELECT id FROM orders WHERE created_at < now() - interval '2 years' LIMIT 10000
+);
+-- repeat until 0 rows; or, with time partitioning:
+-- DROP TABLE orders_2024_10;   (instant)
+```
+
+Common mistake: `DELETE FROM big_table WHERE created_at < ...` in one statement at peak time. Fix: batches, off-peak, or partition drops.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: an update that changes an indexed column is, for the index, a delete plus an insert: the entry must move to its new sorted position. Updating the leading column of a concatenated index on many rows is expensive. Also, a unique index is checked on every insert and update of its columns.
+
+```sql
+-- changing customer_id moves the row's entry in every index starting with customer_id
+UPDATE orders SET customer_id = 8 WHERE customer_id = 7;
+-- and every index containing customer_id elsewhere must be updated too
+```
+
+Common mistake: storing a frequently changing status as the leading column of a big index. Fix: lead with stable columns; use partial indexes for status slices.
+
+</Level>
+
+<Level name="Production level">
+
+In production, I audit indexes: unused ones (no scans in `pg_stat_user_indexes` over a representative period), duplicates (same leading columns), and oversized ones. Removing an unused index speeds up every write.
+
+```sql
+SELECT s.indexrelname, s.idx_scan, pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.idx_scan = 0 AND NOT i.indisunique ORDER BY pg_relation_size(s.indexrelid) DESC;
+```
+
+Common mistake: dropping an index used only by a monthly report. Fix: look at statistics over a long enough period, and check replicas, which have their own counters.
+
+</Level>
+
+<Level name="Mindset">
+
+Every index is a trade: faster reads for slower writes and more storage. I keep the set small and deliberate.
+
+<Compare left="read benefit" right="write cost" rows={[
+  ['seek instead of scan', 'one more entry per insert'],
+  ['covering avoids table access', 'more columns to maintain, fewer HOT updates'],
+  ['pipelined order', 'page splits as data arrives'],
+  ['partial index: small', 'cheap: only matching rows maintained'],
+]} caption="The trade every index makes." />
+
+Common mistake: optimising reads without measuring write impact. Fix: benchmark inserts and updates with the full index set.
+
+</Level>
+
+<Level name="System design">
+
+For a write-heavy table (events, logs), I design for writes: few indexes, a time-ordered primary key (so inserts go to the right edge of the tree), time partitioning for retention, and summaries for the reads. For read-heavy tables I index more freely.
+
+```text
+table: events (writes: 5k/s, reads: dashboards)
+  primary key: (created_at, id)          -- appends at the end of the index
+  indexes: one on (user_id, created_at)  -- for the user's activity page
+  partitioning: monthly; drop after 13 months
+  dashboards: from hourly summary tables, not raw events
+```
+
+Common mistake: random UUIDv4 primary keys on a write-heavy table, spreading inserts across the whole index. Fix: time-ordered ids (UUIDv7 or bigserial).
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: measure insert throughput into a table with zero to eight indexes and plot it. Measure HOT update ratio before and after adding an index on an updated column. Run a batched delete and a partition drop and compare.
+
+Exercise: audit the indexes of a database I use and propose which to drop, with evidence.
+
+Done when I can quantify, on my machine, what each extra index costs inserts, and I have removed at least one index with evidence.
+
+</Level>
+</Levels>
+
+The appendices are a reference: how to get and read execution plans in Db2, MySQL, Oracle, PostgreSQL, SQL Server, SQLite and Gupta SQLBase (including access versus filter predicates); a myth directory (indexes degenerating, most selective column first, Oracle and NULL, dynamic SQL being slow, select star); the example schema scripts; and a glossary. I use the PostgreSQL execution plan appendix alongside every chapter.
+
+## Misreadings to avoid
+
+- "Index every column." Each index costs every write; design a few concatenated indexes from the queries.
+- "Put the most selective column first." The guide lists this as a myth: put equality columns first, the range column last, and choose order by the queries' prefixes.
+- "The planner is wrong, force the index." Often the planner is right because many rows match; check rows and buffers before overriding.
+- "Indexes degenerate and must be rebuilt regularly." Another myth in its directory; rebuild for bloat with evidence, not on a schedule.
+- "OFFSET paging is fine." It gets slower with every page and repeats rows under inserts; use seek paging for feeds.
+- "Fast on my laptop means fast." Test at production volume and load, and read predicates in the plan.
+
+## Done with this book when
+
+- I can draw a B-tree with its leaf chain and explain the three steps of a lookup and which are expensive.
+- For any where clause I can design the index and identify access and filter predicates in the plan.
+- I have written seek pagination with a correct tiebreaker and shown it constant time on millions of rows.
+- I have produced an index-only scan with zero heap fetches, and a pipelined order by with no Sort node.
+- I have measured the write cost of indexes and removed an unused one with evidence.
+- Gate: I can pass the phase 8 gate of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core plan</a> by reading a query plan and explaining why an index is or is not used.
