@@ -1,0 +1,1382 @@
+---
+title: "Node.js Design Patterns, chapter by chapter"
+description: "Casciaro and Mammino's Node.js book, all 13 chapters climbed from beginner to strategy: the event loop, modules, async control flow, streams, patterns and scaling."
+edition: "fourth edition (Packt, 2025)"
+tocVerified: true
+tocSources:
+  - "https://nodejsdesignpatterns.com/"
+  - "https://loige.co/nodejs-design-patterns-fourth-edition/"
+  - "https://github.com/PacktPublishing/Node.js-Design-Patterns-Fourth-Edition"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the backend book of the <a href={withBase('/plans/software-ai-developer/')}>software AI developer</a>
+roadmap, phase 3: an API with auth, jobs and limits. Everything I build in that phase runs on Node, and
+most of the bugs I have shipped in Node came from not knowing what the runtime does between two lines of
+`await`. This book is the one that explains the runtime first and the patterns second.
+
+The fourth edition targets current Node with ES modules, `async`/`await`, the built-in test runner and
+TypeScript notes throughout, so the code transfers straight into what I write every day.
+
+## How I would learn it
+
+I read it with a terminal open and a scratch repo called `ndp-lab`, one folder per chapter. Every
+pattern gets typed, run, broken on purpose and then rewritten in TypeScript. For each chapter I keep one
+file, `WHAT-BROKE.md`, where I write the exact error or wrong output I caused and why it happened. That
+file is the real artifact; the code is just how I got it.
+
+The order is the book's order for chapters 1 to 6, because each builds on the one before. Chapters 7 to 9
+I read against my own phase 3 API: for every pattern I find the place in my code where it already exists
+or where it should. Chapters 10 to 13 I read when the API needs tests, recipes, a second process and a
+queue.
+
+<Timeline items={[
+  { when: 'week 13', what: 'Chapters 1 to 3: the event loop, modules, callbacks and events. Build a tiny event-driven file watcher.' },
+  { when: 'week 14', what: 'Chapters 4 to 6: async control flow and streams. Build a crawler with limited concurrency and a streaming CSV importer.' },
+  { when: 'week 15', what: 'Chapters 7 to 9: creational, structural and behavioural patterns, mapped onto the phase 3 API.' },
+  { when: 'week 16', what: 'Chapter 10: tests with node:test, mocks at the boundaries, and an integration suite.' },
+  { when: 'weeks 17 to 18', what: 'Chapters 11 to 13: recipes, clustering and a job queue. Pass the phase 3 gate.' },
+]} caption="How the chapters map onto phase 3. The first six are foundations; the last seven are applied to the API I am building." />
+
+Every chapter below climbs the same nine levels. The explanations and examples are mine, a paraphrase
+of what each chapter covers, not text from the book.
+
+## The book's arc
+
+<Layers layers={[
+  { name: 'The platform', note: 'chapters 1 and 2: how Node works, and the module system' },
+  { name: 'Asynchrony', note: 'chapters 3 to 6: callbacks, events, promises, async/await, streams' },
+  { name: 'Design patterns', note: 'chapters 7 to 9: creational, structural and behavioural' },
+  { name: 'Quality and recipes', note: 'chapters 10 and 11: testing and advanced recipes' },
+  { name: 'Distribution', note: 'chapters 12 and 13: scaling, architecture and messaging' },
+]} caption="The book has no formal parts; this is my grouping of its 13 chapters. Each layer leans on the one above it." />
+
+## The platform
+
+
+### 1. The Node.js Platform
+
+**Covers:** What Node is for: its small-core philosophy, non-blocking I/O, the reactor pattern, libuv, and how JavaScript in Node differs from the browser, TypeScript included.
+
+<Figure art={`
+  app code --- fs.readFile(cb) ---> [ event demultiplexer (libuv) ]
+                                           |  epoll / kqueue / IOCP
+                                           v
+                                     [ event queue ]
+                                           |
+                                           v
+        handler runs  <--------------- [ event loop ]  (one JS thread)
+`} caption="The reactor pattern: one thread waits for any I/O to be ready, then runs the matching handler to completion." />
+
+<Levels label="Chapter 1, The Node.js Platform">
+<Level name="Beginner">
+
+Node runs JavaScript on one thread, and hands slow work (disk, network, timers) to the operating system.
+When that work finishes, Node puts a callback on a queue and runs it when the thread is free. The
+smallest program that shows this:
+
+```js
+import { readFile } from 'node:fs';
+readFile(import.meta.filename, () => console.log('2: file read'));
+console.log('1: after readFile call');
+```
+
+Output, always in this order:
+
+```
+1: after readFile call
+2: file read
+```
+
+The common mistake is reading the code top to bottom and expecting `2` first. The fix is to think of
+`readFile` as "start reading, call me later".
+
+</Level>
+<Level name="Intermediate">
+
+Blocking versus non-blocking is the whole design. A blocking server needs one thread per connection;
+a non-blocking one waits on many sockets at once with an *event demultiplexer* (epoll on Linux, kqueue on
+macOS, IOCP on Windows), which libuv wraps. Node's philosophy follows from that: a small core, small
+modules, a small surface area, and pragmatism over purity.
+
+```js
+import { createServer } from 'node:http';
+let n = 0;
+createServer((req, res) => res.end(`hello ${++n}\n`)).listen(3000);
+```
+
+One thread serves thousands of idle keep-alive connections, because an idle connection costs a file
+descriptor, not a thread.
+
+</Level>
+<Level name="Advanced">
+
+The loop has phases: timers, pending callbacks, poll (I/O), check (`setImmediate`), close callbacks.
+Between every callback, Node drains `process.nextTick` callbacks and then the promise microtask queue.
+Filesystem work and DNS lookups (`dns.lookup`) do not go through epoll at all; they run on libuv's thread
+pool, four threads by default (`UV_THREADPOOL_SIZE`).
+
+```js
+setTimeout(() => console.log('timeout'), 0);
+setImmediate(() => console.log('immediate'));
+Promise.resolve().then(() => console.log('microtask'));
+process.nextTick(() => console.log('nextTick'));
+```
+
+Prints `nextTick`, `microtask`, then `timeout` and `immediate` in an order that can differ between runs
+when called from the main module, because the 1 ms timer may or may not have expired when the loop
+starts.
+
+</Level>
+<Level name="Edge cases">
+
+Zero I/O but heavy CPU is the boundary where the model fails: a 200 ms JSON parse or a regex with
+catastrophic backtracking stalls every request on the server, not just one.
+
+```js
+const t = Date.now();
+JSON.parse(JSON.stringify(Array.from({ length: 2e6 }, (_, i) => ({ i }))));
+console.log('blocked for', Date.now() - t, 'ms');   // e.g. "blocked for 900 ms"
+```
+
+During those milliseconds the HTTP server answers nobody. The fix is to move the work off the loop
+(a worker thread, a child process, or chunking it with `setImmediate`).
+
+</Level>
+<Level name="Corner cases">
+
+Thread pool plus many slow file reads: five concurrent `fs.readFile` calls on a slow network disk, and
+a sixth `dns.lookup` for an outgoing HTTP call, means the DNS lookup waits behind file I/O in a pool of
+four. Outbound requests look slow, and nothing in the network explains it. Raising
+`UV_THREADPOOL_SIZE` (set before the pool starts) or using `dns.resolve` (which uses the network, not the
+pool) fixes it.
+
+</Level>
+<Level name="Production level">
+
+In production I measure event loop delay, not just CPU. `perf_hooks.monitorEventLoopDelay()` gives a
+histogram; a p99 above a few tens of milliseconds means some handler is hogging the thread.
+
+```js
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+const h = monitorEventLoopDelay({ resolution: 20 }); h.enable();
+setInterval(() => console.log('p99 ms', (h.percentile(99) / 1e6).toFixed(1)), 5000);
+```
+
+I also pin the Node version, run TypeScript through a build step or Node's type stripping on purpose,
+and install `@types/node` matching the runtime version.
+
+</Level>
+<Level name="Mindset">
+
+Node teaches me to ask "what is this thread doing right now?" before "is this code correct?". Every
+line either finishes fast or yields. Code that is correct but holds the thread is a production bug.
+
+</Level>
+<Level name="System design">
+
+In a larger system, Node is the I/O-bound edge: API gateways, BFFs, webhooks, streaming proxies. CPU-bound
+work (image resizing, embeddings, big reports) goes to workers or to another service behind a queue. The
+decision sits in the architecture diagram as "which boxes may block and which may not".
+
+</Level>
+<Level name="Strategy">
+
+I build three toy servers: one that blocks with a busy loop, one that offloads to `worker_threads`, and
+one that chunks with `setImmediate`, and load each with `autocannon`. Done when I can predict the order
+of the four-line timers example above and explain the p99 latency difference between the three servers.
+
+</Level>
+</Levels>
+
+### 2. The Module System
+
+**Covers:** Why modules exist, ES modules and CommonJS, how resolution and loading work, live bindings, circular dependencies, monkey patching, interoperability, and modules in TypeScript.
+
+<Flow steps={["specifier", "resolve to a file URL", "parse (find imports)", "instantiate (link bindings)", "evaluate (run once)", "cached"]} caption="How an ES module is loaded: the whole graph is resolved and linked before any module body runs." />
+
+<Levels label="Chapter 2, The Module System">
+<Level name="Beginner">
+
+A module is a file with its own scope that chooses what to export. ES modules use `import` and
+`export`; Node treats `.mjs` files, or `.js` files under `"type": "module"` in `package.json`, as ESM.
+
+```js
+// math.js
+export const add = (a, b) => a + b;
+// main.js
+import { add } from './math.js';
+console.log(add(2, 3)); // 5
+```
+
+Common mistake: `import { add } from './math'` without the extension. In ESM Node does not guess
+extensions, so this fails with `ERR_MODULE_NOT_FOUND`. Write `./math.js`.
+
+</Level>
+<Level name="Intermediate">
+
+Named exports, default exports, and dynamic `import()` combine in real code. Dynamic import returns a
+promise and lets me load a module only when needed, for example a heavy PDF library on one route.
+
+```js
+app.get('/report.pdf', async (req, res) => {
+  const { renderPdf } = await import('./pdf.js'); // loaded on first request only
+  res.type('pdf').send(await renderPdf(req.query));
+});
+```
+
+Before ESM, the *revealing module pattern* (an IIFE returning an object) and CommonJS
+(`require`/`module.exports`) did the same job. CommonJS is synchronous and evaluates as it goes.
+
+</Level>
+<Level name="Advanced">
+
+ESM loads in three phases: construction (find and parse every file), instantiation (link exported names
+to memory slots), evaluation (run each body once, dependencies first). Imports are *read-only live
+bindings*: the importer sees the exporter's current value, but cannot assign to it.
+
+```js
+// counter.js
+export let count = 0;
+export const inc = () => { count++; };
+// main.js
+import { count, inc } from './counter.js';
+inc(); console.log(count); // 1, live
+count = 5;                 // TypeError: Assignment to constant variable.
+```
+
+In CommonJS, `const { count } = require('./counter')` copies the value at that moment, so it stays 0.
+
+</Level>
+<Level name="Edge cases">
+
+Circular dependencies: `a.js` imports `b.js` which imports `a.js`. In ESM, `b` runs first and sees `a`'s
+bindings in the temporal dead zone, so touching a `let` or `const` export throws
+`ReferenceError: Cannot access 'x' before initialization`. In CommonJS the same cycle silently hands `b`
+a half-filled `exports` object, so a value is `undefined` instead of an error.
+
+</Level>
+<Level name="Corner cases">
+
+Interop meets a cycle: an ESM file imports a CommonJS package, which only exposes `module.exports` as the
+default export, and named imports work only when Node's static analysis can detect them. Add a cycle
+and a conditional `module.exports = ...` assignment, and `import { x } from 'pkg'` fails with
+`SyntaxError: Named export 'x' not found` while `import pkg from 'pkg'; pkg.x` works. The fix is the
+default import, or the package shipping proper `exports` conditions.
+
+</Level>
+<Level name="Production level">
+
+Modules are singletons per resolved path, which is a production hazard: two copies of the same library
+in `node_modules` (different versions) give two "singletons", and `instanceof` checks fail across them.
+Monkey patching a module (changing another module's exports at load time) works in CommonJS and breaks
+in ESM, where namespace objects are frozen; it also defeats TypeScript's types. In production I keep
+`"type": "module"`, an `exports` map in each package, and no patching outside tests.
+
+</Level>
+<Level name="Mindset">
+
+A module boundary is a promise about what is public. The habit: export the smallest surface that lets
+the caller do the job, and treat everything else as free to change.
+
+</Level>
+<Level name="System design">
+
+At system scale, module boundaries become package boundaries and then service boundaries. A clean
+dependency graph inside one repo (no cycles, a clear direction from routes to services to data) is the
+cheapest rehearsal for splitting a service later.
+
+</Level>
+<Level name="Strategy">
+
+I write the same two-file cycle in ESM and CommonJS, record both behaviours, then run `madge --circular`
+on my phase 3 API. Done when the API has no cycles and I can explain live bindings with the counter
+example from memory.
+
+</Level>
+</Levels>
+
+## Asynchrony
+
+
+### 3. Callbacks and Events
+
+**Covers:** Continuation-passing style, synchronous versus asynchronous callbacks and the Zalgo problem, Node's callback conventions, and the Observer pattern through EventEmitter, including its memory-leak risk.
+
+<Compare left="Callback" right="EventEmitter" rows={[["One result, then done", "Many events over time"], ["One listener, the caller", "Any number of listeners"], ["Error is the first argument", "Error is an 'error' event"], ["Order is fixed by the call", "Listeners run in registration order"]]} caption="Two ways to hear about results. A callback answers once; an emitter can speak many times to many listeners." />
+
+<Levels label="Chapter 3, Callbacks and Events">
+<Level name="Beginner">
+
+A callback is a function passed in to be called with the result. Node's convention: the callback is the
+last argument and the error comes first.
+
+```js
+import { readFile } from 'node:fs';
+readFile('missing.txt', 'utf8', (err, data) => {
+  if (err) return console.error(err.code); // ENOENT
+  console.log(data);
+});
+```
+
+Common mistake: forgetting `return` after handling the error, so the code continues with `data`
+undefined. Always `return` from the error branch.
+
+</Level>
+<Level name="Intermediate">
+
+The Observer pattern in Node is `EventEmitter`: `on`, `once`, `emit`, `removeListener`. A class that
+extends it becomes observable.
+
+```js
+import { EventEmitter } from 'node:events';
+class Watcher extends EventEmitter {
+  check(file) { this.emit('checked', file); if (file.endsWith('.tmp')) this.emit('match', file); }
+}
+const w = new Watcher();
+w.on('match', (f) => console.log('found', f));
+w.check('a.tmp'); // found a.tmp
+```
+
+Combining both is common: a function takes a callback for the final result and returns an emitter for
+progress.
+
+</Level>
+<Level name="Advanced">
+
+A function must be always synchronous or always asynchronous. A function that calls back synchronously
+from a cache and asynchronously otherwise "unleashes Zalgo": listeners registered after the call miss
+the synchronous event.
+
+```js
+const cache = new Map();
+function read(file, cb) {
+  if (cache.has(file)) return process.nextTick(() => cb(cache.get(file))); // defer: stay async
+  readFile(file, 'utf8', (e, d) => { cache.set(file, d); cb(d); });
+}
+```
+
+`process.nextTick` defers before any I/O; `setImmediate` defers after it. Both make the cached path
+asynchronous, which is the fix.
+
+</Level>
+<Level name="Edge cases">
+
+An `'error'` event with no listener throws: `Error [ERR_UNHANDLED_ERROR]: Unhandled error.` and crashes the
+process. An emitter that never emits errors is fine without a listener; one that might must have one.
+And a thrown exception inside an async callback cannot be caught by a `try` around the original call; it
+becomes an `uncaughtException`.
+
+</Level>
+<Level name="Corner cases">
+
+Many listeners plus a long-lived emitter: adding a listener per request to a shared emitter without
+removing it prints `MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 listeners
+added`. Raising the limit hides the leak. The fix is `once`, or removing the listener in a `finally`, or
+`events.once(emitter, 'name', { signal })` with an `AbortSignal`.
+
+</Level>
+<Level name="Production level">
+
+In production every emitter that can fail has an `'error'` handler, every per-request listener is
+removed, and `process.on('uncaughtException')` is used only to log and exit, never to continue, because
+state after an unknown throw is unknown. I watch heap growth over hours, which is how listener leaks
+show up.
+
+</Level>
+<Level name="Mindset">
+
+The habit: decide the contract first. Called once or many times? Synchronously or never? Who owns
+cleanup? Most event bugs are contract bugs.
+
+</Level>
+<Level name="System design">
+
+The Observer pattern scales up into pub/sub between services (chapter 13). The same questions apply at
+that size: delivery once or many times, ordering, and who unsubscribes.
+
+</Level>
+<Level name="Strategy">
+
+I write a `read` function with the Zalgo bug, show a missed event in a test, fix it with `nextTick`, and
+write a leak test that adds 10,000 listeners in a loop. Done when both tests pass and I can say when to
+pick a callback, a promise or an emitter.
+
+</Level>
+</Levels>
+
+### 4. Asynchronous Control Flow Patterns with Callbacks
+
+**Covers:** Callback hell and the discipline that avoids it, and the core control flows: sequential execution and iteration, unlimited concurrency, race conditions, and limited concurrency with a queue, built around a web spider.
+
+<Flow steps={["queue of tasks", "start up to N", "one finishes", "start next", "queue empty and running = 0", "done"]} caption="Limited concurrency: at most N tasks run at once; each completion pulls the next task off the queue." />
+
+<Levels label="Chapter 4, Asynchronous Control Flow Patterns with Callbacks">
+<Level name="Beginner">
+
+Callback hell is code that drifts right as each step nests in the previous one's callback. The
+discipline that fixes it: return early on errors, name the functions instead of nesting anonymous ones,
+and split into small steps.
+
+```js
+function spider(url, cb) {
+  download(url, (err, body) => {
+    if (err) return cb(err);
+    saveFile(url, body, cb);   // named step, no extra nesting
+  });
+}
+```
+
+</Level>
+<Level name="Intermediate">
+
+Sequential iteration over a list is a recursive `iterate(index)` function: process item `index`, and in
+its callback call `iterate(index + 1)`. Unlimited concurrency is starting all tasks in a loop and
+counting completions until the count equals the total.
+
+```js
+function all(tasks, cb) {
+  let done = 0, failed = false;
+  if (tasks.length === 0) return process.nextTick(cb);
+  for (const t of tasks) t((err) => {
+    if (failed) return;
+    if (err) { failed = true; return cb(err); }
+    if (++done === tasks.length) cb();
+  });
+}
+```
+
+</Level>
+<Level name="Advanced">
+
+Limited concurrency keeps a `running` counter and a queue. A `next()` function starts tasks while
+`running < concurrency` and the queue is not empty; each completion decrements `running` and calls
+`next()` again. Making the queue global (one `TaskQueue` shared by the whole crawl) limits the total, not
+just the concurrency per level of recursion.
+
+```js
+class TaskQueue {
+  constructor(c) { this.c = c; this.running = 0; this.q = []; }
+  push(task) { this.q.push(task); process.nextTick(() => this.next()); }
+  next() {
+    while (this.running < this.c && this.q.length) {
+      const t = this.q.shift(); this.running++;
+      t(() => { this.running--; this.next(); });
+    }
+  }
+}
+```
+
+</Level>
+<Level name="Edge cases">
+
+An empty task list: the counting version never reaches `done === tasks.length` unless I check for zero
+up front, so the callback never fires and the caller hangs forever. That is why the `all` above handles
+length zero first.
+
+</Level>
+<Level name="Corner cases">
+
+Concurrency plus shared state: two concurrent spider tasks both check "have I downloaded this URL?",
+both see no, and both download it. The race is between the check and the write. The fix is to mark the
+URL as in progress synchronously, before starting the async work, with a `Set`.
+
+</Level>
+<Level name="Production level">
+
+Unbounded concurrency is how a crawler or a batch job takes down a dependency or runs out of file
+descriptors (`EMFILE: too many open files`). In production every fan-out has a limit, and the limit is
+configuration, not a constant.
+
+</Level>
+<Level name="Mindset">
+
+Concurrency is a resource I spend, not a speed-up I get for free. The habit is to ask "how many at once,
+and who else feels it?".
+
+</Level>
+<Level name="System design">
+
+The same pattern appears as a connection pool, a worker pool, and a rate limiter. At the system level,
+limited concurrency is how one service protects another (back pressure, chapter 6, and load shedding).
+
+</Level>
+<Level name="Strategy">
+
+I build the spider three times (sequential, unlimited, limited to 2) against a local server that logs
+concurrent requests. Done when the log shows at most 2 in flight and an empty list and a failing task
+both finish correctly.
+
+</Level>
+</Levels>
+
+### 5. Asynchronous Control Flow Patterns with Promises and Async/Await
+
+**Covers:** Promises and thenables, promisification, sequential, concurrent and limited-concurrency execution with promises, async/await error handling, the return versus return await trap, the forEach antipattern, and unbounded promise chains.
+
+<Figure art={`
+             resolve(value)
+   pending  ----------------->  fulfilled (value)
+      |
+      +-------------------->  rejected (reason)
+             reject(error) / throw
+`} caption="A promise settles once. Every then/await on it gets the same outcome, no matter when it attaches." />
+
+<Levels label="Chapter 5, Asynchronous Control Flow Patterns with Promises and Async/Await">
+<Level name="Beginner">
+
+A promise is an object for a value that is not ready yet. `await` pauses the async function until it
+settles.
+
+```js
+import { readFile } from 'node:fs/promises';
+async function size(file) {
+  const text = await readFile(file, 'utf8');
+  return text.length;
+}
+size('package.json').then(console.log);
+```
+
+Promisification turns a callback API into a promise API: `util.promisify(fn)`, or wrapping in
+`new Promise((resolve, reject) => fn(..., (err, v) => err ? reject(err) : resolve(v)))`.
+
+</Level>
+<Level name="Intermediate">
+
+Sequential: `for (const x of items) await work(x)`. Concurrent: `await Promise.all(items.map(work))`.
+Limited: a promise-based `TaskQueue` whose `runTask(fn)` returns a promise that settles when that task
+does.
+
+```js
+// Antipattern: forEach does not wait
+items.forEach(async (x) => { await work(x); });
+console.log('done'); // runs before any work finishes
+```
+
+The fix is `for...of` with `await`, or `Promise.all` if order does not matter.
+
+</Level>
+<Level name="Advanced">
+
+`then` callbacks always run asynchronously as microtasks, even on an already-resolved promise, which
+removes Zalgo by design. Any object with a `then` method (a *thenable*) is adopted by `await`.
+`Promise.all` rejects on the first failure but does not cancel the others; `Promise.allSettled` waits for
+all; `Promise.race` and `Promise.any` settle on the first.
+
+The `return` versus `return await` trap:
+
+```js
+async function f() {
+  try { return mayReject(); }        // rejection escapes the catch
+  catch (e) { return 'handled'; }
+}
+async function g() {
+  try { return await mayReject(); }  // rejection is caught here
+  catch (e) { return 'handled'; }
+}
+```
+
+</Level>
+<Level name="Edge cases">
+
+An empty array: `Promise.all([])` resolves immediately with `[]`, `Promise.race([])` never settles, and
+`Promise.any([])` rejects with an `AggregateError`. Code that races a timeout against an empty list hangs.
+
+</Level>
+<Level name="Corner cases">
+
+Infinite recursion with promises plus a long-running loop: a function that `return`s a call to itself
+inside `.then` builds a chain that never resolves, and each step keeps the previous promise alive, so
+memory grows until the process dies. The fix is a plain `while` loop with `await`, which does not
+chain.
+
+```js
+async function poll() { while (running) { await tick(); await sleep(1000); } }
+```
+
+</Level>
+<Level name="Production level">
+
+In production, unhandled rejections crash Node by default (`--unhandled-rejections=throw` is the
+default since Node 15). Every promise is either awaited, returned, or given a `.catch`. Fire-and-forget
+work gets an explicit catch that logs. Lazy promises (created only when awaited) keep expensive work from
+starting early.
+
+</Level>
+<Level name="Mindset">
+
+Async/await makes asynchronous code look sequential. The habit is to keep seeing the concurrency anyway:
+every `await` is a point where other code runs and state can change.
+
+</Level>
+<Level name="System design">
+
+`Promise.all` over 10,000 items is a fan-out with no limit; at system scale it is a self-inflicted load
+spike on a database. The limited-concurrency queue from this chapter is what sits between my API and
+every downstream service.
+
+</Level>
+<Level name="Strategy">
+
+I rewrite the chapter 4 spider with promises, then async/await, and add tests for the empty list, a
+rejection mid-batch, and the `return` versus `return await` trap. Done when the tests pass and
+`node --trace-warnings` shows no unhandled rejection.
+
+</Level>
+</Levels>
+
+### 6. Coding with Streams
+
+**Covers:** Why streams matter (space, time and composition), the four stream types, piping and pipeline, back pressure, async iteration, and the patterns for piping: combining, forking, merging, multiplexing.
+
+<Flow steps={["fs.createReadStream", "gunzip", "parse CSV", "transform rows", "write to DB", "done"]} caption="A pipeline: each stage handles one chunk at a time, so a 10 GB file never has to fit in memory." />
+
+<Levels label="Chapter 6, Coding with Streams">
+<Level name="Beginner">
+
+A stream handles data in chunks instead of all at once. The smallest useful one copies a file without
+loading it into memory:
+
+```js
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+await pipeline(createReadStream('big.log'), createWriteStream('copy.log'));
+```
+
+`readFile` on a 4 GB file fails with `RangeError [ERR_FS_FILE_TOO_LARGE]` or exhausts memory; the stream
+version uses a few kilobytes.
+
+</Level>
+<Level name="Intermediate">
+
+There are four types: Readable, Writable, Duplex (both, independent) and Transform (output computed from
+input). A Transform in a pipeline:
+
+```js
+import { Transform } from 'node:stream';
+const upper = new Transform({
+  transform(chunk, _enc, cb) { cb(null, chunk.toString().toUpperCase()); },
+});
+await pipeline(process.stdin, upper, process.stdout);
+```
+
+Readables can be consumed with `for await (const chunk of stream)`, which is often the clearest form.
+
+</Level>
+<Level name="Advanced">
+
+Back pressure: `writable.write()` returns `false` when its internal buffer passes `highWaterMark`
+(16 KiB by default for byte streams, 16 objects in object mode). A correct producer stops and waits for
+`'drain'`. `pipe` and `pipeline` do this for me; a hand-written loop must do it itself.
+
+```js
+for (const line of lines) {
+  if (!out.write(line + '\n')) await once(out, 'drain');
+}
+```
+
+Object mode lets chunks be any JavaScript value, which is how row-by-row processing works.
+
+</Level>
+<Level name="Edge cases">
+
+A chunk boundary in the middle of a multi-byte character or a line: splitting a UTF-8 buffer on
+`chunk.toString()` can cut an emoji in half and print `�`. The fix is `setEncoding('utf8')` (which uses a
+string decoder) and a line splitter that keeps the partial last line for the next chunk.
+
+</Level>
+<Level name="Corner cases">
+
+An error in one stage plus `.pipe()` chains: `a.pipe(b).pipe(c)` does not forward errors or destroy the
+other streams, so a failing middle stage leaves file descriptors open and the process hangs. `pipeline`
+destroys every stream and rejects once. Always use `pipeline`.
+
+</Level>
+<Level name="Production level">
+
+Production streaming is about memory staying flat under load. I watch RSS while uploading a large file,
+set `highWaterMark` deliberately, and stream HTTP responses (CSV exports, LLM tokens) instead of
+building strings. Forking a stream to two destinations means the slowest one sets the pace for both.
+
+</Level>
+<Level name="Mindset">
+
+Streams teach me to think in rates, not sizes. The question is not "how big is the data" but "how fast
+does each stage consume it, and what happens when one is slower".
+
+</Level>
+<Level name="System design">
+
+Back pressure is the same idea as a queue with a limit between services. Streaming responses, Kafka
+consumers and TCP flow control are all this chapter at different scales.
+
+</Level>
+<Level name="Strategy">
+
+I build a CSV importer that reads a 2 GB generated file, parses, validates and batch-inserts rows, and
+I chart RSS during the run. Done when memory stays under 100 MB for any file size and a bad row stops
+the pipeline cleanly.
+
+</Level>
+</Levels>
+
+## Design patterns
+
+
+### 7. Creational Design Patterns
+
+**Covers:** How objects get made in JavaScript: Factory, Builder, Revealing Constructor, Singleton, and wiring modules together with dependency injection.
+
+<Compare left="Hard-wired" right="Injected" rows={[["module imports db directly", "module receives db as an argument"], ["tests must mock the import", "tests pass a fake"], ["one database for everyone", "each caller chooses"], ["hidden coupling", "coupling visible in the signature"]]} caption="Dependency injection moves the choice of collaborator from inside the module to whoever creates it." />
+
+<Levels label="Chapter 7, Creational Design Patterns">
+<Level name="Beginner">
+
+A factory is a function that creates objects, hiding which class or shape it returns.
+
+```js
+function createImage(name) {
+  if (name.endsWith('.png')) return new PngImage(name);
+  if (name.endsWith('.jpg')) return new JpegImage(name);
+  throw new Error(`Unsupported format: ${name}`);
+}
+```
+
+Closures give factories private state that no caller can reach, which classes only got later with
+`#private` fields.
+
+</Level>
+<Level name="Intermediate">
+
+A Builder assembles a complex object step by step with readable, chained calls, useful when a
+constructor would take ten positional arguments.
+
+```js
+const req = new UrlBuilder().protocol('https').host('api.example.com').path('/v1/users').build();
+```
+
+The Revealing Constructor exposes some powers only at creation time; the `Promise` constructor is the
+classic case: `resolve` and `reject` are handed to the executor and nobody else.
+
+</Level>
+<Level name="Advanced">
+
+A Singleton in Node is just a module that exports an instance, because modules are cached by resolved
+path. Dependency injection makes the wiring explicit:
+
+```ts
+export function createUserService(deps: { db: Db; clock: () => Date }) {
+  return { async create(name: string) { return deps.db.insert({ name, at: deps.clock() }); } };
+}
+```
+
+The composition root (one place, usually `main.ts`) creates every dependency and passes it down.
+
+</Level>
+<Level name="Edge cases">
+
+The Singleton boundary: two installed versions of the same package give two "singletons", so a
+connection pool is created twice and a cache is split. `npm ls <pkg>` shows the duplicate.
+
+</Level>
+<Level name="Corner cases">
+
+A builder plus a missing required field: `build()` with no host creates a half-valid object that fails
+much later. The builder must validate in `build()` and throw with a clear message, so the failure stays
+at the place the mistake was made.
+
+</Level>
+<Level name="Production level">
+
+In production, DI is how I swap a real payment client for a fake in tests, and how I give each tenant
+its own config without globals. Singletons hold connection pools and must be closed on shutdown, or the
+process will not exit.
+
+</Level>
+<Level name="Mindset">
+
+Creation is a decision point. The habit: push decisions about *which* object to the edge, keep the core
+code working with *whatever* object it is given.
+
+</Level>
+<Level name="System design">
+
+At system scale the composition root becomes configuration and service discovery: which database, which
+queue, which model provider. The same pattern makes an AI feature able to swap providers.
+
+</Level>
+<Level name="Strategy">
+
+I refactor my phase 3 API so that no module imports the database directly, and every test builds its
+own service with fakes. Done when the test suite runs without a database.
+
+</Level>
+</Levels>
+
+### 8. Structural Design Patterns
+
+**Covers:** Proxy, Decorator and Adapter in JavaScript, including the ES2015 Proxy object, change observers, and LevelDB-style plugins.
+
+<Layers layers={[{"name": "Client code", "note": "calls one interface"}, {"name": "Proxy or Decorator", "note": "same interface, adds control or behaviour"}, {"name": "Adapter", "note": "converts one interface into another"}, {"name": "Real subject", "note": "does the work"}]} caption="Structural patterns wrap an object. A proxy controls access, a decorator adds behaviour, an adapter changes the interface." />
+
+<Levels label="Chapter 8, Structural Design Patterns">
+<Level name="Beginner">
+
+A proxy stands in front of an object with the same interface and controls access to it, for example
+caching or logging.
+
+```js
+const logged = new Proxy(api, {
+  get(target, prop) {
+    const v = target[prop];
+    return typeof v === 'function' ? (...a) => { console.log('call', prop); return v.apply(target, a); } : v;
+  },
+});
+```
+
+</Level>
+<Level name="Intermediate">
+
+A decorator adds behaviour to one object without changing its class. An adapter makes an object with
+one interface usable where another is expected, for example making a key-value store look like `fs`.
+
+```js
+function withRetry(client, tries = 3) {
+  return { ...client, async get(url) {
+    for (let i = 1; ; i++) { try { return await client.get(url); } catch (e) { if (i >= tries) throw e; } }
+  } };
+}
+```
+
+</Level>
+<Level name="Advanced">
+
+The built-in `Proxy` object intercepts operations with traps (`get`, `set`, `has`, `deleteProperty`,
+`apply`). A *change observer* uses a `set` trap to call a function whenever a property changes, which is
+how reactive libraries work.
+
+```js
+function observe(target, onChange) {
+  return new Proxy(target, { set(t, k, v) { const old = t[k]; t[k] = v; onChange(k, old, v); return true; } });
+}
+const s = observe({ total: 0 }, (k, a, b) => console.log(k, a, '->', b));
+s.total = 5; // total 0 -> 5
+```
+
+</Level>
+<Level name="Edge cases">
+
+A `set` trap that forgets `return true` throws in strict mode (all ESM is strict): `TypeError: 'set' on
+proxy: trap returned falsish for property 'total'`. And `Proxy` cannot wrap private class fields: a
+method that reads `this.#x` through the proxy fails with `TypeError: Cannot read private member`.
+
+</Level>
+<Level name="Corner cases">
+
+Decorator plus object spread: `{ ...client }` copies only own enumerable properties, so methods on a
+class prototype are lost and the decorated object has only `get`. The fix is delegating explicitly or
+wrapping with a `Proxy` instead of spreading.
+
+</Level>
+<Level name="Production level">
+
+In production, proxies add a cost on every property access and make stack traces deeper. I use them at
+boundaries (an SDK wrapper, a cache in front of an API) and not in hot inner loops. Adapters are where
+third-party SDKs stop: my code depends on my interface, not on the vendor's.
+
+</Level>
+<Level name="Mindset">
+
+Wrapping keeps a change local. The habit: when I want new behaviour, first ask whether I can wrap the
+thing instead of editing it.
+
+</Level>
+<Level name="System design">
+
+At system scale these are API gateways (proxies), middleware (decorators), and anti-corruption layers
+(adapters). A model-provider adapter is what lets an AI product switch providers without touching
+product code.
+
+</Level>
+<Level name="Strategy">
+
+I wrap my API's HTTP client with a logging proxy, a retry decorator and a provider adapter, each with a
+test. Done when swapping the underlying client changes one file.
+
+</Level>
+</Levels>
+
+### 9. Behavioral Design Patterns
+
+**Covers:** Strategy, State, Template, Iterator (including generators and async iterators), Middleware and Command, applied the Node way.
+
+<Figure art={`
+     connect()            send() ok            close()
+  [offline] -------> [connecting] -------> [online] -------> [closed]
+      ^                   |                    |
+      |   error/timeout   |      socket error  |
+      +-------------------+--------------------+
+   offline queues messages; online sends them; closed rejects them
+`} caption="The State pattern for a socket client: behaviour depends on which state object is current." />
+
+<Levels label="Chapter 9, Behavioral Design Patterns">
+<Level name="Beginner">
+
+Strategy: pass the varying part in as an object or function. A config loader that accepts a
+`{ parse, serialize }` pair works with JSON, YAML or INI without changing.
+
+```js
+const json = { parse: JSON.parse, serialize: (o) => JSON.stringify(o, null, 2) };
+class Config { constructor(strategy) { this.s = strategy; } load(text) { this.data = this.s.parse(text); } }
+```
+
+</Level>
+<Level name="Intermediate">
+
+State: the object delegates to a current state object, and switching state switches behaviour. Template:
+a base class defines the algorithm's skeleton and subclasses fill in steps. Middleware: a chain of
+functions, each able to act and then call `next`.
+
+```js
+const compose = (fns) => (ctx) => fns.reduceRight((next, fn) => () => fn(ctx, next), () => {})();
+compose([(c, n) => { c.log = ['a']; n(); }, (c, n) => { c.log.push('b'); n(); }])(ctx);
+```
+
+</Level>
+<Level name="Advanced">
+
+The Iterator protocol: any object with `[Symbol.iterator]()` returning `{ next() }` works with `for...of`.
+Generators produce iterators with `yield`, and async generators produce async iterators for
+`for await`. Command: wrap an action as an object (with `run` and `undo`) so it can be queued,
+logged, retried or sent over the network.
+
+```js
+async function* pages(fetchPage) {
+  for (let token = undefined; ; ) {
+    const { items, next } = await fetchPage(token);
+    yield* items; if (!next) return; token = next;
+  }
+}
+for await (const user of pages(api.listUsers)) console.log(user.id);
+```
+
+</Level>
+<Level name="Edge cases">
+
+An iterator consumed twice: a generator object is single-use, so a second `for...of` over it yields
+nothing, silently. If a value must be iterated twice, export a function that creates a fresh generator.
+
+</Level>
+<Level name="Corner cases">
+
+An async iterator plus an early `break`: breaking out of `for await` calls `return()` on the iterator,
+which runs the generator's `finally`. If cleanup (closing a DB cursor) is not in a `finally`, it never
+runs and the cursor leaks.
+
+</Level>
+<Level name="Production level">
+
+Middleware is the backbone of every Node web framework, and order is behaviour: auth before rate
+limiting means anonymous floods are cheap to reject; the reverse means they cost a lookup each. Commands
+become jobs in a queue, which need idempotency because they will be retried.
+
+</Level>
+<Level name="Mindset">
+
+These patterns are about naming what varies. The habit: find the part of the code that changes most
+often and give it its own object.
+
+</Level>
+<Level name="System design">
+
+State machines model order flows, payments and agent loops. Commands become messages between services.
+The same vocabulary scales from a class to a distributed workflow.
+
+</Level>
+<Level name="Strategy">
+
+I model my API's job lifecycle (queued, running, succeeded, failed, retrying) as an explicit State
+pattern, and write the paginated client as an async generator. Done when an invalid transition throws
+in a test and a `break` releases the cursor.
+
+</Level>
+</Levels>
+
+## Quality and recipes
+
+
+### 10. Testing: Patterns and Best Practices
+
+**Covers:** Testing in Node with the built-in test runner: unit, integration and end-to-end tests, test doubles, testing asynchronous code, and the patterns that keep a suite fast and trustworthy.
+
+<Layers layers={[{"name": "End-to-end", "note": "few, slow, through the real HTTP API"}, {"name": "Integration", "note": "real database or queue in a container"}, {"name": "Unit", "note": "many, fast, pure logic with fakes at the edges"}]} caption="The usual shape of a suite. The exact proportions are a judgement, not a rule." />
+
+<Levels label="Chapter 10, Testing: Patterns and Best Practices">
+<Level name="Beginner">
+
+Node ships a test runner. A test file and `node --test` are enough:
+
+```js
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { slugify } from './slugify.js';
+test('slugify lowercases and dashes', () => {
+  assert.equal(slugify('Hello World'), 'hello-world');
+});
+```
+
+Output includes `# pass 1` and `# fail 0`. A failing assertion prints the expected and actual values side
+by side.
+
+</Level>
+<Level name="Intermediate">
+
+Asynchronous tests return a promise or use `async`; the runner waits. Test doubles replace a dependency:
+a stub returns canned values, a spy records calls, a mock does both and checks expectations. `node:test`
+has `mock.fn()` and `mock.method()`.
+
+```js
+import { mock, test } from 'node:test';
+test('sends a welcome email', async () => {
+  const send = mock.fn(async () => {});
+  await createUser({ send }, 'a@b.c');
+  assert.equal(send.mock.callCount(), 1);
+});
+```
+
+</Level>
+<Level name="Advanced">
+
+Integration tests use real infrastructure: a database in a container, migrations applied, each test in a
+transaction that rolls back, or a fresh schema per worker. End-to-end tests start the server on a random
+port and call it over HTTP. Mock timers (`mock.timers.enable()`) make time-based code deterministic.
+
+</Level>
+<Level name="Edge cases">
+
+A test that passes because the assertion never ran: an async callback assertion with no `await`, so the
+test ends first. `assert.rejects(promise)` must itself be awaited, or a rejection is reported against a
+later test or not at all.
+
+</Level>
+<Level name="Corner cases">
+
+Parallel test files plus a shared database: two files truncate the same table at the same time and fail
+one run in ten. The fix is isolation per worker (separate schemas or databases), never `--test-concurrency=1`
+as the permanent answer.
+
+</Level>
+<Level name="Production level">
+
+A production suite is fast enough to run on every push, deterministic (no real clock, network or random
+seed without control), and fails with a message that names the behaviour. Flaky tests are bugs; I
+quarantine and fix them rather than adding retries.
+
+</Level>
+<Level name="Mindset">
+
+A test is a specification that runs. The habit: test behaviour through public interfaces, so
+refactoring the inside does not break the tests.
+
+</Level>
+<Level name="System design">
+
+Contract tests between services, smoke tests after deploy, and eval suites for AI features are all
+this chapter at larger scale: a check that runs automatically and blocks a bad change.
+
+</Level>
+<Level name="Strategy">
+
+I write unit tests for my API's services with fakes, integration tests against Postgres in a
+container, and three end-to-end journeys. Done when CI runs all three layers in under five minutes and
+a deliberately broken query fails exactly one integration test.
+
+</Level>
+</Levels>
+
+### 11. Advanced Recipes
+
+**Covers:** Practical recipes: components that initialise asynchronously, batching and caching asynchronous requests, cancelling asynchronous operations, and running CPU-bound tasks without blocking the event loop.
+
+<Flow steps={["request A for key k", "no cached promise: start fetch", "request B for k: reuse same promise", "fetch resolves", "both get result", "promise dropped or cached with TTL"]} caption="Request batching: concurrent callers for the same key share one in-flight promise instead of each hitting the backend." />
+
+<Levels label="Chapter 11, Advanced Recipes">
+<Level name="Beginner">
+
+An asynchronously initialised component (a DB client that must connect first) needs callers to wait
+until it is ready. The simplest fix is a ready promise:
+
+```js
+class Db { constructor() { this.ready = this.connect(); } async query(sql) { await this.ready; /* ... */ } }
+```
+
+</Level>
+<Level name="Intermediate">
+
+Batching: if 50 requests ask for the same report at once, run it once and share the promise. Caching
+keeps the result for a while after.
+
+```js
+const inFlight = new Map();
+function getReport(id) {
+  if (!inFlight.has(id)) inFlight.set(id, build(id).finally(() => inFlight.delete(id)));
+  return inFlight.get(id);
+}
+```
+
+Cancellation uses `AbortController`: pass `signal` into `fetch`, timers and your own loops, and check
+`signal.aborted` between steps.
+
+</Level>
+<Level name="Advanced">
+
+CPU-bound work has three escapes: interleave with `setImmediate` (chunk the work so the loop breathes),
+a child process (separate memory, IPC over messages), or `worker_threads` (separate isolate, can share
+memory with `SharedArrayBuffer`). A pool of workers reuses them instead of paying startup cost per task.
+
+```js
+import { Worker } from 'node:worker_threads';
+const run = (data) => new Promise((res, rej) => {
+  const w = new Worker(new URL('./hash.js', import.meta.url), { workerData: data });
+  w.once('message', res); w.once('error', rej);
+});
+```
+
+</Level>
+<Level name="Edge cases">
+
+A batched promise that rejects: if I cache the promise without the `finally` cleanup, every later caller
+gets the same old error forever. Failed promises must be evicted immediately.
+
+</Level>
+<Level name="Corner cases">
+
+Cancellation plus batching: caller A aborts, but caller B is sharing the same in-flight promise. Aborting
+the underlying work hurts B. The shared operation needs reference counting, and only aborts when every
+caller has gone.
+
+</Level>
+<Level name="Production level">
+
+In production, request coalescing protects databases from cache-stampede spikes. Every outbound call
+gets a timeout via `AbortSignal.timeout(ms)`. Worker pools have a fixed size tied to CPU count, and a
+queue with a limit in front of them.
+
+</Level>
+<Level name="Mindset">
+
+Most performance work in Node is about not doing the same thing twice and not doing slow things on the
+main thread. The habit is to look for duplicate work before optimising the work itself.
+
+</Level>
+<Level name="System design">
+
+These recipes are the in-process versions of system pieces: coalescing is a CDN's request collapsing,
+cancellation is deadline propagation across services, worker pools are a compute tier.
+
+</Level>
+<Level name="Strategy">
+
+I add coalescing and a 30-second cache to my API's most expensive endpoint and move one CPU-heavy task to
+a worker pool. Done when a 100-concurrent load test shows one backend call per key and event loop p99
+stays under 20 ms.
+
+</Level>
+</Levels>
+
+## Distribution
+
+
+### 12. Scalability and Architectural Patterns
+
+**Covers:** The three dimensions of scaling, cloning with the cluster module and resilience, stateful communication, load balancers and reverse proxies, service discovery, and decomposing a monolith into services with integration patterns.
+
+<Figure art={`
+           Y: split by function (services)
+           ^
+           |
+           |        Z: split by data (shards, tenants)
+           |       /
+           |      /
+           +-----------> X: clone (N identical copies behind a load balancer)
+`} caption="The scale cube: three independent ways to scale an application." />
+
+<Levels label="Chapter 12, Scalability and Architectural Patterns">
+<Level name="Beginner">
+
+The easiest way to scale a Node app is to run more copies of it. The `cluster` module forks one worker
+per CPU core and shares the listening port.
+
+```js
+import cluster from 'node:cluster';
+import { availableParallelism } from 'node:os';
+if (cluster.isPrimary) for (let i = 0; i < availableParallelism(); i++) cluster.fork();
+else (await import('./server.js')).start();
+```
+
+</Level>
+<Level name="Intermediate">
+
+Clones need to be stateless: sessions in a shared store (Redis), uploads in object storage. A reverse
+proxy (Nginx, a cloud load balancer) spreads traffic and restarts nothing by itself; the primary process
+restarts crashed workers, and a rolling restart replaces workers one by one for zero downtime.
+
+</Level>
+<Level name="Advanced">
+
+Stateful communication breaks naive balancing: WebSockets or in-memory sessions need *sticky sessions*
+(route a client to the same instance), which hurt even distribution and fail when that instance dies.
+Service discovery lets instances register themselves (Consul, Kubernetes services), so the balancer
+finds them dynamically.
+
+</Level>
+<Level name="Edge cases">
+
+One CPU core: `availableParallelism()` returns 1 in a small container, so a cluster gives no gain and
+adds a primary process. In containers I usually run one process each and let the orchestrator scale.
+
+</Level>
+<Level name="Corner cases">
+
+Sticky sessions plus a rolling deploy: every client stuck to the instance being replaced is dropped at
+once, and they all reconnect to the remaining instances in the same second. The fix is to drain
+connections gradually and have clients reconnect with jitter.
+
+</Level>
+<Level name="Production level">
+
+In production, X-axis cloning is the default; Y-axis (splitting into services) is chosen for team or
+deployment independence, not raw speed; Z-axis (sharding by tenant) is for data size. Every split adds
+network calls that can fail, which is what the reliability books on this shelf are about.
+
+</Level>
+<Level name="Mindset">
+
+Scaling is a design property, not an operation. The habit: before adding instances, ask what state each
+instance holds and what happens when one disappears.
+
+</Level>
+<Level name="System design">
+
+This chapter is the bridge from a Node app to a system: load balancer, N stateless API instances, a
+shared session store, a database, a queue. That diagram is the starting point of my phase 10 design doc.
+
+</Level>
+<Level name="Strategy">
+
+I run my API with three instances behind a local Nginx, kill one under load, and do a rolling restart.
+Done when an `autocannon` run shows no failed requests during the restart.
+
+</Level>
+</Levels>
+
+### 13. Messaging and Integration Patterns
+
+**Covers:** Message types, one-way and request/reply exchanges, publish/subscribe with Redis and ZeroMQ, durable subscribers with streams, task distribution pipelines, competing consumers, and correlation identifiers.
+
+<Flow steps={["producer", "queue", "competing consumers", "ack", "or nack and retry", "dead-letter queue"]} caption="Task distribution with a queue: each message goes to one consumer; failures are retried and finally parked for a human." />
+
+<Levels label="Chapter 13, Messaging and Integration Patterns">
+<Level name="Beginner">
+
+Messaging lets services talk without calling each other directly. A command says "do this", an event
+says "this happened", a document carries data. Pub/sub with Redis:
+
+```js
+await sub.subscribe('orders', (msg) => console.log('got', JSON.parse(msg)));
+await pub.publish('orders', JSON.stringify({ id: 1, type: 'created' }));
+```
+
+</Level>
+<Level name="Intermediate">
+
+Plain pub/sub forgets messages sent while a subscriber is down. Durable subscribers fix that with a log
+(Redis Streams, Kafka) and consumer groups that remember their position. Request/reply over messaging
+needs a *correlation ID* on each request and a *return address* (a reply queue) so responses find their
+caller.
+
+```js
+const id = randomUUID();
+await send('rpc.requests', { id, replyTo: 'rpc.replies.web-1', body });
+// the reply handler resolves the pending promise stored under id
+```
+
+</Level>
+<Level name="Advanced">
+
+Task distribution uses competing consumers: many workers read from one queue, each message goes to one
+worker. Delivery is *at least once* in practice, so the same message can arrive twice (a worker crashed
+after doing the work but before acknowledging). Handlers must be idempotent.
+
+</Level>
+<Level name="Edge cases">
+
+A poison message: one malformed message that crashes the worker is redelivered forever, blocking the
+queue. The fix is a delivery-attempt count and a dead-letter queue after N failures.
+
+</Level>
+<Level name="Corner cases">
+
+Ordering plus competing consumers: two events for the same order (created, then cancelled) go to two
+workers, and cancelled is processed first. The fix is partitioning by key (all events for one order to
+one consumer) or making handlers tolerate out-of-order arrival with version numbers.
+
+</Level>
+<Level name="Production level">
+
+In production I monitor queue depth and age of the oldest message, not just errors. A queue that only
+grows means consumers are too slow or stuck. Every message carries an ID, a type, a version and a
+timestamp, and the schema is versioned like an API.
+
+</Level>
+<Level name="Mindset">
+
+Messaging trades immediate answers for decoupling. The habit: for every message, ask "what if it arrives
+twice, late, out of order, or never?"
+
+</Level>
+<Level name="System design">
+
+This is where background jobs, webhooks, event-driven architecture and AI pipelines (ingest, chunk,
+embed, index) live. The phase 3 gate's "jobs" is this chapter.
+
+</Level>
+<Level name="Strategy">
+
+I add a job queue with competing workers, retries with backoff, a dead-letter queue and idempotent
+handlers to my API, and test a crash between work and ack. Done when that test shows the job's effect
+exactly once.
+
+</Level>
+</Levels>
+
+## Misreadings to avoid
+
+- "Node is single-threaded, so it cannot use more than one core." The JavaScript runs on one thread; I/O,
+  the thread pool, workers and clustering use the rest.
+- "Async means parallel." Async means not waiting; two async functions still take turns on one thread.
+- "Patterns are classes to copy from Java." In JavaScript most of them are a function, a closure or a
+  module.
+- "`Promise.all` is how you make things fast." Without a limit it is how you overload a dependency.
+- "Streams are only for huge files." They are for anything whose rate matters: uploads, exports, LLM
+  output.
+
+## Done with this book when
+
+- My phase 3 API passes its gate: auth, jobs with retries and a dead-letter queue, and rate limits.
+- I can predict the output order of mixed timers, `nextTick` and promise code, and explain why.
+- Every fan-out in the API has a concurrency limit and every outbound call a timeout.
+- A 2 GB import runs in flat memory, and a CPU-heavy task runs without hurting event loop p99.
+- The test suite has unit, integration and end-to-end layers and runs in CI on every push.

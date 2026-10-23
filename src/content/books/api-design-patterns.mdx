@@ -1,0 +1,1891 @@
+---
+title: "API Design Patterns, chapter by chapter"
+description: "JJ Geewax's API Design Patterns, all 30 chapters from beginner to strategy: naming, resources, standard and custom methods, LROs, pagination, versioning, retries and auth."
+edition: "first edition (Manning, 2021)"
+tocVerified: true
+tocSources:
+  - "https://www.manning.com/books/api-design-patterns"
+  - "https://www.oreilly.com/library/view/api-design-patterns/9781617295850/Text/toc.htm"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the contracts book. It anchors the contracts lens of the
+<a href={withBase('/plans/underrated-fundamentals/')}>underrated fundamentals</a> (an OpenAPI schema,
+boundary validation and contract tests) and the API half of phase 3 of the
+<a href={withBase('/plans/software-ai-developer/')}>software AI developer</a> roadmap. Every chapter is one
+pattern with the same anatomy (motivation, overview, implementation, trade-offs), which makes it easy to
+apply one pattern at a time to a real API.
+
+The examples are resource-oriented, in the style of Google's API guidance. I translate each one into
+REST with JSON and TypeScript types, since that is what I ship.
+
+## How I would learn it
+
+I keep one running API, a small notes service, and every chapter changes it: rename fields in chapter 3,
+reshape resources in chapter 4, add field masks in chapter 8, an operation resource in chapter 10, and so
+on. Each change lands as a commit with an OpenAPI diff, so by the end the history of the spec is the
+history of what I learned. For each pattern I also write the request a client would send and the exact
+response, including the error case, before writing any server code.
+
+<Timeline items={[
+  { when: 'fundamentals week 5', what: 'Chapters 1 to 9: principles and fundamentals. OpenAPI schema, standard methods, validation at the boundary, contract tests.' },
+  { when: 'AI phase 3, week 1', what: 'Chapters 10 and 11: long-running operations and rerunnable jobs, wired to the job queue.' },
+  { when: 'AI phase 3, week 2', what: 'Chapters 12 to 16: relationships between resources.' },
+  { when: 'AI phase 3, week 3', what: 'Chapters 17 to 23: collective operations, pagination and filtering.' },
+  { when: 'AI phase 3, week 4', what: 'Chapters 24 to 30: versioning, soft delete, deduplication, validation, revisions, retries, authentication.' },
+]} caption="The first nine chapters are the fundamentals artifact; the rest are applied to the phase 3 API." />
+
+Each chapter below climbs the nine levels. It is my paraphrase with my own examples, not the book's text.
+
+## The book's six parts
+
+<Layers layers={[
+  { name: 'Part 1: Introduction', note: 'chapters 1 and 2: what APIs and patterns are' },
+  { name: 'Part 2: Design principles', note: 'chapters 3 to 5: naming, resource layout, data types' },
+  { name: 'Part 3: Fundamentals', note: 'chapters 6 to 11: identifiers, standard and custom methods, partial updates, LROs, jobs' },
+  { name: 'Part 4: Resource relationships', note: 'chapters 12 to 16: singletons, references, associations, polymorphism' },
+  { name: 'Part 5: Collective operations', note: 'chapters 17 to 23: copy, batch, purge, anonymous writes, pagination, filtering, import/export' },
+  { name: 'Part 6: Safety and security', note: 'chapters 24 to 30: versioning, soft delete, deduplication, validation, revisions, retries, auth' },
+]} caption="Principles first, then the core methods, then patterns that build on them." />
+
+## Part 1: Introduction
+
+
+### 1. Introduction to APIs
+
+**Covers:** What web APIs are, why they matter, what resource-oriented APIs are, and what makes an API good: operational, expressive, simple and predictable.
+
+<Layers layers={[{"name": "Operational", "note": "it does the job, within latency and accuracy limits"}, {"name": "Expressive", "note": "users can say what they want plainly"}, {"name": "Simple", "note": "few concepts, common cases easy"}, {"name": "Predictable", "note": "learn one part, guess the rest"}]} caption={"Four qualities of a good API. Predictability is what makes the rest scale."} />
+
+<Levels label={"Chapter 1, Introduction to APIs"}>
+<Level name="Beginner">
+
+An API is the interface one program offers another. A web API is reached over the network, and once
+published, its shape is hard to change because other people's code depends on it.
+
+</Level>
+<Level name="Intermediate">
+
+Resource-oriented APIs organise everything as nouns (resources) acted on by a small set of verbs
+(standard methods), instead of an ever-growing list of RPC calls.
+
+```http
+GET    /notes/42         # get
+POST   /notes            # create
+PATCH  /notes/42         # update
+DELETE /notes/42         # delete
+```
+
+</Level>
+<Level name="Advanced">
+
+Good is judged from the caller's side: does it work operationally, can I express what I want, is the
+common case simple, and having learned one resource can I predict the others? Predictability means the
+same patterns are used for every resource.
+
+</Level>
+<Level name="Edge cases">
+
+An API with one endpoint that takes a command name (`POST /rpc { "action": "archiveNote" }`) is fully
+expressive and completely unpredictable: every action is a new thing to learn.
+
+</Level>
+<Level name="Corner cases">
+
+Simple plus expressive collide: a single `search` endpoint with 30 optional parameters is expressive and no
+longer simple. Patterns help find the balance.
+
+</Level>
+<Level name="Production level">
+
+In production the API is the product for its users. Breaking it costs them work; inconsistency costs them
+time on every new endpoint.
+
+</Level>
+<Level name="Mindset">
+
+Design from the caller's chair.
+
+</Level>
+<Level name="System design">
+
+Internal APIs between services deserve the same care, because they become public within the organisation.
+
+</Level>
+<Level name="Strategy">
+
+I list my API's endpoints and mark which follow the resource pattern. Done when each odd one has a reason or a fix.
+
+</Level>
+</Levels>
+
+### 2. Introduction to API design patterns
+
+**Covers:** What API design patterns are, why they matter more for APIs than for code, the anatomy of a pattern (name, motivation, overview, implementation, trade-offs), and a case study of a small Twitter-like API.
+
+<Flow steps={["name and synopsis", "motivation", "overview", "implementation", "trade-offs"]} caption={"The anatomy every pattern in the book follows. I write my own design notes in the same shape."} />
+
+<Levels label={"Chapter 2, Introduction to API design patterns"}>
+<Level name="Beginner">
+
+A design pattern is a reusable solution to a common problem. For APIs, patterns matter more than for
+internal code, because API mistakes cannot be refactored away once clients depend on them.
+
+</Level>
+<Level name="Intermediate">
+
+Each pattern has a motivation (the problem), an overview (the idea), an implementation (concrete
+fields and methods), and trade-offs (what it costs).
+
+</Level>
+<Level name="Advanced">
+
+The case study shows how a naive API (list all messages in one response, export with a custom one-off
+method) runs into trouble as it grows, and how patterns such as pagination and import/export fix it.
+
+</Level>
+<Level name="Edge cases">
+
+A tiny API with three users may not need patterns yet, but adding them later means a breaking change.
+Cheap ones (pagination) should be there from day one.
+
+</Level>
+<Level name="Corner cases">
+
+A pattern applied without its motivation: adding long-running operations to an endpoint that always
+finishes in 50 ms adds complexity for nothing.
+
+</Level>
+<Level name="Production level">
+
+In production, a shared pattern catalogue across teams is what makes many APIs feel like one.
+
+</Level>
+<Level name="Mindset">
+
+Choose patterns by the problem, and write down the trade-off accepted.
+
+</Level>
+<Level name="System design">
+
+Patterns are the vocabulary of API design reviews.
+
+</Level>
+<Level name="Strategy">
+
+I write a design note for one endpoint using the five-part anatomy. Done when a reviewer could reject it on
+trade-offs alone.
+
+</Level>
+</Levels>
+
+## Part 2: Design principles
+
+
+### 3. Naming
+
+**Covers:** Why names matter in APIs, what makes a good name (expressive, simple, predictable), language, grammar and syntax, context, data types and units, and what bad names cost.
+
+<Compare left={"Unclear"} right={"Clear"} rows={[["timeout: 30", "timeoutSeconds: 30"], ["size", "sizeBytes"], ["text_content_string", "content"], ["userInfoData", "user"]]} caption={"Names carry meaning callers rely on forever."} />
+
+<Levels label={"Chapter 3, Naming"}>
+<Level name="Beginner">
+
+Names are the first documentation. A good name is expressive (says what it is), simple (no extra words),
+and predictable (follows the same rules everywhere).
+
+</Level>
+<Level name="Intermediate">
+
+Rules that help: American English throughout, nouns for resources and fields, verbs for methods, plural
+collection names, consistent case (`camelCase` in JSON).
+
+</Level>
+<Level name="Advanced">
+
+Units belong in the name when the type does not carry them: `durationSeconds`, `sizeBytes`. Context
+removes redundancy: inside a `Book` resource, `title` not `bookTitle`.
+
+</Level>
+<Level name="Edge cases">
+
+A boolean named `disabled` set to `false` is a double negative; prefer `enabled`. A field named `time`
+could be a timestamp or a duration.
+
+</Level>
+<Level name="Corner cases">
+
+A unit-less name plus a client in another language: `timeout: 30` read as milliseconds by one SDK and
+seconds by another gives a 1000x bug.
+
+</Level>
+<Level name="Production level">
+
+In production, names cannot change without a version. Review names as carefully as behaviour.
+
+</Level>
+<Level name="Mindset">
+
+A name is a contract.
+
+</Level>
+<Level name="System design">
+
+A glossary shared across services keeps names consistent at system scale.
+
+</Level>
+<Level name="Strategy">
+
+I rename every ambiguous field in my API's draft spec. Done when each numeric field states its unit.
+
+</Level>
+</Levels>
+
+### 4. Resource scope and hierarchy
+
+**Covers:** Resource layout: types of relationships, entity relationship diagrams, choosing references, in-line data or hierarchy, and the anti-patterns of resources for everything, deep hierarchies and in-lining everything.
+
+<Figure art={`
+  users/{user}
+     └── notebooks/{notebook}
+            └── notes/{note}
+  tags/{tag}          (top level; notes reference tags by name)
+`} caption={"A resource hierarchy for a notes API."} />
+
+<Levels label={"Chapter 4, Resource scope and hierarchy"}>
+<Level name="Beginner">
+
+Resources relate to each other: a note belongs to a notebook; a note references tags. The layout decides
+URLs and ownership.
+
+</Level>
+<Level name="Intermediate">
+
+Three options: hierarchy (child owned by parent, deleted with it), reference (a field holding another
+resource's name), or in-line data (a nested object with no identity of its own).
+
+```ts
+interface Note { name: `users/${string}/notebooks/${string}/notes/${string}`; tagNames: string[]; body: string }
+```
+
+</Level>
+<Level name="Advanced">
+
+Hierarchy implies lifecycle and permission inheritance. Use it when the child truly cannot exist without
+the parent. References keep resources independent.
+
+</Level>
+<Level name="Edge cases">
+
+A resource that could belong to two parents (a note in two notebooks) cannot be a child of both; it needs
+references or an association resource (chapter 14).
+
+</Level>
+<Level name="Corner cases">
+
+A deep hierarchy plus a move: `orgs/1/teams/2/projects/3/tasks/4` must change its name if the project
+moves teams, breaking every stored reference.
+
+</Level>
+<Level name="Production level">
+
+In production: shallow hierarchies, references for anything that can move, and in-line data only for
+values with no identity.
+
+</Level>
+<Level name="Mindset">
+
+Ownership first, URLs second.
+
+</Level>
+<Level name="System design">
+
+Resource layout mirrors data ownership; it shapes database schemas and service boundaries.
+
+</Level>
+<Level name="Strategy">
+
+I draw my API's ERD and justify each relationship type. Done when every child resource truly dies with its parent.
+
+</Level>
+</Levels>
+
+### 5. Data types and defaults
+
+**Covers:** Data types in APIs: missing versus null, booleans, numbers, strings, enumerations, lists and maps, with their bounds, default values and serialisation.
+
+<Compare left={"Field absent"} right={"Field null"} rows={[["Not mentioned, leave as is", "Explicitly cleared"], ["Use the default", "No value"], ["Omitted in partial update", "Set to empty"]]} caption={"Two different statements a client can make, which the API must treat differently."} />
+
+<Levels label={"Chapter 5, Data types and defaults"}>
+<Level name="Beginner">
+
+Every field has a type, a default, and limits. JSON has only a few types, so the API must say what a value
+means.
+
+</Level>
+<Level name="Intermediate">
+
+Numbers: say the range, and send very large integers (over 2 to the 53rd) as strings, because JavaScript
+loses precision.
+
+```js
+JSON.parse('{"id": 9007199254740993}').id  // 9007199254740992, silently wrong
+```
+
+Strings: say the maximum length and encoding. Enumerations: often better as strings than numbers, and
+clients must tolerate unknown values.
+
+</Level>
+<Level name="Advanced">
+
+Missing versus null: in a partial update, absence means "do not change"; `null` means "clear". Lists and
+maps need bounds (maximum items) and a stated atomicity (is the whole list replaced?).
+
+</Level>
+<Level name="Edge cases">
+
+An empty string versus missing versus null for a `nickname`: three different states unless the API defines
+them as the same.
+
+</Level>
+<Level name="Corner cases">
+
+A boolean default of `false` plus a later need for a third state ("unset"): booleans cannot grow; use an
+enum from the start if a third state is likely.
+
+</Level>
+<Level name="Production level">
+
+In production: document bounds and enforce them; return 400 with the field name when exceeded.
+
+</Level>
+<Level name="Mindset">
+
+Defaults are API decisions as important as fields.
+
+</Level>
+<Level name="System design">
+
+Data types cross language boundaries; choose representations every client language handles correctly.
+
+</Level>
+<Level name="Strategy">
+
+I add bounds, defaults and the missing/null rule to every field in my spec. Done when contract tests cover each bound.
+
+</Level>
+</Levels>
+
+## Part 3: Fundamentals
+
+
+### 6. Resource identification
+
+**Covers:** What identifiers are, what makes one good (easy to use, unique, permanent, fast to generate, unpredictable, readable, dense), formats, checksums, tombstoning, storage, and UUIDs.
+
+<Flow steps={["generate random bytes", "encode (e.g. Crockford base32)", "add checksum", "store with tombstone on delete"]} caption={"A good identifier: random, compact, verifiable, and never reused."} />
+
+<Levels label={"Chapter 6, Resource identification"}>
+<Level name="Beginner">
+
+Each resource needs an identifier that is unique and never changes. Database auto-increment IDs are easy
+but predictable and leak counts.
+
+</Level>
+<Level name="Intermediate">
+
+Random identifiers encoded in a readable alphabet (Crockford's base32 avoids look-alike characters) are
+unpredictable and shareable.
+
+```ts
+const alphabet = '0123456789abcdefghjkmnpqrstvwxyz';
+const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => alphabet[b % 32]).join('');
+```
+
+</Level>
+<Level name="Advanced">
+
+A checksum character lets the API tell a typo (invalid ID, 400) from a missing resource (404).
+Tombstoning keeps deleted IDs reserved so they are never reused for a different resource.
+
+</Level>
+<Level name="Edge cases">
+
+`b % 32` over bytes is unbiased only because 256 is a multiple of 32; for other alphabet sizes, modulo
+introduces bias. Use rejection sampling.
+
+</Level>
+<Level name="Corner cases">
+
+UUIDs plus a hierarchy: a UUID is unique globally, but the full resource name includes parents, so
+uniqueness scope must be stated.
+
+</Level>
+<Level name="Production level">
+
+In production: random IDs, case-insensitive parsing, a checksum for user-facing IDs, and tombstones.
+
+</Level>
+<Level name="Mindset">
+
+An identifier is forever.
+
+</Level>
+<Level name="System design">
+
+ID formats affect database index performance (random versus time-ordered) and sharding.
+
+</Level>
+<Level name="Strategy">
+
+I switch my API to random base32 IDs with a checksum. Done when a mistyped ID returns 400, not 404.
+
+</Level>
+</Levels>
+
+### 7. Standard methods
+
+**Covers:** Get, list, create, update, delete and replace: which to support, idempotence and side effects, and the expected behaviour of each.
+
+<Compare left={"Method"} right={"Idempotent?"} rows={[["GET, LIST", "yes, no side effects"], ["CREATE", "no, unless deduplicated (chapter 26)"], ["UPDATE (PATCH)", "yes for the same values"], ["DELETE", "yes in effect; the second call may return 404"], ["REPLACE (PUT)", "yes"]]} caption={"Idempotence of the standard methods. Retrying an idempotent call has the same effect as calling once."} />
+
+<Levels label={"Chapter 7, Standard methods"}>
+<Level name="Beginner">
+
+Standard methods are the same for every resource, so learning one resource teaches all of them.
+
+```http
+POST /notebooks/1/notes    { "body": "hi" }   -> 201 + the created note
+GET  /notebooks/1/notes/abc                   -> 200 + the note
+```
+
+</Level>
+<Level name="Intermediate">
+
+Rules: get and list have no side effects; create returns the created resource; update changes only given
+fields; delete removes; replace swaps the whole resource.
+
+</Level>
+<Level name="Advanced">
+
+Idempotence: safe retries depend on it. Create is not idempotent by default; a retried create makes two
+resources unless the client supplies a request ID (chapter 26) or an ID.
+
+</Level>
+<Level name="Edge cases">
+
+Deleting a missing resource: return 404, which is honest, even though the effect is the same.
+
+</Level>
+<Level name="Corner cases">
+
+Replace plus a field added in a newer version: an old client's replace erases the new field it does not
+know. Prefer update with field masks.
+
+</Level>
+<Level name="Production level">
+
+In production: consistent status codes, consistent error shapes, and no side effects on reads.
+
+</Level>
+<Level name="Mindset">
+
+Consistency beats cleverness.
+
+</Level>
+<Level name="System design">
+
+Standard methods map to CRUD in storage and to cache rules: GETs can be cached.
+
+</Level>
+<Level name="Strategy">
+
+I implement all standard methods for notes with contract tests. Done when each method's status codes match a table I wrote first.
+
+</Level>
+</Levels>
+
+### 8. Partial updates and retrievals
+
+**Covers:** Field masks for reading and updating only some fields: transport, nested and repeated fields, defaults, implicit masks, dynamic structures, and invalid fields.
+
+<Flow steps={["client sends PATCH with fields + mask", "server validates mask paths", "apply only masked fields", "return full updated resource"]} caption={"A field mask says exactly which fields to change, so absent fields are never accidentally cleared."} />
+
+<Levels label={"Chapter 8, Partial updates and retrievals"}>
+<Level name="Beginner">
+
+A field mask lists the fields a request cares about. Partial retrieval returns only those; partial update
+changes only those.
+
+```http
+PATCH /notes/abc?updateMask=title,tags
+{ "title": "New", "tags": ["a"], "body": "ignored" }
+```
+
+</Level>
+<Level name="Intermediate">
+
+Without a mask, the server must guess intent from which fields are present, which breaks on null versus
+missing. An implicit mask (fields present) is a convenient default.
+
+</Level>
+<Level name="Advanced">
+
+Nested fields use dotted paths (`settings.theme`); map keys need escaping rules; repeated fields are
+replaced whole, not merged.
+
+</Level>
+<Level name="Edge cases">
+
+A mask naming a field that does not exist: return 400 so typos do not silently do nothing.
+
+</Level>
+<Level name="Corner cases">
+
+Implicit masks plus a field the client's old schema does not know: the client never sends it, so it is left
+alone, which is exactly the safe behaviour.
+
+</Level>
+<Level name="Production level">
+
+In production, field masks reduce payload sizes on lists and make updates safe across versions.
+
+</Level>
+<Level name="Mindset">
+
+Say exactly what you mean to change.
+
+</Level>
+<Level name="System design">
+
+Field masks protect against lost updates between clients that know different versions of a resource.
+
+</Level>
+<Level name="Strategy">
+
+I implement update masks for notes and test missing, null and unknown fields. Done when all three behave as documented.
+
+</Level>
+</Levels>
+
+### 9. Custom methods
+
+**Covers:** When standard methods are not enough: custom methods for actions with side effects, on resources or collections, and stateless custom methods.
+
+<Compare left={"Standard method misused"} right={"Custom method"} rows={[["PATCH status=sent (sends email silently)", "POST /emails/1:send"], ["PATCH archived=true (also moves files)", "POST /notes/1:archive"], ["GET /translate?text=... (stateless)", "POST /text:translate"]]} caption={"Some actions are not CRUD. Forcing them into an update hides side effects."} />
+
+<Levels label={"Chapter 9, Custom methods"}>
+<Level name="Beginner">
+
+Some actions (send, archive, translate) are not create, read, update or delete. Custom methods name them
+explicitly.
+
+```http
+POST /notes/abc:archive
+```
+
+</Level>
+<Level name="Intermediate">
+
+Custom methods usually use POST, act on a resource, a collection, or nothing (stateless), and document their
+side effects.
+
+</Level>
+<Level name="Advanced">
+
+Use them when an action has side effects beyond changing fields, or when it would break the standard method
+rules.
+
+</Level>
+<Level name="Edge cases">
+
+A custom method that only sets one field should probably be an update.
+
+</Level>
+<Level name="Corner cases">
+
+A custom method plus long running work: it should return an operation (chapter 10), not block.
+
+</Level>
+<Level name="Production level">
+
+In production: few custom methods, clearly named, idempotent where possible.
+
+</Level>
+<Level name="Mindset">
+
+Make side effects visible in the interface.
+
+</Level>
+<Level name="System design">
+
+Custom methods often map to commands in a domain model.
+
+</Level>
+<Level name="Strategy">
+
+I replace one hidden side effect in my API with a custom method. Done when the update method has no side effects beyond the fields.
+
+</Level>
+</Levels>
+
+### 10. Long-running operations
+
+**Covers:** Operations for work that takes too long for one request: what an LRO looks like, resolution, errors, progress, cancelling, pausing and resuming, listing operations, and persistence.
+
+<Figure art={`
+  POST /reports:generate  ->  202 { name: "operations/op1", done: false }
+  GET  /operations/op1     ->  { done: false, metadata: { progress: 40 } }
+  GET  /operations/op1     ->  { done: true, response: { report... } }
+                            or { done: true, error: { code, message } }
+`} caption={"An operation resource returned instead of the final result."} />
+
+<Levels label={"Chapter 10, Long-running operations"}>
+<Level name="Beginner">
+
+Work that takes minutes cannot run inside one HTTP request. The API returns an operation resource the
+client can check.
+
+</Level>
+<Level name="Intermediate">
+
+The operation has a name, a `done` flag, metadata (progress), and either a result or an error.
+
+```ts
+type Operation<R, M> = { name: string; done: boolean; metadata?: M; response?: R; error?: { code: number; message: string } };
+```
+
+</Level>
+<Level name="Advanced">
+
+Operations can support cancel, pause and resume, and list for discovery. They must persist beyond the
+process that started them, so they live in a database, with an expiry.
+
+</Level>
+<Level name="Edge cases">
+
+An operation that finishes instantly still returns an operation, so clients have one code path.
+
+</Level>
+<Level name="Corner cases">
+
+Cancel plus a nearly finished operation: the work may complete anyway. The operation must report the true
+final state, not assume cancelled.
+
+</Level>
+<Level name="Production level">
+
+In production: operations backed by a job queue, polling with backoff, and expiry after a period.
+
+</Level>
+<Level name="Mindset">
+
+Do not hold a connection for work that does not need it.
+
+</Level>
+<Level name="System design">
+
+LROs connect the API to background jobs and queues.
+
+</Level>
+<Level name="Strategy">
+
+I make my report generation an LRO backed by the phase 3 job queue. Done when restarting the server mid-job leaves the operation still trackable.
+
+</Level>
+</Levels>
+
+### 11. Rerunnable jobs
+
+**Covers:** Jobs as resources that hold configuration, a custom run method, and execution resources recording each run.
+
+<Flow steps={["create job resource with config", "POST job:run", "operation", "execution resource with result"]} caption={"Separating the configuration (job) from each run (execution) lets the same job run many times."} />
+
+<Levels label={"Chapter 11, Rerunnable jobs"}>
+<Level name="Beginner">
+
+A job resource stores a task's configuration so it can be run repeatedly, instead of passing all parameters
+on every call.
+
+</Level>
+<Level name="Intermediate">
+
+`POST /jobs/backup:run` starts a run and returns an operation; each run creates an execution resource with
+results.
+
+</Level>
+<Level name="Advanced">
+
+Jobs separate permissions: some users can configure, others only run. Executions give a history.
+
+</Level>
+<Level name="Edge cases">
+
+Running a job while another run is in progress: decide whether to queue, reject, or allow parallel runs.
+
+</Level>
+<Level name="Corner cases">
+
+Changing a job's config during a run: the execution should record the config it used.
+
+</Level>
+<Level name="Production level">
+
+In production, scheduled jobs call run on a schedule; executions are kept for audit.
+
+</Level>
+<Level name="Mindset">
+
+Configuration is a resource worth naming.
+
+</Level>
+<Level name="System design">
+
+Jobs connect to schedulers and audit systems.
+
+</Level>
+<Level name="Strategy">
+
+I model a nightly export as a job with executions. Done when two runs show in history with their configs.
+
+</Level>
+</Levels>
+
+## Part 4: Resource relationships
+
+
+### 12. Singleton sub-resources
+
+**Covers:** Splitting part of a resource into a singleton child for size, security or update frequency: standard methods, resetting, hierarchy, atomicity, and exactly one sub-resource.
+
+<Figure art={`
+  users/{user}            name, email
+  users/{user}/settings   theme, language   (exactly one, no create/delete)
+`} caption={"A singleton sub-resource: exactly one per parent, with its own get and update."} />
+
+<Levels label={"Chapter 12, Singleton sub-resources"}>
+<Level name="Beginner">
+
+A singleton sub-resource is a part of a resource with its own URL but no separate identity: there is
+exactly one per parent.
+
+</Level>
+<Level name="Intermediate">
+
+Use it when part of a resource is large, changes often, or needs different permissions (for example
+user settings).
+
+</Level>
+<Level name="Advanced">
+
+It supports get and update, plus a reset custom method; it is created and deleted with its parent.
+
+</Level>
+<Level name="Edge cases">
+
+Getting the singleton of a missing parent returns 404 for the parent.
+
+</Level>
+<Level name="Corner cases">
+
+Updating the parent and the singleton together is not atomic, because they are separate requests.
+
+</Level>
+<Level name="Production level">
+
+In production: use sparingly; each split adds a request.
+
+</Level>
+<Level name="Mindset">
+
+Split by access patterns, not by class diagram.
+
+</Level>
+<Level name="System design">
+
+Singletons can map to separate tables or services with their own permissions.
+
+</Level>
+<Level name="Strategy">
+
+I move my users' settings to a singleton. Done when settings updates no longer conflict with profile updates.
+
+</Level>
+</Levels>
+
+### 13. Cross references
+
+**Covers:** Referencing other resources by name: field naming, data integrity when the target is deleted, and value versus reference.
+
+<Compare left={"Reference"} right={"Value copy"} rows={[["Stores the target's name", "Stores a copy of its data"], ["Always current", "Snapshot at the time"], ["Can dangle if target deleted", "Never dangles"], ["Needs another read", "Self-contained"]]} caption={"Two ways to point at another resource."} />
+
+<Levels label={"Chapter 13, Cross references"}>
+<Level name="Beginner">
+
+A cross reference stores another resource's name, like a foreign key: `authorName: "users/42"`.
+
+</Level>
+<Level name="Intermediate">
+
+Name the field after the target type (`authorName` or `author`) consistently.
+
+</Level>
+<Level name="Advanced">
+
+Decide what happens when the target is deleted: allow dangling references (clients must handle 404s) or
+block deletion. Value copies are better when a snapshot is the intent (the price at order time).
+
+</Level>
+<Level name="Edge cases">
+
+A reference to a resource the caller cannot read: return the name but not the data.
+
+</Level>
+<Level name="Corner cases">
+
+Copying a value plus later corrections: the snapshot keeps the error; decide whether that is correct.
+
+</Level>
+<Level name="Production level">
+
+In production, most APIs allow dangling references and document it.
+
+</Level>
+<Level name="Mindset">
+
+Decide whether you mean "that thing" or "what that thing was".
+
+</Level>
+<Level name="System design">
+
+References across services cannot be enforced by a database; they need clear ownership.
+
+</Level>
+<Level name="Strategy">
+
+I review each reference in my API and decide reference or value. Done when deletion behaviour is documented for each.
+
+</Level>
+</Levels>
+
+### 14. Association resources
+
+**Covers:** Many-to-many relationships as their own resources, with naming, standard method behaviour, uniqueness, read-only fields, alias methods and referential integrity.
+
+<Figure art={`
+  users/{u}    groups/{g}
+        \\       /
+     memberships/{m}  { user, group, role, joinedAt }
+`} caption={"An association resource for many-to-many."} />
+
+<Levels label={"Chapter 14, Association resources"}>
+<Level name="Beginner">
+
+A many-to-many relationship (users in groups) becomes a resource itself: a membership.
+
+</Level>
+<Level name="Intermediate">
+
+The association can hold data about the relationship (role, join date) and supports standard methods.
+
+</Level>
+<Level name="Advanced">
+
+Uniqueness (one membership per user and group) must be enforced. Alias methods like
+`GET /groups/1/users` help clients navigate.
+
+</Level>
+<Level name="Edge cases">
+
+Creating a duplicate membership returns 409.
+
+</Level>
+<Level name="Corner cases">
+
+Deleting a user who has memberships: cascade, block, or leave dangling, decided explicitly.
+
+</Level>
+<Level name="Production level">
+
+In production, association resources map to join tables and are listed with pagination.
+
+</Level>
+<Level name="Mindset">
+
+Relationships can be things too.
+
+</Level>
+<Level name="System design">
+
+Association resources keep relationship data from leaking into either side.
+
+</Level>
+<Level name="Strategy">
+
+I model note sharing as an association with a role field. Done when duplicate shares return 409.
+
+</Level>
+</Levels>
+
+### 15. Add and remove custom methods
+
+**Covers:** A lighter alternative for many-to-many: add and remove custom methods on one side, listing associated resources, data integrity, and their limits (non-reciprocal relationships, no metadata).
+
+<Compare left={"Association resource"} right={"Add and remove methods"} rows={[["Relationship has its own data", "No metadata on the relationship"], ["Standard methods on memberships", "POST groups/1:addUser"], ["Either side can list", "One side owns the relationship"]]} caption={"The lighter pattern trades flexibility for simplicity."} />
+
+<Levels label={"Chapter 15, Add and remove custom methods"}>
+<Level name="Beginner">
+
+Instead of a membership resource, `POST /groups/1:addUser { user }` and `:removeUser`.
+
+</Level>
+<Level name="Intermediate">
+
+Listing uses a method like `GET /groups/1/users`.
+
+</Level>
+<Level name="Advanced">
+
+This works when the relationship has no data of its own and one side owns it.
+
+</Level>
+<Level name="Edge cases">
+
+Adding a user already present: return success or 409, documented.
+
+</Level>
+<Level name="Corner cases">
+
+Needing a role later means migrating to association resources, a breaking change.
+
+</Level>
+<Level name="Production level">
+
+In production, pick this only when certain no metadata is coming.
+
+</Level>
+<Level name="Mindset">
+
+Pick the simplest pattern that will survive the next requirement.
+
+</Level>
+<Level name="System design">
+
+The choice affects permission checks (who may add).
+
+</Level>
+<Level name="Strategy">
+
+I compare both patterns for tags on notes and pick one with a written reason. Done when the reason names the future change.
+
+</Level>
+</Levels>
+
+### 16. Polymorphism
+
+**Covers:** Resources that come in several types: when to use polymorphic resources, structure with a type field, polymorphic behaviour, and why polymorphic methods are a bad idea.
+
+<Figure art={`
+  messages/{m}  { type: "text",  text: "hi" }
+                { type: "image", imageUri: "...", caption: "" }
+                { type: "poll",  options: [...] }
+`} caption={"A polymorphic resource with a discriminator field."} />
+
+<Levels label={"Chapter 16, Polymorphism"}>
+<Level name="Beginner">
+
+A polymorphic resource has a `type` field and type-specific fields, such as messages that are text,
+images or polls.
+
+</Level>
+<Level name="Intermediate">
+
+In TypeScript, a discriminated union:
+
+```ts
+type Message = { type: 'text'; text: string } | { type: 'image'; imageUri: string; caption?: string };
+```
+
+</Level>
+<Level name="Advanced">
+
+Use polymorphism when types share most behaviour and lifecycle; otherwise use separate resources.
+Avoid polymorphic methods (one method that does different things by input type).
+
+</Level>
+<Level name="Edge cases">
+
+Changing a resource's type after creation: usually disallowed.
+
+</Level>
+<Level name="Corner cases">
+
+A new type added plus old clients: they must handle unknown types gracefully.
+
+</Level>
+<Level name="Production level">
+
+In production, document every type and require clients to tolerate new ones.
+
+</Level>
+<Level name="Mindset">
+
+Share structure where it is truly shared.
+
+</Level>
+<Level name="System design">
+
+Polymorphism maps to single-table inheritance or JSON columns in storage.
+
+</Level>
+<Level name="Strategy">
+
+I add an attachment type to notes as a discriminated union. Done when an unknown type is handled by an old client test.
+
+</Level>
+</Levels>
+
+## Part 5: Collective operations
+
+
+### 17. Copy and move
+
+**Covers:** Copying and moving resources: identifiers, child and related resources, external data, inherited metadata, and atomicity.
+
+<Flow steps={["POST notes/1:move to notebook 2", "new name assigned", "children moved", "references updated or left", "old name tombstoned"]} caption={"Moving changes a resource's name. Every decision about what goes with it must be explicit."} />
+
+<Levels label={"Chapter 17, Copy and move"}>
+<Level name="Beginner">
+
+Copy duplicates a resource; move changes its parent. Both are custom methods.
+
+</Level>
+<Level name="Intermediate">
+
+Moving changes the resource name in a hierarchical API, which breaks stored references.
+
+</Level>
+<Level name="Advanced">
+
+Decide what happens to child resources, related resources, external data (files) and inherited settings
+(permissions from the old parent).
+
+</Level>
+<Level name="Edge cases">
+
+Moving to the same parent should be a no-op or an error, documented.
+
+</Level>
+<Level name="Corner cases">
+
+A move plus concurrent edits: atomicity is hard across many resources; use an LRO.
+
+</Level>
+<Level name="Production level">
+
+In production, many APIs avoid move altogether, using references instead of hierarchy.
+
+</Level>
+<Level name="Mindset">
+
+Moves reveal whether the hierarchy was right.
+
+</Level>
+<Level name="System design">
+
+Copy and move across storage systems need transactions or compensation.
+
+</Level>
+<Level name="Strategy">
+
+I implement copy for notebooks with child notes as an LRO. Done when a failure halfway leaves no partial copy visible.
+
+</Level>
+</Levels>
+
+### 18. Batch operations
+
+**Covers:** Operating on many resources in one request: atomicity, operating on the collection, ordering of results, common fields, across parents, and batch get, delete, create and update.
+
+<Flow steps={["POST notes:batchGet ids=[a,b,c]", "validate all", "fetch all", "return in request order or fail whole batch"]} caption={"An atomic batch: all succeed or none do, and results come back in request order."} />
+
+<Levels label={"Chapter 18, Batch operations"}>
+<Level name="Beginner">
+
+Batch methods act on many resources in one call, reducing round trips: `POST /notes:batchGet`.
+
+</Level>
+<Level name="Intermediate">
+
+Results keep the request order so clients can match them.
+
+</Level>
+<Level name="Advanced">
+
+Atomic batches (all or nothing) are simpler to reason about than partial success. Common fields (a parent)
+can be specified once.
+
+</Level>
+<Level name="Edge cases">
+
+An empty batch: return an empty result, not an error.
+
+</Level>
+<Level name="Corner cases">
+
+A batch limit plus a request at the limit: document the maximum and return 400 above it.
+
+</Level>
+<Level name="Production level">
+
+In production, batch sizes are capped and atomicity is implemented with transactions.
+
+</Level>
+<Level name="Mindset">
+
+All or nothing is easier for everyone.
+
+</Level>
+<Level name="System design">
+
+Batch operations map to database transactions and can strain them; caps protect the database.
+
+</Level>
+<Level name="Strategy">
+
+I add batchGet and batchDelete with limits and atomicity tests. Done when a batch with one bad ID changes nothing.
+
+</Level>
+</Levels>
+
+### 19. Criteria-based deletion
+
+**Covers:** Purging resources matching a filter: filtering, validation only by default, result counts and samples, and consistency.
+
+<Flow steps={["POST notes:purge filter=... force=false", "count and sample returned", "review", "repeat with force=true", "delete"]} caption={"Purge defaults to a dry run so a mistaken filter shows its damage before doing it."} />
+
+<Levels label={"Chapter 19, Criteria-based deletion"}>
+<Level name="Beginner">
+
+Purge deletes every resource matching a filter, which is powerful and dangerous.
+
+</Level>
+<Level name="Intermediate">
+
+It defaults to validation only: it returns how many would be deleted and a sample, and deletes only with
+`force: true`.
+
+</Level>
+<Level name="Advanced">
+
+Between the dry run and the real run, data may change; the counts are estimates.
+
+</Level>
+<Level name="Edge cases">
+
+An empty filter would match everything; require an explicit filter.
+
+</Level>
+<Level name="Corner cases">
+
+A dry run plus concurrent writes: the real purge deletes resources created after the dry run.
+
+</Level>
+<Level name="Production level">
+
+In production, purge needs special permissions and audit logging.
+
+</Level>
+<Level name="Mindset">
+
+Dangerous operations should show their effect first.
+
+</Level>
+<Level name="System design">
+
+Purge interacts with soft deletion and retention policies.
+
+</Level>
+<Level name="Strategy">
+
+I implement purge with dry-run default. Done when an empty filter is rejected in a test.
+
+</Level>
+</Levels>
+
+### 20. Anonymous writes
+
+**Covers:** Writing data that does not need to be addressed individually, such as analytics events, and the consistency trade-offs.
+
+<Flow steps={["client writes event", "accepted, no ID returned", "stored in log or warehouse", "visible later in aggregates"]} caption={"Anonymous writes trade addressability and immediate visibility for throughput."} />
+
+<Levels label={"Chapter 20, Anonymous writes"}>
+<Level name="Beginner">
+
+Some data (log events, metrics) is never read individually. A `write` method accepts it without
+creating addressable resources.
+
+</Level>
+<Level name="Intermediate">
+
+The data appears later in aggregate queries, not immediately.
+
+</Level>
+<Level name="Advanced">
+
+This fits analytical data; transactional data needs resources.
+
+</Level>
+<Level name="Edge cases">
+
+Duplicate writes on retry: anonymous data cannot be deduplicated without an ID, so either accept
+duplicates or add an event ID.
+
+</Level>
+<Level name="Corner cases">
+
+Eventual visibility plus a dashboard test: a test that writes and reads immediately will fail.
+
+</Level>
+<Level name="Production level">
+
+In production, anonymous writes go to queues or streams.
+
+</Level>
+<Level name="Mindset">
+
+Not everything needs an identity.
+
+</Level>
+<Level name="System design">
+
+This connects APIs to data pipelines.
+
+</Level>
+<Level name="Strategy">
+
+I add a usage event write method. Done when its docs state delay and duplicate behaviour.
+
+</Level>
+</Levels>
+
+### 21. Pagination
+
+**Covers:** Paging through large collections with page size and opaque page tokens, total counts, paging inside resources, and why offset and limit is an anti-pattern.
+
+<Flow steps={["GET notes?pageSize=50", "response + nextPageToken", "GET notes?pageToken=...", "...", "no nextPageToken = end"]} caption={"Token pagination: the token is opaque, so the server can change how it works without breaking clients."} />
+
+<Levels label={"Chapter 21, Pagination"}>
+<Level name="Beginner">
+
+Lists must be paged: the client asks for a page size and gets a token for the next page.
+
+```ts
+type ListNotesResponse = { notes: Note[]; nextPageToken?: string };
+```
+
+</Level>
+<Level name="Intermediate">
+
+The token is opaque (often an encoded cursor of the last seen key). The page size is a maximum; the server
+may return fewer.
+
+</Level>
+<Level name="Advanced">
+
+Offset and limit fails on large tables (slow skips) and shifts when data changes. Cursor tokens are stable.
+
+```sql
+SELECT * FROM notes WHERE (created_at, id) > ($1, $2) ORDER BY created_at, id LIMIT 50;
+```
+
+</Level>
+<Level name="Edge cases">
+
+A page with zero results but a next token can happen with filters; clients must keep going until no token.
+
+</Level>
+<Level name="Corner cases">
+
+A token plus changed filter parameters: reject tokens used with different filters.
+
+</Level>
+<Level name="Production level">
+
+In production, page sizes are capped, tokens expire, and total counts are avoided or estimated.
+
+</Level>
+<Level name="Mindset">
+
+Every list grows.
+
+</Level>
+<Level name="System design">
+
+Pagination ties API design to index design.
+
+</Level>
+<Level name="Strategy">
+
+I replace offset pagination with cursor tokens. Done when inserting during paging neither skips nor repeats items in a test.
+
+</Level>
+</Levels>
+
+### 22. Filtering
+
+**Covers:** Filtering list results with a filter string: structure, syntax and behaviour, and trade-offs.
+
+<Flow steps={["filter string", "parse to AST", "validate fields and types", "translate to safe query", "results"]} caption={"A filter is a small language. Parsing it to a tree and validating it keeps it from becoming an injection point."} />
+
+<Levels label={"Chapter 22, Filtering"}>
+<Level name="Beginner">
+
+A filter parameter narrows a list: `filter=tag = "work" AND archived = false`.
+
+</Level>
+<Level name="Intermediate">
+
+A string filter is flexible; structured filters (JSON) are easier to validate but verbose.
+
+</Level>
+<Level name="Advanced">
+
+The filter must be parsed, validated against allowed fields, and translated to a safe query, never
+concatenated into SQL.
+
+</Level>
+<Level name="Edge cases">
+
+An empty filter means no filtering.
+
+</Level>
+<Level name="Corner cases">
+
+A filter plus pagination: tokens must be tied to the filter.
+
+</Level>
+<Level name="Production level">
+
+In production, limit filterable fields to indexed ones.
+
+</Level>
+<Level name="Mindset">
+
+Filters are a language; treat them like one.
+
+</Level>
+<Level name="System design">
+
+Filtering capabilities decide index requirements.
+
+</Level>
+<Level name="Strategy">
+
+I implement a small filter grammar with a parser and tests for injection attempts. Done when every attempt is rejected.
+
+</Level>
+</Levels>
+
+### 23. Importing and exporting
+
+**Covers:** Moving data in and out via storage systems: import and export methods, converting between resources and bytes, consistency, identifiers and collisions, related resources, failures and retries, filtering and field masks.
+
+<Flow steps={["POST notes:export destination=bucket", "LRO", "read consistent snapshot", "serialise", "write to storage", "done"]} caption={"Export as a long-running operation writing to storage, rather than streaming through the API."} />
+
+<Levels label={"Chapter 23, Importing and exporting"}>
+<Level name="Beginner">
+
+Import and export move many resources between the API and a storage system (a bucket).
+
+</Level>
+<Level name="Intermediate">
+
+They are LROs, take a data destination or source, and a format.
+
+</Level>
+<Level name="Advanced">
+
+Exports need a consistent view; imports need a policy for ID collisions and related resources.
+
+</Level>
+<Level name="Edge cases">
+
+Importing a file that is half invalid: fail all or import valid items with an error report.
+
+</Level>
+<Level name="Corner cases">
+
+Retrying an import: without deduplication, it duplicates.
+
+</Level>
+<Level name="Production level">
+
+In production, export and import support filters and field masks.
+
+</Level>
+<Level name="Mindset">
+
+Bulk data deserves its own path.
+
+</Level>
+<Level name="System design">
+
+Import and export connect APIs to data lakes and backups.
+
+</Level>
+<Level name="Strategy">
+
+I implement export to a file with an LRO. Done when importing the export reproduces the data.
+
+</Level>
+</Levels>
+
+## Part 6: Safety and security
+
+
+### 24. Versioning and compatibility
+
+**Covers:** What compatibility is, defining backward compatibility, versioning strategies (perpetual stability, agile instability, semantic versioning), and their trade-offs.
+
+<Compare left={"Strategy"} right={"Cost"} rows={[["Perpetual stability", "API team supports old versions forever"], ["Agile instability", "Clients must keep up with frequent change"], ["Semantic versioning", "Major versions for breaking changes, with deprecation"]]} caption={"Versioning strategies and who pays for them."} />
+
+<Levels label={"Chapter 24, Versioning and compatibility"}>
+<Level name="Beginner">
+
+Backward compatible changes let old clients keep working. Breaking changes need a new version.
+
+</Level>
+<Level name="Intermediate">
+
+Adding fields is usually compatible; removing or renaming is not.
+
+</Level>
+<Level name="Advanced">
+
+Compatibility is a policy decision: some consider new enum values breaking. Each strategy trades
+stability for the freedom to change.
+
+</Level>
+<Level name="Edge cases">
+
+Changing a default value is breaking, even though the schema is identical.
+
+</Level>
+<Level name="Corner cases">
+
+Two versions sharing storage must agree on data.
+
+</Level>
+<Level name="Production level">
+
+In production, define compatibility in writing and test it with old client contract tests.
+
+</Level>
+<Level name="Mindset">
+
+Compatibility is a promise, defined by the API owner.
+
+</Level>
+<Level name="System design">
+
+Versioning policy affects every client team.
+
+</Level>
+<Level name="Strategy">
+
+I write my API's compatibility policy. Done when it lists five changes as compatible or breaking.
+
+</Level>
+</Levels>
+
+### 25. Soft deletion
+
+**Covers:** Marking resources deleted instead of removing them: designation, changes to standard methods, undelete, expunge, expiration, referential integrity, and adding soft delete across versions.
+
+<Figure art={`
+  active --delete--> deleted (hidden from list, get with showDeleted)
+     ^                  |           |
+     +----undelete------+           +--expire or expunge--> gone forever
+`} caption={"Soft deletion states."} />
+
+<Levels label={"Chapter 25, Soft deletion"}>
+<Level name="Beginner">
+
+Soft deletion marks a resource as deleted so it can be restored, instead of removing it immediately.
+
+</Level>
+<Level name="Intermediate">
+
+Deleted resources are hidden from list by default, can be restored with undelete, and are permanently
+removed by expunge or after expiry.
+
+</Level>
+<Level name="Advanced">
+
+Unique constraints must account for deleted resources; references to deleted resources need rules.
+
+</Level>
+<Level name="Edge cases">
+
+Deleting an already deleted resource: return success or 404, documented.
+
+</Level>
+<Level name="Corner cases">
+
+Adding soft deletion in a new version: old clients assume delete is permanent.
+
+</Level>
+<Level name="Production level">
+
+In production, expiry jobs expunge after a retention period, and privacy requests force expunge.
+
+</Level>
+<Level name="Mindset">
+
+Deletion is a lifecycle, not a moment.
+
+</Level>
+<Level name="System design">
+
+Soft deletion affects storage size, indexes and privacy compliance.
+
+</Level>
+<Level name="Strategy">
+
+I add soft delete with undelete and expiry to notes. Done when an expired note is gone from the database.
+
+</Level>
+</Levels>
+
+### 26. Request deduplication
+
+**Covers:** Making non-idempotent methods safe to retry with request IDs, response caching, consistency, collisions, and cache expiry.
+
+<Flow steps={["request with requestId", "seen before?", "yes: return cached response", "no: execute, store response under id", "return"]} caption={"Deduplication makes a create safe to retry: the same request ID returns the original result."} />
+
+<Levels label={"Chapter 26, Request deduplication"}>
+<Level name="Beginner">
+
+A retried create can create twice. A client-chosen request ID lets the server recognise a retry.
+
+```http
+POST /orders  Idempotency-Key: 6f1c...  { ... }
+```
+
+</Level>
+<Level name="Intermediate">
+
+The server stores the response for each request ID and returns it for repeats.
+
+```ts
+const prior = await store.get(key);
+if (prior) return prior.response;
+const response = await createOrder(body);
+await store.set(key, { hash: hashBody(body), response }, { ttlSeconds: 86400 });
+```
+
+</Level>
+<Level name="Advanced">
+
+The stored request must match: same ID with a different body is a collision and should be rejected.
+Concurrent duplicates need a lock or an insert-if-absent.
+
+</Level>
+<Level name="Edge cases">
+
+A request ID reused after cache expiry creates a second resource.
+
+</Level>
+<Level name="Corner cases">
+
+Two duplicates arriving at the same moment: both miss the cache and both execute, unless the check and
+insert are atomic.
+
+</Level>
+<Level name="Production level">
+
+In production, payment and order APIs require idempotency keys.
+
+</Level>
+<Level name="Mindset">
+
+Assume every request will be sent twice.
+
+</Level>
+<Level name="System design">
+
+Deduplication pairs with retries (chapter 29) and queues.
+
+</Level>
+<Level name="Strategy">
+
+I add idempotency keys to order creation and test concurrent duplicates. Done when exactly one order is created.
+
+</Level>
+</Levels>
+
+### 27. Request validation
+
+**Covers:** A validate-only mode that checks a request without executing it, including external dependencies and special side effects.
+
+<Flow steps={["request with validateOnly=true", "full validation and permission checks", "no changes made", "return what would happen"]} caption={"Validation-only mode: a dry run that exercises everything except the write."} />
+
+<Levels label={"Chapter 27, Request validation"}>
+<Level name="Beginner">
+
+`validateOnly: true` checks a request without making changes, so clients can test safely.
+
+</Level>
+<Level name="Intermediate">
+
+It runs the same validation and permission checks as the real request.
+
+</Level>
+<Level name="Advanced">
+
+External dependencies may make validation incomplete; document what is and is not checked.
+
+</Level>
+<Level name="Edge cases">
+
+A validation-only request on a method with external side effects must not trigger them.
+
+</Level>
+<Level name="Corner cases">
+
+Validation passes, then the real request fails because state changed between them.
+
+</Level>
+<Level name="Production level">
+
+In production, validate-only supports form UIs and CI checks of configuration.
+
+</Level>
+<Level name="Mindset">
+
+Let people try before they commit.
+
+</Level>
+<Level name="System design">
+
+Validation endpoints pair with config-as-code workflows.
+
+</Level>
+<Level name="Strategy">
+
+I add validateOnly to note creation. Done when a test shows no row was written.
+
+</Level>
+</Levels>
+
+### 28. Resource revisions
+
+**Covers:** Keeping a history of a resource: revision identifiers, creating, retrieving, listing, restoring and deleting revisions, and child resources.
+
+<Flow steps={["edit note", "new revision id", "list revisions", "get note@rev", "restore creates a new revision"]} caption={"Revisions: history is append-only; restoring an old version adds a new revision rather than rewriting history."} />
+
+<Levels label={"Chapter 28, Resource revisions"}>
+<Level name="Beginner">
+
+Revisions keep previous versions of a resource so they can be viewed and restored.
+
+</Level>
+<Level name="Intermediate">
+
+Each change creates a revision with an ID; `GET /notes/1@rev3` reads an old one.
+
+</Level>
+<Level name="Advanced">
+
+Restoring creates a new revision copying an old one. Child resources may or may not be included.
+
+</Level>
+<Level name="Edge cases">
+
+Retention limits: keep N revisions or a time window.
+
+</Level>
+<Level name="Corner cases">
+
+Restoring a revision that references a deleted resource.
+
+</Level>
+<Level name="Production level">
+
+In production, revisions cost storage; decide which fields trigger a revision.
+
+</Level>
+<Level name="Mindset">
+
+History should be append-only.
+
+</Level>
+<Level name="System design">
+
+Revisions relate to event sourcing and audit logs.
+
+</Level>
+<Level name="Strategy">
+
+I add revisions to notes. Done when restoring rev 1 after rev 3 shows four revisions.
+
+</Level>
+</Levels>
+
+### 29. Request retrial
+
+**Covers:** Which failed requests are safe to retry, exponential backoff with jitter, avoiding stampeding herds, and server-specified retry timing with Retry-After.
+
+<Flow steps={["request fails", "retryable code?", "wait base * 2^n with jitter (or Retry-After)", "retry", "give up after max"]} caption={"Retry with exponential backoff and jitter. Non-retryable errors fail immediately."} />
+
+<Levels label={"Chapter 29, Request retrial"}>
+<Level name="Beginner">
+
+Some failures (503, timeouts) may succeed on retry; others (400, 403) never will.
+
+</Level>
+<Level name="Intermediate">
+
+Exponential backoff with jitter spreads retries:
+
+```ts
+async function retry<T>(fn: () => Promise<T>, max = 5) {
+  for (let n = 0; ; n++) {
+    try { return await fn(); }
+    catch (e: any) {
+      if (n >= max || ![429, 503, 504].includes(e.status)) throw e;
+      const wait = e.retryAfterMs ?? Math.random() * 100 * 2 ** n;
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+}
+```
+
+</Level>
+<Level name="Advanced">
+
+Retry-After lets the server set timing. Only idempotent (or deduplicated) requests are safe to retry.
+
+</Level>
+<Level name="Edge cases">
+
+A retry with no maximum loops forever.
+
+</Level>
+<Level name="Corner cases">
+
+Retries plus many clients after an outage: synchronised retries stampede the recovering server; jitter
+avoids it.
+
+</Level>
+<Level name="Production level">
+
+In production, retry policy is documented per error code, and clients cap total retry time.
+
+</Level>
+<Level name="Mindset">
+
+Retries are load; spend them wisely.
+
+</Level>
+<Level name="System design">
+
+Retries connect to deduplication and circuit breakers.
+
+</Level>
+<Level name="Strategy">
+
+I write a retry helper with tests for non-retryable codes and Retry-After. Done when both pass.
+
+</Level>
+</Levels>
+
+### 30. Request authentication
+
+**Covers:** Proving a request's origin, integrity and non-repudiation with digital signatures: credential generation, registration and exchange, signing, request fingerprinting, including the signature, and verifying it.
+
+<Flow steps={["client signs fingerprint of request with private key", "sends request + signature", "server looks up public key", "verifies signature over same fingerprint", "accept or reject"]} caption={"Signed requests: the server proves who sent the request and that it was not changed, without ever holding the client's secret."} />
+
+<Levels label={"Chapter 30, Request authentication"}>
+<Level name="Beginner">
+
+Authentication proves who sent a request. Signatures prove origin and integrity.
+
+</Level>
+<Level name="Intermediate">
+
+The client holds a private key; the server stores the public key. The client signs a fingerprint of the
+request (method, path, selected headers, body hash).
+
+```ts
+import { sign, verify } from 'node:crypto';
+const fp = `${method}\n${path}\n${date}\n${sha256(body)}`;
+const sig = sign(null, Buffer.from(fp), privateKey).toString('base64');
+```
+
+</Level>
+<Level name="Advanced">
+
+Asymmetric keys give non-repudiation: the server cannot forge a client's signature because it never holds
+the private key.
+
+</Level>
+<Level name="Edge cases">
+
+A missing date in the fingerprint allows replay attacks; include a timestamp and reject old requests.
+
+</Level>
+<Level name="Corner cases">
+
+A proxy that changes headers plus a fingerprint including them: valid requests fail verification.
+Choose fingerprint headers carefully.
+
+</Level>
+<Level name="Production level">
+
+In production, webhooks are verified by signature.
+
+</Level>
+<Level name="Mindset">
+
+Prove who and prove unchanged.
+
+</Level>
+<Level name="System design">
+
+Signatures complement TLS for end-to-end integrity across proxies.
+
+</Level>
+<Level name="Strategy">
+
+I verify webhook signatures in my API with a replay window. Done when a modified body and an old timestamp both fail tests.
+
+</Level>
+</Levels>
+
+## Misreadings to avoid
+
+- "Patterns are rules." Each is a trade-off with a stated cost; the book shows the cost.
+- "Resource-oriented means REST with HTTP verbs only." Custom methods and LROs are part of the style.
+- "Pagination can be added later." Adding it later is a breaking change.
+- "Idempotency is automatic for POST with retries." It needs deduplication.
+
+## Done with this book when
+
+- My OpenAPI spec passes the fundamentals week 5 artifact: boundary validation and contract tests.
+- My phase 3 API uses standard methods, field masks, LROs for long work, cursor pagination and idempotency keys.
+- I have a written compatibility policy and contract tests for an old client.
+- Webhooks are verified with signatures and a replay window.
