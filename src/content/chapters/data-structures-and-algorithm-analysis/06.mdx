@@ -1,0 +1,1514 @@
+---
+book: data-structures-and-algorithm-analysis
+number: 6
+title: "Priority Queues (Heaps)"
+description: "Binary heaps with percolation and linear-time build, selection and event simulation, d-heaps, leftist and skew heaps, binomial queues and the library priority_queue."
+part: "The core structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A queue serves the oldest item first. A priority queue serves the most
+important one first, whatever order they arrived in: the job with the
+earliest deadline, the event with the earliest time, the shortest
+unexplored path. This chapter builds the binary heap, an array that
+behaves like a tree and gives O(log n) insert and remove-minimum with
+almost no overhead, and shows two of its classic uses: selecting the top
+k items and simulating a system driven by events. Then it builds heaps
+that can be merged quickly (leftist heaps, skew heaps and binomial
+queues), which matter when priority queues must be combined.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- State the priority queue ADT and compare the simple implementations
+  (list, sorted list, search tree) with a heap.
+- Build a binary heap in an array, with percolate up and percolate down,
+  and build one from n items in linear time.
+- Use a heap to select the k largest items of a stream in O(n log k), and
+  to drive a discrete event simulation.
+- Explain when a d-heap is better than a binary heap.
+- Merge leftist heaps, skew heaps and binomial queues, and say why each
+  merges in O(log n).
+- Use the library priority queue in C++ and build one in TypeScript.
+
+What you should already know: arrays and queues from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/03-lists-stacks-and-queues/')}>chapter 3</a>,
+binary trees and their height from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/04-trees/')}>chapter 4</a>,
+and amortised cost from the growable array.
+
+Reading time: about 90 minutes, plus two evenings for the code.
+
+## Chapter map
+
+<Layers caption="The chapter as layers. The binary heap is the workhorse; applications sit on it; the lower layers are heaps designed so that two of them can be merged quickly." layers={[
+  { name: "6.1–6.2 The ADT and simple versions", note: "insert and deleteMin; list, sorted list, tree" },
+  { name: "6.3 Binary heap", note: "complete tree in an array; percolate up and down; buildHeap" },
+  { name: "6.4 Applications", note: "selection (top k), event simulation" },
+  { name: "6.5 d-heaps", note: "wider nodes, shallower heap" },
+  { name: "6.6–6.7 Leftist and skew heaps", note: "pointer heaps that merge in O(log n)" },
+  { name: "6.8 Binomial queues", note: "a forest like a binary number; merge is addition" },
+  { name: "6.9 The library", note: "priority_queue, a max-heap by default" },
+]} />
+
+## 6.1 Model
+
+### In one sentence
+
+A priority queue supports `insert` and `deleteMin`, which removes and
+returns the smallest item, and nothing else is required.
+
+### The idea
+
+The **priority queue** ADT has two essential operations: **insert** adds
+an item, and **deleteMin** finds, removes and returns the minimum. Many
+implementations also offer `findMin` (look without removing), and some
+offer `decreaseKey` (make an item's priority more urgent), `remove`
+(delete an arbitrary item) and `merge` (combine two queues). "Minimum"
+is by priority: smaller number means more urgent. A max priority queue
+is the same with the comparison reversed.
+
+Where priority queues are used: operating system schedulers choose the
+next process; printers or job runners choose the next job by priority;
+simulations choose the next event by time; graph algorithms (chapter 9's
+Dijkstra and Prim) choose the next vertex by distance; sorting (heapsort,
+chapter 7) and compression (Huffman coding, chapter 10) need them too.
+
+The ADT promises nothing about order beyond the minimum. Unlike a search
+tree, you cannot ask for the second smallest without removing the first,
+or find an arbitrary item quickly.
+
+### Worked example
+
+Simple: an emergency room. Patients arrive in any order and are seen by
+severity. Severity 1 (critical) is seen before severity 3, even if the
+severity 3 patient has waited longer. That is a min priority queue keyed
+on severity.
+
+Realistic: a job runner with deadlines. Each job has a due time; the
+worker always runs the job with the earliest due time next. Jobs arrive
+continuously from users and scheduled tasks. The operations are insert
+(new job) and deleteMin (next to run), thousands of times per second,
+which is exactly what a heap is designed for.
+
+### Step by step
+
+<Flow caption="The life of a priority queue in a scheduler. Notice that items leave in priority order, not arrival order." steps={[
+  "insert job C, due 10:05",
+  "insert job A, due 10:01",
+  "insert job B, due 10:03",
+  "deleteMin → A (10:01)",
+  "insert job D, due 10:02",
+  "deleteMin → D (10:02), then B, then C",
+]} />
+
+### Common mistake
+
+The mistake is using a priority queue when a plain queue is meant, or vice
+versa. If items have equal priority, a heap does not preserve their
+arrival order; jobs of the same priority come out in an arbitrary order.
+When fairness among equals matters, add the arrival sequence number as a
+tie-breaker in the key.
+
+### In real systems
+
+Linux's scheduler uses a red-black tree ordered by virtual runtime as its
+priority queue. Timer systems in Node (libuv), Go's runtime and Java's
+`ScheduledThreadPoolExecutor` keep pending timers in a heap keyed by fire
+time. Kubernetes schedules pending pods from a priority queue. Message
+brokers such as RabbitMQ support priority queues for messages.
+
+### Check yourself
+
+1. Which two operations define the priority queue ADT?
+
+<details>
+<summary>Answer</summary>
+
+`insert` and `deleteMin`.
+
+</details>
+
+2. Why add a sequence number to the key when priorities tie?
+
+<details>
+<summary>Answer</summary>
+
+Heaps do not keep equal items in arrival order. Using (priority,
+sequence) as the key makes equals come out first-in first-out.
+
+</details>
+
+## 6.2 Simple implementations
+
+### In one sentence
+
+An unsorted list gives O(1) insert and O(n) deleteMin, a sorted list the
+reverse, and a balanced search tree O(log n) for both but with more
+machinery than the job needs.
+
+### The idea
+
+Three obvious implementations:
+
+- **Unsorted list or array:** insert appends in O(1); deleteMin scans all
+  items in O(n).
+- **Sorted list:** insert walks to the right place in O(n); deleteMin
+  takes the front in O(1).
+- **Binary search tree:** both are O(log n) on average. deleteMin always
+  removes from the left side, which unbalances a plain BST over time
+  (the right side keeps its nodes while the left is drained); a balanced
+  tree fixes that but supports many operations the priority queue does not
+  need.
+
+The book's observation is that there tend to be more inserts than
+deleteMins in many workloads, so the unsorted list is not as bad as it
+looks, but neither list version is good for both. The binary heap gives
+O(log n) worst case for both, O(1) average insert, and needs no pointers
+at all.
+
+### Worked example
+
+Simple, the costs for 1,000 inserts followed by 1,000 deleteMins:
+
+- Unsorted array: 1,000 cheap inserts, then deleteMins scanning 1,000,
+  999, ..., 1 items: about 500,000 comparisons.
+- Sorted array: inserts shifting up to 1,000 items each, about 250,000
+  moves on average, then 1,000 cheap removals (from the end, if sorted
+  descending).
+- Binary heap: about 2,300 comparisons for the inserts (measured below)
+  and about 2 × 10 × 1,000 = 20,000 for the deleteMins.
+
+Realistic: a JavaScript developer's first priority queue is often an
+array that is re-sorted after each insert: `jobs.push(j); jobs.sort(...)`.
+That is O(n log n) per insert. For a hundred jobs it is fine. For a
+hundred thousand timers in a server it is a CPU spike every time a timer
+is added.
+
+### Step by step
+
+<Compare left="Simple implementations" right="Binary heap" rows={[
+  ["unsorted: insert O(1), deleteMin O(n)", "insert O(log n) worst, O(1) average"],
+  ["sorted: insert O(n), deleteMin O(1)", "deleteMin O(log n)"],
+  ["BST: O(log n) average, unbalances", "always balanced (complete tree)"],
+  ["re-sort array: O(n log n) per insert", "build from n items: O(n)"],
+]} caption="Why the heap is the default. Each simple version is fast at one operation and slow at the other; the heap is fast enough at both." />
+
+### Common mistake
+
+The mistake is re-sorting an array on every insert, which is the slowest
+of all options. If the workload is all inserts first and then all
+removals, sort once in between. If they interleave, use a heap.
+
+### In real systems
+
+Small fixed-size priority queues (a few dozen items) are sometimes kept
+as sorted arrays, since shifting a few elements in cache is cheaper than
+any pointer structure; network schedulers with eight priority levels use
+an array of eight FIFO queues, an O(1) priority queue for a tiny key
+range. Beyond that, heaps are standard.
+
+### Check yourself
+
+1. Why does deleteMin unbalance a plain BST?
+
+<details>
+<summary>Answer</summary>
+
+It always removes the leftmost node, so the left side shrinks while the
+right side keeps its nodes, and the tree drifts towards a right-leaning
+chain.
+
+</details>
+
+2. For eight fixed priority levels, what is an O(1) priority queue?
+
+<details>
+<summary>Answer</summary>
+
+An array of eight queues: insert into the queue for its level, and
+deleteMin takes from the first non-empty queue.
+
+</details>
+
+## 6.3 Binary heap
+
+### In one sentence
+
+A binary heap is a complete binary tree stored in an array, in which every
+parent is no larger than its children, so the minimum is at the root, and
+insert and deleteMin repair the order along one root-to-leaf path in
+O(log n).
+
+### The idea
+
+A **heap** has two properties, and an operation can break either, so each
+operation restores both.
+
+#### 6.3.1 Structure property
+
+A heap is a **complete binary tree**: every level is full except possibly
+the last, which is filled from left to right. A complete tree of height h
+has between 2ʰ and 2ʰ⁺¹ − 1 nodes, so its height is ⌊log₂ n⌋.
+
+A complete tree needs no pointers. Store it level by level in an array.
+With the book's convention of a 1-based array, the children of position i
+are at 2i and 2i + 1 and its parent at ⌊i / 2⌋. With a 0-based array, as
+in TypeScript, the children are at 2i + 1 and 2i + 2 and the parent at
+⌊(i − 1) / 2⌋. Moving around the tree is arithmetic; the only cost is
+that the array must be sized (or grown, as in chapter 3).
+
+#### 6.3.2 Heap-order property
+
+**Heap order:** every node's key is no larger than its children's keys.
+So the minimum is always at the root, and `findMin` is O(1). Nothing is
+said about the order between siblings or cousins; a heap is far less
+ordered than a search tree, which is what makes it cheap to maintain.
+
+#### 6.3.3 Basic heap operations
+
+**insert** creates a hole at the next free position (keeping the tree
+complete) and **percolates up**: while the new key is smaller than the
+hole's parent, move the parent down into the hole and move the hole up.
+Then put the key in the hole. The book's trick is to move the hole
+rather than swapping, saving two of every three assignments. Worst case
+O(log n), when the new key is the new minimum. On average, a random key
+rises only a constant number of levels, because half the nodes are
+leaves and most keys belong near the bottom.
+
+**deleteMin** removes the root, leaving a hole at the top, and takes the
+last element out of the array (keeping the tree complete). It then
+**percolates down**: while the hole has children and the smaller child is
+smaller than the last element, move that child up into the hole and move
+the hole down. Then put the last element in the hole. This costs O(log n)
+in the worst case and also on average, because the last element came from
+the bottom and usually goes back near the bottom.
+
+#### 6.3.4 Other heap operations
+
+A heap cannot find an arbitrary key quickly; it would have to scan. If the
+caller keeps track of each item's position (with a map or an index stored
+in the item), more operations become possible:
+
+- **decreaseKey(p, Δ):** lower the key at position p and percolate up.
+  This is what Dijkstra's algorithm needs.
+- **increaseKey(p, Δ):** raise the key and percolate down.
+- **remove(p):** decrease the key to minus infinity, then deleteMin.
+- **buildHeap:** given n items at once, put them in the array in any
+  order, then percolate down every non-leaf node, from the last one
+  (position ⌊n/2⌋) back to the root.
+
+buildHeap is O(n), not O(n log n). Most nodes are near the bottom and
+percolate down only a little: n/4 nodes move at most 1 level, n/8 at most
+2, and so on. The book bounds the total by the sum of the heights of all
+nodes in a perfect tree, which is 2ʰ⁺¹ − 1 − (h + 1), less than n.
+
+### Worked example
+
+My heap, with a comparison counter:
+
+```ts
+class Heap {
+  a: number[] = []; cmp = 0;
+  push(x: number) {
+    const a = this.a; a.push(x);
+    let i = a.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      this.cmp++; if (a[p] <= x) break;
+      a[i] = a[p]; i = p;                 // move the parent down; the hole moves up
+    }
+    a[i] = x;
+  }
+  pop(): number | undefined {
+    const a = this.a; if (!a.length) return undefined;
+    const top = a[0], last = a.pop()!;
+    if (a.length) this.down(0, last);
+    return top;
+  }
+  // continued below
+}
+```
+
+```ts
+  down(i: number, x: number) {             // percolate x down from hole i
+    const a = this.a, n = a.length;
+    for (;;) {
+      let c = 2 * i + 1; if (c >= n) break;
+      if (c + 1 < n) { this.cmp++; if (a[c + 1] < a[c]) c++; }   // smaller child
+      this.cmp++; if (a[c] >= x) break;
+      a[i] = a[c]; i = c;
+    }
+    a[i] = x;
+  }
+  static build(xs: number[]) {
+    const h = new Heap(); h.a = xs.slice();
+    for (let i = (h.a.length >> 1) - 1; i >= 0; i--) h.down(i, h.a[i]);
+    return h;
+  }
+```
+
+Pushing my own keys 31, 14, 26, 9, 19, 5, 22, one at a time:
+
+```text
++31  [31]
++14  [14,31]
++26  [14,31,26]
++9   [9,14,26,31]
++19  [9,14,26,31,19]
++5   [5,14,9,31,19,26]
++22  [5,14,9,31,19,26,22]
+pops 5 9 14 19 22 26 31
+```
+
+Building from `[31,14,26,9,19,5,22,17,3]` at once gives
+`[3,9,5,14,19,26,22,17,31]`.
+
+The measurements I care about, comparisons per item:
+
+```text
+                        push one by one   buildHeap   log2 n
+random, n = 100,000          2.28            1.88       16.6
+random, n = 1,000,000        2.28            1.88       19.9
+descending, n = 100,000     14.69            2.00
+descending, n = 1,000,000   17.95            2.00
+```
+
+Random inserts cost a constant 2.28 comparisons each, independent of n:
+the O(1) average. Descending input makes every new key the new minimum, so
+each rises to the root: about log₂ n comparisons. buildHeap stays at about
+2 per item for any order, confirming the linear bound.
+
+### Step by step
+
+<Figure caption="The heap after the seven pushes, as a tree and as the 0-based array. Children of index i are at 2i + 1 and 2i + 2; no pointers are stored." art={`
+                 5                       index: 0   1   2   3   4   5   6
+               /   \\                    value: 5  14   9  31  19  26  22
+            14       9
+           /  \\     /  \\                parent of i = (i − 1) >> 1
+         31   19  26   22               children = 2i + 1, 2i + 2
+`} />
+
+<Trace columns={["step", "hole at", "compare", "action", "array after"]} rows={[
+  ["push 5", "5 (end)", "parent [2] = 26 > 5", "26 moves down to 5", "9,14,_,31,19,26"],
+  ["", "2", "parent [0] = 9 > 5", "9 moves down to 2", "_,14,9,31,19,26"],
+  ["", "0", "no parent", "place 5", "5,14,9,31,19,26"],
+]} caption="Percolating 5 up into the heap [9,14,26,31,19]. The hole rises from the new last position; each larger parent moves down one step, and 5 is written once at the end." />
+
+<Trace columns={["deleteMin", "hole", "children", "smaller", "last = 22 vs it", "move"]} rows={[
+  ["remove 5", "0", "14, 9", "9 (index 2)", "22 > 9", "9 up to 0"],
+  ["", "2", "26, (none)", "26 (index 5)", "22 < 26", "stop; place 22 at 2"],
+  ["result", "", "", "", "", "[9,14,22,31,19,26]"],
+]} caption="deleteMin on the seven-item heap. The last element, 22, is lifted out and the hole sinks along the path of smaller children until 22 fits." />
+
+### Common mistake
+
+The mistake in percolate down is comparing with only the left child, or
+forgetting that the last internal node may have only one child. Always
+find the smaller of the existing children. The second mistake is building
+a heap by n pushes when all the items are available at once: it is
+O(n log n) on sorted input (17.95 comparisons per item above) versus 2 for
+buildHeap.
+
+A third mistake is `decreaseKey` without position tracking. Searching the
+heap for the item is O(n) and turns Dijkstra's algorithm quadratic.
+
+### In real systems
+
+Most heaps in libraries are binary heaps in arrays: C++'s
+`priority_queue` and `make_heap`, Java's `PriorityQueue`, Python's
+`heapq`, Go's `container/heap`. Python's `heapq.heapify` is the linear
+buildHeap. Timer heaps in event loops store each timer's index inside the
+timer object so that cancelling a timer (a `remove`) is O(log n).
+
+### Check yourself
+
+1. In a 0-based heap array, where are the children of index 6?
+
+<details>
+<summary>Answer</summary>
+
+Indexes 13 and 14.
+
+</details>
+
+2. Why is buildHeap O(n) while n pushes can be O(n log n)?
+
+<details>
+<summary>Answer</summary>
+
+buildHeap percolates down, and most nodes are near the leaves and move
+only a level or two. Pushes percolate up, and with sorted input every
+item travels the full height.
+
+</details>
+
+3. What does deleteMin put in the root's hole first?
+
+<details>
+<summary>Answer</summary>
+
+Nothing directly: it removes the last element and percolates the hole
+down, then places the last element where it fits.
+
+</details>
+
+## 6.4 Applications of priority queues
+
+### In one sentence
+
+A heap selects the k-th largest of n items in O(n + k log n) or
+O(n log k) without sorting everything, and it is the event list at the
+heart of every discrete event simulation.
+
+### The idea
+
+#### 6.4.1 The selection problem
+
+Chapter 1's selection problem asks for the k-th largest of n items. Two
+heap algorithms:
+
+- **Build, then remove.** buildHeap on all n items (a max-heap, or a
+  min-heap for the k-th smallest), then k deleteMax operations. Cost
+  O(n + k log n). For k up to n / log n this is O(n); for the median it is
+  O(n log n). Doing all n removals sorts the data, which is heapsort.
+- **Keep a heap of k.** Read the first k items into a *min*-heap. For each
+  later item, if it is larger than the heap's minimum (the smallest of the
+  current top k), replace the minimum with it and percolate down. At the
+  end, the root is the k-th largest and the heap holds the top k. Cost
+  O(n log k), with O(k) memory, and it works on a stream that never fits
+  in memory.
+
+Chapter 7 shows a quickselect algorithm that finds the k-th item in O(n)
+on average, and chapter 10 one that is O(n) in the worst case.
+
+#### 6.4.2 Event simulation
+
+A **discrete event simulation** models a system (a bank, a network, a
+factory) as a sequence of **events**, each with a time: a customer
+arrives, a teller finishes. Instead of ticking a clock one unit at a time,
+which wastes work when nothing happens, the simulation keeps all pending
+events in a priority queue keyed by time. It repeatedly removes the
+earliest event, advances the clock to its time, processes it, and inserts
+any events it causes (a customer starts service, so a departure event is
+scheduled for later).
+
+With C customers and k tellers, the queue holds at most about C + k
+events, and each operation costs O(log(C + k)), so the whole simulation
+is O(C log(C + k)), regardless of how long the simulated time span is.
+
+### Worked example
+
+Selection: the top 10 of a million random numbers, with a heap of 10
+versus sorting:
+
+```ts
+const hp = new Heap();                          // min-heap of the best 10 so far
+for (const x of xs) {
+  if (hp.a.length < k) hp.push(x);
+  else if (x > hp.a[0]) { hp.a[0] = x; hp.down(0, x); }   // replace the weakest
+}
+```
+
+```text
+top-10 of 1,000,000: heap 22.6 ms   full sort 286.4 ms   same answer: true
+```
+
+Twelve times faster, and the heap version reads the data once with ten
+numbers of memory, so it works on a log file of any size.
+
+Event simulation: my bank model, with 100,000 customers arriving on
+average every 1 minute (exponentially distributed gaps), service taking
+on average 2.7 minutes, and k tellers. The event list is a binary heap of
+(time, kind, customer). Utilisation is 2.7 / k.
+
+```text
+tellers 2   utilisation 1.35   average wait 17,987.69 min   longest line 26,535
+tellers 3   utilisation 0.90   average wait      8.33 min   longest line     88
+tellers 4   utilisation 0.68   average wait      0.86 min   longest line     23
+```
+
+With two tellers, work arrives faster than it can be done and the line
+grows without limit. With three, the bank keeps up but runs at 90%, and
+customers wait over eight minutes on average. A fourth teller cuts the
+wait nearly tenfold. This is the queueing theory remark from chapter 3,
+reproduced by a 30-line simulation.
+
+### Step by step
+
+<Flow caption="The event loop of a discrete event simulation. The clock jumps from event to event; the heap always yields the next one in time order." steps={[
+  "insert all arrival events (or generate them as you go)",
+  "deleteMin: the earliest event; set clock to its time",
+  "arrival: if a teller is free, start service and insert a departure at clock + service time; else join the line",
+  "departure: if the line is non-empty, start the next customer and insert their departure; else free the teller",
+  "repeat until the event heap is empty",
+]} />
+
+<Trace columns={["clock", "event", "tellers busy", "line", "events inserted"]} rows={[
+  ["0.0", "arrive c1", "1", "", "depart c1 at 3.0"],
+  ["0.5", "arrive c2", "2", "", "depart c2 at 2.0"],
+  ["1.0", "arrive c3", "2", "c3", "–"],
+  ["2.0", "depart c2", "2", "", "depart c3 at 4.5 (c3 waited 1.0)"],
+  ["3.0", "depart c1", "1", "", "–"],
+  ["4.5", "depart c3", "0", "", "–"],
+]} caption="A hand trace with two tellers and three customers. The clock jumps from 1.0 to 2.0 to 3.0 with nothing in between to simulate." />
+
+### Common mistake
+
+In selection, the mistake is using a max-heap of size k for the k
+largest. The heap must be a min-heap, so that its root is the weakest of
+the current best and can be compared with each new item. In simulations,
+the mistake is processing simultaneous events in an arbitrary order when
+order matters (a departure and an arrival at the same instant). Add a
+tie-break to the key.
+
+### In real systems
+
+"Top k" is everywhere: trending topics, the slowest endpoints in a
+monitoring tool, the closest k results in a vector search (where the
+heap keeps the best k candidates seen so far), and `ORDER BY ... LIMIT k`
+in databases, which use a bounded heap instead of a full sort. Discrete
+event simulation drives network simulators (ns-3), chip and logistics
+simulators, and load-testing models used to size systems before
+building them.
+
+### Check yourself
+
+1. Why does the streaming top-k algorithm use a min-heap?
+
+<details>
+<summary>Answer</summary>
+
+Its root is the smallest of the current top k, the one to evict when a
+larger item arrives. Finding it must be O(1).
+
+</details>
+
+2. Why is event simulation independent of the simulated time span?
+
+<details>
+<summary>Answer</summary>
+
+The clock jumps directly to the next event, so idle time costs nothing;
+the work depends only on the number of events.
+
+</details>
+
+## 6.5 d-heaps
+
+### In one sentence
+
+A d-heap gives each node d children instead of two, making the heap
+shallower so inserts are cheaper, at the cost of comparing d children at
+each step of deleteMin.
+
+### The idea
+
+A **d-heap** is a complete d-ary tree with heap order. With a 0-based
+array, the children of i are at d·i + 1 to d·i + d and its parent at
+⌊(i − 1) / d⌋. The height is about log_d n.
+
+insert percolates up through log_d n levels, one comparison each, so it
+gets cheaper as d grows. deleteMin percolates down, and at each level it
+must find the smallest of d children (d − 1 comparisons) plus one more
+comparison with the moving key, so its cost is about d log_d n, which
+grows with d. When d is a power of 2, the child and parent arithmetic is
+shifts.
+
+So d-heaps help workloads with many more inserts (or decreaseKeys) than
+deleteMins, such as some graph algorithms, and they help memory locality:
+with d = 4 or 8, a node's children often share one cache line, and
+real-world timings for 4-heaps are often better than for binary heaps even
+with equal numbers of operations. Very large d also suits heaps that do
+not fit in memory, for the same reason B-trees do.
+
+The book notes the other weakness of all array heaps: merging two of them
+takes linear time (concatenate and rebuild). That motivates the rest of
+the chapter.
+
+### Worked example
+
+Heights for a million items: 19 levels for d = 2, 10 for d = 4, 7 for
+d = 8. Timing a million inserts followed by a million deleteMins in
+TypeScript, counting comparisons per item (both operations together):
+
+```text
+d = 2:  270 ms   37.2 comparisons per item
+d = 4:  256 ms   37.8 comparisons per item
+d = 8:  265 ms   51.1 comparisons per item
+```
+
+The 4-heap does about the same number of comparisons as the binary heap
+and was slightly faster, because its paths are half as long and each
+group of four children is adjacent in memory. The 8-heap makes a third
+more comparisons and loses the advantage. In JavaScript the effect is
+small; in C or Rust, with tighter memory layouts, 4-heaps are often
+measurably faster.
+
+### Step by step
+
+<Figure caption="The same eight keys as a binary heap (left, height 3) and a 4-heap (right, height 2). The 4-heap's root has four children; a deleteMin compares all four to find the smallest." art={`
+   binary heap (d = 2)              4-heap (d = 4)
+           2                               2
+         /   \\                     /    /    \\    \\
+        4     3                   4    3      8    6
+       / \\   / \\                /|\\
+      8   6 9   7               9 7 11
+     /
+    11                          children of i: 4i + 1 … 4i + 4
+   array for both: [2, 4, 3, 8, 6, 9, 7, 11]
+`} />
+
+<Compare left="Binary heap" right="4-heap" rows={[
+  ["height log₂ n (19 at a million)", "height log₄ n (10 at a million)"],
+  ["insert: about log₂ n comparisons worst case", "insert: about half as many"],
+  ["deleteMin: 2 comparisons per level", "deleteMin: 4 comparisons per level"],
+  ["children may be in different cache lines", "four children usually adjacent"],
+]} caption="Choosing d. A small d favours deleteMin; a larger d favours insert and decreaseKey and memory locality, up to about 4 or 8." />
+
+### Common mistake
+
+The mistake is choosing a large d for "fewer levels" without counting
+the d − 1 comparisons per level in deleteMin. Measure on the real mix of
+operations. The second mistake is an off-by-one in the child formula when
+switching from the book's 1-based convention to 0-based arrays.
+
+### In real systems
+
+Go's timer implementation uses a 4-ary heap. Several high-performance
+Dijkstra implementations use 4-heaps or 8-heaps. .NET's `PriorityQueue`
+is a 4-ary heap. External-memory priority queues use very high arity, for
+the same block-size reasons as B-trees.
+
+### Check yourself
+
+1. In a 0-based 3-heap, where is the parent of index 10?
+
+<details>
+<summary>Answer</summary>
+
+⌊(10 − 1) / 3⌋ = 3.
+
+</details>
+
+2. Why does deleteMin get slower as d grows?
+
+<details>
+<summary>Answer</summary>
+
+Each level needs d − 1 comparisons to find the smallest child, so the cost
+is about d log_d n, which increases with d beyond small values.
+
+</details>
+
+## 6.6 Leftist heaps
+
+### In one sentence
+
+A leftist heap is a heap-ordered binary tree kept deliberately unbalanced
+towards the left, so that its right path is short (O(log n)), and merging
+two heaps walks only their right paths.
+
+### The idea
+
+Array heaps cannot merge quickly. Pointer-based heaps can, if they are
+shaped right. Merging must combine two trees by working down some path,
+and the trick is to make that path short in every tree.
+
+#### 6.6.1 Leftist heap property
+
+The **null path length** npl(X) of a node is the length of the shortest
+path from X to a node with fewer than two children. A leaf (or a node with
+one child) has npl 0, and npl(null) is defined as −1. The **leftist heap
+property**: for every node, the npl of its left child is at least the npl
+of its right child.
+
+So the tree leans left, and the right path from the root is a shortest
+path to a missing child. The book proves that a leftist tree with r nodes
+on its right path has at least 2ʳ − 1 nodes, so the right path has at most
+about log₂(n + 1) nodes. Leftist trees can be very unbalanced overall
+(a long left chain is allowed), but the right path is always short.
+
+#### 6.6.2 Leftist heap operations
+
+Everything is built on **merge**. To merge heaps H₁ and H₂, let H₁ be the
+one with the smaller root. Recursively merge H₂ with H₁'s right subtree,
+and make the result H₁'s right child. If that breaks the leftist property
+at H₁ (right npl now exceeds left), swap H₁'s children. Update H₁'s npl to
+1 + npl of its right child.
+
+The recursion follows the right paths of both heaps, so merge is
+O(log n). Then insert is merge with a one-node heap, and deleteMin removes
+the root and merges its two subtrees. Both are O(log n).
+
+### Worked example
+
+My leftist heap:
+
+```ts
+type LH = { k: number; l: LH; r: LH; npl: number } | null;
+const npl = (t: LH) => (t ? t.npl : -1);
+function merge(a: LH, b: LH): LH {
+  if (!a) return b;
+  if (!b) return a;
+  if (b.k < a.k) [a, b] = [b, a];            // a has the smaller root
+  a!.r = merge(a!.r, b);
+  if (npl(a!.l) < npl(a!.r)) [a!.l, a!.r] = [a!.r, a!.l];   // restore leftist property
+  a!.npl = npl(a!.r) + 1;
+  return a;
+}
+```
+
+Building A from inserts 4, 12, 9, 20 and B from 6, 8, 15, then merging:
+
+```text
+A      4(12,9(20,-))
+B      6(8,15)
+merge  4(6(9(20,15),8),12)
+```
+
+And the property that matters, measured: after 100,000 random inserts,
+the right path of the leftist heap had 6 nodes. The bound allows up to
+about 16.6. The left side can be long; merge never goes there.
+
+### Step by step
+
+<Trace columns={["call", "smaller root", "recurse on", "after return", "swap?"]} rows={[
+  ["merge(A, B)", "4", "merge(9(20), B)", "4.r = 6(...)", "npl(12) = 0 < npl(6) = 1: swap"],
+  ["merge(9(20), 6(8,15))", "6", "merge(15, 9(20))", "6.r = 9(20,15)", "npl(8) = 0 < 1: swap"],
+  ["merge(15, 9(20))", "9", "merge(null, 15)", "9.r = 15", "npl(20) = npl(15) = 0: no swap"],
+  ["merge(null, 15)", "–", "base case", "returns 15", "–"],
+]} caption="Merging A and B. Each call takes the smaller root and recurses on its right child; swaps on the way back up keep the right paths short." />
+
+<Figure caption="The merged leftist heap. Its right path (4 → 12) has two nodes, while the left side holds most of the tree. The npl of each node is shown in brackets." art={`
+                  4 [1]
+                /       \\
+            6 [1]        12 [0]
+           /     \\
+        9 [1]     8 [0]
+       /    \\
+    20 [0]   15 [0]
+`} />
+
+### Common mistake
+
+The mistake is forgetting to update npl after the swap, or computing it
+from the left child instead of the right. npl is 1 + npl(right), because
+after the swap the right child has the smaller npl. Another mistake is
+deep recursion: merge recurses along right paths, which are short, so
+recursion is safe here, unlike in the skew heap below where a single
+right path can be long.
+
+### In real systems
+
+Leftist heaps are mostly a teaching structure and a stepping stone to
+pairing heaps and Fibonacci heaps (chapters 11 and 12), but mergeable
+priority queues are needed in practice: merging per-thread work queues,
+combining partial results in parallel algorithms, and functional
+languages, where leftist heaps are a standard purely functional priority
+queue because merge creates new nodes only along one path.
+
+### Check yourself
+
+1. What is the npl of a node with exactly one child?
+
+<details>
+<summary>Answer</summary>
+
+0, because it already has fewer than two children.
+
+</details>
+
+2. Why does merge only walk right paths?
+
+<details>
+<summary>Answer</summary>
+
+It always merges into the right subtree of the smaller root, and the
+leftist property guarantees that right paths are O(log n) long.
+
+</details>
+
+## 6.7 Skew heaps
+
+### In one sentence
+
+A skew heap is a leftist heap without the bookkeeping: merge always swaps
+the children, which gives O(log n) amortised time per operation with no
+npl field at all.
+
+### The idea
+
+A **skew heap** is to a leftist heap what a splay tree is to an AVL tree.
+It is a heap-ordered binary tree with no structural condition, and merge
+is the same recursion as before, except that after merging into the right
+subtree, the children are *always* swapped. (The book's version has one
+exception: the largest node on the right paths does not have its children
+swapped, a detail that does not change the bound.)
+
+A single right path can become long, so one merge can cost O(n). But the
+always-swap rule moves long right paths to the left, where later merges do
+not go, and chapter 11 proves that any m operations take O(m log n): an
+amortised O(log n) per operation.
+
+The advantage is simplicity: no extra field, no condition test. The cost
+is that worst-case operations can be slow and recursion can be deep, so
+practical versions merge iteratively.
+
+### Worked example
+
+My skew heap merge:
+
+```ts
+type SH = { k: number; l: SH; r: SH } | null;
+function merge(a: SH, b: SH): SH {
+  if (!a) return b;
+  if (!b) return a;
+  if (b.k < a.k) [a, b] = [b, a];
+  const t = a!.r;
+  a!.r = a!.l;                 // always swap ...
+  a!.l = merge(t, b);          // ... and the merged result goes left
+  return a;
+}
+```
+
+The same inputs as the leftist example:
+
+```text
+A      4(12(20,-),9)
+B      6(15,8)
+merge  4(6(8(9,-),15),12(20,-))
+```
+
+The shapes differ from the leftist heap's because the swaps happen
+unconditionally. Inserting 1 to 7 in order gives `1(3(7,5),2(6,4))`,
+which is perfectly balanced. A plain BST would have produced a chain.
+
+### Step by step
+
+<Compare left="Leftist heap" right="Skew heap" rows={[
+  ["stores npl in every node", "stores nothing extra"],
+  ["swaps children only when npl says so", "always swaps"],
+  ["worst case O(log n) per operation", "amortised O(log n); one merge may be O(n)"],
+  ["recursion depth bounded by log n", "recursion can be deep; merge iteratively"],
+]} caption="The same idea with and without bookkeeping, like AVL trees and splay trees in chapter 4." />
+
+### Common mistake
+
+The mistake is the recursive merge on large skew heaps: a long right path
+can exhaust the call stack. Write merge with an explicit loop down the
+right paths, then swap on the way back. A second mistake is expecting
+skew heaps to be balanced; they are not, and their speed is only
+guaranteed over sequences.
+
+### In real systems
+
+Skew heaps appear in functional programming libraries and in some
+schedulers where merge is frequent and simplicity matters. Their analysis
+technique, a potential function on the number of "heavy" right nodes, is
+reused for many self-adjusting structures and is the subject of chapter
+11.
+
+### Check yourself
+
+1. What is the only structural rule in a skew heap?
+
+<details>
+<summary>Answer</summary>
+
+Heap order. There is no balance or npl condition.
+
+</details>
+
+2. Why is skew heap merge only amortised O(log n)?
+
+<details>
+<summary>Answer</summary>
+
+A single right path can be long, making one merge slow, but the
+unconditional swaps shorten right paths for later operations so the total
+over any sequence is O(m log n).
+
+</details>
+
+## 6.8 Binomial queues
+
+### In one sentence
+
+A binomial queue is a forest of heap-ordered binomial trees, at most one
+of each size 2ᵏ, so the forest mirrors the binary representation of n and
+merging two queues is binary addition, in O(log n).
+
+### The idea
+
+#### 6.8.1 Binomial queue structure
+
+A **binomial tree** Bₖ is defined recursively: B₀ is a single node, and Bₖ
+is two copies of Bₖ₋₁ with the root of one attached as a child of the
+other. So Bₖ has 2ᵏ nodes, height k, and its root has k children, which
+are B₀, B₁, ..., Bₖ₋₁. (The number of nodes at depth d is the binomial
+coefficient C(k, d), which gives the name.)
+
+A **binomial queue** is a collection of heap-ordered binomial trees, at
+most one of each rank. A queue of 13 items (binary 1101) has exactly B₃,
+B₂ and B₀. There are at most ⌊log₂ n⌋ + 1 trees, so the minimum (the
+smallest root) is found in O(log n), or O(1) if tracked.
+
+#### 6.8.2 Binomial queue operations
+
+**Merge** works like adding two binary numbers. Go through ranks from 0
+upward. At each rank there may be 0, 1, 2 or 3 trees (one from each queue
+plus a carry). With 0 or 1, the result has that. With 2, **link** them
+into one tree of the next rank (the larger root becomes a child of the
+smaller), which becomes the carry. With 3, keep one and link the other
+two as the carry. Linking two trees is O(1), and there are O(log n)
+ranks, so merge is O(log n).
+
+**insert** is merge with a one-item queue. Its worst case is O(log n),
+but like incrementing a binary counter, the average over many inserts is
+O(1): most increments flip only a few bits. Building a queue of n items
+by n inserts is O(n).
+
+**deleteMin** finds the tree with the smallest root, removes it from the
+forest, removes its root (its children B₀ ... Bₖ₋₁ form a binomial queue
+by themselves), and merges that queue back in: O(log n).
+
+#### 6.8.3 Implementation
+
+Each tree is stored with first-child/next-sibling pointers (from chapter
+4), with children ordered by decreasing rank so that linking a new child
+is O(1) at the front. The forest is an array indexed by rank.
+
+### Worked example
+
+My binomial queue, inserting 13, 7, 21, 3, 18, 10, 25 and showing which
+trees exist after each insert (like the binary digits of the size):
+
+```text
++13   B0(min 13)                                 size 1   = 1
++7    -  B1(min 7)                               size 2   = 10
++21   B0(min 21)  B1(min 7)                      size 3   = 11
++3    -  -  B2(min 3)                            size 4   = 100
++18   B0(min 18)  -  B2(min 3)                   size 5   = 101
++10   -  B1(min 10)  B2(min 3)                   size 6   = 110
++25   B0(min 25)  B1(min 10)  B2(min 3)          size 7   = 111
+deleteMin → 3:   -  B1(min 21)  B2(min 7)        size 6   = 110
+```
+
+The insert of 3 caused two carries (B₀ + B₀ → B₁, then B₁ + B₁ → B₂),
+exactly as 3 + 1 = 4 does in binary. deleteMin removed the B₂ rooted at 3;
+its children (a B₀ holding 21, and a B₁ rooted at 7 holding 7 and 13)
+merged with the remaining B₀ (25) and B₁ (10), giving a B₁ and a B₂.
+
+### Step by step
+
+<Figure caption="Binomial trees B0 to B3. Each Bk is two B(k−1) trees linked at the roots; Bk has 2^k nodes and its root has k children." art={`
+   B0     B1        B2              B3
+   o      o         o                 o
+          |        / |            /   |  \\
+          o       o  o           o    o    o
+                  |             / |   |
+                  o            o  o   o
+                               |
+                               o
+`} />
+
+<Trace columns={["rank", "queue 1", "queue 2", "carry in", "result", "carry out"]} rows={[
+  ["0", "B0 (25)", "B0 (21)", "–", "–", "B1 (21, 25)"],
+  ["1", "B1 (10)", "B1 (7)", "B1 (21)", "B1 (21) kept", "B2 (7: 13, 10, 18)"],
+  ["2", "–", "–", "B2 (7)", "B2 (7)", "–"],
+]} caption="The merge inside deleteMin: the remaining forest (B0 = 25, B1 = 10) plus the removed root's children (B0 = 21, B1 = 7). Two trees at a rank link into a carry; three keep one and carry the link of the other two." />
+
+### Common mistake
+
+The mistake is linking trees of different ranks, which breaks the "one per
+rank" invariant and the binary analogy. Link only equal ranks. A second
+mistake in deleteMin is forgetting that the removed root's children are
+in decreasing rank order (with the first-child list) and must be reversed
+or indexed by rank before merging.
+
+### In real systems
+
+Binomial queues are the conceptual basis of Fibonacci heaps (chapter 11),
+which make decreaseKey O(1) amortised and give Dijkstra's algorithm its
+best theoretical bound. In practice, binary or pairing heaps (chapter 12)
+usually run faster. The binary-counter analogy itself (structure mirrors
+the binary digits of n) reappears in log-structured merge trees, which
+keep runs of sizes in geometric progression and merge them like carries.
+
+### Check yourself
+
+1. Which binomial trees form a queue of 22 items?
+
+<details>
+<summary>Answer</summary>
+
+22 is 10110 in binary, so B₄, B₂ and B₁.
+
+</details>
+
+2. Why is n inserts into an empty binomial queue O(n) in total?
+
+<details>
+<summary>Answer</summary>
+
+Each insert is a binary increment, and n increments flip O(n) bits in
+total: each link is a carry, and carries happen on average about once per
+increment.
+
+</details>
+
+## 6.9 Priority queues in the standard library
+
+### In one sentence
+
+C++'s `priority_queue` is a binary heap on top of a `vector`, a max-heap
+by default, with `push`, `top`, `pop` and no decreaseKey or merge.
+
+### The idea
+
+The library class template `priority_queue` wraps a container (by default
+`vector`) and keeps it as a binary heap. Its operations are `push`,
+`top` (look at the largest), `pop` (remove the largest), `empty` and
+`size`. By default it is a **max**-heap, which surprises people coming
+from the book's min-heaps; a min-heap needs `greater<T>` as the
+comparison. It offers no decreaseKey, no remove, and no merge.
+
+The lower-level functions `make_heap`, `push_heap` and `pop_heap` apply
+the same algorithms directly to any random-access range, which is how one
+builds a heap with linear-time construction or a custom layout.
+
+JavaScript has no built-in priority queue. The usual choices are a small
+binary heap class like mine, or a library. For graph algorithms that need
+decreaseKey, the common workaround is **lazy deletion**: push the new
+(smaller) priority as a new entry and skip stale entries when they are
+popped.
+
+### Worked example
+
+Lazy decreaseKey in a TypeScript heap of `[priority, item]` pairs: when a
+shorter distance to vertex v is found, push `[newDist, v]`; when popping,
+skip if the popped priority is larger than the best known distance for
+that item. The heap may hold several entries for one vertex, but each
+extra entry costs one extra push and pop, O(log n) each, which keeps the
+total bound for Dijkstra at O(E log V).
+
+### Step by step
+
+<Compare left="C++ priority_queue" right="TypeScript (hand-built)" rows={[
+  ["max-heap by default; greater<T> for min", "write the comparison you need"],
+  ["push, top, pop, size, empty", "push, peek, pop, size; add what you need"],
+  ["no decreaseKey or merge", "lazy deletion or position tracking for decreaseKey"],
+  ["make_heap gives O(n) construction", "static build() with percolate down"],
+]} caption="Library and hand-built heaps. Both are binary heaps in arrays; the differences are in the default ordering and the extras." />
+
+### Common mistake
+
+The mistake in C++ is forgetting that the default is a max-heap and
+getting the largest item when the smallest was intended. In TypeScript,
+the mistake is a comparison that returns a boolean where a number is
+expected (or the reverse), or comparing tuple keys with `<`, which
+compares them as strings.
+
+### In real systems
+
+Python's `heapq` is a min-heap of list elements, with tuples as
+(priority, item); Java's `PriorityQueue` is a min-heap with a
+comparator. Both, like C++, lack decreaseKey, and Dijkstra
+implementations in all three languages use lazy deletion.
+
+### Check yourself
+
+1. How do you get a min-heap from C++'s `priority_queue`?
+
+<details>
+<summary>Answer</summary>
+
+Pass `greater<T>` as the comparison type, with `vector<T>` as the
+container.
+
+</details>
+
+2. What is lazy deletion for decreaseKey?
+
+<details>
+<summary>Answer</summary>
+
+Push the item again with its new priority and, when popping, discard
+entries whose priority is worse than the item's current best.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 6, Priority Queues (Heaps)">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the chapter teaches one tool: a structure that
+always hands you the smallest (or most urgent) item, quickly, while new
+items keep arriving. Sorting would also give the smallest, but re-sorting
+after every arrival is wasteful. A heap does just enough ordering to keep
+the minimum on top.
+
+A worked example: merging three sorted lists of log lines into one sorted
+stream. Put the first line of each list in a heap keyed by timestamp. Pop
+the smallest, output it, and push the next line from the same list.
+
+```ts
+const lists = [[1, 7, 12], [3, 4, 20], [2, 9]];
+const out: number[] = [];
+const h: [number, number, number][] = lists.map((l, i) => [l[0], i, 0]); // value, list, index
+while (h.length) {
+  h.sort((a, b) => a[0] - b[0]);            // fine for 3 lists; use a real heap for many
+  const [v, li, ix] = h.shift()!;
+  out.push(v);
+  if (ix + 1 < lists[li].length) h.push([lists[li][ix + 1], li, ix + 1]);
+}
+console.log(out.join(' '));                 // 1 2 3 4 7 9 12 20
+```
+
+The beginner mistake is the one in the comment: sorting a small array is
+fine, but with a thousand lists it is a heap's job.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can write a binary heap in an array from
+memory: index arithmetic, percolate up with a hole, percolate down with
+the smaller child, linear buildHeap. I know insert averages 2.28
+comparisons on random input and log₂ n on descending input, and that
+buildHeap is about 2 per item.
+
+A worked example: the k closest points to the origin among a million, in
+O(n log k), with a max-heap of size k keyed by distance (so the root is
+the farthest of the current best and is evicted when a closer point
+arrives). This is the mirror image of the top-k largest with a min-heap.
+
+The intermediate mistake is getting the heap direction backwards in
+top-k problems. The rule: to keep the k smallest, use a max-heap; to keep
+the k largest, use a min-heap. The root is always the one to evict.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+The advanced level is mergeable heaps and their analyses. Leftist heaps
+bound the right path by log₂(n + 1) through the npl invariant. Skew heaps
+drop the invariant and get amortised bounds. Binomial queues mirror binary
+numbers: merge is addition with carries, insert is increment and is O(1)
+amortised. Chapter 11 analyses skew heaps and binomial queues formally
+and builds Fibonacci heaps, where decreaseKey is O(1) amortised.
+
+A precise example: the sum of heights in a perfect binary tree of height
+h is 2ʰ⁺¹ − 1 − (h + 1). For h = 19 (about a million nodes) that is
+1,048,555, slightly less than n. That sum bounds buildHeap's swaps, so the
+measured 1.88 comparisons per item (about two comparisons per level moved)
+fits.
+
+The advanced mistake is choosing a Fibonacci heap for its bounds without
+measuring. Its constants and pointer overhead often make it slower than a
+binary heap with lazy deletion.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+The boundary inputs to settle on purpose:
+
+- **deleteMin on empty.** Return `undefined` (mine) or throw. Peeking an
+  empty heap must not read `a[0]` as a real value.
+- **One element.** deleteMin must not percolate the "last" element into
+  the root after removing it; my `pop` checks `a.length` after the
+  `pop()`.
+- **Duplicates.** Heaps allow equal keys; use `<=` in percolate up so
+  equal keys stop early, and expect no stable order among them.
+- **Last internal node with one child.** Percolate down must check that
+  the right child exists before comparing it.
+- **k larger than n in top-k.** The heap never fills; return all items.
+- **Simultaneous events.** Break ties deterministically, or results vary
+  run to run.
+
+The mistake is assuming the middle of the heap is where bugs are. They
+are at sizes 0, 1, 2 and at the last internal node.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases come from keys and language details.
+
+- **NaN priorities.** Every comparison with NaN is false, so a NaN key
+  stops wherever it lands and corrupts heap order around it. Reject NaN.
+- **Mutable priorities.** Changing an item's priority while it is in the
+  heap, without percolating, silently breaks heap order. Use decreaseKey
+  or lazy reinsertion.
+- **Comparator sign errors.** A comparator returning `a > b` (a boolean)
+  instead of `a - b` gives inconsistent results with `sort` and with
+  hand-written heaps that expect a number.
+- **Overflow in comparator subtraction.** In languages with fixed-width
+  integers, `a - b` overflows for large values; compare instead. In
+  JavaScript, subtracting large floats is safe but loses precision for
+  very close values.
+- **Deep recursion in skew heap merge.** Use the iterative form.
+
+The mistake is believing the heap is "self-correcting". It maintains
+order only through its own operations.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, heaps run timers, schedulers and top-k queries, and
+the questions are cancellation, memory and fairness. A timer heap with a
+million timers where most are cancelled before firing (request timeouts)
+fills with dead entries. Either store each timer's index so cancellation
+removes it in O(log n), or use lazy deletion and periodically rebuild.
+
+A worked example: a job queue with priorities 1 to 5 and a requirement
+that low-priority jobs are not starved. A pure heap always serves
+priority 1 first, so a steady stream of urgent jobs blocks everything
+else. The fix is aging: the effective key is (priority − waiting time ×
+rate), so long-waiting jobs rise. Or use separate queues per priority with
+weighted round-robin.
+
+For massive event volumes, timing wheels (arrays of buckets indexed by
+time modulo a period) replace heaps with O(1) insert and cancel, at the
+cost of time granularity. Linux and Kafka use them for timers.
+
+The production mistake is unbounded growth: a priority queue fed faster
+than it is drained, with no metric on its size.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that a heap is for "next", not for "all". When the code
+needs the next item by some order, repeatedly, while the set changes, it
+is a heap. When it needs the full order once, sort. When it needs
+arbitrary lookups or ranges, use a tree.
+
+The second habit is to recognise a heap's shape in problems that do not
+mention priority: merging k sorted streams, scheduling meeting rooms
+(a heap of end times), running medians (two heaps, one for each half),
+and the next-shortest-path step in Dijkstra.
+
+A worked example of the mindset: a "find median of a stream" problem.
+Keep a max-heap of the lower half and a min-heap of the upper half,
+rebalance so their sizes differ by at most 1, and the median is at one or
+both roots. Each update is O(log n).
+
+The mindset mistake is reaching for a sorted structure to answer a
+question that only needs the extreme.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design, priority queues appear as schedulers and as
+"most important first" processing. A distributed job system (Sidekiq,
+Celery, Kubernetes scheduling) has priority classes; a CDN's cache
+eviction is a priority by recency or frequency; a search engine merges
+per-shard top-k results with a heap; a stream processor (Flink) keeps
+timers in a heap per key to fire window results.
+
+A worked example: global top 100 of scores across 50 shards. Each shard
+computes its local top 100 with a heap of 100; the coordinator merges the
+50 lists of 100 with a heap of 50 cursors and stops after 100 outputs.
+Network traffic is 5,000 scores instead of the whole data set, and every
+step is a heap operation.
+
+The system design mistake is asking each shard for "the top 100" without
+realising that for an exact answer each shard must return at least 100;
+returning only the top 10 per shard gives a wrong global top 100.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy for this chapter is to make the binary heap reflexive, then
+understand the mergeable heaps well enough to read chapters 11 and 12.
+The binary heap is the one I will write by hand in interviews and in
+JavaScript code; the others I will mostly reason about.
+
+The plan, in order: write the binary heap with percolation and buildHeap,
+plus a randomised test against sorting; reproduce the comparison counts;
+write the streaming top-k and the running median; build the bank
+simulation and vary the tellers; implement leftist merge and binomial
+queue merge, tracing each by hand once.
+
+The strategic mistake is skipping the simulation as "not algorithms". It
+teaches more about queues, utilisation and latency than any formula, and
+it is the same loop as an event-driven server.
+
+Done when my heap passes randomised tests, my top-k and median are
+O(n log k) and O(log n) per update, and I can merge two binomial queues
+on paper as binary addition.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Is a heap sorted?**
+No. Only the root is guaranteed to be the minimum; siblings and cousins
+have no order. An inorder traversal of a heap is not sorted.
+
+**Why store a tree in an array?**
+A complete tree has no gaps, so positions are computable and pointers are
+unnecessary. That saves memory and keeps the data contiguous.
+
+**Why is buildHeap faster than n inserts?**
+Most nodes are near the bottom and move only a little when percolated
+down. Inserting one at a time can move every item the full height.
+
+**When would I need a mergeable heap?**
+When two priority queues must be combined often: parallel work queues,
+some graph algorithms, or purely functional code. Otherwise a binary heap
+is simpler and faster.
+
+**How do I do decreaseKey without position tracking?**
+Lazy deletion: push a new entry with the smaller key and skip stale
+entries when popped. It is standard for Dijkstra in JavaScript, Python
+and Java.
+
+**What is the difference between a heap here and "the heap" in memory?**
+Unrelated uses of one word. Memory "heap" means the region for dynamic
+allocation; this chapter's heap is a data structure.
+
+**Is a heap stable?**
+No. Equal keys come out in no particular order. Add a sequence number to
+the key for FIFO among equals.
+
+## Key takeaways
+
+- A priority queue supports insert and deleteMin; a heap does both in
+  O(log n), insert in O(1) on average (2.28 comparisons measured).
+- A binary heap is a complete tree in an array; children of i are 2i + 1
+  and 2i + 2.
+- Percolate up for insert, down for deleteMin; move a hole, not swaps.
+- buildHeap is O(n): about 2 comparisons per item for any input order.
+- Top k of n with a heap of k is O(n log k): 22.6 ms versus 286.4 ms for a
+  full sort of a million.
+- Event simulation jumps from event to event with a heap; my bank showed
+  the cost of high utilisation.
+- d-heaps trade cheaper inserts for costlier deleteMins; 4 is often best.
+- Leftist heaps, skew heaps and binomial queues merge in O(log n); a
+  binomial queue mirrors binary numbers.
+
+## Glossary
+
+- **Priority queue:** an ADT with insert and deleteMin.
+- **Binary heap:** a complete binary tree with heap order, stored in an
+  array.
+- **Complete binary tree:** all levels full except the last, filled left
+  to right.
+- **Heap order:** each node is no larger than its children.
+- **Percolate up / down:** moving a hole up or down to restore heap order.
+- **buildHeap:** linear-time construction by percolating down every
+  internal node from the bottom.
+- **decreaseKey:** lowering an item's priority, then percolating up.
+- **Discrete event simulation:** a simulation driven by a priority queue
+  of timed events.
+- **d-heap:** a heap in which each node has d children.
+- **Null path length (npl):** length of the shortest path from a node to
+  one with fewer than two children.
+- **Leftist heap:** a heap where left npl is at least right npl at every
+  node.
+- **Skew heap:** a self-adjusting leftist heap that always swaps children
+  in merge.
+- **Binomial tree Bₖ:** two Bₖ₋₁ trees linked at the roots; 2ᵏ nodes.
+- **Binomial queue:** a forest with at most one binomial tree per rank.
+- **Lazy deletion (heaps):** pushing updated entries and skipping stale
+  ones on pop.
+
+## Exercises and self-check
+
+### Warm-up
+
+1. Insert 40, 25, 33, 10, 18, 29, 5 into an empty binary heap one at a
+   time and write the array after each insert.
+2. Run buildHeap on `[40, 25, 33, 10, 18, 29, 5]` and write the array
+   after each percolate down.
+3. Perform two deleteMins on your heap from exercise 1 and write the array
+   after each.
+
+### Build
+
+4. Add `decreaseKey` with position tracking (a `Map` from item to index)
+   to my heap, and test it with random operations against a sorted
+   array.
+5. Write a generic `Heap<T>` taking a comparator, and use it for the
+   running median of a stream with two heaps.
+6. Implement heapsort in place with a max-heap and `down`, and compare its
+   speed with `Array.prototype.sort` on a million numbers.
+7. Extend the bank simulation with a priority customer class served
+   first, and measure both classes' waits.
+
+### Stretch
+
+8. Implement a leftist heap with an iterative merge and a skew heap with
+   an iterative merge, and compare their right path lengths after a
+   million random operations.
+9. Implement a binomial queue with insert, deleteMin and merge, and check
+   that n inserts perform fewer than n links.
+10. Implement Dijkstra's algorithm with lazy deletion on a random graph of
+    100,000 vertices and compare with a version using decreaseKey.
+
+### Self-check
+
+<details>
+<summary>Answers to the warm-ups</summary>
+
+1. [40]; [25,40]; [25,40,33]; [10,25,33,40]; [10,18,33,40,25];
+   [10,18,29,40,25,33]; [5,18,10,40,25,33,29].
+2. Start [40,25,33,10,18,29,5]. Percolate index 2 (33): smaller child 5,
+   giving [40,25,5,10,18,29,33]. Index 1 (25): smaller child 10, giving
+   [40,10,5,25,18,29,33]. Index 0 (40): smaller child 5, then 29, giving
+   [5,10,29,25,18,40,33].
+3. First deleteMin returns 5: [10,18,29,40,25,33]. Second returns 10:
+   [18,25,29,40,33].
+
+</details>
+
+## How I'd study this chapter
+
+I give this chapter three sessions of about ninety minutes.
+
+Session one is sections 6.1 to 6.3. I write the binary heap from memory,
+then a randomised test that pushes and pops against a sorted array. I add
+comparison counters and reproduce the 2.28 and 1.88 figures, then try
+descending input to see the log₂ n cost.
+
+Session two is applications and d-heaps. I write the streaming top-k and
+time it against sorting, then build the bank simulation and vary the
+tellers until I can predict the wait from utilisation. I make the heap
+generic in d and run the timing.
+
+Session three is the mergeable heaps. I trace a leftist merge on paper
+before running mine, then write the skew heap and compare shapes. For
+binomial queues I write sizes in binary next to the forest after each
+insert until the analogy is automatic.
+
+This chapter supports
+<a href={withBase('/plans/traditional-software-developer/#strategy-3')}>phase 3 of the traditional roadmap</a>,
+and heaps continue in
+<a href={withBase('/books/introduction-to-algorithms/')}>Introduction to Algorithms</a>
+(heapsort and priority queues). The next chapter page is chapter 7,
+Sorting.
+
+Done when my heap passes randomised tests, my measurements match the
+analysis, and I can merge leftist heaps and binomial queues by hand.
