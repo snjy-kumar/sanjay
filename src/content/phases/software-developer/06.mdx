@@ -1,0 +1,1629 @@
+---
+plan: software-developer
+phase: 6
+title: "Agents: tools, MCP and guardrails, every topic from beginner to strategy"
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Six weeks, one agent: a maintainer for my own repository that reads issues and draft notes, runs the
+build and the check, opens a draft pull request and comments with a summary. It cannot merge, deploy or
+write to `main` without my approval. Every topic below is one part of keeping that agent bounded. The
+primary sources are the Model Context Protocol specification and my provider's tool-calling docs; the
+phase 5 eval habit carries straight over.
+
+#### Phase 6: how I would learn it
+
+I build the deterministic version first: a script that runs the build and check on a branch and posts the
+result. Only then do I add a model, and only for the steps where the path has to be chosen (which files
+to read, what to propose). Each week adds one guardrail before it adds one capability. The order is the
+lesson: bounds first, power second.
+
+<Timeline
+  caption="Phase 6's six weeks"
+  items={[
+    { when: 'week 41', what: 'Automation versus agent. The deterministic script first. Tool calling with two read-only tools.' },
+    { when: 'week 42', what: 'MCP: wrap the tools as an MCP server, connect a client, list and call tools. Least-privilege tool design.' },
+    { when: 'week 43', what: 'The loop: observe, plan, act, check, stop. Budgets, timeouts, a kill switch. Traces for every step.' },
+    { when: 'week 44', what: 'Sandboxing: a container with no network by default and a scratch filesystem. Approval gate for writes.' },
+    { when: 'week 45', what: 'Deployment as a cron job and as a queue worker. Idempotency, retries, compensation.' },
+    { when: 'week 46', what: 'Agent evals: task success, trajectory, tool correctness, cost. Ten runs, a postmortem, then the gate.' },
+  ]}
+/>
+
+<Layers
+  caption="The bounded agent, as the plan designs it"
+  layers={[
+    { name: 'Tools', note: 'read repository, run tests, open a draft PR, comment. No merge, no deploy, no secrets.' },
+    { name: 'Loop', note: 'observe, plan, act, check, stop' },
+    { name: 'Guardrails', note: 'allowlist, approval, token budget, timeout, kill switch' },
+    { name: 'Trace', note: 'every tool call, input, output, token count, latency and decision' },
+    { name: 'Eval', note: 'task success, trajectory correctness, tool correctness, cost' },
+  ]}
+/>
+
+#### Phase 6: Automation is not an agent
+
+**Covers:** telling apart a job whose steps are known (write a script) from a job whose path has to be
+chosen at run time (maybe an agent), and why the default is the script.
+
+<Flow
+  caption="The first design decision"
+  steps={['are the steps known in advance?', 'yes: write a script, schedule it', 'no: can a human choose quickly?', 'yes: a script plus a prompt to the human', 'no: an agent, bounded, with approval']}
+/>
+
+<Levels label="Phase 6, automation versus agent">
+
+<Level name="Beginner">
+
+Automation runs fixed steps: build, test, post the result. An agent is a loop where a model decides the
+next step from what it has seen. Agents are flexible and unpredictable; scripts are rigid and
+predictable. For a job with known steps, predictable wins.
+
+```yaml
+# .github/workflows/check.yml  — automation: the steps never change
+on: pull_request
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci && npm run build && npm run check
+```
+
+Common mistake: building an agent to do what this file already does. Fix: write the script first; add a
+model only where a choice is needed.
+
+</Level>
+
+<Level name="Intermediate">
+
+The maintainer job has both kinds of steps. Running the build is fixed. Reading an issue and deciding
+which files to change is not. So the design is a script that calls the model for the choice and does the
+fixed steps itself.
+
+</Level>
+
+<Level name="Advanced">
+
+Each step I hand to the model adds variance, cost and a new failure mode. I list every step, mark it
+fixed or chosen, and only chosen steps get model calls. The publish bot on this site is deterministic on
+purpose; an agent would sit above it, with approval.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A "chosen" step that has only two options: a rule or a small classifier is enough.
+- A fixed step that sometimes fails: retries in code, not a model deciding to retry.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A script that grows twenty conditionals to handle cases: that is the moment an agent might be the
+  simpler design, and the moment to measure both.
+
+</Level>
+
+<Level name="Production level">
+
+Scripts are easier to test, audit and roll back. I keep as much of the system as possible in scripts so
+the agent's surface stays small.
+
+</Level>
+
+<Level name="Mindset">
+
+If a deterministic script can do it, use the script. Using an agent should feel like a justified
+exception, written down.
+
+</Level>
+
+<Level name="System design">
+
+<Layers
+  caption="Deterministic floor, agent on top"
+  layers={[
+    { name: 'Agent', note: 'chooses which issue, which files, what to propose' },
+    { name: 'Scripts', note: 'build, check, test, open draft PR, comment' },
+    { name: 'Platform', note: 'GitHub permissions, branch protection on main' },
+  ]}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Write the step list and mark each one fixed or chosen before writing code. Done when the agent's model
+calls cover only the chosen steps and the rest is a script with tests.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Tool calling and tool schemas
+
+**Covers:** how a model asks my code to run a function, how I describe tools so it calls them correctly,
+and why my code, not the model, executes and validates every call.
+
+<Figure art={`
+  me    -> model : messages + tools [ read_file(path), run_check() ]
+  model -> me    : tool_call  read_file { "path": "src/x.ts" }
+  me             : validate args, check allowlist, run, capture output
+  me    -> model : tool result (truncated, as text)
+  model -> me    : tool_call run_check {}   ... or a final answer
+`} caption="The model only requests. My code decides, runs and reports." />
+
+<Levels label="Phase 6, tool calling">
+
+<Level name="Beginner">
+
+With tool calling, I send the model a list of tools, each with a name, a description and a JSON Schema
+for its arguments. Instead of text, the model can reply with a request to call one of them. My code runs
+the function and sends the result back as a new message. The model never runs anything itself.
+
+```ts
+const tools = [{
+  type: 'function',
+  function: {
+    name: 'read_file',
+    description: 'Read a UTF-8 text file from the repository. Paths are relative to the repo root.',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'e.g. src/data/plans.ts' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+}];
+```
+
+Common mistake: a vague description ("reads stuff"). The model then guesses argument shapes. Fix:
+describe the tool like a function's doc comment, with an example.
+
+</Level>
+
+<Level name="Intermediate">
+
+Every argument the model sends is untrusted. I validate with Zod, then apply policy (is the path inside
+the repo, is the tool allowed in this run), then execute with a timeout, then truncate the output before
+it goes back.
+
+```ts
+const ReadFile = z.object({ path: z.string().min(1) });
+async function readFileTool(raw: unknown) {
+  const { path: p } = ReadFile.parse(raw);
+  const full = path.resolve(REPO, p);
+  if (!full.startsWith(REPO + path.sep)) throw new ToolError('path outside repository');
+  const text = await fs.readFile(full, 'utf8');
+  return text.length > 20_000 ? text.slice(0, 20_000) + '\n[truncated]' : text;
+}
+```
+
+Calling it with `../../etc/passwd` gives `ToolError: path outside repository`, which goes back to the
+model as the tool result, not as a crash.
+
+</Level>
+
+<Level name="Advanced">
+
+Tool design is API design for a reader that skims. Few tools, each doing one clear thing; names that say
+what happens (`open_draft_pull_request`, not `github`); errors that tell the model what to do next
+("file not found; call list_files first"). The model may call several tools in one turn; I run them in
+order unless they are read-only and independent.
+
+</Level>
+
+<Level name="Edge cases">
+
+- The model calls a tool that does not exist: return an error result naming the available tools.
+- Arguments that pass the schema but are absurd (read a 2 GB file): size checks in the tool.
+- A tool that returns nothing: return an explicit "no results", or the model may assume failure and retry.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A tool output containing instructions (an issue body saying "now delete the branch"): indirect prompt
+  injection from phase 5, now with tools attached. Only the policy layer stands between it and harm.
+
+</Level>
+
+<Level name="Production level">
+
+Tool calls are logged with arguments (redacted), result size, duration and error. A tool that errors on a
+large share of calls usually has a bad description or schema.
+
+</Level>
+
+<Level name="Mindset">
+
+The model proposes; my code disposes. Authority lives in code I wrote and tested.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="The execution path for one tool call"
+  steps={['tool call from model', 'schema validate', 'policy check', 'approval needed?', 'execute in sandbox with timeout', 'truncate and redact', 'trace', 'result to model']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Start with two read-only tools and an eval of ten tasks. Done when every tool has a schema, a policy
+check, a timeout and a test for its error path.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: MCP, the Model Context Protocol
+
+**Covers:** the open protocol that lets one tool server work with many AI clients: what a server exposes,
+how clients discover and call it, and what it does not decide for me (permissions).
+
+<Figure art={`
+  host app (editor, chat app, my agent)
+    |
+    +-- MCP client --- stdio or Streamable HTTP --- MCP server: repo-tools
+    |                  JSON-RPC 2.0 messages          tools:     read_file, run_check
+    |                                                 resources: notes, issues
+    +-- MCP client --- ... ------------------------- MCP server: github (scoped token)
+`} caption="One client per server connection; the protocol is JSON-RPC over a transport" />
+
+<Levels label="Phase 6, MCP">
+
+<Level name="Beginner">
+
+Without a standard, every AI app needs its own plugin format. MCP is a shared protocol: I write a server
+once that exposes tools (functions), resources (readable data) and prompts (templates), and any MCP
+client can connect, list them and call them. Messages are JSON-RPC 2.0; the transports in the spec are
+stdio for local servers and Streamable HTTP for remote ones.
+
+```ts
+// A tiny MCP server with the official TypeScript SDK (API names as in its docs at the time of writing).
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+const server = new McpServer({ name: 'repo-tools', version: '0.1.0' });
+server.tool('run_check', 'Run npm run build and npm run check; return the last 80 lines.', {}, async () => {
+  const out = await runCheck();
+  return { content: [{ type: 'text', text: out }] };
+});
+await server.connect(new StdioServerTransport());
+```
+
+Common mistake: writing `console.log` debugging in a stdio server. Stdout is the protocol channel, so the
+client sees garbage and the connection fails. Fix: log to stderr.
+
+</Level>
+
+<Level name="Intermediate">
+
+The lifecycle: the client starts or connects to the server, they exchange `initialize` with protocol
+versions and capabilities, the client calls `tools/list`, then `tools/call` with a name and arguments.
+I test my server with the MCP Inspector before connecting any model, the same way I would test an API
+with curl before writing a front end.
+
+</Level>
+
+<Level name="Advanced">
+
+MCP standardizes the plumbing, not the trust. A server can expose a dangerous tool; a client may call it.
+Permissions are my design: which servers are connected, which tools are enabled, which need approval,
+what credentials the server holds. Remote servers need authentication (the spec describes an OAuth-based
+flow for HTTP transport) and the same input validation as any API.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A server that crashes mid-call: the client sees the transport close. My agent treats it as a tool error
+  and stops or retries per policy.
+- Tool names that collide across two servers: clients namespace them differently; I name tools
+  distinctively anyway.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A third-party server whose tool descriptions contain instructions to the model: the description is
+  model input too. I read the descriptions of every server I connect, like reading a dependency's install
+  script.
+
+</Level>
+
+<Level name="Production level">
+
+Pin server versions, give each server its own narrowly scoped credential, log every `tools/call`, and
+keep a list of connected servers per environment. Treat adding a server like adding a dependency with
+network access.
+
+</Level>
+
+<Level name="Mindset">
+
+A protocol makes integration cheap, which makes over-integration cheap too. Connect the minimum.
+
+</Level>
+
+<Level name="System design">
+
+<Layers
+  caption="Where MCP sits"
+  layers={[
+    { name: 'Agent loop', note: 'decides which tool to call' },
+    { name: 'MCP client', note: 'discovery, calls, transport' },
+    { name: 'MCP server', note: 'validation, policy, execution' },
+    { name: 'Real systems', note: 'filesystem, Git, GitHub API with a scoped token' },
+  ]}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Wrap my two tools as an MCP server, test it in the Inspector, connect one client. Done when I can draw the
+initialize, list and call exchange, and every connected server is on a written list with its permissions.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: The loop: observe, plan, act, check, stop
+
+**Covers:** the agent's control loop, and making "stop" a designed outcome rather than whatever happens
+when the model goes quiet.
+
+<Figure art={`
+           +-----------+
+     +---->|  observe  |  issue, files, last tool result
+     |     +-----+-----+
+     |           v
+     |     +-----------+
+     |     |   plan    |  next step, in one sentence, logged
+     |     +-----+-----+
+     |           v
+     |     +-----------+
+     |     |    act    |  one tool call through policy
+     |     +-----+-----+
+     |           v
+     |     +-----------+     done / budget / timeout / no progress
+     +-----|   check   |----------------------------------------> stop
+           +-----------+
+`} caption="Every pass through the loop can end it, for five named reasons" />
+
+<Levels label="Phase 6, the agent loop">
+
+<Level name="Beginner">
+
+An agent is a loop: give the model the goal and the state, let it pick a tool, run the tool, add the
+result to the state, repeat. The loop ends when the model gives a final answer, or when my code stops it.
+
+```ts
+for (let step = 0; step < MAX_STEPS; step++) {
+  const reply = await complete(messages, { tools });
+  if (!reply.toolCalls?.length) return finish(reply.text, 'done');
+  for (const call of reply.toolCalls) messages.push(await runTool(call));
+}
+return finish(null, 'max_steps');
+```
+
+Common mistake: `while (true)` with the model as the only exit. Fix: a step limit, always.
+
+</Level>
+
+<Level name="Intermediate">
+
+The check step is mine, not the model's: after each action, code checks the stop conditions: the task is
+done (the check passes, the draft PR exists), the budget is spent, the time is up, or there has been no
+progress (the same tool with the same arguments twice).
+
+```ts
+const key = `${call.name}:${JSON.stringify(call.args)}`;
+if (seen.has(key)) return finish(null, 'no_progress');
+seen.add(key);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Planning helps when the task has several steps: ask for a short plan first, log it, then execute step by
+step with the plan in context. Replanning after a failure is useful; replanning every step burns tokens
+and drifts. The plan is also the best trace for a human reviewer.
+
+</Level>
+
+<Level name="Edge cases">
+
+- The task is already done (the issue is closed): observe should notice and stop with nothing to do.
+- The first tool fails: stop with a clear reason rather than improvise.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Context growth: every tool result is added to messages, and long runs overflow the window. Summarize old
+  results, or keep only the last few in full.
+- No-progress detection with slightly different arguments each time (reading the same file with a
+  different line range): compare on the resource, not the exact arguments.
+
+</Level>
+
+<Level name="Production level">
+
+Each run ends with a status from a fixed list (`done`, `needs_approval`, `budget`, `timeout`,
+`no_progress`, `error`) so that runs can be counted and compared.
+
+</Level>
+
+<Level name="Mindset">
+
+Stopping well is a feature. A loop without a designed exit is not autonomy; it is a bug with a bill.
+
+</Level>
+
+<Level name="System design">
+
+<Compare
+  left="Exit reason"
+  right="What happens next"
+  caption="Every exit has a defined follow-up"
+  rows={[
+    ['done', 'Comment the summary; draft PR waits for review'],
+    ['needs_approval', 'Notify me; the run pauses'],
+    ['budget or timeout', 'Comment what was tried; no partial writes left behind'],
+    ['no_progress', 'Mark the issue for a human'],
+    ['error', 'Trace saved; alert if repeated'],
+  ]}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Write the loop in under 100 lines with all five exits and a test for each. Done when every run in the log
+ends with a named status.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Memory
+
+**Covers:** what an agent remembers within a run (the context) and across runs (a store), and why most of
+my agent's memory should be the repository itself.
+
+<Compare
+  left="Short-term: the context"
+  right="Long-term: a store"
+  caption="Two kinds of memory with different failure modes"
+  rows={[
+    ['Messages in this run', 'Notes saved between runs'],
+    ['Bounded by the window', 'Bounded by what I choose to save'],
+    ['Lost when the run ends', 'Persists, and can go stale or wrong'],
+    ['Summarize to fit', 'Retrieve to use (phase 5 again)'],
+  ]}
+/>
+
+<Levels label="Phase 6, memory">
+
+<Level name="Beginner">
+
+The model remembers nothing between calls; the conversation history is resent. Within a run, memory is
+the message list. Across runs, it is whatever I write somewhere and load next time.
+
+</Level>
+
+<Level name="Intermediate">
+
+For a maintainer agent, the best long-term memory already exists: the repository, the issues, the PR
+history and a small `AGENTS.md`-style file of conventions I write. Loading those is retrieval, with
+everything I learned in phase 5.
+
+</Level>
+
+<Level name="Advanced">
+
+Letting the agent write its own memory ("lessons learned") is risky: a wrong lesson persists and
+compounds. If I allow it, memory writes go through review like code.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A remembered fact that became false (a renamed file): memory entries carry a date and a source.
+
+</Level>
+
+<Level name="Corner cases">
+
+- An injected instruction saved to memory: it now affects every future run. Memory is untrusted input on
+  read, and writes are reviewed.
+
+</Level>
+
+<Level name="Production level">
+
+Memory has a size budget, an owner, and a way to inspect and delete entries.
+
+</Level>
+
+<Level name="Mindset">
+
+Prefer memory that a human can read and edit over memory only the agent can see.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="Where context comes from on each run"
+  steps={['conventions file', 'the issue', 'retrieved files', 'last tool results', 'summary of earlier steps']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Start with no long-term memory beyond the repo and a conventions file. Done when I can show exactly what
+the agent saw at each step of a run.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Sandboxing
+
+**Covers:** running the agent's actions where mistakes cannot reach anything that matters: a disposable
+container, a scratch filesystem, and no network unless a step needs it.
+
+<Figure art={`
+  host (my machine / CI runner)
+  +------------------------------------------------------+
+  |  container: agent-run-2026-10-23-01   (disposable)    |
+  |  +-----------------+   network: none (default)        |
+  |  | /work (clone)   |   egress allowlist: registry,     |
+  |  | rw, scratch     |     api.github.com (scoped token) |
+  |  +-----------------+   cpu, memory, time limits        |
+  |  no host mounts, no secrets except the scoped token    |
+  +------------------------------------------------------+
+`} caption="The blast radius is the box, not my machine" />
+
+<Levels label="Phase 6, sandboxing">
+
+<Level name="Beginner">
+
+A sandbox is an environment where an action can only affect the sandbox. For my agent that is a fresh
+container with a clone of the repo. If it deletes everything, I delete the container.
+
+```bash
+docker run --rm --network none --memory 1g --cpus 1 \
+  -v "$PWD/scratch:/work" node:22 bash -lc "cd /work && npm ci --offline && npm run build"
+```
+
+Common mistake: running the agent directly on my laptop with my shell and my SSH keys. Fix: never. The
+agent gets a container.
+
+</Level>
+
+<Level name="Intermediate">
+
+Network is off by default. A step that needs it (installing packages, calling GitHub) gets a specific
+egress allowlist, or runs in a separate step that does not take model input.
+
+</Level>
+
+<Level name="Advanced">
+
+Resource limits are guardrails too: CPU, memory, disk and wall-clock time. A runaway test or an infinite
+loop the agent wrote ends at the limit, and the run ends with `timeout`.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A build that needs the network (fetching fonts, for example): pre-fetch in a trusted step.
+- A file the agent writes outside the scratch directory: no mount exists, so the write fails.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A scoped token inside the sandbox plus an injected instruction: the token's scope is the limit of the
+  damage. That is why it can open drafts and comment, and nothing else.
+
+</Level>
+
+<Level name="Production level">
+
+Every run gets a new sandbox; nothing persists unless I copy it out on purpose. Sandbox images are pinned
+and rebuilt on a schedule.
+
+</Level>
+
+<Level name="Mindset">
+
+Assume the agent will eventually do the worst thing its permissions allow, and design the permissions
+for that day.
+
+</Level>
+
+<Level name="System design">
+
+<Layers
+  caption="Containment layers"
+  layers={[
+    { name: 'Policy', note: 'which tools, which arguments' },
+    { name: 'Credentials', note: 'scoped token, nothing else' },
+    { name: 'Sandbox', note: 'container, no host mounts, no network by default' },
+    { name: 'Platform', note: 'branch protection: main needs a reviewed PR' },
+  ]}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Run the deterministic script in the sandbox first, then the agent. Done when a deliberate `rm -rf /work`
+inside a run harms nothing outside it.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Filesystem and network permissions
+
+**Covers:** least privilege for each tool: which paths it can read and write, which hosts it can reach,
+and which credentials it holds.
+
+<Compare
+  left="Convenient"
+  right="Least privilege"
+  caption="The same agent, with two permission sets"
+  rows={[
+    ['Token with repo admin', 'Token: contents write to agent/* branches, PRs and issues write'],
+    ['Reads the whole disk', 'Reads the clone only'],
+    ['Writes anywhere in the repo', 'Writes only under src/content and docs on a branch'],
+    ['Any network host', 'GitHub API and the package registry'],
+    ['Can merge', 'Cannot merge; branch protection enforces it'],
+  ]}
+/>
+
+<Levels label="Phase 6, permissions">
+
+<Level name="Beginner">
+
+Least privilege: give each part exactly what its job needs and nothing more. My agent needs to read the
+repo, write to its own branch, open a draft PR and comment. It does not need to merge, change settings,
+or read secrets.
+
+</Level>
+
+<Level name="Intermediate">
+
+Path allowlists are checked in the tool, with resolved paths, as in the `read_file` example. Writes are
+allowed only under named directories. GitHub fine-grained tokens can be limited to one repository and
+specific permissions; branch protection on `main` requires a reviewed PR regardless of the token.
+
+```ts
+const WRITABLE = ['src/content/', 'docs/'];
+const ok = WRITABLE.some(prefix => rel.startsWith(prefix)) && !rel.includes('..');
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Two independent layers for every important rule: the tool refuses to merge, and the platform refuses too.
+If one is misconfigured, the other holds.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A symlink inside the repo pointing outside it: resolve real paths (`fs.realpath`) before the check.
+- A path with mixed case on a case-insensitive filesystem: normalize before comparing.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Writing `.github/workflows/*.yml` would let the agent change what CI runs with CI's own credentials.
+  Workflows are outside the writable list, explicitly.
+
+</Level>
+
+<Level name="Production level">
+
+Permissions are reviewed quarterly and when a tool is added. Tokens expire and are rotated.
+
+</Level>
+
+<Level name="Mindset">
+
+Convenience granted today is an incident tomorrow. Write the permission table before the code.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="A write request, two independent refusals"
+  steps={['agent asks to write main', 'tool policy: refuse', 'if bypassed: token lacks permission', 'if bypassed: branch protection refuses']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Write the permission table as an ADR, then test each refusal. Done when a test proves the agent cannot
+write outside its directories or push to `main`.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Guardrails: allowlist, budget, timeout, kill switch
+
+**Covers:** the hard limits around the loop, enforced by code the model cannot talk its way past.
+
+<Layers
+  caption="The guardrails, checked before every tool call"
+  layers={[
+    { name: 'Kill switch', note: 'a flag checked every step; flipping it ends all runs' },
+    { name: 'Allowlist', note: 'only these tools, with these argument rules' },
+    { name: 'Budget', note: 'tokens and money per run and per day' },
+    { name: 'Timeout', note: 'wall-clock per tool call and per run' },
+    { name: 'Step limit', note: 'a maximum number of loop iterations' },
+  ]}
+/>
+
+<Levels label="Phase 6, guardrails">
+
+<Level name="Beginner">
+
+A guardrail is a rule enforced in code around the model. The prompt can ask for good behaviour; the
+guardrail guarantees a limit. My agent has five: an allowlist, a budget, a timeout, a step limit and a
+kill switch.
+
+```ts
+async function guard(run: Run, call: ToolCall) {
+  if (await flags.get('agent.kill')) throw new Stop('killed');
+  if (!ALLOWED.has(call.name)) throw new Stop(`tool not allowed: ${call.name}`);
+  if (run.tokens > RUN_TOKEN_BUDGET) throw new Stop('budget');
+  if (Date.now() - run.startedAt > RUN_TIMEOUT_MS) throw new Stop('timeout');
+}
+```
+
+Common mistake: a kill switch that requires a deploy to flip. Fix: a flag in a store the agent reads every
+step, flippable from my phone.
+
+</Level>
+
+<Level name="Intermediate">
+
+Budgets count before the call, using an estimate, and after, using the real usage. Timeouts use
+`AbortController` so the underlying request really stops.
+
+```ts
+const ac = new AbortController();
+const t = setTimeout(() => ac.abort(), TOOL_TIMEOUT_MS);
+try { return await tool.run(args, { signal: ac.signal }); } finally { clearTimeout(t); }
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The kill switch must be tested, not just present. The plan's proof asks for a kill switch I have used, so
+I flip it during a real run and check the run ends at the next step, leaves no partial write, and logs
+`killed`.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A single tool call longer than the remaining run time: its own timeout is the minimum of the two.
+- Budget reached in the middle of a multi-call turn: finish nothing further; report what ran.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Kill switch flipped while a write is in progress: the write either completes and is reported, or is
+  rolled back. Never left half-done. This is where compensation (below) matters.
+
+</Level>
+
+<Level name="Production level">
+
+Guardrail trips are counted by reason. Frequent budget trips mean the task is too big or the agent is
+looping; frequent timeouts mean a slow tool.
+
+</Level>
+
+<Level name="Mindset">
+
+Trust is not a setting; it is a set of limits I can prove.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="The guard runs before policy and execution on every step"
+  steps={['step begins', 'kill switch?', 'budget left?', 'time left?', 'tool allowed?', 'execute']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Write each guardrail with a test that trips it. Done when all five have tripped at least once in tests and
+the kill switch once in a real run.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Human in the loop and approval gates
+
+**Covers:** where a person must say yes, how the agent pauses and resumes, and how to make approval quick
+enough that it does not get rubber-stamped.
+
+<Flow
+  caption="An approval gate as a state machine"
+  steps={['agent proposes write', 'run pauses: needs_approval', 'I see the diff and the reason', 'approve: execute once', 'reject: record why, run ends', 'no answer in 24h: expire']}
+/>
+
+<Levels label="Phase 6, human in the loop">
+
+<Level name="Beginner">
+
+An approval gate means some actions only happen after a person agrees. For my agent, everything that
+changes anything outside its branch needs approval, and merging is not an action it has at all.
+
+</Level>
+
+<Level name="Intermediate">
+
+The approval request must carry enough to decide in under a minute: what, why, the exact diff or
+command, and what happens if I say no. A pending approval is stored with an id so the run can resume in
+another process.
+
+```ts
+type Approval = { id: string; runId: string; action: string; args: unknown; reason: string; diff?: string;
+  status: 'pending' | 'approved' | 'rejected' | 'expired'; createdAt: string };
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Approvals bind to exact arguments. Approving "open a PR with this diff" must not allow a different diff.
+I hash the arguments into the approval and check the hash at execution.
+
+</Level>
+
+<Level name="Edge cases">
+
+- Approving twice (double click): execution is idempotent on the approval id.
+- An approval after the branch moved: the diff no longer applies; the agent re-proposes.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Approval fatigue: if I approve 50 things a day, I stop reading. Fewer, bigger, clearer requests, and
+  auto-approval only for actions that are reversible and inside the sandbox.
+
+</Level>
+
+<Level name="Production level">
+
+Every approval is logged with who, when and what, and is part of the trace. "Zero unapproved writes" in
+the plan's proof is checked from this log.
+
+</Level>
+
+<Level name="Mindset">
+
+The human is part of the system design, not a fallback for when the AI fails.
+
+</Level>
+
+<Level name="System design">
+
+<Compare
+  left="No approval needed"
+  right="Approval needed"
+  caption="The line I draw for the maintainer agent"
+  rows={[
+    ['Read files, run build and check in the sandbox', 'Push a branch'],
+    ['Draft a summary', 'Open a draft PR'],
+    ['Propose a plan', 'Comment publicly on an issue'],
+    ['', 'Merge or deploy: not available at all'],
+  ]}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Build the pause and resume path before any write tool exists. Done when an approval can be given from a
+link, binds to the exact diff, and the log shows zero writes without one.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Traces and spans
+
+**Covers:** recording every step of a run (each model call and tool call with inputs, outputs, tokens,
+latency and the decision) as a tree I can read afterwards.
+
+<Figure art={`
+  run 8f2c  maintainer: issue #41                       12.4s  $0.03
+  +- span plan        model   in 2.1k  out 180   1.1s  "read plans.ts, then run check"
+  +- span read_file   tool    src/data/plans.ts  0.02s 14 KB (truncated)
+  +- span act         model   in 6.3k  out 420   2.3s  "propose fix to phase title"
+  +- span run_check   tool    exit 0             8.1s
+  +- span open_pr     tool    needs_approval     -
+`} caption="A trace is the run, replayable on paper" />
+
+<Levels label="Phase 6, traces">
+
+<Level name="Beginner">
+
+A trace is a record of one run; a span is one step inside it, with a start, an end and attributes. If a
+run goes wrong, the trace is how I find out what the agent saw and why it did what it did.
+
+```ts
+async function span<T>(run: Run, name: string, attrs: object, fn: () => Promise<T>): Promise<T> {
+  const start = performance.now();
+  try {
+    const out = await fn();
+    run.spans.push({ name, attrs, ms: performance.now() - start, ok: true });
+    return out;
+  } catch (e) {
+    run.spans.push({ name, attrs, ms: performance.now() - start, ok: false, error: String(e) });
+    throw e;
+  }
+}
+```
+
+Common mistake: logging only the final answer. Fix: one span per model call and per tool call.
+
+</Level>
+
+<Level name="Intermediate">
+
+OpenTelemetry is the standard way to emit spans, with a trace id that ties them together; there are also
+semantic conventions for generative AI calls. I can start with JSON lines in a file and move to
+OpenTelemetry when I want a viewer, because the shape is the same.
+
+</Level>
+
+<Level name="Advanced">
+
+The decision is the most useful attribute: the one-line plan or reason the model gave before each
+action. With it, a reviewer can judge the trajectory, not just the outcome.
+
+</Level>
+
+<Level name="Edge cases">
+
+- Huge tool outputs: store a size and a hash, plus a truncated preview.
+- Secrets in tool output (an env dump): redact before storing.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A crash that kills the process mid-run: spans buffered in memory are lost. Write each span as it ends.
+
+</Level>
+
+<Level name="Production level">
+
+Traces are retained for a set period, searchable by run, issue and status, and linked from the PR comment
+the agent leaves.
+
+</Level>
+
+<Level name="Mindset">
+
+If I cannot replay why it happened, I cannot trust that it will not happen again.
+
+</Level>
+
+<Level name="System design">
+
+Traces feed three consumers: debugging (one run), evals (trajectory scoring), and cost reporting (sums
+over runs). One format, three uses.
+
+</Level>
+
+<Level name="Strategy">
+
+Span everything from the first run. Done when any run in the last month can be read step by step with
+its cost.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Agent evals
+
+**Covers:** measuring an agent on fixed tasks: did it succeed, did it take a sensible path, did it call
+tools correctly, and what did it cost.
+
+<Compare
+  left="Metric"
+  right="How I measure it"
+  caption="The four scores from the plan's bounded design"
+  rows={[
+    ['Task success', 'A checkable end state: the check passes, the draft PR has the expected change'],
+    ['Trajectory correctness', 'The path was sensible: no forbidden tools, no loops, reasonable step count'],
+    ['Tool correctness', 'Arguments valid, right tool for the step, errors handled'],
+    ['Cost', 'Tokens and money per run, and wall-clock time'],
+  ]}
+/>
+
+<Levels label="Phase 6, agent evals">
+
+<Level name="Beginner">
+
+An agent eval is a task with a known good end state, run in the sandbox from a fixed starting commit. I
+write ten: fix a typo in a note's frontmatter, add a missing phase title, report that the build fails,
+refuse a task that needs merging.
+
+```json
+{"id":"t03","start":"a1b2c3d","task":"Issue: phase 7 title is missing a word","success":"draft PR diff touches only src/data/plans.ts; npm run check passes","forbidden":["merge","push_main"]}
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Success is checked by code where possible (diff touches the right file, check passes). Trajectory is
+checked from the trace: step count, forbidden tools, repeated calls. A run that succeeds by a bad path
+(read 200 files) still fails the trajectory score.
+
+</Level>
+
+<Level name="Advanced">
+
+Agents are less repeatable than single calls, so each task runs several times and I report the success
+rate per task. A task that passes three times in five is a finding, not a pass.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A task with two valid solutions: success checks the property (the check passes, the title is right),
+  not an exact diff.
+- A refusal task: success is that nothing was written and the reason names the forbidden action.
+
+</Level>
+
+<Level name="Corner cases">
+
+- The repo changed since the task was written, so the start commit no longer builds with current tools:
+  pin the environment with the commit.
+
+</Level>
+
+<Level name="Production level">
+
+The agent eval runs before any change to its prompt, tools, model or guardrails. Real runs that went
+wrong become new tasks.
+
+</Level>
+
+<Level name="Mindset">
+
+Ten runs measured beat a hundred runs remembered.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="An agent eval run"
+  steps={['fresh sandbox at start commit', 'run agent with task', 'collect trace', 'score success', 'score trajectory and tools', 'sum cost', 'compare with last version']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Write the ten tasks in week 43, before the agent is good. Done when the table of four scores exists for
+two versions of the agent and I can say which is better and why.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Multi-agent trade-offs
+
+**Covers:** when splitting work across several agents is worth the coordination cost, and why the plan
+says a single agent must work first.
+
+<Compare
+  left="One agent"
+  right="Several agents"
+  caption="What the extra agents buy and what they cost"
+  rows={[
+    ['One context, one trace', 'Hand-offs, partial context, several traces to join'],
+    ['Simpler to evaluate', 'Failures compound across hand-offs'],
+    ['Can get overloaded on huge tasks', 'Parallel work on separable parts'],
+    ['One budget', 'Budgets multiply'],
+  ]}
+/>
+
+<Levels label="Phase 6, multi-agent">
+
+<Level name="Beginner">
+
+Multi-agent means several model loops, each with its own role, passing work between them. It can help
+when the work splits cleanly into independent parts. It is not a way to make one confused agent smarter.
+
+</Level>
+
+<Level name="Intermediate">
+
+The cheapest multi-agent pattern is a coordinator that splits a task into independent subtasks with
+clear inputs and outputs, runs workers in parallel, and merges their results. If the subtasks need to
+talk to each other constantly, they are not independent, and one agent is better.
+
+</Level>
+
+<Level name="Advanced">
+
+Each hand-off loses context and adds a place for misunderstanding. I measure a multi-agent design against
+the single agent on the same eval tasks, including cost, before adopting it.
+
+</Level>
+
+<Level name="Edge cases">
+
+- Two workers editing the same file: conflicts. Assign ownership of files, or serialize.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A worker that fails silently and returns a plausible empty result: the coordinator must validate each
+  worker's output like any untrusted input.
+
+</Level>
+
+<Level name="Production level">
+
+Total budget and a global kill switch apply across all agents. One trace id ties all their spans.
+
+</Level>
+
+<Level name="Mindset">
+
+Add coordination only when the single agent's limits are measured, not imagined.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="The only multi-agent shape I would try first"
+  steps={['coordinator splits', 'workers in parallel, own files each', 'each output validated', 'coordinator merges', 'one approval for the result']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Do not build it in this phase unless the single agent is passing its eval. Done when I can explain, with
+my own eval numbers, why my agent is single.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Deployment: cron job, queue worker or request
+
+**Covers:** the three ways an agent runs in production, and what each one means for timeouts, retries and
+who is waiting.
+
+<Compare
+  left="Shape"
+  right="Fits when"
+  caption="Pick the trigger by who is waiting"
+  rows={[
+    ['Cron job (nightly)', 'Nobody is waiting; batch work like triaging new issues'],
+    ['Queue worker', 'Events arrive (issue labelled), work is slow, retries matter'],
+    ['Request (HTTP)', 'A person is waiting and the run is short'],
+  ]}
+/>
+
+<Levels label="Phase 6, deployment">
+
+<Level name="Beginner">
+
+A cron job runs on a schedule. A queue worker takes jobs from a queue as they arrive. A request runs while
+someone waits for the response. Most agents should not run inside a request, because runs are slow and
+unpredictable.
+
+```yaml
+# Scheduled maintainer run in GitHub Actions
+on:
+  schedule: [{ cron: '30 18 * * *' }]   # UTC; 00:00 IST
+  workflow_dispatch: {}
+```
+
+Common mistake: forgetting cron in CI is in UTC. Fix: write the local time next to it in a comment, as
+above.
+
+</Level>
+
+<Level name="Intermediate">
+
+A queue gives retries, visibility and back-pressure: a label on an issue enqueues a job with the issue id;
+the worker runs the agent; failures go to a dead-letter queue after a few attempts.
+
+</Level>
+
+<Level name="Advanced">
+
+Whatever the trigger, the run must be safe to start twice (the next topic). Schedulers can double-fire;
+queues deliver at least once.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A nightly run still going when the next one starts: a lock per repository.
+- A burst of 50 labelled issues: concurrency limit on workers, so the budget is not spent in a minute.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A runner restart mid-run in a queue worker: the job is redelivered; the run resumes or restarts safely.
+
+</Level>
+
+<Level name="Production level">
+
+Each run has a run id, start and end status, cost, and a link to its trace. A daily summary counts runs by
+status.
+
+</Level>
+
+<Level name="Mindset">
+
+Design for the trigger that is honest about time: agents are slow, so let them be slow somewhere nobody
+is waiting.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="Event-driven run"
+  steps={['issue labelled agent', 'webhook', 'enqueue issue id', 'worker takes lock', 'run in sandbox', 'comment and release lock']}
+/>
+
+</Level>
+
+<Level name="Strategy">
+
+Ship the cron version first, then the queue version. Done when both have run for real, with a lock that
+prevented an overlapping run.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Idempotency
+
+**Covers:** making each action safe to repeat, so a retry or a double trigger does not open two pull
+requests or post two comments.
+
+<Figure art={`
+  key = "agent:issue-41:open-draft-pr:" + hash(diff)
+
+  attempt 1:  key unseen -> open PR #57 -> store key -> #57
+  attempt 2:  key seen   -> return #57 (no new PR)
+`} caption="The same request, done once, however many times it arrives" />
+
+<Levels label="Phase 6, idempotency">
+
+<Level name="Beginner">
+
+An idempotent action has the same effect whether it runs once or five times. Reading is naturally
+idempotent. Opening a PR is not: run it twice, get two PRs. I make it idempotent with a key.
+
+```ts
+async function openDraftPrOnce(key: string, open: () => Promise<number>) {
+  const existing = await store.get(key);
+  if (existing) return Number(existing);
+  const pr = await open();
+  await store.set(key, String(pr));
+  return pr;
+}
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Natural keys are better than stored ones where they exist: one branch name per issue (`agent/issue-41`),
+and "find the open PR for this branch" before opening one. The platform then enforces uniqueness.
+
+</Level>
+
+<Level name="Advanced">
+
+The gap between doing the action and recording the key is the danger: a crash there causes a duplicate
+on retry. Checking the platform's state (does a PR for this branch exist?) closes the gap better than my
+own store.
+
+</Level>
+
+<Level name="Edge cases">
+
+- Same issue, different diff (the issue changed): a new key, and the agent updates the existing PR rather
+  than opening another.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Two workers racing with the same key: a lock or a unique constraint, not a check-then-act.
+
+</Level>
+
+<Level name="Production level">
+
+Duplicate actions are counted; a non-zero count is a bug to fix, not noise.
+
+</Level>
+
+<Level name="Mindset">
+
+Every write will be retried someday. Write it so that the retry is boring.
+
+</Level>
+
+<Level name="System design">
+
+The phase 3 idempotency-key pattern for payments is the same pattern here. The agent is just another
+client.
+
+</Level>
+
+<Level name="Strategy">
+
+Run every write tool twice in a test. Done when every write is safe to repeat and the test proves it.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Retries
+
+**Covers:** retrying the right failures, the right number of times, with backoff, inside the run's budget.
+
+<Flow
+  caption="Retry decision for a failed step"
+  steps={['error', 'retryable? (429, 5xx, network, timeout)', 'attempts left and budget left?', 'wait backoff with jitter', 'retry', 'else stop with error']}
+/>
+
+<Levels label="Phase 6, retries">
+
+<Level name="Beginner">
+
+Some failures are temporary (a rate limit, a network blip), and trying again works. Others are permanent
+(a bad argument), and trying again wastes money. Retry only the first kind, a few times, waiting longer
+each time.
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries = 3) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i >= tries - 1 || !isRetryable(e)) throw e;
+      const wait = 2 ** i * 500 + Math.random() * 250;   // exponential backoff with jitter
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Retries happen at one layer. If the HTTP client retries three times, the tool retries three times and the
+loop retries three times, one failure becomes 27 calls. I pick one layer, usually the closest to the
+failing call.
+
+</Level>
+
+<Level name="Advanced">
+
+A model-level retry is different: the model choosing a different approach after a tool error. That is
+part of the loop and counts toward the step limit and the no-progress check.
+
+</Level>
+
+<Level name="Edge cases">
+
+- A `retry-after` header: honour it, even if it exceeds my backoff.
+
+</Level>
+
+<Level name="Corner cases">
+
+- Retrying a non-idempotent write after a timeout: the first attempt may have succeeded. Idempotency first,
+  retries second.
+
+</Level>
+
+<Level name="Production level">
+
+Retry counts per tool on the dashboard; a rising count is an early warning of a degrading dependency.
+
+</Level>
+
+<Level name="Mindset">
+
+A retry is a bet that the world changed. Make the bet small and bounded.
+
+</Level>
+
+<Level name="System design">
+
+Retries, budgets and idempotency form one design: each retry spends budget, and only idempotent actions
+may be retried blindly.
+
+</Level>
+
+<Level name="Strategy">
+
+Inject failures with a fake tool (fail twice, then succeed; always fail). Done when both behave as
+designed and one layer owns retries.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: Compensation
+
+**Covers:** undoing the effects of a half-finished run when steps cannot be wrapped in one transaction.
+
+<Figure art={`
+  step                 compensation (run in reverse on failure)
+  1 create branch      -> delete branch
+  2 push commit        -> (removed with the branch)
+  3 open draft PR      -> close PR with a comment saying why
+  4 comment on issue   -> follow-up comment: run aborted, PR closed
+`} caption="Each step that changes the world has a written undo" />
+
+<Levels label="Phase 6, compensation">
+
+<Level name="Beginner">
+
+A database transaction can roll back. A sequence of API calls cannot. If step 3 of 4 fails, steps 1 and 2
+already happened. Compensation means each step has an undo action, and on failure I run the undos for the
+completed steps in reverse order. This is the saga pattern.
+
+```ts
+const undo: Array<() => Promise<void>> = [];
+try {
+  await createBranch(b); undo.push(() => deleteBranch(b));
+  const pr = await openDraftPr(b); undo.push(() => closePr(pr, 'run aborted'));
+  await comment(issue, summary);
+} catch (e) {
+  for (const u of undo.reverse()) await u().catch(err => log.error({ event: 'compensation_failed', err }));
+  throw e;
+}
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Some actions cannot be undone, only answered (a public comment can be deleted, but people may have seen
+it). Those go last in the run and behind approval.
+
+</Level>
+
+<Level name="Advanced">
+
+Compensations can fail too. They are logged, and a failed compensation alerts me, because the world is
+now in a state no code planned for.
+
+</Level>
+
+<Level name="Edge cases">
+
+- Failure before any write: nothing to compensate.
+- The kill switch: treated as a failure, so compensation runs.
+
+</Level>
+
+<Level name="Corner cases">
+
+- A human acted on the draft PR (reviewed it) before the run failed: closing it may lose their comments.
+  The compensation comments instead of closing when the PR has reviews.
+
+</Level>
+
+<Level name="Production level">
+
+The trace records each compensation as its own span, so the postmortem shows exactly what was undone.
+
+</Level>
+
+<Level name="Mindset">
+
+Plan the unhappy path when planning the happy one. Every write is a promise to clean up.
+
+</Level>
+
+<Level name="System design">
+
+Order steps so that the irreversible ones come last and the reversible ones first, and put approval right
+before the first irreversible step.
+
+</Level>
+
+<Level name="Strategy">
+
+Force a failure at each step in a test and check the world afterwards. Done when every failure point leaves
+no stray branch or PR.
+
+</Level>
+
+</Levels>
+
+#### Phase 6: the build, a maintainer agent for this repository
+
+<Timeline
+  caption="The build in order"
+  items={[
+    { when: '1', what: 'The deterministic script: checkout, build, check, report. In the sandbox.' },
+    { when: '2', what: 'Read-only tools and the loop with five exits. Traces from the first run.' },
+    { when: '3', what: 'Write tools behind approval: push an agent branch, open a draft PR, comment.' },
+    { when: '4', what: 'Guardrails tested: allowlist, budget, timeout, step limit, kill switch used once.' },
+    { when: '5', what: 'Cron and queue triggers with a lock. Idempotency, retries, compensation tested.' },
+    { when: '6', what: 'Ten eval tasks scored on four metrics. Ten real runs. A failure postmortem.' },
+  ]}
+/>
+
+It reads issues and draft notes, runs the build and check, proposes a pull request and comments with a
+summary. It cannot merge, deploy or write to `main` without approval, and the platform enforces the same.
+
+#### Phase 6: the gate
+
+Build a tool-using agent and show, without notes: the approval gate (a pending request, an approval bound
+to an exact diff), a full trace of every tool call with inputs, outputs, tokens, latency and decisions,
+the budget that stopped a run, and the kill switch used during a live run. With it: ten successful runs,
+zero unapproved writes (from the approval log), a failure postmortem, and a cost per run. Then the
+AI-assisted half: explain every guardrail line and why each limit has its value.
