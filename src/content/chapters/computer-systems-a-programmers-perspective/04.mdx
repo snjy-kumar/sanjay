@@ -1,0 +1,1581 @@
+---
+book: computer-systems-a-programmers-perspective
+number: 4
+title: "Processor Architecture"
+description: "Y86-64 ISA, HCL logic, a sequential five-stage CPU, then pipelining with data and control hazards, forwarding, branch prediction and PIPE performance."
+part: "Part I, Program Structure and Execution"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Chapter 3 showed me what a processor must do: fetch bytes, decode an
+instruction, read registers, compute, touch memory, write a result. This
+chapter builds a processor that does exactly that. It invents a small
+cousin of x86-64 called Y86-64, describes its instructions as bit patterns,
+implements them first as a single-cycle-per-instruction machine (SEQ), then
+pipelines that machine (PIPE) and confronts the hazards that pipelining
+creates. I am not trying to become a chip designer; I am trying to know
+why a mispredicted branch costs five cycles and why `addq %rax, %rbx`
+followed by `subq %rbx, %rcx` can run without waiting. Every encoding and
+every HCL fragment on this page I built myself.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- Encode and decode every Y86-64 instruction by hand, including the register and destination fields.
+- Read and write small HCL expressions for boolean and word-level combinational logic, including set membership.
+- Walk an instruction through the six SEQ stages (fetch, decode, execute, memory, write back, PC update) and name the values on every wire.
+- Explain why pipelining improves throughput but not latency, and compute the throughput of a balanced pipeline.
+- Identify data hazards and control hazards in a Y86-64 pipeline diagram, and show how forwarding and branch prediction handle them.
+- State the PIPE control combinations (bubble, stall, normal) that resolve load-use hazards and mispredicted branches.
+- Sketch why exception handling and precise interrupts constrain the pipeline.
+
+What I should already know: <a href={withBase('/books/computer-systems-a-programmers-perspective/03-machine-level-representation-of-programs/')}>chapter 3</a>
+well enough to read x86-64 assembly without panic, and chapter 2's bit
+operations. Digital logic is introduced here from scratch.
+
+Reading time: about two and a half hours for this page. The Architecture
+Lab (building and testing a PIPE variant) is another week of evenings.
+
+## Chapter map
+
+<Flow steps={["4.1 Y86-64 ISA: state, instructions, encodings, exceptions", "4.2 Logic design and HCL: gates, combinational circuits, memory and clocks", "4.3 SEQ: one instruction at a time through six stages", "4.4 Pipelining principles: throughput, latency, limitations, feedback", "4.5 PIPE: pipeline registers, prediction, hazards, forwarding, control logic", "4.6 Summary and the Y86-64 simulators"]} caption="The chapter builds a CPU twice: once as a simple sequential machine that makes every stage obvious, then again as a pipeline that makes every hazard obvious." />
+
+## 4.1 The Y86-64 Instruction Set Architecture
+
+### In one sentence
+
+Y86-64 is a deliberately small subset of x86-64: fifteen registers, a
+handful of move and arithmetic ops, jumps, call and ret, push and pop, and
+four status codes, all encoded in a regular byte-oriented format I can
+decode with a pencil.
+
+### The idea
+
+#### 4.1.1 Programmer-Visible State
+
+What a Y86-64 program can see:
+
+- **Fifteen registers:** `%rax` through `%r14`, with `%rsp` used as the
+  stack pointer by push, pop, call and ret. There is no `%r15`; the value
+  0xF in a register field means "no register".
+- **Three condition codes:** ZF, SF, OF (no CF; Y86-64 arithmetic is
+  signed-oriented for branches).
+- **Program counter (PC):** the address of the next instruction.
+- **Memory:** a single byte-addressable array, as in chapter 3.
+- **Status code:** a four-valued enum that says whether the machine is
+  running or has stopped for a reason.
+
+<Trace columns={["Status", "Meaning"]} rows={[
+  ["AOK", "Normal operation"],
+  ["HLT", "halt instruction executed"],
+  ["ADR", "Invalid address (bad PC or data address)"],
+  ["INS", "Invalid instruction"],
+]} caption="Y86-64 status codes. Anything other than AOK stops instruction fetch; the simulator reports which one." />
+
+#### 4.1.2 Y86-64 Instructions
+
+The instruction set is small enough to fit on one page:
+
+<Trace columns={["Group", "Instructions"]} rows={[
+  ["Stops", "halt, nop"],
+  ["Moves", "rrmovq, irmovq, rmmovq, mrmovq"],
+  ["Conditional moves", "cmovle, cmovl, cmove, cmovne, cmovge, cmovg"],
+  ["Arithmetic", "addq, subq, andq, xorq"],
+  ["Jumps", "jmp, jle, jl, je, jne, jge, jg"],
+  ["Stack and call", "call, ret, pushq, popq"],
+]} caption="Every Y86-64 instruction. Conditional moves and jumps share the same six condition suffixes as x86-64." />
+
+Semantics match the x86-64 cousins from chapter 3, with two simplifications:
+only quad-word data, and `subq rA, rB` computes R[rB] ← R[rB] − R[rA]
+(destination last, same as AT&T). There are no shift instructions, no
+byte or long operations, and no floating point.
+
+#### 4.1.3 Instruction Encoding
+
+Every instruction starts with a one-byte **icode/ifun** pair: high nibble
+is the opcode class, low nibble the function (condition or ALU op). Optional
+fields follow in a fixed order: a register byte (two 4-bit register ids),
+an 8-byte constant or destination (little-endian).
+
+I wrote an encoder and checked the bytes:
+
+```text
+assembly                         hex                                      len
+halt                             00                                       1
+nop                              10                                       1
+irmovq 256, %rsp                 30 f4 00 01 00 00 00 00 00 00            10
+irmovq 3, %rax                   30 f0 03 00 00 00 00 00 00 00            10
+addq %rax, %rbx                  60 03                                    2
+rmmovq %rbx, 0, %rsp             40 34 00 00 00 00 00 00 00 00            10
+jmp 23                           70 17 00 00 00 00 00 00 00               9
+pushq %rax                       a0 0f                                    2
+popq %rax                        b0 0f                                    2
+ret                              90                                       1
+cmovle %rax, %rbx                21 03                                    2
+```
+
+<Figure art={`
+  byte:   0        1        2........9
+  irmovq: [3|0]    [F|rB]   [  8-byte immediate V  ]
+  addq:   [6|0]    [rA|rB]
+  jmp:    [7|0]    [  8-byte destination Dest ]
+  pushq:  [A|0]    [rA|F]
+  halt:   [0|0]
+
+  register ids:  rax=0 rcx=1 rdx=2 rbx=3 rsp=4 rbp=5 rsi=6 rdi=7
+                 r8=8 ... r14=14   F = no register
+`} caption="Y86-64 encoding formats. The first byte is always icode in the high nibble and ifun in the low. Register byte uses F when a field is unused. Constants are 8-byte little-endian." />
+
+A small program that sums 1 through 10 encodes to 53 bytes; the loop sits
+at address `0x28` and the `jne` carries that absolute address:
+
+```text
+0x00: irmovq 512, %rsp
+0x0a: irmovq 0, %rax
+0x14: irmovq 10, %rdi
+0x1e: irmovq 1, %rcx
+0x28: addq %rdi, %rax     # loop
+0x2a: subq %rcx, %rdi
+0x2c: jne 0x28
+```
+
+#### 4.1.4 Y86-64 Exceptions
+
+An exception in Y86-64 sets the status to ADR or INS (or HLT for `halt`)
+and stops fetching. There are no privilege levels, no handler tables and
+no resumption; the simulator just reports the status. That is enough to
+practise precise exception handling in the pipeline later: an exception
+detected in a deep stage must not let earlier (younger) instructions
+change programmer-visible state.
+
+#### 4.1.5 Y86-64 Programs
+
+Y86-64 assembly looks like a trimmed x86-64. A function that adds an array
+of longs would use `mrmovq` to load, `addq` to accumulate, `irmovq` for
+constants, and `call`/`ret` with `%rsp`. The Architecture Lab ships an
+assembler `yas` and a simulator `yis` that run these programs; on this page
+I use my own encoder and reason about the bytes directly.
+
+#### 4.1.6 Some Y86-64 Instruction Details
+
+A few details that matter for the hardware:
+
+- `rrmovq` and the six conditional moves share icode 2; ifun selects the
+  condition. Unconditional move is ifun 0.
+- `pushq` and `popq` adjust `%rsp` by ±8 and move data; their encodings
+  leave the second register nibble as F.
+- `call` pushes the return address (the next PC) and jumps; `ret` pops into
+  the PC. Same stack discipline as chapter 3.
+- Jumps and `call` encode an absolute destination, not a relative offset.
+  That simplifies the SEQ hardware at the cost of position dependence.
+
+
+A second encoding table I keep on paper is the ifun meanings:
+
+<Trace columns={["icode", "ifun 0", "ifun 1", "ifun 2", "ifun 3", "ifun 4", "ifun 5", "ifun 6"]} rows={[
+  ["2 cmov", "rrmovq", "cmovle", "cmovl", "cmove", "cmovne", "cmovge", "cmovg"],
+  ["6 OPq", "addq", "subq", "andq", "xorq", "", "", ""],
+  ["7 jXX", "jmp", "jle", "jl", "je", "jne", "jge", "jg"],
+]} caption="Function codes shared across conditional moves, ALU ops and jumps. Memorising this grid makes decoding a single-byte lookup." />
+
+Byte-length formula: 1 (always) + 1 if the instruction needs a register byte + 8 if it needs a constant. So halt is 1, addq is 2, jmp is 9, irmovq is 10. No Y86-64 instruction is any other length, which is why fetch's valP HCL is three terms long.
+
+
+### One more encoding drill
+
+I encode a five-instruction prologue the way a compiler would for a
+small leaf function that uses `%rbx`:
+
+```text
+0x00: 30 f4 00 01 00 00 00 00 00 00   irmovq 0x100, %rsp
+0x0a: a0 3f                           pushq  %rbx
+0x0c: 30 f3 00 00 00 00 00 00 00 00   irmovq 0, %rbx
+0x16: b0 3f                           popq   %rbx
+0x18: 90                              ret
+```
+
+Total 25 bytes. Tracing it on PIPE: the `pushq` is a store to memory and a
+write to `%rsp`; the next `irmovq` does not depend on `%rsp`, so no stall;
+the `popq` depends on `%rsp` from `pushq`, but by the time `popq` decodes,
+`pushq` has already produced the new `%rsp` in execute and can forward it.
+The `ret` will stall until its return address (whatever was on the stack
+above our pushed `%rbx`) is read in memory. Even a trivial prologue shows
+every major PIPE mechanism except a mispredicted branch.
+
+
+The same prologue also shows why leaf functions matter: a leaf that needs
+no callee-saved register can skip the push/pop pair entirely, removing a
+store, a load and the `ret`'s dependence on a stack slot it just wrote.
+Compilers know this; chapter 5 will count the cycles. After PIPE, I can
+see those cycles as concrete stalls and memory ops rather than as a vague
+"function-call overhead". The habit of translating "overhead" into named
+hazard events is the lasting payoff of the chapter. I use it every time a profiler points at a branchy hot spot or a surprising load-use dependence chain.
+
+### Worked example
+
+Decode `60 03`:
+
+1. High nibble 6 → arithmetic; low nibble 0 → `addq`.
+2. Register byte `03` → rA = 0 (`%rax`), rB = 3 (`%rbx`).
+3. Instruction is `addq %rax, %rbx`, length 2.
+
+Decode `30 f4 00 01 00 00 00 00 00 00`:
+
+1. icode 3 → `irmovq`.
+2. Register byte `f4` → rA unused, rB = 4 (`%rsp`).
+3. Next 8 bytes little-endian = `0x100`.
+4. Instruction is `irmovq 0x100, %rsp`, length 10.
+
+### Step by step
+
+To encode an instruction:
+
+1. Look up icode and ifun; write that byte.
+2. If it needs registers, write the register byte (F for unused).
+3. If it needs a constant or destination, write 8 little-endian bytes.
+4. Sum the lengths; that is how far to advance the PC.
+
+### Common mistake
+
+Forgetting that Y86-64 destinations are absolute. Copying an x86-64 relative
+`jmp` encoding into a Y86-64 program jumps into nowhere. Another: using
+`%r15`, which does not exist; the id F means "no register", not `%r15`.
+
+### In real systems
+
+Real ISAs (x86-64, ARM64, RISC-V) use denser and more irregular encodings,
+but the same ideas: an opcode, register fields, immediates, and a small
+set of formats. RISC-V's fixed 32-bit formats are closest in spirit to
+Y86-64's regularity; x86-64's variable length is what chapter 3's
+`objdump` listings showed.
+
+### Check yourself
+
+<details>
+<summary>What does the byte F mean in a register field?</summary>
+
+No register; that field is unused by this instruction.
+
+</details>
+
+<details>
+<summary>How many bytes is je 0x1000?</summary>
+
+Nine: one opcode byte and an eight-byte destination.
+
+</details>
+
+<details>
+<summary>Which status does an attempt to execute 0xFF as an opcode produce?</summary>
+
+INS (invalid instruction).
+
+</details>
+
+## 4.2 Logic Design and the Hardware Control Language HCL
+
+### In one sentence
+
+Hardware is built from gates that compute boolean functions without memory,
+and from memory elements that hold values between clock edges; HCL is a
+notation for describing the combinational part cleanly.
+
+### The idea
+
+#### 4.2.1 Logic Gates
+
+Three gates are enough for every boolean function: AND, OR and NOT. Their
+outputs respond continuously to their inputs (after a tiny gate delay).
+They have no memory: the output is a pure function of the current inputs.
+
+#### 4.2.2 Combinational Circuits and HCL Boolean Expressions
+
+Wiring gates together without cycles gives a **combinational circuit**.
+HCL writes the same thing as a C-like boolean expression:
+
+```text
+bool eq = (a && b) || (!a && !b);   # a equals b for one-bit signals
+```
+
+#### 4.2.3 Word-Level Combinational Circuits and HCL Integer Expressions
+
+Real machines move 64-bit words. A word-level multiplexor selects one of
+several words based on a control signal. In HCL:
+
+```text
+word Out = [
+    s == 1 : B;
+    1      : A;
+];
+```
+
+The bracket is a case list: the first true condition's value wins. I built
+the one-bit mux and lifted it to eight bits in Python to check:
+
+```text
+mux2(0, 0b10110010, 0b01001101) = 0b10110010
+mux2(1, 0b10110010, 0b01001101) = 0b1001101
+```
+
+An ALU is a word-level circuit with a control code:
+
+```text
+word alu_out = [
+    alufun == ADD : A + B;
+    alufun == SUB : B - A;
+    alufun == AND : A & B;
+    alufun == XOR : A ^ B;
+];
+```
+
+```text
+alu(0,3,5) -> 8     # add
+alu(1,3,5) -> 2     # sub (B - A)
+alu(2,240,15) -> 0  # and
+alu(3,255,15) -> 240 # xor
+```
+
+#### 4.2.4 Set Membership
+
+HCL has a set-membership test that keeps instruction decoding readable:
+
+```text
+bool need_regids = icode in { RRMOVQ, IRMOVQ, RMMOVQ, MRMOVQ,
+                              OPq, PUSHQ, POPQ };
+```
+
+That one line replaces a long OR of equalities, and it is exactly how SEQ
+and PIPE decide whether to read a register byte from the instruction
+stream.
+
+#### 4.2.5 Memory and Clocking
+
+Combinational circuits cannot store information. Storage needs a **clock**
+and devices that load a new value only on a clock edge:
+
+- **Registers** (pipeline registers, the program counter, the condition
+  codes) load on every rising edge, or on an edge when an enable is high.
+- **Memories** (register file, data memory, instruction memory) have
+  address and data inputs; writes are committed on the clock edge, reads
+  are combinational (the value appears after a short delay).
+
+The discipline that makes SEQ and PIPE workable: **all combinational logic
+settles between clock edges; all state changes happen at the edge**. If the
+clock is too fast, the logic does not settle and the machine computes
+garbage. That is the speed limit of a stage, and the reason a pipeline's
+clock cannot be faster than its slowest stage.
+
+<Figure art={`
+  combinational logic          state elements
+  (gates, ALUs, muxes)         (registers, memories)
+
+   inputs ---> [ logic ] ---> values ready
+                                |
+                     clock edge |  copies values into state
+                                v
+                              new inputs for next cycle
+`} caption="The clocked-circuit contract. Combinational logic has most of the cycle to settle; the rising edge snapshots its outputs into registers that feed the next cycle." />
+
+### Worked example
+
+HCL for "next PC" in a simplified SEQ, choosing among the sequential next
+instruction, a jump target and a return address:
+
+```text
+word new_pc = [
+    icode == CALL : valC;               # dest from instruction
+    icode in { JXX } && Cnd : valC;     # taken branch
+    icode == RET : valM;                # from stack
+    1 : valP;                           # default: PC + length
+];
+```
+
+### Step by step
+
+To write an HCL case expression:
+
+1. List every condition that should produce a distinct value, most specific first.
+2. End with `1 : default` so the result is always defined.
+3. Use `in { ... }` for opcode sets; it reads as the prose.
+
+### Common mistake
+
+Writing a cyclic combinational circuit (an output wired back to an input
+without a register). In real hardware that oscillates or settles to a
+useless value; in the HCL tools it is rejected. Another: forgetting the
+default case, so some input combinations produce no value.
+
+
+HCL integer expressions also cover the arithmetic the ALU needs. Unlike C,
+HCL addition on words is just another combinational function; there is no
+undefined overflow. Subtraction is addition of a negated operand. Bitwise
+ops match chapter 2. The condition-code outputs are separate boolean
+signals computed from the result and the operands (for OF, from the carry
+into and out of the sign bit). When I write `set_cc = icode in { OPQ }` I
+am saying "only arithmetic instructions update the flags"; moves and
+address calculations leave them alone, matching x86-64 behaviour for the
+corresponding instructions.
+
+### In real systems
+
+Hardware description languages used in industry (SystemVerilog, VHDL, Chisel)
+are richer cousins of HCL. The same split between combinational always-blocks
+and clocked registers is the first thing every digital design course
+teaches. The CS:APP HCL subset is enough to specify a CPU and small enough
+to reason about on paper.
+
+### Check yourself
+
+<details>
+<summary>What separates combinational logic from sequential logic?</summary>
+
+Combinational logic has no memory; its outputs are a pure function of its
+current inputs. Sequential logic includes clocked state.
+
+</details>
+
+<details>
+<summary>Why must the clock period exceed the longest combinational delay?</summary>
+
+So every signal settles to its correct value before the edge that captures
+it into a register.
+
+</details>
+
+## 4.3 Sequential Y86-64 Implementations
+
+### In one sentence
+
+SEQ is a processor that does one instruction completely before starting the
+next, organised as six stages that share a single clock edge at the end, so
+every value I draw on the whiteboard is also a wire in the machine.
+
+### The idea
+
+#### 4.3.1 Organizing Processing into Stages
+
+Six stages cover every Y86-64 instruction:
+
+1. **Fetch.** Read the instruction bytes at the PC; extract icode, ifun,
+   optional registers rA/rB, optional constant valC; compute valP = PC +
+   length.
+2. **Decode.** Read up to two operands from the register file, producing
+   valA and valB. For instructions that need `%rsp`, decode reads it even
+   when the register byte says F.
+3. **Execute.** The ALU computes a value (valE) and optionally sets the
+   condition codes. For address calculations (rmmovq, mrmovq, push, pop,
+   call) the ALU adds an offset to a base. For conditional moves and jumps
+   a condition signal Cnd is computed from ifun and the flags.
+4. **Memory.** Read or write data memory: `mrmovq` and `popq`/`ret` read
+   (valM); `rmmovq`, `pushq` and `call` write.
+5. **Write back.** Up to two register writes: valE and/or valM into the
+   destinations the instruction updates.
+6. **PC update.** Set the PC to valP, valC or valM depending on the
+   instruction and Cnd.
+
+<Flow steps={["Fetch: bytes at PC -> icode, ifun, rA, rB, valC, valP", "Decode: register file -> valA, valB", "Execute: ALU -> valE, Cnd; maybe set CC", "Memory: data memory <-> valM", "Write back: valE / valM into registers", "PC update: PC <- valP or valC or valM"]} caption="SEQ's six stages. In the hardware they are all combinational paths fed by the old PC and register file; the clock edge at the end writes the new PC, registers, memory and flags together." />
+
+#### 4.3.2 SEQ Hardware Structure
+
+The hardware is one long combinational path from the old PC to all the
+next-state values, plus the register file, data memory, condition-code
+register and PC register that load on the clock. Instruction memory is
+read-only in SEQ (a program is loaded before the run). Control signals
+(ALU function, ALU A/B selects, memory read/write enables, register write
+enables, PC select) are combinational functions of icode and ifun, written
+in HCL.
+
+#### 4.3.3 SEQ Timing
+
+Because everything is combinational until the clock edge, the clock period
+must be longer than the longest path through all six stages. That path
+usually goes through fetch → decode → execute → memory → write-back setup.
+A typical textbook estimate puts that around 600 ps, so SEQ's instruction
+throughput is about one instruction every 600 ps. Pipelining will cut the
+period to roughly the longest single stage.
+
+No instruction's side effects become visible until the edge. That is why
+SEQ has no hazard problems: the next instruction sees a fully updated
+machine.
+
+#### 4.3.4 SEQ Stage Implementations
+
+The HCL for each stage is a page of case expressions. The patterns that
+matter:
+
+**Fetch.**
+
+```text
+bool need_regids = icode in { RRMOVQ, OPQ, PUSHQ, POPQ,
+                              IRMOVQ, RMMOVQ, MRMOVQ };
+bool need_valC   = icode in { IRMOVQ, RMMOVQ, MRMOVQ, JXX, CALL };
+word valP = PC + 1 + need_regids + 8 * need_valC;
+```
+
+**Decode.** Select which registers to read:
+
+```text
+word srcA = [
+    icode in { RRMOVQ, RMMOVQ, OPQ, PUSHQ } : rA;
+    icode in { POPQ, RET } : RRSP;
+    1 : RNONE;
+];
+word srcB = [
+    icode in { OPQ, RMMOVQ, MRMOVQ } : rB;
+    icode in { PUSHQ, POPQ, CALL, RET } : RRSP;
+    1 : RNONE;
+];
+```
+
+**Execute.** ALU inputs and function:
+
+```text
+word aluA = [
+    icode in { RRMOVQ, OPQ } : valA;
+    icode in { IRMOVQ, RMMOVQ, MRMOVQ } : valC;
+    icode in { CALL, PUSHQ } : -8;
+    icode in { RET, POPQ } : 8;
+];
+word aluB = [
+    icode in { RMMOVQ, MRMOVQ, OPQ, CALL,
+               PUSHQ, RET, POPQ } : valB;
+    icode in { RRMOVQ, IRMOVQ } : 0;
+];
+```
+
+**Memory.** Address and data selects; read/write enables from icode.
+
+**Write back.** Two ports (Y86-64 needs them for `popq`, which writes both
+the destination and `%rsp`):
+
+```text
+word dstE = [
+    icode in { RRMOVQ } && Cnd : rB;
+    icode in { IRMOVQ, OPQ } : rB;
+    icode in { PUSHQ, POPQ, CALL, RET } : RRSP;
+    1 : RNONE;
+];
+word dstM = [
+    icode in { MRMOVQ, POPQ } : rA;
+    1 : RNONE;
+];
+```
+
+**PC update.** The next-PC HCL from 4.2.
+
+### Worked example
+
+Trace `addq %rax, %rbx` through SEQ, with `%rax = 3`, `%rbx = 5`:
+
+<Trace columns={["Stage", "Key values"]} rows={[
+  ["Fetch", "icode=OPQ, ifun=ADD, rA=rax, rB=rbx, valP=PC+2"],
+  ["Decode", "valA=3, valB=5"],
+  ["Execute", "aluA=3, aluB=5, valE=8, CC updated (ZF=0,SF=0,OF=0)"],
+  ["Memory", "no access"],
+  ["Write back", "dstE=rbx, R[rbx]=8"],
+  ["PC update", "PC=valP"],
+]} caption="One arithmetic instruction in SEQ. Five of the six stages do real work; memory is idle." />
+
+Trace `ret` when the stack top holds `0x28` and `%rsp = 0x100`:
+
+<Trace columns={["Stage", "Key values"]} rows={[
+  ["Fetch", "icode=RET, valP=PC+1"],
+  ["Decode", "valA=valB=R[rsp]=0x100"],
+  ["Execute", "valE=0x100+8=0x108"],
+  ["Memory", "valM=M[0x100]=0x28 (the return address)"],
+  ["Write back", "R[rsp]=0x108"],
+  ["PC update", "PC=valM=0x28"],
+]} caption="ret in SEQ. The return address comes from memory (valM); the restored %rsp is valE. PC update selects valM, not valP." />
+
+### Step by step
+
+To trace any instruction through SEQ:
+
+1. Fetch: write down icode, ifun, registers, valC, valP.
+2. Decode: which srcA/srcB? Read those registers.
+3. Execute: which aluA/aluB/alufun? Compute valE and Cnd; note whether CC updates.
+4. Memory: read, write or neither? Note valM.
+5. Write back: which dstE/dstM? Which values?
+6. PC: valP, valC or valM?
+
+### Common mistake
+
+Thinking SEQ takes six clock cycles per instruction. It takes one: all
+stages are combinational in the same cycle. The six-stage vocabulary is
+about the logical organisation, reused when we pipeline.
+
+
+Looking at all four ALU ops and the four memory-touching instructions side by side shows the pattern SEQ relies on: the ALU either computes a program value or an address, and memory either idles, loads into valM, or stores valA. Everything else is steering.
+
+<Compare left="Instruction" right="ALU role / Memory role" rows={[
+  ["addq / subq / andq / xorq", "program value in valE / idle"],
+  ["rrmovq / cmovXX / irmovq", "pass-through or 0+valC / idle"],
+  ["rmmovq", "address = valB+valC / store valA"],
+  ["mrmovq", "address = valB+valC / load valM"],
+  ["pushq / call", "address = valB-8 / store valA (or valP)"],
+  ["popq / ret", "address = valB / load valM; valE = valB+8"],
+]} caption="How each instruction class uses the execute and memory stages. Once I see this table, the HCL case lists are just its transcription." />
+
+Timing discipline in SEQ also explains a rule chapter 5 will use: a single-cycle machine cannot be faster than its longest instruction. Memory access and the ALU add dominate; instruction-memory fetch is on the same path. That is why even SEQ implementers care about cache hits, and why PIPE's stage balance starts by asking which of those cuts is the slowest.
+
+### In real systems
+
+No modern CPU is a SEQ, but every CPU's pipeline stages are the SEQ stages
+cut apart. Understanding SEQ first is why PIPE's diagrams are readable
+instead of mystical. Microcontrollers and teaching cores (PicoRV32,
+many J. J. Hennessy/Patterson examples) are still essentially SEQ or
+shallow pipelines.
+
+### Check yourself
+
+<details>
+<summary>Which stages does nop use for anything besides advancing the PC?</summary>
+
+Only fetch (to know it is a nop and compute valP). Decode, execute, memory
+and write back are idle; PC update sets PC to valP.
+
+</details>
+
+<details>
+<summary>Why does popq need two register-write ports?</summary>
+
+It writes the popped value into rA and the new stack pointer into `%rsp`
+in the same instruction.
+
+</details>
+
+## 4.4 General Principles of Pipelining
+
+### In one sentence
+
+Pipelining overlaps the stages of successive instructions so that
+throughput rises toward one instruction per stage delay, while latency of
+any one instruction stays about the same and new hazards appear.
+
+### The idea
+
+#### 4.4.1 Computational Pipelines
+
+A laundry analogy: wash, dry, fold. Doing one load completely before the
+next takes 3 hours per load. Starting a new load every hour, with three
+loads in flight, finishes one load per hour after the pipeline fills.
+Throughput triples; the time from a shirt going in to coming out is still
+about three hours.
+
+#### 4.4.2 A Detailed Look at Pipeline Operation
+
+In a processor the stages are fetch, decode, execute, memory, write back
+(PC update folds into fetch of the next instruction). Ideal timing with a
+300 ps stage budget:
+
+<Figure art={`
+  time -->
+  I1: [F][D][E][M][W]
+  I2:    [F][D][E][M][W]
+  I3:       [F][D][E][M][W]
+  I4:          [F][D][E][M][W]
+
+  throughput once full: 1 instruction / stage-delay
+  latency of I1: still 5 stage-delays
+`} caption="A five-stage pipeline in steady state. A new instruction enters every cycle; five instructions are in flight; each instruction still takes five cycles to finish." />
+
+#### 4.4.3 Limitations of Pipelining
+
+Three limits:
+
+1. **Non-uniform stage delays.** The clock must wait for the slowest
+   stage. Unbalanced stages waste time in the fast ones.
+2. **Overhead of pipeline registers.** Each stage boundary adds setup and
+   hold time. Too many stages and the overhead dominates.
+3. **Hazards.** Dependencies between instructions force stalls or extra
+   hardware, cutting the ideal throughput.
+
+#### 4.4.4 Pipelining a System with Feedback
+
+A feedback path (an instruction that computes the next PC, or that produces
+a value a young instruction needs) couples stages. Pure feed-forward
+pipelines are easy; processors are not pure. The rest of the chapter is
+about making feedback safe and fast.
+
+### Worked example
+
+SEQ clock 600 ps → 1.67 GHz, throughput 1.67 GIPS.
+PIPE with five balanced 120 ps stages plus 20 ps register overhead →
+140 ps clock → 7.1 GHz ideal, throughput 7.1 GIPS. Real PIPE with stalls
+and mispredictions might average 0.5 to 0.8 instructions per cycle, still
+several times SEQ.
+
+### Step by step
+
+To estimate pipeline speedup:
+
+1. Find SEQ's longest path; that is T_seq.
+2. Find the longest stage after splitting; add register overhead; that is T_pipe.
+3. Ideal speedup is T_seq / T_pipe.
+4. Multiply by the realised instructions-per-cycle after hazards (less than 1).
+
+### Common mistake
+
+Claiming pipelining makes each instruction faster. It makes the machine
+complete more instructions per second; each instruction still walks every
+stage.
+
+### In real systems
+
+Modern out-of-order cores have 10 to 20+ pipeline stages, issue several
+instructions per cycle, and rename registers to remove false dependencies.
+The hazards in this chapter are the same hazards those machines solve with
+more hardware. Understanding PIPE is the prerequisite for reading about
+Tomasulo's algorithm or a load/store queue.
+
+
+A useful comparison across generations of machines I have used: a teaching
+SEQ-like microcontroller finishes about one instruction every few cycles
+at a low clock; a phone-class out-of-order core finishes two to four per
+cycle at a few GHz; a big server core can be higher still on friendly
+code. The gap is not mainly better silicon speed. It is deeper pipelines,
+wider issue, better predictors and caches that keep the pipe full. This
+chapter is the first rung of that ladder: once PIPE's hazards are
+intuitive, every later idea is "the same hazard, more machinery".
+
+### Check yourself
+
+<details>
+<summary>Does pipelining reduce the latency of one instruction?</summary>
+
+Not materially; it raises throughput. Latency stays about the number of
+stages times the new (shorter) clock.
+
+</details>
+
+<details>
+<summary>Name the three limits on pipeline performance.</summary>
+
+Unbalanced stages, pipeline-register overhead, and hazards.
+
+</details>
+
+## 4.5 Pipelined Y86-64 Implementations
+
+### In one sentence
+
+PIPE cuts SEQ into five stages separated by pipeline registers, predicts
+the next PC up front, then spends most of its control logic on detecting
+and repairing the data and control hazards that prediction and overlapping
+create.
+
+### The idea
+
+#### 4.5.1 SEQ+: Rearranging the Computation Stages
+
+Before inserting registers, SEQ is rearranged so that PC update happens at
+the start of the next instruction's fetch rather than at the end of the
+current one. The next PC is computed in the previous instruction and held
+in the PC register. That makes the PC just another pipeline register.
+
+#### 4.5.2 Inserting Pipeline Registers
+
+Five registers sit between stages: F (holds prediction of next PC), D
+(holds fetched instruction fields), E (holds decoded values), M (holds
+execute results), W (holds memory results). Their fields have names like
+`D_icode`, `E_valA`, `M_Cnd`, `W_valM`. On every clock edge the whole
+bundle moves one stage forward.
+
+<Layers layers={[
+  { name: "F", note: "predicted PC" },
+  { name: "D", note: "icode, ifun, rA, rB, valC, valP, status" },
+  { name: "E", note: "icode, valA, valB, valC, dstE, dstM, srcA, srcB, status" },
+  { name: "M", note: "icode, Cnd, valE, valA, dstE, dstM, status" },
+  { name: "W", note: "icode, valE, valM, dstE, dstM, status" },
+]} caption="PIPE's pipeline registers from fetch to write back. Each holds just enough of the instruction's state for the stages that follow." />
+
+#### 4.5.3 Rearranging and Relabeling Signals
+
+Signal names gain a stage prefix so that `valA` in decode is `d_valA` (the
+combinational output) feeding `E_valA` (the registered value). Reading PIPE
+HCL is mostly tracking those prefixes.
+
+#### 4.5.4 Next PC Prediction
+
+Fetch must choose a next PC every cycle, before the current instruction has
+decoded. PIPE's prediction:
+
+- For most instructions: predict valP (fall through).
+- For `call` and unconditional `jmp`: predict the target valC (known in fetch).
+- For conditional jumps: predict **taken** (the target valC).
+- For `ret`: cannot predict easily; PIPE stalls until `ret` reaches memory
+  and produces valM.
+
+Wrong predictions are repaired when the branch resolves in execute: the
+wrongly fetched instructions are turned into bubbles, and the correct PC
+is fed into F.
+
+#### 4.5.5 Pipeline Hazards
+
+Two families:
+
+**Data hazards.** An instruction needs a value that a previous instruction
+has not yet written back. Example:
+
+```text
+addq %rax, %rbx    # produces new %rbx in write back
+subq %rbx, %rcx    # needs %rbx in decode
+```
+
+Without help, `subq` would read the old `%rbx`. **Forwarding** (bypassing)
+fixes most cases: the pipeline notices that `E_dstE` matches `d_srcA` and
+routes `e_valE` (or `M_valE`, or `W_valE`/`W_valM`) into the decode stage's
+valA/valB muxes. The one case forwarding cannot fix is a **load-use
+hazard**:
+
+```text
+mrmovq 0(%rax), %rbx   # value arrives only in memory stage
+subq %rbx, %rcx        # needs it in execute the next cycle
+```
+
+PIPE stalls the `subq` for one cycle (inserts a bubble into execute) so
+that the load's valM can be forwarded from memory.
+
+**Control hazards.** A jump's direction or a return address is not known
+at fetch. Prediction plus squash-on-wrong handles conditional jumps;
+`ret` stalls until the address is ready.
+
+<Figure art={`
+  cycle:     1    2    3    4    5    6
+  addq:     [F]  [D]  [E]  [M]  [W]
+  subq:          [F]  [D]  [E]  [M]  [W]
+                       ^
+                       decode of subq gets rbx via
+                       forwarding from E_valE of addq
+
+  load-use:
+  mrmovq:   [F]  [D]  [E]  [M]  [W]
+  subq:          [F]  [D]  [D]  [E]  [M]  [W]
+                            stall: bubble into E
+`} caption="Forwarding saves the add-then-sub case. A load followed by a use must stall one cycle because the data exists only after the memory stage." />
+
+#### 4.5.6 Exception Handling
+
+An exception can be detected in fetch (bad PC, bad instruction), in memory
+(bad address) or by `halt`. Because younger instructions may already be in
+the pipeline, PIPE transfers a status code along with each instruction and
+only lets the exception take effect when that instruction reaches write
+back. Instructions after the excepting one are cancelled. That gives
+**precise exceptions**: the machine looks as if it stopped at the faulting
+instruction, with every older instruction complete and every younger one
+undone.
+
+#### 4.5.7 PIPE Stage Implementations
+
+Each stage's HCL is SEQ's HCL plus the forwarding muxes and the prediction
+logic. The decode-stage forwarding mux is the heart of it:
+
+```text
+word d_valA = [
+    D_icode in { CALL, JXX } : D_valP;         # return addr / fallthrough
+    d_srcA == e_dstE : e_valE;                 # forward from execute
+    d_srcA == M_dstM : m_valM;                 # forward from memory (load)
+    d_srcA == M_dstE : M_valE;
+    d_srcA == W_dstM : W_valM;
+    d_srcA == W_dstE : W_valE;
+    1 : d_rvalA;                               # from register file
+];
+```
+
+Priority matters: the newest matching producer wins.
+
+#### 4.5.8 Pipeline Control Logic
+
+Four boolean signals per pipeline register: whether to stall it, whether
+to bubble it (inject a nop), or to let it load normally. The combinations
+PIPE needs:
+
+<Trace columns={["Situation", "F", "D", "E", "M", "W"]} rows={[
+  ["Normal", "normal", "normal", "normal", "normal", "normal"],
+  ["Load-use hazard", "stall", "stall", "bubble", "normal", "normal"],
+  ["Mispredicted branch", "normal", "bubble", "bubble", "normal", "normal"],
+  ["ret in progress", "stall", "bubble", "normal", "normal", "normal"],
+  ["Exception reaching W", "bubble", "bubble", "bubble", "bubble", "normal"],
+]} caption="PIPE control combinations. Stall holds a register's value; bubble overwrites it with a nop-like instruction; normal loads from the previous stage." />
+
+When two special cases collide (a load-use hazard and a ret in flight, for
+example), the control logic has a priority: the book works through the
+combinations so that a single HCL block produces the right enables. The
+Architecture Lab's testing regime catches the priority bugs.
+
+#### 4.5.9 Performance Analysis
+
+Ideal PIPE: CPI = 1. Real CPI is 1 plus penalties:
+
+- Load-use: about 0.25 of instructions are loads, maybe 0.3 of those have
+  a use next → roughly 0.075 cycles per instruction of stall.
+- Mispredicted branches: about 0.2 of instructions are conditional jumps,
+  prediction accuracy maybe 0.6 with the simple taken strategy → 0.2 × 0.4
+  × 2-cycle penalty ≈ 0.16.
+- `ret` stalls: rare in integer code, a few hundredths.
+
+A rough CPI of 1.25 means PIPE at a 140 ps clock delivers about 5.7 GIPS,
+still several times SEQ's 1.67. Better branch predictors (two-bit counters,
+return stacks) cut the control penalty sharply; that is the next step past
+this chapter.
+
+#### 4.5.10 Unfinished Business
+
+PIPE does not rename registers, issue out of order, or speculate past
+multiple branches. It does not have a data cache with miss stalls, nor
+virtual memory. Chapters 5 and 6 pick up performance from the program's
+side and the memory side; the hardware story continues in computer-
+architecture books that start where CS:APP stops.
+
+
+Forwarding priority, written as a story: decode asks "who has the value I need?". Execute answers first (the instruction that just produced valE). Memory answers next, and must offer both valE (an ALU result that has moved one stage) and valM (a just-finished load). Write back answers last. The register file answers only if nobody else does. Implementing that story as a case list with newest-first order is the entire forwarding mux.
+
+Branch recovery costs two bubbles because PIPE fetches on prediction for two cycles before execute resolves the condition: the instruction in D and the instruction just moving into E are both from the wrong path. A design with an earlier branch resolution (some RISC cores resolve in decode for simple cases) would cut that penalty to one; a design with a deeper pipe would raise it. The two-cycle number is a property of this pipe, not a law.
+
+Return-address prediction is the obvious upgrade the book leaves as unfinished business. Real CPUs keep a small stack of predicted return addresses pushed on call and popped on ret, and they are right more than 90 percent of the time on ordinary code. Adding one to PIPE would replace the ret stall with a predict-and-squash path just like a branch; the Architecture Lab sometimes offers that as an open-ended challenge.
+
+Performance numbers I actually care about when reading PIPE traces:
+
+<Trace columns={["Event", "Cycles lost", "How I spot it in a diagram"]} rows={[
+  ["Load-use stall", "1", "D repeats a cycle; E gets a bubble"],
+  ["Mispredicted branch", "2", "D and E both become bubbles; F loads fall-through"],
+  ["ret stall", "3", "F stalls while ret walks D, E, M; D bubbled each cycle"],
+  ["Normal forward", "0", "Arrow from e_valE or m_valM into d_valA; no bubble"],
+]} caption="Penalty cheat sheet for reading PIPE diagrams. Counting these events over a hundred-instruction trace is how I estimate CPI without a simulator." />
+
+### Worked example
+
+Hazard in this sequence:
+
+```text
+1: mrmovq 0(%rdx), %rax
+2: addq   %rax, %rbx
+3: je     target
+```
+
+Cycle-by-cycle after instruction 1 enters execute:
+
+1. Instruction 2 must stall in decode for one cycle (load-use on `%rax`).
+2. Instruction 3's fetch stalls with it (F stalls when D stalls).
+3. After the stall, `%rax` forwards from M to E for instruction 2.
+4. Instruction 3 is a conditional jump predicted taken; if the flags from
+   instruction 2 (which set them) say not taken, instructions fetched from
+   `target` are bubbled out of D and E, and F gets the fall-through PC.
+
+### Step by step
+
+To analyse a PIPE run:
+
+1. Write the instructions in a column; draw stage slots across cycles.
+2. Mark every read of a register and every write; draw forwarding arrows
+   or stall bubbles where needed.
+3. For each jump, mark the prediction and, when it resolves, any squash.
+4. Count bubbles and stalls; CPI = 1 + (stalls + bubbles that occupy the
+   commit slot) / instruction count.
+
+### Common mistake
+
+Forwarding from write back only. The critical path is execute to decode;
+without that forward, every dependent pair stalls. Another: forgetting
+that a bubble in E still moves; it is a real nop instruction occupying a
+slot, not an empty cycle of the whole pipe.
+
+### In real systems
+
+Every modern core has the descendants of these mechanisms: a bypass
+network, a load-use interlock (or a scheduler that refuses to issue the
+use), a branch predictor with a rename-based recovery stack, and a
+reorder buffer that commits exceptions precisely. The vocabulary of this
+section is the vocabulary of CPU design papers and of performance
+counters like `branches` / `branch-misses` in `perf`.
+
+### Check yourself
+
+<details>
+<summary>Which hazard does forwarding not fix?</summary>
+
+A load-use hazard, because the data is not ready until the memory stage,
+one cycle too late for the next instruction's execute.
+
+</details>
+
+<details>
+<summary>What does PIPE predict for a conditional jump?</summary>
+
+Taken: fetch continues from the target. If execute finds the jump not
+taken, the two wrongly fetched instructions are bubbled and fetch resumes
+at fall-through.
+
+</details>
+
+<details>
+<summary>Why is exception status carried to write back instead of acted on immediately?</summary>
+
+To keep exceptions precise: older instructions must finish, younger ones
+must not change architected state.
+
+</details>
+
+## 4.6 Summary
+
+### In one sentence
+
+A processor is a clocked pipeline of the stages an instruction needs, held
+together by encodings, combinational HCL and control logic that repairs
+hazards; Y86-64 is small enough that I can hold the whole machine in my
+head.
+
+### The idea
+
+#### 4.6.1 Y86-64 Simulators
+
+The CS:APP student site ships:
+
+- **yas**, the Y86-64 assembler, which turns `.ys` files into `.yo` byte
+  listings.
+- **yis**, an ISA-level simulator that executes one instruction at a time
+  and reports final register and memory state (useful as a reference).
+- **ssim** / **ssim+**, SEQ and PIPE simulators driven by the student's
+  HCL, with TTY and GUI front ends that show every wire each cycle.
+
+The Architecture Lab asks for HCL changes (new instructions, a different
+prediction policy, an optimisation) and tests them against reference
+traces. My encoder on this page is enough to practise encodings; the lab
+simulators are where PIPE control logic becomes real.
+
+### Worked example
+
+A one-line mental checklist before changing PIPE HCL:
+
+1. Does every instruction still get correct valA/valB under forwarding?
+2. Does load-use stall exactly one cycle, and not stall when the load
+   destination is unused?
+3. Does a mispredicted branch bubble D and E, and only D and E?
+4. Does `ret` stall F and bubble D until it reaches memory?
+5. Does an exception arriving in W prevent younger instructions from
+   writing registers or memory?
+
+### Step by step
+
+How I would implement a new Y86-64 instruction (for example, a two-register
+`mulq`):
+
+1. Assign an icode/ifun and extend the encoder and `yas`.
+2. Teach fetch to parse it (need_regids, need_valC).
+3. Teach decode its src/dst.
+4. Teach execute its ALU behaviour (or add a multiply unit).
+5. Decide whether it sets CC and whether it touches memory.
+6. Run SEQ tests, then PIPE tests, watching for new hazards (a multi-cycle
+   multiply would need stalls PIPE does not yet have).
+
+### Common mistake
+
+Testing only the happy path. The lab's secret tests hit every combination
+of hazard and exception; a change that works on a five-line program often
+fails on a load-use during a mispredicted branch during a `ret`.
+
+### In real systems
+
+Industrial CPU verification runs millions of random instruction sequences
+against a reference model, plus formal checks on the control logic. The
+Architecture Lab is that idea at homework scale. Once I have changed PIPE
+and survived the tests, reading about a real microarchitecture is much less
+abstract.
+
+### Check yourself
+
+<details>
+<summary>What is yis for, versus the HCL simulators?</summary>
+
+`yis` is the ISA reference: correct final state, no timing. The HCL
+simulators test whether my SEQ or PIPE implementation matches that
+reference cycle by cycle.
+
+</details>
+
+<details>
+<summary>Name one PIPE change that would need new stall logic beyond the book.</summary>
+
+A multi-cycle execute operation (multiply, divide, or a floating-point
+add), which must hold younger instructions out of execute until it
+finishes.
+
+</details>
+
+
+## Putting a full instruction through both machines
+
+Before the levels, one side-by-side trace. Instruction sequence:
+
+```text
+irmovq 5, %rax
+irmovq 7, %rbx
+addq   %rax, %rbx
+rmmovq %rbx, 0(%rsp)
+```
+
+**SEQ view** (one instruction per long cycle):
+
+<Trace columns={["Instr", "Fetch", "Decode", "Execute", "Memory", "Write back"]} rows={[
+  ["irmovq 5,%rax", "valC=5,valP=+10", "src none", "valE=5", "idle", "R[rax]=5"],
+  ["irmovq 7,%rbx", "valC=7,valP=+10", "src none", "valE=7", "idle", "R[rbx]=7"],
+  ["addq %rax,%rbx", "rA=rax,rB=rbx", "valA=5,valB=7", "valE=12, CC", "idle", "R[rbx]=12"],
+  ["rmmovq %rbx,0(%rsp)", "rA=rbx,rB=rsp,valC=0", "valA=12,valB=rsp", "addr=rsp+0", "M[rsp]=12", "no reg write"],
+]} caption="SEQ executes each instruction to completion. The add sees the irmovqs' results because they already wrote the register file on earlier clock edges." />
+
+**PIPE view** (overlapping, with forwarding):
+
+<Figure art={`
+ cycle    1     2     3     4     5     6     7     8
+ irmovq5 [F]   [D]   [E]   [M]   [W]
+ irmovq7       [F]   [D]   [E]   [M]   [W]
+ addq                [F]   [D]   [E]   [M]   [W]
+ rmmovq                    [F]   [D]   [E]   [M]   [W]
+
+ forwards:
+   addq's decode gets %rax from W of irmovq5 (or earlier from M)
+   addq's decode gets %rbx from E/M of irmovq7
+   rmmovq's decode gets %rbx from E of addq (newest)
+`} caption="PIPE overlaps the four instructions. No stall is required: every dependence is covered by forwarding. Eight cycles to complete four instructions that needed four SEQ cycles, at a much shorter clock." />
+
+The same program on SEQ at 600 ps is 2.4 ns of work. On an ideal PIPE at 140 ps it is about 1.1 ns once the pipe fills (4 instructions + 4 fill cycles). The speedup is real even on a tiny example, and it grows with run length because fill cost amortises.
+
+### A second PIPE example with a stall and a mispredict
+
+```text
+mrmovq 0(%rdx), %rax    # load
+addq   %rax, %rbx       # use  -> load-use stall
+je     target           # predict taken; suppose not taken
+irmovq 1, %rcx          # fall-through (correct path)
+```
+
+<Figure art={`
+ cycle    1    2    3    4    5    6    7    8    9
+ mrmovq  [F]  [D]  [E]  [M]  [W]
+ addq         [F]  [D]  [D]  [E]  [M]  [W]
+                     stall
+ je                [F]  [F]  [D]  [E]  [M]  [W]
+                          stall with addq
+ (wrong path)                [F]  [D]  bubble bubble
+ irmovq                            [F]  [D]  [E]  [M]  [W]
+                                   refetch fall-through
+`} caption="Combined load-use stall and branch misprediction. The stall delays the branch's resolve by one cycle; when je in execute sees not-taken, the wrongly fetched target instruction is bubbled and fetch resumes at the fall-through irmovq." />
+
+Reading diagrams like this until they feel obvious is the whole practical skill of the chapter.
+
+
+### Building intuition for stage balance
+
+Suppose measurement of a SEQ prototype shows these combinational delays:
+
+<Trace columns={["Path", "Delay"]} rows={[
+  ["Fetch (instruction memory + decode fields)", "150 ps"],
+  ["Decode (register file read)", "70 ps"],
+  ["Execute (ALU + condition)", "120 ps"],
+  ["Memory (data memory)", "150 ps"],
+  ["Write-back setup", "40 ps"],
+]} caption="Example stage delays inside SEQ's long path. The sum is 530 ps, plus maybe 70 ps of misc muxing, matching the roughly 600 ps SEQ clock used in the speedup examples." />
+
+A naive five-way split would give stages of 150, 70, 120, 150, 40 ps. The clock would be set by the 150 ps stages plus register overhead, and the 40 ps write-back stage would sit idle most of the cycle. Hardware designers merge write-back with memory or split fetch into more equal pieces; the book's five-stage PIPE is already a reasoned merge of the six SEQ stages into five roughly comparable ones. Whenever I see a real core described as "having a long fetch" or "memory-bound", this is the picture: one stage set the clock, and the others had slack.
+
+### What I ignore on purpose in this chapter
+
+Y86-64 has no virtual memory, no caches, no interrupts from devices, no
+multiple cores, no floating point, and no privilege levels. Each of those
+adds a feedback path and a hazard class. Chapter 6 puts caches under the
+memory stage; chapter 9 puts page tables under both fetch and memory;
+chapter 8 puts exception handlers behind the status codes. Keeping them
+out of PIPE is not a denial that they matter; it is the only way to finish
+the hazard story in one chapter.
+
+
+### Worked SEQ vs PIPE timing numbers
+
+I like to keep one numeric example that I can recompute without the book.
+Assume:
+
+- SEQ critical path 600 ps → clock 600 ps → frequency 1.67 GHz → peak 1.67 GIPS.
+- PIPE stage budget 100 ps logic + 20 ps register overhead = 120 ps → frequency 8.33 GHz peak.
+- Realised CPI on integer code with the book's predictor ≈ 1.25.
+
+Then PIPE's sustained throughput is 8.33 / 1.25 ≈ 6.7 GIPS, about four
+times SEQ. If I improve the branch predictor enough to drop CPI to 1.10,
+throughput rises to 7.6 GIPS without changing the clock. If I unbalance
+the pipe and the slowest stage grows to 150 ps, frequency falls to 6.67 GHz
+and even with CPI 1.10 I only get 6.1 GIPS, worse than the balanced pipe
+with the worse predictor. That is why stage balance and hazard rate are
+the two knobs this chapter keeps returning to.
+
+### Reading a PIPE trace from the simulator
+
+A typical PIPE simulator trace line names the instruction in each stage
+and any special event. I read it like this:
+
+1. Scan for `bubble` or `stall` markers; each is either a hazard or a recovery.
+2. When I see a stall in D, look at E's instruction: if it is a load whose
+   destination matches D's source, that is load-use; if E is a `ret` or a
+   not-yet-resolved branch, that is control.
+3. When I see two bubbles enter D and E together, look at M: a conditional
+   jump with `Cnd=0` when it was predicted taken is the usual cause.
+4. Confirm that after recovery the instruction entering F is the correct
+   fall-through or target.
+
+After a few dozen lines of that reading, the control table stops being
+abstract and becomes a pattern I recognise in the trace.
+
+### Why the book uses a predict-taken policy
+
+Predict-taken is wrong on every loop exit and right on every loop back
+edge. Since back edges execute many times and exits once, the policy does
+well on loop-heavy code without any history table. Predict-not-taken is
+simpler in hardware (fall-through is already valP) but worse on loops.
+A one-bit or two-bit predictor keyed by branch PC beats both once the
+workload leaves the "tight loop" pattern. The book sticks with
+predict-taken so the HCL stays short; the idea of "predict now, repair
+later" is the transferable part.
+
+### Connecting condition codes to cmov and jXX
+
+The execute stage computes a six-way condition from ZF, SF, OF and ifun,
+exactly like chapter 3's `set` and `j` families:
+
+- le: (SF XOR OF) OR ZF
+- l:  SF XOR OF
+- e:  ZF
+- ne: not ZF
+- ge: not (SF XOR OF)
+- g:  not ((SF XOR OF) OR ZF)
+
+That boolean block is shared by conditional moves (which use Cnd to enable
+the register write) and conditional jumps (which use Cnd to choose between
+valC and valP at PC update, or to confirm a prediction in PIPE). Getting
+those six formulas wrong is a classic Architecture Lab bug: every ALU op
+looks fine, but every branch misbehaves.
+
+### From Y86-64 back to x86-64
+
+After this chapter, an x86-64 listing from chapter 3 looks different. A
+`ret` is a control hazard. A load into a register used by the next
+arithmetic instruction is a load-use. A dense block of independent
+arithmetic is what PIPE (and real cores) eat for breakfast. Conditional
+moves are attractive partly because they remove a control hazard. When
+chapter 5 talks about a processor that can issue several operations per
+cycle, I will picture several PIPEs sharing a register file, not a black
+box.
+
+### How SEQ stage HCL connects to PIPE stage HCL
+
+Every PIPE stage HCL is the SEQ stage HCL with three kinds of edit:
+
+1. **Rename** PC to `F_predPC` or `f_pc`, `valA` to `d_valA` / `E_valA`, and so on, so each value is tied to a stage.
+2. **Add forwarding muxes** in decode (and sometimes execute) that prefer newer pipeline-register values over the register file.
+3. **Add control** that can stall or bubble each pipeline register, driven by hazard detectors that look at icode and dst/src fields across stages.
+
+If I can write the SEQ HCL for a new instruction, the PIPE HCL is mechanical once I decide whether the instruction creates a new kind of hazard. That is why the book insists on SEQ first.
+
+### Memory and register-file ports in PIPE
+
+The register file is written in write back and read in decode. Because write back of instruction i and decode of instruction i+4 happen in the same cycle, a naive register file would need the write to "forward" internally to a same-cycle read of the same register. Real register files support that (write-before-read in the same cycle), and the book's HCL assumes it. Data memory is used only in the memory stage, so a single port is enough for Y86-64; an instruction that both loaded and stored would need a redesign.
+
+Instruction memory is read every cycle in fetch. In SEQ it was on the long combinational path; in PIPE it is a stage of its own. Separate instruction and data memories (a Harvard view inside the core) keep fetch and memory from fighting over one port. Real cores look like that from the pipeline's point of view even when the outer memory system is unified.
+
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Processor Architecture">
+
+<Level name="Beginner" depth={3}>
+
+I encode and decode Y86-64 by hand until the formats are automatic. I
+trace one of each instruction class through SEQ on paper, naming every
+value (valA, valB, valE, valM, valP, Cnd) at each stage. I do not touch
+PIPE until SEQ traces are boring. I rebuild the ifun grid from memory at
+the start of every study session.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+I can write the HCL for next-PC, srcA/srcB and dstE/dstM from memory. I
+can draw a five-instruction PIPE diagram with forwarding arrows and say
+which case of the forwarding mux fires at each decode. I can explain
+load-use and mispredicted-branch recovery with a concrete example, and I
+can fill in the control-table row for each without looking it up. I can
+take a twenty-instruction `.yo` listing and mark every hazard before
+running the simulator.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+I finish the Architecture Lab: a new instruction or a branch-prediction
+variant, with every hazard combination passing. I can compute CPI from a
+trace by counting stalls and bubbles. I can point to the exact HCL line
+that implements a given forwarding path. I can explain why adding a
+four-cycle multiply needs a different stall discipline than load-use, and
+I can sketch the HCL for a return-address stack predictor.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+A load into `%rsp` followed by `ret`; a conditional move that does not
+write because Cnd is false (and must not create a false dependency in
+forwarding); a `halt` in the delay slot of a mispredicted branch; a jump
+to an address that is itself invalid.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Simultaneous load-use and `ret` in the pipe; an exception detected in
+memory while a younger instruction has already written the flags in
+execute (the flags write must be undone or suppressed); self-modifying
+code, which Y86-64 simulators usually forbid and real x86 makes
+expensive.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+I do not design CPUs at work, but I read `perf` branch-miss and
+load-use counters with a PIPE-shaped mental model. When I write code with
+unpredictable branches or tight load-then-use chains, I know what I am
+asking of the hardware. When a vendor talk mentions "a 20-stage pipeline"
+or "two-cycle load-to-use", I can translate. I also know when a performance
+bug is not a pipeline hazard at all (cache miss, TLB miss, false sharing)
+so I do not waste time staring at assembly that is already well scheduled.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+
+When I am stuck on a PIPE bug in the lab, I bisect: freeze a failing trace, ask whether the wrong value first appears in D, E, M or W, and only then look at the HCL for that stage. Nine times out of ten the bug is a missing case in a mux or a control-priority mistake, not a deep conceptual error. That debugging habit is as much a goal of this chapter as the material itself.
+
+A CPU is not magic; it is a clocked circuit with a few carefully chosen
+tables. Every surprising performance cliff I have seen in software has a
+picture in this chapter: a mispredict bubble, a load-use stall, a stage
+that became too long. Drawing the picture is the skill.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+ISA design trades encoding density, decode simplicity and pipeline
+friendliness. Y86-64 chose simplicity. RISC-V chose regularity and
+extensibility. x86-64 chose compatibility. Knowing that those are
+choices, not laws of nature, is what lets me evaluate a new architecture
+proposal or an accelerator's instruction set without being dazzled.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+I study this chapter with a pencil, not a keyboard, until the SEQ traces
+are fluent. Then I do the Architecture Lab in concentrated sittings with
+the HCL reference open. I keep one sheet: encodings, stage responsibilities,
+forwarding priority, control combinations. I redraw the PIPE hazard
+examples from memory the day before any interview that might ask about
+pipelines.
+
+Done when I can, from a blank page, draw PIPE's stages, place a
+load-use hazard and a mispredicted branch on the diagram, and write the
+control-row that handles each.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Why invent Y86-64 instead of using real x86-64?**
+Because x86-64 encodings and side effects would bury the pipeline ideas
+under pages of special cases. Y86-64 is small enough that every instruction
+has a clear path through SEQ and PIPE, yet close enough that the lessons
+transfer.
+
+**Is a five-stage pipeline still how CPUs work?**
+It is the teaching form of how they work. Real cores are deeper, issue
+wider, execute out of order and speculate much more aggressively, but they
+still fetch, decode, execute, touch memory and commit, and they still
+fight data and control hazards.
+
+**Do I need to memorise all the HCL?**
+I memorise the patterns (set membership for opcode classes, case lists for
+muxes, forwarding priority order). Exact field names I look up. The lab
+rewards understanding, not photocopying.
+
+**What is the single most important idea in this chapter?**
+That pipelining raises throughput by overlapping instructions, and that
+almost all of the control complexity is there to preserve the illusion
+that instructions ran one at a time.
+
+
+**Why absolute jump destinations instead of relative?**
+Relative jumps are position-independent and denser for short offsets; absolute jumps make SEQ's next-PC mux a pure select among valP, valC and valM with no adder on the PC path. Y86-64 chose the teaching simplification. RISC-V and ARM64 use mostly PC-relative branches for the reasons chapter 7 will touch when we talk about position-independent code.
+
+**What is the Architecture Lab really testing?**
+Whether I can change a working PIPE without breaking the hazard story. The new instruction or new prediction policy is the flavour; the invariant that every dependent pair still gets the right value is the substance.
+
+## Key takeaways
+
+- Y86-64 is a small, regularly encoded ISA with fifteen registers, four ALU ops, moves, jumps, call/ret and push/pop.
+- Combinational logic settles between clocks; state changes at the edge; HCL describes the combinational part.
+- SEQ does one instruction per long cycle through six logical stages; it is the reference for correctness.
+- Pipelining splits those stages with registers, raising throughput toward one instruction per short cycle.
+- Data hazards are mostly fixed by forwarding; load-use hazards need a one-cycle stall.
+- Control hazards are fixed by predicting the next PC and squashing on a wrong prediction; `ret` stalls.
+- Precise exceptions ride with the instruction to write back so younger instructions can be cancelled cleanly.
+- PIPE control is a small table of stall/bubble/normal combinations; getting the priorities right is the Architecture Lab.
+- Stage balance and hazard rate together set sustained throughput; a faster clock with a worse CPI can lose to a slower balanced design.
+- Predict-taken is a teaching policy; the enduring idea is predict now and repair on a wrong prediction.
+
+## Glossary
+
+- **Bubble:** a nop-like instruction injected into a pipeline register to cancel a wrongly fetched or wrongly started instruction.
+- **CPI:** cycles per instruction; 1 in an ideal PIPE, higher with stalls and bubbles.
+- **Forwarding (bypassing):** routing a produced value from a later stage back to an earlier stage so a dependent instruction need not wait for write back.
+- **HCL:** hardware control language; the book's notation for combinational logic.
+- **Hazard:** a situation where the natural pipeline flow would compute the wrong result or read the wrong state.
+- **icode / ifun:** the two nibbles of a Y86-64 opcode byte (instruction class and function).
+- **Load-use hazard:** a data hazard where a load's data arrives too late for the next instruction's execute; needs a stall.
+- **PIPE:** the book's pipelined Y86-64 implementation.
+- **Precise exception:** the machine state at an exception matches having executed every instruction before the faulting one and none after.
+- **SEQ:** the book's sequential Y86-64 implementation.
+- **Stall:** holding a pipeline register's value for an extra cycle so a hazard can clear.
+- **Throughput vs latency:** instructions finished per second versus time from start to finish of one instruction.
+- **Y86-64:** the pedagogical ISA used in this chapter, a subset of x86-64 ideas with regular encodings.
+
+## Exercises and self-check
+
+**Warm-up**
+
+1. Encode `irmovq 0x20, %rsp` and `xorq %rax, %rax` as hex bytes.
+2. Decode `a0 4f` and `75 00 01 00 00 00 00 00 00`.
+3. List the six SEQ stages and one sentence each on what they do.
+
+**Build**
+
+4. Hand-trace `pushq %rax` through SEQ with `%rax = 9` and `%rsp = 0x80`.
+5. Draw a PIPE diagram for the three-instruction sequence `addq %rax, %rbx; mrmovq 0(%rbx), %rcx; subq %rcx, %rdx`, marking forwards and stalls.
+6. Write HCL for `srcA` that covers every Y86-64 instruction.
+7. Compute ideal CPI and estimated real CPI for a program that is 15% loads (30% of them used next), 20% conditional jumps (50% mispredicted at 2-cycle penalty), and 1% `ret` (3-cycle stall).
+
+**Stretch**
+
+8. Add a `mulq rA, rB` instruction to the encoding and sketch the SEQ changes; explain what PIPE would need if multiply took four execute cycles.
+9. Propose a two-bit saturating branch predictor for PIPE and describe how the pipeline control table changes on a misprediction.
+10. Using the book's simulators (or a clone), run a short `.ys` program under yis and under your PIPE HCL and diff the cycle-by-cycle register traces.
+
+11. Write a Y86-64 program (on paper) that computes the length of a zero-terminated string of quadwords and returns the count in `%rax`. Encode the loop.
+12. From a PIPE diagram with five bubbles in twenty cycles, estimate CPI and the fraction of ideal throughput you kept.
+
+**Self-check**
+
+<details>
+<summary>1. What are the four Y86-64 status codes?</summary>
+
+AOK, HLT, ADR, INS.
+
+</details>
+
+<details>
+<summary>2. How long is rmmovq %rax, 8(%rbx)?</summary>
+
+Ten bytes: opcode, register byte, eight-byte displacement.
+
+</details>
+
+<details>
+<summary>3. Why does SEQ have no data hazards?</summary>
+
+Because each instruction finishes completely, including write back, before
+the next instruction's decode reads the register file.
+
+</details>
+
+<details>
+<summary>4. What does PIPE predict for ret?</summary>
+
+It does not predict; it stalls until `ret` reaches the memory stage and
+produces the return address.
+
+</details>
+
+<details>
+<summary>5. In the forwarding mux, who wins if both M and W have the same destination?</summary>
+
+M, the more recent producer. Forwarding priority is newest first.
+
+</details>
+
+<details>
+<summary>6. What control row handles a load-use hazard?</summary>
+
+F stall, D stall, E bubble, M normal, W normal.
+
+</details>
+
+<details>
+<summary>7. What makes an exception precise in PIPE?</summary>
+
+The status travels with the instruction and only takes effect at write
+back, with younger instructions bubbled away.
+
+</details>
+
+<details>
+<summary>8. Does pipelining change the result a program computes?</summary>
+
+No. It changes when results are computed, not which results. That is the
+whole point of hazard control.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter is week 26 of
+<a href={withBase('/plans/traditional-software-developer/#strategy-5')}>phase
+5 of the traditional core</a>, and it is the reading for the Architecture
+Lab. I would give it eight sessions, most of them with a pencil.
+
+<Timeline caption="Eight sessions for chapter 4. Paper first, simulators second." items={[
+  { when: "Session 1", what: "4.1: encode and decode twenty instructions; write the sum-1-to-10 program in bytes; memorise register ids." },
+  { when: "Session 2", what: "4.2: rebuild the mux and ALU in any language; write five HCL case expressions from prose descriptions." },
+  { when: "Session 3", what: "4.3: trace one of each instruction class through SEQ on paper; then check against the book's figures." },
+  { when: "Session 4", what: "4.4: compute ideal speedups; explain the three limits to someone else without notes." },
+  { when: "Session 5", what: "4.5 to hazards: draw PIPE registers; walk forwarding priority; do three load-use diagrams." },
+  { when: "Session 6", what: "4.5 control: reproduce the stall/bubble table from memory; work a mispredicted branch and a ret through the pipe." },
+  { when: "Session 7", what: "Architecture Lab part A (SEQ changes) or equivalent HCL exercises." },
+  { when: "Session 8", what: "Architecture Lab part B (PIPE changes); redo the self-check cold." },
+]} />
+
+I do not read the PIPE section passively. Every paragraph becomes a
+diagram in my notebook. When the lab disagrees with my intuition, I trust
+the simulator and fix the intuition. The encodings and the control table
+are the two things I keep on a card; everything else I can re-derive from
+the stage responsibilities.
+
+Done when I can encode any Y86-64 instruction, trace it through SEQ, place
+it on a PIPE diagram with correct forwards or stalls, and name the control
+row that handles a load-use hazard and a mispredicted branch.
+
+I also keep a short "debug script" for the lab: on a failing trace, print
+the F/D/E/M/W icode each cycle, then the src/dst fields, then the
+stall/bubble enables. The first cycle where those disagree with a paper
+diagram is the bug. That script has saved me more hours than any amount of
+re-reading the chapter prose.
+
+
