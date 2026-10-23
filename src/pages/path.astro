@@ -4,6 +4,9 @@ import SiteLayout from '../layouts/SiteLayout.astro';
 import { series } from '../data/series';
 import { roadmap } from '../data/roadmap';
 import { topicBySlug } from '../data/tags';
+import { checkPlans, planById, plans as allPlanData, planGroups, plansForSeries, plansForTrack, roadmapPlans } from '../data/plans';
+import PhaseTable from '../components/PhaseTable.astro';
+import PlannedNotes from '../components/PlannedNotes.astro';
 import { withBase } from '../utils/base';
 import {
   counters,
@@ -52,6 +55,33 @@ const tracks = series.map((s) => {
 // dates and no progress bar. It is shown separately from the tracks that have
 // a curriculum and a schedule.
 const plannedSeries = series.filter((s) => s.posts.length === 0);
+const plannedTotal = plannedSeries.reduce((sum, s) => sum + (s.planned?.length ?? 0), 0);
+
+// The strategy: three roadmaps to the same place, compared phase by phase,
+// with the fundamentals and the books underneath. The wiring lives in
+// src/data/plans.ts and has to agree with series.ts and roadmap.ts.
+checkPlans(plans.map((entry) => entry.id));
+const allPlanIds = allPlanData.map((plan) => plan.id);
+const planOrder = (id: string) => {
+  const index = allPlanIds.indexOf(id);
+  return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+};
+const planEntry = (id: string) => plans.find((entry) => entry.id === id)!;
+const groupName = (id: string) => planGroups.find((g) => g.id === planById(id)!.group)!.name;
+const underneath = ['underrated-fundamentals', 'books-that-still-matter']
+  .map((id) => planById(id))
+  .filter((plan) => plan !== undefined);
+const destinationsOf = (planId: string) => {
+  const plan = planById(planId)!;
+  const ids = new Set(plan.phases.flatMap((phase) => phase.series));
+  return series.filter((s) => ids.has(s.id));
+};
+const used = new Set(usedTopics(posts));
+// The plans in the order plans.ts gives them, so the list reads from the
+// traditional core to the series plans.
+const orderedPlans = [...plans].sort(
+  (a, b) => planOrder(a.id) - planOrder(b.id),
+);
 
 // The subjects, counted. This is the skills map: what the notes actually
 // cover, as opposed to what I planned to cover.
@@ -70,7 +100,7 @@ const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
 const ogImageUrl = new URL(withBase('/og/path.png'), siteOrigin).href;
 const pageUrl = new URL(withBase('/path/'), siteOrigin).href;
 
-const description = `The whole learning path in one page: ${stats.notes} notes across ${stats.series} series since ${stats.first ? stats.first.toISOString().slice(0, 10) : ''}, the subjects they cover, and what comes next.`;
+const description = `The whole learning path in one page: ${stats.notes} notes across ${stats.series} series since ${stats.first ? stats.first.toISOString().slice(0, 10) : ''}, the three roadmaps behind them, the subjects they cover, and what comes next.`;
 
 const jsonLd = {
   '@context': 'https://schema.org',
@@ -121,7 +151,7 @@ const jsonLd = {
     {tracks
       .filter(({ planned, published }) => planned > 0 || published > 0)
       .map(({ series: s, published, planned, percent, next, hasPage }) => (
-        <article class="track">
+        <article class="track" id={`series-${s.id}`}>
           <header>
             <h3>
               {hasPage ? (
@@ -147,21 +177,120 @@ const jsonLd = {
       ))}
   </div>
 
-  {plannedSeries.length > 0 && (
+  <h2 id="strategy">The learning strategy</h2>
+  <p class="series-note">
+    Three roadmaps go to the same place by different roads. The traditional
+    core starts from how computation works. The modern path starts from a
+    page in the browser and ships something at the end of every phase. The
+    software AI developer path assumes the basics and goes deep on owning an
+    AI-native product. Each phase ends in a gate: something I can do without
+    notes, or I go back.
+  </p>
+  <p class="series-note">
+    The order on this site is a spiral: use the abstraction, then open it.
+    TypeScript and React come before the JavaScript series because that is
+    the order the bugs arrived in. The roadmaps are the map; the series are
+    the deep dives, and every phase lands in a series slot or a track below.
+  </p>
+
+  <div class="entry plan">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Roadmap</th>
+          <th scope="col">The question</th>
+          <th scope="col">Best for</th>
+          <th scope="col">Length</th>
+          <th scope="col">Notes go to</th>
+        </tr>
+      </thead>
+      <tbody>
+        {roadmapPlans.map((plan) => (
+          <tr>
+            <td><a href={withBase(`/plans/${plan.id}/`)}>{plan.label}</a></td>
+            <td>{plan.question}</td>
+            <td>{plan.bestFor}</td>
+            <td>{plan.length}, {plan.phases.length} phases</td>
+            <td>{destinationsOf(plan.id).map((s) => s.name).join(', ')}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  {roadmapPlans.map((plan) => (
+    <section class="month" id={`roadmap-${plan.id}`}>
+      <h3><a href={withBase(`/plans/${plan.id}/`)}>{groupName(plan.id)}: {plan.label.replace(/^The /, 'the ')}</a></h3>
+      <p class="span">{plan.length} · {plan.question}</p>
+      <PhaseTable plan={plan} posts={posts} />
+    </section>
+  ))}
+
+  {underneath.length > 0 && (
     <>
-      <h2>Dedicated series, not started</h2>
       <p class="series-note">
-        Each of these has a series slot and a description. No notes are written
-        or scheduled yet, so they are listed without a progress bar.
+        Under all three roadmaps, whichever one is being followed:
       </p>
       <ul class="roadmap-list">
-        {plannedSeries.map((s) => (
+        {underneath.map((plan) => (
           <li>
-            <h3>{s.name}</h3>
-            <p class="meta">{s.dateRange}</p>
-            <p>{s.description}</p>
+            <h3><a href={withBase(`/plans/${plan.id}/`)}>{planEntry(plan.id).data.title}</a></h3>
+            <p class="meta">{plan.length}</p>
+            <p>{planEntry(plan.id).data.description}</p>
           </li>
         ))}
+      </ul>
+    </>
+  )}
+
+  {plannedSeries.length > 0 && (
+    <>
+      <h2 id="planned">Dedicated series, not started</h2>
+      <p class="series-note">
+        Each of these has a series slot and a description. No notes are written
+        or scheduled yet, so they are listed without a progress bar. The
+        {' '}{plannedTotal} rows below are the notes the plans call for: titles
+        only, no dates and no pages, until a note is scheduled.
+      </p>
+      <ul class="roadmap-list">
+        {plannedSeries.map((s) => {
+          const from = plansForSeries(s.id);
+          return (
+            <li id={`series-${s.id}`}>
+              <h3>{s.name}</h3>
+              <p class="meta">
+                {s.dateRange}
+                {s.planned && s.planned.length > 0 && <> · {s.planned.length} notes planned</>}
+              </p>
+              <p>{s.description}</p>
+              {s.topics.length > 0 && (
+                <p>
+                  Topics:{' '}
+                  {s.topics.map((slug, i) => (
+                    <>
+                      {i > 0 && ', '}
+                      {used.has(slug)
+                        ? <a href={topicHref(slug)}>{topicBySlug(slug)?.label ?? slug}</a>
+                        : topicBySlug(slug)?.label ?? slug}
+                    </>
+                  ))}
+                </p>
+              )}
+              {from.length > 0 && (
+                <p>
+                  From:{' '}
+                  {from.map((plan, i) => (
+                    <>
+                      {i > 0 && ', '}
+                      <a href={withBase(`/plans/${plan.id}/`)}>{plan.label}</a>
+                    </>
+                  ))}
+                </p>
+              )}
+              <PlannedNotes series={s} />
+            </li>
+          );
+        })}
       </ul>
     </>
   )}
@@ -209,10 +338,21 @@ const jsonLd = {
   </p>
   <ul class="roadmap-list">
     {roadmap.map((track) => (
-      <li>
+      <li id={`track-${track.id}`}>
         <h3>{track.name}</h3>
         <p class="meta">{track.size}</p>
         <p>{track.why}</p>
+        {plansForTrack(track.id).length > 0 && (
+          <p>
+            From:{' '}
+            {plansForTrack(track.id).map((plan, i) => (
+              <>
+                {i > 0 && ', '}
+                <a href={withBase(`/plans/${plan.id}/`)}>{plan.label}</a>
+              </>
+            ))}
+          </p>
+        )}
       </li>
     ))}
   </ul>
@@ -223,15 +363,16 @@ const jsonLd = {
       <p class="series-note">
         The curriculum behind a series, published before the notes are
         written. A note is a plan that survived contact with a real failure.
+        The <a href={withBase('/plans/')}>plans index</a> groups them by kind.
       </p>
       <ul class="roadmap-list">
-        {plans.map((plan) => (
+        {orderedPlans.map((plan) => (
           <li>
             <h3><a href={withBase(`/plans/${plan.id}/`)}>{plan.data.title}</a></h3>
             <p class="meta">
               {plan.data.series
-                ? seriesName(plan.data.series)
-                : 'Plan'}
+                ? `The ${seriesName(plan.data.series)} series`
+                : planById(plan.id) ? groupName(plan.id) : 'Plan'}
             </p>
             <p>{plan.data.description}</p>
           </li>
