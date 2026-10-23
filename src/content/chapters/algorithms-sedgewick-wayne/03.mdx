@@ -1,0 +1,1941 @@
+---
+book: algorithms-sedgewick-wayne
+number: 3
+title: "Searching"
+description: "Symbol tables from linked lists and sorted arrays to binary search trees, left-leaning red–black trees and hash tables, built and measured in TypeScript."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Searching means finding the value that belongs to a key: the price of a
+product, the user behind a session token, the line numbers where a word
+appears. The data structure that does this is the **symbol table**, and it
+is probably the most used structure in all of software, under names like
+map, dictionary, hash, associative array and index. This chapter builds it
+four ways, each one fixing the weakness of the last: a linked list, a
+sorted array, a binary search tree, a balanced tree, and finally a hash
+table. Then it shows how much real software is just a symbol table with a
+good name.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Describe the symbol table API, including the ordered operations min, max, floor, ceiling, rank, select and range search.
+- Build sequential search and binary search symbol tables and explain why both are too slow for big dynamic data.
+- Write a binary search tree with `put`, `get`, `floor`, `rank`, `select`, range search and Hibbard deletion, and predict its height on random and sorted input.
+- Explain 2-3 trees and write a left-leaning red–black tree from its three local fix-ups.
+- Write separate chaining and linear probing hash tables with resizing and correct deletion, and explain why the hash function matters more than the table.
+- Choose between an ordered tree and a hash table for a real job, and recognise symbol tables inside sets, indexes, caches and sparse vectors.
+
+What you should already know:
+<a href={withBase('/books/algorithms-sedgewick-wayne/01-fundamentals/')}>chapter 1</a>
+(linked lists, binary search, tilde notation and the doubling test) and
+<a href={withBase('/books/algorithms-sedgewick-wayne/02-sorting/')}>chapter 2</a>
+(comparators and why `n lg n` is a good cost). Recursion on trees should
+feel comfortable; if it does not, write the size and height functions
+below by hand first.
+
+Reading time: about two hours to read; four or five evenings to build and
+run everything.
+
+## Chapter map
+
+<Flow caption="The chapter's five sections. Each implementation keeps what worked in the one before and fixes its worst case; the last section uses the result everywhere." steps={[
+  "3.1 Symbol Tables: the API, sequential search, binary search in a sorted array",
+  "3.2 Binary Search Trees: fast on random keys, ordered operations, deletion",
+  "3.3 Balanced Search Trees: 2-3 trees and left-leaning red–black trees, lg n guaranteed",
+  "3.4 Hash Tables: hashing, separate chaining, linear probing, resizing",
+  "3.5 Searching Applications: sets, dictionaries, indexes, sparse vectors",
+]} />
+
+The thread through the chapter is a single question: **what does each
+operation cost in the worst case, on average, and when keys arrive in
+order?** All code is my own TypeScript, run on Node 22, and every output
+block is real output from that code.
+
+## 3.1 Symbol Tables
+
+### In one sentence
+
+A symbol table stores key–value pairs and answers "what is the value for
+this key?", and the two simplest implementations, an unordered linked list
+and a sorted array, show exactly what a better one has to fix.
+
+### The idea
+
+#### The API and its conventions
+
+The basic API has three operations: `put(key, val)` inserts a pair,
+replacing the old value if the key is already there; `get(key)` returns the
+value or nothing; `delete(key)` removes the pair. `contains`, `isEmpty`,
+`size` and iteration over the keys round it out.
+
+The book fixes a few conventions, and they are worth copying because they
+remove whole classes of bugs:
+
+- **No duplicate keys.** One value per key. If you need several, store a
+  list or a set as the value.
+- **Null is not a key and not a value.** `get` returns nothing for a
+  missing key, so storing nothing as a value would be ambiguous. In
+  TypeScript I return `undefined` and never store it.
+- **Keys are immutable.** If a key changes after it has been inserted, the
+  table has filed it under the old identity and will never find it again.
+- **Equality must be consistent.** For hash tables, equal keys must hash
+  equal. For ordered tables, the compare function must be a total order.
+
+#### Ordered symbol tables
+
+When keys are comparable, a much richer API becomes possible, and much of
+the chapter is about supporting it cheaply:
+
+- `min()` and `max()`: the smallest and largest keys.
+- `floor(key)`: the largest key less than or equal to `key`. `ceiling(key)`: the smallest key greater than or equal to it.
+- `rank(key)`: how many keys are strictly smaller. `select(k)`: the key of rank `k`.
+- `deleteMin()`, `deleteMax()`.
+- `keys(lo, hi)` and `size(lo, hi)`: range search and range count.
+
+These are the queries real systems ask all the time. "The last price
+before 10:03" is a floor. "Which servers own the hash ring position just
+after this one" is a ceiling. "What percentile is this response time" is a
+rank. "All orders between Monday and Friday" is a range search. A hash
+table can answer none of them without scanning everything.
+
+#### Sequential search in an unordered list
+
+The simplest implementation keeps the pairs in a linked list. `get` walks
+the list comparing keys; `put` walks it, replaces the value if it finds the
+key, and otherwise adds a new node at the front.
+
+```ts
+export class SequentialSearchST<K, V> {
+  first: { key: K; val: V; next: any } | null = null; n = 0; compares = 0;
+  get(key: K): V | undefined {
+    for (let x = this.first; x; x = x.next) { this.compares++; if (x.key === key) return x.val; }
+    return undefined;
+  }
+  put(key: K, val: V) {
+    for (let x = this.first; x; x = x.next) { this.compares++; if (x.key === key) { x.val = val; return; } }
+    this.first = { key, val, next: this.first }; this.n++;
+  }
+}
+```
+
+A search miss looks at all `n` keys, and so does every insert of a new key,
+because it must first confirm the key is absent. Inserting `n` distinct
+keys therefore costs about `n²/2` compares. This is fine for ten keys and
+hopeless for a hundred thousand.
+
+#### Binary search in a sorted array
+
+The second implementation keeps two parallel arrays, `keys` sorted and
+`vals` aligned with them. Everything rests on one function, `rank(key)`,
+which returns the number of keys smaller than `key`. If the key is present,
+that is its index; if not, it is where the key would go.
+
+```ts
+export class BinarySearchST<K, V> {
+  keys: K[] = []; vals: V[] = []; cmp: (a: K, b: K) => number;
+  constructor(cmp: (a: K, b: K) => number) { this.cmp = cmp; }
+  size() { return this.keys.length; }
+  rank(key: K): number {                       // number of keys less than key
+    let lo = 0, hi = this.keys.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1; const c = this.cmp(key, this.keys[mid]);
+      if (c < 0) hi = mid - 1; else if (c > 0) lo = mid + 1; else return mid;
+    }
+    return lo;
+  }
+  get(key: K): V | undefined {
+    const i = this.rank(key);
+    return i < this.size() && this.cmp(this.keys[i], key) === 0 ? this.vals[i] : undefined;
+  }
+  put(key: K, val: V) {
+    const i = this.rank(key);
+    if (i < this.size() && this.cmp(this.keys[i], key) === 0) { this.vals[i] = val; return; }
+    this.keys.splice(i, 0, key); this.vals.splice(i, 0, val);   // shifts: linear
+  }
+  floor(key: K) {
+    const i = this.rank(key);
+    if (i < this.size() && this.cmp(this.keys[i], key) === 0) return this.keys[i];
+    return i === 0 ? undefined : this.keys[i - 1];
+  }
+  ceiling(key: K) { const i = this.rank(key); return i === this.size() ? undefined : this.keys[i]; }
+}
+```
+
+Search is now about `lg n` compares, which is excellent. But `put` of a new
+key must shift every larger key one place right, so inserts cost up to `n`
+array moves, and building a table of `n` keys in random order costs about
+`n²/4` moves. The sorted array is the right structure for data that is
+built once and searched many times. It is the wrong one for data that
+keeps changing.
+
+<Compare left="Sequential search (linked list)" right="Binary search (sorted arrays)" caption="The two baselines. Each is fast at exactly what the other is slow at; the rest of the chapter looks for a structure that is fast at both." rows={[
+  ["search hit: about n/2 compares", "search: about lg n compares"],
+  ["search miss: n compares", "search miss: lg n compares"],
+  ["insert: n compares, then O(1) link", "insert: lg n compares, then up to n moves"],
+  ["keys in no order", "keys in order: floor, rank, range are cheap"],
+  ["needs only equality", "needs a total order"],
+]} />
+
+### Worked example
+
+I fed the sentence "the quick brown fox jumps over the lazy dog the end"
+to the binary search table, counting occurrences with
+`put(w, (get(w) ?? 0) + 1)`, then asked three ordered questions about the
+key `m`, which is not in the table:
+
+```text
+brown dog end fox jumps lazy over quick the
+1 1 1 1 1 1 1 1 3
+rank(m) 6 floor(m) lazy ceiling(m) over
+```
+
+The keys come out sorted for free, and "the" has a count of 3. `rank(m)` is
+6 because six keys (`brown` through `lazy`) sort before `m`. `floor(m)` is
+the key just before that position and `ceiling(m)` the key at it. All
+three answers come from one binary search.
+
+The bigger worked example is the frequency-count benchmark at the end of
+3.5, but its first row belongs here. Counting 40,000 words with 8,608
+distinct values, sequential search took **2,426 ms**; binary search took
+**32 ms**. The gap is the difference between `n²` and `n lg n` compares
+plus cheap moves, at a size where `n` is still small.
+
+### Step by step
+
+Here is binary search inserting `fox` into the sorted keys
+`brown dog end jumps lazy over quick the`, with `lo` and `hi` before each
+compare:
+
+<Trace
+  columns={["lo", "hi", "mid", "keys[mid]", "compare fox with it"]}
+  rows={[
+    ["0", "7", "3", "jumps", "fox < jumps, so hi = 2"],
+    ["0", "2", "1", "dog", "fox > dog, so lo = 2"],
+    ["2", "2", "2", "end", "fox > end, so lo = 3"],
+    ["3", "2", "-", "-", "lo > hi: stop, rank = 3"],
+  ]}
+  caption="rank(fox) returns 3, the insertion point. put then shifts jumps through the, five keys, one place right and writes fox at index 3. The search is logarithmic; the shift is linear."
+/>
+
+Notice the loop ends with `lo` equal to the number of keys smaller than
+the target. That invariant, "everything left of `lo` is smaller, everything
+right of `hi` is larger", is what makes `rank` correct on both hits and
+misses, and it is worth stating out loud whenever you write a binary
+search.
+
+### Common mistake
+
+The classic binary search bug is the off-by-one at the boundaries: using
+`lo < hi` with `hi = mid - 1`, or returning `mid` instead of `lo` on a miss.
+The first skips the last candidate; the second returns a position that is
+not the insertion point, so `put` inserts out of order and every later
+search can fail silently. A second, sneakier bug is computing
+`mid = (lo + hi) / 2` without flooring in JavaScript, which gives a
+fractional index and `undefined`. I use `(lo + hi) >>> 1`, which floors and
+cannot overflow for array-sized numbers.
+
+The fix for both is a property test: insert random keys into the table and
+into a `Map`, then check every `get`, and check that `keys` stays sorted
+after every `put`.
+
+### In real systems
+
+Sorted arrays with binary search are everywhere data is written once and
+read many times. A database's sorted string tables (the immutable files of
+an LSM tree, as in LevelDB, RocksDB and Cassandra) are sorted runs searched
+by binary search over an index block. Column stores keep sorted columns
+and binary search them for range filters. In front-end code, a sorted array
+of timestamps and a binary search for the floor is how a chart finds the
+data point under the mouse.
+
+Sequential search survives too, wherever `n` is tiny: a handful of HTTP
+headers, the few entries in a small inline cache, the five options of a
+config. A linear scan of eight items in contiguous memory is often faster
+than any cleverer structure.
+
+### Check yourself
+
+<details>
+<summary>1. Why does binary search make building a table of n random keys quadratic, when each search is only lg n?</summary>
+
+Because insertion is not search. Each new key lands, on average, in the
+middle, so about half the keys shift one place right. Summed over `n`
+inserts that is about `n²/4` moves.
+
+</details>
+
+<details>
+<summary>2. What does rank return for a key larger than every key in the table?</summary>
+
+`n`, the size of the table. That is also why `ceiling` returns nothing when
+`rank` equals the size.
+
+</details>
+
+<details>
+<summary>3. Why does the API forbid storing an undefined value?</summary>
+
+Because `get` uses undefined to mean "not present". If undefined were also
+a legal value, a caller could not tell a missing key from a present key
+with an empty value. Some libraries use undefined as a delete instead.
+
+</details>
+
+## 3.2 Binary Search Trees
+
+### In one sentence
+
+A binary search tree keeps every key larger than everything in its left
+subtree and smaller than everything in its right subtree, which makes
+search and insert as cheap as binary search on random input while keeping
+every ordered operation available.
+
+### The idea
+
+#### The shape and the rule
+
+A **binary search tree** (BST) is made of nodes, each holding a key, a
+value, a link to a left subtree, a link to a right subtree, and, in the
+book's version, a count of the nodes in its own subtree. The **symmetric
+order** rule: every key in the left subtree is smaller than the node's key
+and every key in the right subtree is larger.
+
+Search follows one path from the root. Compare with the node's key: equal,
+done; smaller, go left; larger, go right; reach an empty link, the key is
+absent. Insert does the same search and, on reaching the empty link,
+attaches a new node there. That is the whole algorithm, and it gives
+binary search's speed with a linked structure's cheap inserts.
+
+```ts
+type N<K, V> = { key: K; val: V; left: N<K, V> | null; right: N<K, V> | null; size: number };
+
+export class BST<K, V> {
+  root: N<K, V> | null = null; cmp: (a: K, b: K) => number;
+  constructor(cmp: (a: K, b: K) => number) { this.cmp = cmp; }
+  private sz(x: N<K, V> | null) { return x ? x.size : 0; }
+  size() { return this.sz(this.root); }
+  get(key: K): V | undefined {
+    let x = this.root;
+    while (x) { const c = this.cmp(key, x.key); if (c === 0) return x.val; x = c < 0 ? x.left : x.right; }
+    return undefined;
+  }
+  put(key: K, val: V) { this.root = this.putAt(this.root, key, val); }
+  private putAt(x: N<K, V> | null, key: K, val: V): N<K, V> {
+    if (!x) return { key, val, left: null, right: null, size: 1 };
+    const c = this.cmp(key, x.key);
+    if (c < 0) x.left = this.putAt(x.left, key, val);
+    else if (c > 0) x.right = this.putAt(x.right, key, val);
+    else x.val = val;
+    x.size = 1 + this.sz(x.left) + this.sz(x.right);
+    return x;
+  }
+}
+```
+
+The recursive `put` has a pattern worth learning once and reusing all
+chapter: **each call returns the root of the subtree it was given, possibly
+changed, and the caller stores that result back into its link.** On the way
+down the code searches; on the way back up it repairs: here only the size
+count, in 3.3 the colours and rotations. The red–black tree is this same
+function with three extra lines.
+
+#### What the shape depends on
+
+The tree's shape depends entirely on the order keys arrive in. Insert keys
+in random order and the tree is bushy: the book proves that a search hit
+costs about `2 ln n`, roughly `1.39 lg n`, compares on average, only about
+39% worse than perfect balance. Insert keys in sorted order and every new
+key goes to the right of the last one; the tree is a linked list and every
+operation costs `n`.
+
+I measured both. Random keys, average compares for a search hit and the
+height:
+
+```text
+random 1000 height 22 2 ln n 13.8 4.311 ln n 29.8
+random 10000 height 30 2 ln n 18.4 4.311 ln n 39.7
+random 100000 height 39 2 ln n 23.0 4.311 ln n 49.6
+sorted inserts 2000 height 1999
+```
+
+```text
+1000 BST avg compares (hit) 12.3 1.39 lg n 13.9
+10000 BST avg compares (hit) 16.6 1.39 lg n 18.5
+100000 BST avg compares (hit) 21.0 1.39 lg n 23.1
+1000000 BST avg compares (hit) 25.8 1.39 lg n 27.7
+```
+
+The average sits just under `1.39 lg n` (the exact expression has a
+negative constant term that matters at these sizes), and the height grows
+logarithmically, below the known average-height bound of about
+`4.311 ln n`. Then the last line of the first block: 2,000 sorted inserts,
+height 1,999. Same code, same keys, different order, and the structure is
+a thousand times worse. Sorted input is not a rare corner; it is what
+timestamps, auto-increment ids and alphabetical imports look like.
+
+#### The ordered operations
+
+The subtree sizes make the ordered API cheap, each operation following a
+single path:
+
+- **min / max:** go left (right) until you cannot.
+- **floor(key):** if the key equals the node, done. If it is smaller, the
+  floor is in the left subtree. If it is larger, the floor is either in the
+  right subtree or is this node, so remember this node as the best so far
+  and go right.
+- **rank(key):** going left adds nothing; going right adds the left
+  subtree's size plus one for the node itself; on a hit add the left
+  subtree's size.
+- **select(k):** if the left subtree has more than `k` keys, go left; if it
+  has exactly `k`, this node is the answer; otherwise go right looking for
+  rank `k - leftSize - 1`.
+- **range search keys(lo, hi):** an in-order walk that skips any subtree
+  that cannot contain keys in the range.
+
+```ts
+floor(key: K): K | undefined {
+  let x = this.root, best: K | undefined;
+  while (x) {
+    const c = this.cmp(key, x.key);
+    if (c === 0) return x.key;
+    if (c < 0) x = x.left; else { best = x.key; x = x.right; }
+  }
+  return best;
+}
+rank(key: K): number {                    // keys strictly less than key
+  let x = this.root, r = 0;
+  while (x) {
+    const c = this.cmp(key, x.key);
+    if (c < 0) x = x.left;
+    else if (c > 0) { r += 1 + this.sz(x.left); x = x.right; }
+    else return r + this.sz(x.left);
+  }
+  return r;
+}
+select(k: number): K | undefined {        // key of rank k
+  let x = this.root;
+  while (x) {
+    const t = this.sz(x.left);
+    if (t > k) x = x.left; else if (t < k) { k -= t + 1; x = x.right; } else return x.key;
+  }
+  return undefined;
+}
+keys(lo: K, hi: K): K[] {
+  const out: K[] = [];
+  const walk = (x: N<K, V> | null) => {
+    if (!x) return;
+    const clo = this.cmp(lo, x.key), chi = this.cmp(hi, x.key);
+    if (clo < 0) walk(x.left);
+    if (clo <= 0 && chi >= 0) out.push(x.key);
+    if (chi > 0) walk(x.right);
+  };
+  walk(this.root); return out;
+}
+```
+
+A range search costs the height plus the number of keys it returns, which
+is the best possible: you have to at least touch what you return.
+
+#### Deletion
+
+Deleting the minimum is easy: go left until the left link is empty, and
+replace that node with its right subtree. Deleting an arbitrary node with
+zero or one child is just as easy: replace it with its only child, or with
+nothing. The hard case is a node with two children, and **Hibbard
+deletion** handles it: replace the node with its **successor**, the
+smallest key in its right subtree. The successor has no left child, so
+removing it from its old place is a delete-min, and putting it in the
+deleted node's place keeps symmetric order because it is larger than
+everything on the left and smaller than everything else on the right.
+
+```ts
+private delMinAt(x: N<K, V>): N<K, V> | null {
+  if (!x.left) return x.right;
+  x.left = this.delMinAt(x.left);
+  x.size = 1 + this.sz(x.left) + this.sz(x.right);
+  return x;
+}
+private del(x: N<K, V> | null, key: K): N<K, V> | null {      // Hibbard deletion
+  if (!x) return null;
+  const c = this.cmp(key, x.key);
+  if (c < 0) x.left = this.del(x.left, key);
+  else if (c > 0) x.right = this.del(x.right, key);
+  else {
+    if (!x.right) return x.left;
+    if (!x.left) return x.right;
+    const t = x; let s = t.right!; while (s.left) s = s.left;  // successor
+    s.right = this.delMinAt(t.right!); s.left = t.left; x = s;
+  }
+  x.size = 1 + this.sz(x.left) + this.sz(x.right);
+  return x;
+}
+```
+
+The known weakness is that always taking the successor, never the
+predecessor, is asymmetric, and the analysis of long random sequences of
+insertions and deletions says the tree drifts away from the random-tree
+shape. I tried to see it: a 1,000-key tree, then 200,000 random
+delete-and-insert pairs. Average depth went from 13.4 to 10.7 and the
+height ended at 18, so at this size and length the drift did not show up.
+I would not build on that result either way. The practical answer is the
+balanced tree in the next section, which removes the question.
+
+### Worked example
+
+I inserted `50 30 70 20 40 60 80 35 45 65` into an empty BST and printed
+it sideways (root on the left, right subtree above, left subtree below),
+then asked the ordered questions, then deleted 30, which has two children.
+
+```text
+        80
+    70
+            65
+        60
+50
+            45
+        40
+            35
+    30
+        20
+size 10 height 3 min 20 floor(58) 50 rank(45) 4 select(3) 40
+keys(33,62) 35 40 45 50 60
+after delete 30:
+        80
+    70
+            65
+        60
+50
+            45
+        40
+    35
+        20
+rank(45) 3 size 9
+```
+
+Each answer can be checked by eye. `floor(58)` is 50: 58 goes right at 50
+(remember 50), left at 70, left at 60, and falls off, so the best
+remembered key wins. `rank(45)` is 4 because 20, 30, 35 and 40 are
+smaller. `select(3)` is 40, the fourth smallest. The range search for
+`[33, 62]` skipped the subtrees rooted at 20 and 80 entirely.
+
+Deleting 30: its successor is the smallest key in its right subtree, 35.
+35 is removed from under 40 and takes 30's place, adopting 20 on the left
+and 40 on the right. `rank(45)` drops to 3 and the size to 9, so the
+counts were repaired on the way back up.
+
+<Figure art={`
+ before delete(30)                 after delete(30)
+
+            50                               50
+          /    \\                           /    \\
+        30      70                       35      70
+       /  \\    /  \\                    /  \\    /  \\
+     20   40  60   80                 20   40  60   80
+         /  \\   \\                           \\   \\
+       35   45   65                          45   65
+
+ successor of 30 = min of right subtree = 35
+ 35 has no left child, so it lifts out with a delete-min
+`} caption="Hibbard deletion of a node with two children. The successor is the leftmost node of the right subtree; it moves up into the hole and symmetric order still holds." />
+
+### Step by step
+
+Here is `rank(45)` on the original tree, one row per node visited:
+
+<Trace
+  columns={["node", "compare 45", "left size", "action", "r"]}
+  rows={[
+    ["50", "smaller", "5", "go left, add nothing", "0"],
+    ["30", "larger", "1", "add 1 + 1, go right", "2"],
+    ["40", "larger", "1", "add 1 + 1, go right", "4"],
+    ["45", "equal", "0", "add left size 0, stop", "4"],
+  ]}
+  caption="rank walks one path and adds, each time it turns right, the node plus everything in that node's left subtree. Four nodes visited, answer 4."
+/>
+
+And `select(3)`, which walks the same kind of path in reverse, spending `k`
+instead of accumulating `r`:
+
+<Trace
+  columns={["node", "left size", "k", "action"]}
+  rows={[
+    ["50", "5", "3", "5 > 3: go left"],
+    ["30", "1", "3", "1 < 3: k = 3 − 1 − 1 = 1, go right"],
+    ["40", "1", "1", "1 = 1: answer 40"],
+  ]}
+  caption="select(3) uses the subtree sizes to skip whole subtrees. Without the size field, both rank and select would need an in-order walk of up to n nodes."
+/>
+
+### Common mistake
+
+The most common bug is forgetting to update `size` on the way back up, in
+one of the code paths: after the replace-value branch of `put`, after
+`delMinAt`, or after the two-children branch of `del`. Everything still
+works for `get`, so tests that only check lookups pass, but `rank` and
+`select` quietly return wrong answers. My property test checks `rank` and
+`select` against a sorted array after every random operation for exactly
+this reason.
+
+The second mistake is the recursion itself on unbalanced trees. With 2,000
+sorted keys, the recursive `put` and `height` go 2,000 calls deep. I had to
+raise Node's stack size to run the sorted-input experiment at all. A plain
+BST under sorted input fails not only slowly but with a stack overflow.
+
+### In real systems
+
+Plain, unbalanced BSTs are rare in production precisely because of sorted
+input. Their ideas are everywhere, though. The size-augmented tree is the
+**order-statistic tree**, used for rank queries such as "what percentile is
+this latency" and for leaderboards that need "what place am I in".
+**Treaps** and **randomized BSTs** keep a plain BST's simplicity and buy
+balance with randomness; some in-memory indexes and the Rust and OCaml
+ecosystems use them. Interval trees, segment trees and k-d trees are BSTs
+with different keys and augmented fields, and they power calendar overlap
+checks, range-sum queries and nearest-neighbour search.
+
+### Check yourself
+
+<details>
+<summary>1. Why is the floor of a key sometimes a node you passed on the way down, not the node where the search ended?</summary>
+
+Every time the search goes right, the current node is smaller than the
+key and therefore a candidate floor; going right only looks for a larger
+candidate. If the right subtree has none, the last node where you turned
+right is the answer.
+
+</details>
+
+<details>
+<summary>2. Inserting the same set of keys in two different orders: is the BST always the same?</summary>
+
+No. The first key is always the root, so different orders give different
+shapes. Sorted order gives a path of height `n − 1`; a random order gives
+height about logarithmic.
+
+</details>
+
+<details>
+<summary>3. In Hibbard deletion, why may the successor not have a left child?</summary>
+
+Because it is the minimum of the right subtree. If it had a left child,
+that child would be smaller and would be the minimum instead.
+
+</details>
+
+## 3.3 Balanced Search Trees
+
+### In one sentence
+
+A 2-3 tree stays perfectly balanced by letting nodes hold one or two keys
+and growing upward from the root, and the left-leaning red–black tree
+encodes that 2-3 tree as an ordinary BST so it can reuse all of the BST's
+code with three small fix-ups.
+
+### The idea
+
+#### 2-3 trees
+
+A **2-3 search tree** allows two kinds of node. A **2-node** has one key and
+two children, exactly like a BST node. A **3-node** has two keys and three
+children: keys smaller than both, keys between them, keys larger than both.
+A perfectly balanced 2-3 tree has every empty link at the same distance
+from the root.
+
+Search is the BST search generalised to three-way branches. Insert is
+where the idea lives. Search for the key and reach the bottom:
+
+- If the bottom node is a 2-node, add the key to it and it becomes a
+  3-node. Done; nothing else changes.
+- If it is a 3-node, add the key anyway, making a temporary **4-node** with
+  three keys. Split it: the middle key moves **up** into the parent, and the
+  smaller and larger keys become two 2-nodes. If the parent was a 2-node it
+  becomes a 3-node, and we are done. If the parent was a 3-node, it becomes
+  a temporary 4-node and splits in turn, and so on up the tree.
+- If the splitting reaches the root and the root becomes a 4-node, split it
+  into three 2-nodes: a new root with two children. **Height grows by one,
+  at the top.**
+
+That last point is the whole trick. A BST grows downward, at the leaves, so
+an unlucky order makes one path long. A 2-3 tree only ever grows at the
+root, which lengthens every path at once, so all paths stay the same
+length. The height is between `log₃ n` and `lg n`: about 12 to 20 levels
+for a million keys, whatever the insertion order.
+
+The book's argument for the cost is local: a split touches a constant
+number of links, and the number of splits on one insert is at most the
+height. So insert is logarithmic in the worst case.
+
+#### Why not code the 2-3 tree directly
+
+You can, but it is awkward: two node types, conversion between them,
+temporary 4-nodes, many cases for where the middle key goes, and three-way
+branching everywhere. The book's answer, which I find one of the most
+elegant ideas in the whole subject, is to represent the 2-3 tree as a BST
+with one extra bit per node.
+
+#### Left-leaning red–black trees
+
+Take each 3-node `[a b]` and write it as two BST nodes, `b` with `a` as its
+left child, and mark the link between them **red**. All other links are
+**black**. The book stores the colour in the child node: a node is red if
+the link from its parent is red. The resulting BST is a **left-leaning
+red–black BST** (LLRB), and it has three properties that exactly match the
+2-3 tree:
+
+1. Red links lean left (a 3-node is always drawn the same way).
+2. No node has two red links touching it (that would be a 4-node, which a
+   2-3 tree does not keep).
+3. **Perfect black balance:** every path from the root to an empty link has
+   the same number of black links, because those black links are the 2-3
+   tree's links and that tree is perfectly balanced.
+
+Flatten the red links and you get the 2-3 tree back. So `get`, `min`,
+`floor`, `rank`, `select` and range search are the plain BST code,
+unchanged: a red–black tree is a BST.
+
+#### The three fix-ups
+
+Insert adds a new node with a red link, which is "add a key to the bottom
+node" in 2-3 terms. That may break property 1 or 2, and three local
+operations repair it:
+
+- **rotateLeft(h):** when `h`'s right link is red, turn it into a left
+  link. A right-leaning 3-node becomes a left-leaning one.
+- **rotateRight(h):** when `h`'s left child and that child's left child are
+  both red (two reds in a row), rotate right. This produces a node with two
+  red children, which is a temporary 4-node.
+- **flipColors(h):** when both of `h`'s children are red, make them black
+  and make `h` red. This is the 4-node split: the two outer keys become
+  2-nodes, and the middle key, `h`, joins its parent via its new red link.
+
+```ts
+const RED = true, BLACK = false;
+type N<K, V> = { key: K; val: V; left: N<K, V> | null; right: N<K, V> | null; color: boolean; size: number };
+
+export class RedBlackBST<K, V> {
+  root: N<K, V> | null = null; cmp: (a: K, b: K) => number;
+  constructor(cmp: (a: K, b: K) => number) { this.cmp = cmp; }
+  private isRed(x: N<K, V> | null) { return x !== null && x.color === RED; }
+  private sz(x: N<K, V> | null) { return x ? x.size : 0; }
+  private rotateLeft(h: N<K, V>): N<K, V> {
+    const x = h.right!; h.right = x.left; x.left = h;
+    x.color = h.color; h.color = RED;
+    x.size = h.size; h.size = 1 + this.sz(h.left) + this.sz(h.right);
+    return x;
+  }
+  private rotateRight(h: N<K, V>): N<K, V> {
+    const x = h.left!; h.left = x.right; x.right = h;
+    x.color = h.color; h.color = RED;
+    x.size = h.size; h.size = 1 + this.sz(h.left) + this.sz(h.right);
+    return x;
+  }
+  private flipColors(h: N<K, V>) { h.color = RED; h.left!.color = BLACK; h.right!.color = BLACK; }
+  put(key: K, val: V) { this.root = this.putAt(this.root, key, val); this.root.color = BLACK; }
+  private putAt(h: N<K, V> | null, key: K, val: V): N<K, V> {
+    if (!h) return { key, val, left: null, right: null, color: RED, size: 1 };
+    const c = this.cmp(key, h.key);
+    if (c < 0) h.left = this.putAt(h.left, key, val);
+    else if (c > 0) h.right = this.putAt(h.right, key, val);
+    else h.val = val;
+    if (this.isRed(h.right) && !this.isRed(h.left)) h = this.rotateLeft(h);
+    if (this.isRed(h.left) && this.isRed(h.left!.left)) h = this.rotateRight(h);
+    if (this.isRed(h.left) && this.isRed(h.right)) this.flipColors(h);
+    h.size = 1 + this.sz(h.left) + this.sz(h.right);
+    return h;
+  }
+}
+```
+
+Compare `putAt` with the BST's: the only new lines are the three `if`
+statements after the recursive call. They run on the way back up, at every
+node on the search path, and their order matters: a left rotation can
+create two reds in a row, which the right rotation fixes, which creates a
+4-node, which the flip splits. The root is coloured black after every
+insert because a red root would mean a 4-node split had nowhere to go; in
+2-3 terms that is the moment the tree grows taller.
+
+<Figure art={`
+  rotateLeft(h)                       rotateRight(h)
+
+     h                  x                     h              x
+    / \\                / \\                   / \\            / \\
+   a   x*      =>     h*  c                  x*  c   =>     a*  h*
+      / \\            / \\                    / \\                 / \\
+     b   c          a   b                  a*  b               b   c
+
+  flipColors(h):     h               h*
+                    / \\     =>      / \\
+                   a*  b*          a   b
+
+  * marks a red node (the link from its parent is red)
+`} caption="The three local repairs. Rotations change which node is on top without breaking symmetric order; the flip splits a temporary 4-node and passes its middle key up. Each touches a constant number of links." />
+
+### Worked example
+
+I inserted `M C T A E R X B D F` into an empty LLRB and logged the fix-ups
+each insert triggered. A star marks a red node in the final picture.
+
+```text
+put M -> (no fix-up)
+put C -> (no fix-up)
+put T -> flip(M)
+put A -> (no fix-up)
+put E -> flip(C)
+put R -> (no fix-up)
+put X -> flip(T) flip(M)
+put B -> rotL(A)
+put D -> (no fix-up)
+put F -> flip(E) rotL(C)
+        X
+    T
+        R
+M
+        F
+    E
+            D
+        C*
+            B
+                A*
+valid true height 4 black height [ 3 ]
+```
+
+Read it next to the 2-3 tree it encodes. `T` arriving on a full `[C M]`
+3-node gives `[C M T]`, a 4-node, and `flip(M)` splits it: M goes up and
+becomes the root. `X` causes a double split, `flip(T)` then `flip(M)`,
+which is the 2-3 tree growing a level at the root. `B` arrives as a right
+red child of `A`, a right-leaning 3-node, and `rotL(A)` fixes the lean.
+`F` splits `[D E F]` and the middle key `E` joins `C` as a right red link,
+which `rotL(C)` turns to lean left: in 2-3 terms, `[C E]` is now a
+3-node. The validity check confirms no right reds, no two reds in a row,
+and the same three black nodes on every root-to-leaf path.
+
+<Figure art={`
+ 2-3 tree encoded by the final LLRB
+
+                  [ M ]
+                /       \\
+          [ C  E ]       [ T ]
+         /   |   \\       /   \\
+     [A B]  [D]  [F]   [R]   [X]
+
+ red links: C-E (inside [C E]) and A-B (inside [A B])
+ every empty link is 2 levels below the root
+`} caption="Flatten the red links of the LLRB above and this perfectly balanced 2-3 tree appears. The BST height is 4, the 2-3 height is 2, and the black height is the same on every path." />
+
+The real test is sorted input, the case that destroyed the plain BST:
+
+```text
+sorted 1000 height 9 lg n 10.0 2 lg n 19.9 valid true rot/insert 0.99 flip/insert 0.98
+sorted 100000 height 16 lg n 16.6 2 lg n 33.2 valid true rot/insert 1.00 flip/insert 1.00
+sorted 1000000 height 19 lg n 19.9 2 lg n 39.9 valid - rot/insert 1.00 flip/insert 1.00
+random 1e6 height 27 rot/insert 1.19
+```
+
+A million sorted keys give a tree of height 19, below `lg n`, where the
+plain BST would have had height 999,999 and would not have finished. The
+guarantee is height at most `2 lg n`; random keys land at 27, well inside
+it. On average each insert does about one rotation and one flip, so the
+balance costs a constant amount of work per insert on top of the search.
+
+### Step by step
+
+Inserting `A` to `G` in ascending order shows the fix-ups in rhythm:
+
+<Trace
+  columns={["insert", "fix-ups", "what happened in the 2-3 tree"]}
+  rows={[
+    ["A", "none", "[A]"],
+    ["B", "rotL(A)", "[A B]: a right lean fixed to a left lean"],
+    ["C", "flip(B)", "[A B C] splits: B is the root, [A] and [C]"],
+    ["D", "rotL(C)", "[C D] 3-node on the right, made to lean left"],
+    ["E", "flip(D) rotL(B)", "[C D E] splits, D joins B: root [B D]"],
+    ["F", "rotL(E)", "[E F] 3-node"],
+    ["G", "flip(F) flip(D)", "[E F G] splits, F joins [B D], which splits: D is the new root"],
+  ]}
+  caption="Ascending inserts into an LLRB. Every second insert splits something; G splits twice and the tree grows a level at the top. The final tree is perfectly balanced: D, then B and F, then A, C, E, G."
+/>
+
+```text
+        G
+    F
+        E
+D
+        C
+    B
+        A
+```
+
+Seven sorted keys, height 2, perfectly balanced. This is the picture to
+redraw from memory: it shows that the tree grows at the root.
+
+### Common mistake
+
+The first mistake is the order of the three fix-ups, or checking
+`isRed(h.left.left)` without first checking `isRed(h.left)`, which reads a
+property of a missing node. The order is rotate-left, rotate-right, flip;
+any other order leaves some insert unrepaired, and a validity checker (no
+right reds, no two reds in a row, equal black height) catches it on the
+first few hundred random inserts.
+
+The second mistake is forgetting the size field inside the rotations. A
+rotation changes which node is on top, so both nodes' sizes change: the
+new top takes the old top's size, and the old top is recomputed from its
+new children. Miss it and `rank` drifts, exactly like the BST bug, but only
+after rotations, which makes it harder to reproduce.
+
+The third is trying to learn red–black deletion first. The book's LLRB
+delete is short but subtle (it pushes red links down the search path so
+the deleted node is never a 2-node). Learn insert until you can derive it,
+then read delete.
+
+### In real systems
+
+Red–black trees are the ordered map of most standard libraries: Java's
+`TreeMap` and `TreeSet`, C++'s `std::map` and `std::set` in the common
+implementations, and the Linux kernel's `rbtree`, which backs the
+scheduler's run queue (CFS and its successor EEVDF both keep runnable tasks
+in one, ordered by a virtual time), timers, and memory-area lookups. These use classic red–black
+trees, which are a little more complex than the left-leaning version but
+encode the same idea; they allow right reds to save rotations.
+
+Java's `HashMap` also uses them inside the hash table: when one bucket's
+chain grows past a threshold, it is converted into a small red–black tree,
+so a flood of colliding keys costs `lg n` per lookup instead of `n`. That
+is a balanced tree used as insurance for a hash table, which ties 3.3 to
+3.4.
+
+### Check yourself
+
+<details>
+<summary>1. Why does a 2-3 tree stay perfectly balanced while a BST does not?</summary>
+
+A BST grows at the leaves, so a bad order makes one path long. A 2-3 tree
+absorbs new keys into existing nodes and grows only by splitting the root,
+which adds one level to every path at the same time.
+
+</details>
+
+<details>
+<summary>2. What does flipColors correspond to in the 2-3 tree?</summary>
+
+Splitting a temporary 4-node: the two outer keys become separate 2-nodes
+(their links turn black) and the middle key is passed up to the parent (its
+own link turns red).
+
+</details>
+
+<details>
+<summary>3. Why does the root get coloured black after every insert?</summary>
+
+A red root would mean the root is the middle key of a split with no parent
+to join. Colouring it black is the 2-3 tree growing by one level, and it
+adds one to the black height of every path equally.
+
+</details>
+
+## 3.4 Hash Tables
+
+### In one sentence
+
+A hash table turns each key into an array index with a hash function and
+then handles the keys that land on the same index, either with a short list
+per slot (separate chaining) or by stepping to the next free slot (linear
+probing), which gives constant average time for search and insert at the
+price of giving up order.
+
+### The idea
+
+#### Two problems: hashing and collisions
+
+A hash table is an array of `m` slots. To find a key, compute
+`hash(key) mod m` and look in that slot. If every key got its own slot, a
+search would be one array access. They do not: with more keys than slots,
+or just bad luck, two keys land in the same slot, a **collision**. So every
+hash table solves two separate problems:
+
+1. **The hash function:** turn any key into an integer, spread as evenly as
+   possible over the slots, fast to compute, and the same every time for
+   equal keys.
+2. **Collision resolution:** decide what to do when the slot is taken.
+
+The book's analysis rests on the **uniform hashing assumption**: the hash
+function spreads keys over slots as if at random. Under it, both collision
+methods give constant average cost. Without it, nothing is promised, and
+3.4's most important practical lesson is how easily real hash functions
+break it.
+
+#### Hash functions
+
+For integers, **modular hashing**, `k mod m` with `m` prime, is the classic
+choice. For strings, treat the characters as digits of a number in some
+base and reduce as you go. Java's `String.hashCode` uses base 31 and lets
+the 32-bit arithmetic wrap, and so does mine:
+
+```ts
+export function strHash(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return h;
+}
+export const index = (h: number, m: number) => (h & 0x7fffffff) % m;
+```
+
+`Math.imul` does a true 32-bit multiply (a plain `*` would lose precision
+once the product passes 2^53). The `& 0x7fffffff` clears the sign bit before
+the `mod`, because a negative hash would give a negative index. Using
+`Math.abs` instead is a known bug: the absolute value of the most negative
+32-bit integer is still negative.
+
+For compound keys (a record with several fields), combine the field hashes
+the same way: `h = 31 * h + fieldHash`. Every field that takes part in
+equality must take part in the hash, and no other field may.
+
+#### Separate chaining
+
+Keep an array of `m` lists. A key goes into the list at its slot; search
+scans only that list.
+
+```ts
+export class SeparateChainingST<V> {
+  m: number; n = 0; chains: { key: string; val: V }[][];
+  constructor(m = 4) { this.m = m; this.chains = Array.from({ length: m }, () => []); }
+  private slot(key: string) { return index(strHash(key), this.m); }
+  get(key: string): V | undefined {
+    for (const e of this.chains[this.slot(key)]) if (e.key === key) return e.val;
+    return undefined;
+  }
+  put(key: string, val: V) {
+    const c = this.chains[this.slot(key)];
+    for (const e of c) if (e.key === key) { e.val = val; return; }
+    c.push({ key, val }); this.n++;
+    if (this.n > 8 * this.m) this.resize(2 * this.m);       // keep average chain length bounded
+  }
+  delete(key: string) {
+    const c = this.chains[this.slot(key)]; const i = c.findIndex(e => e.key === key);
+    if (i >= 0) { c.splice(i, 1); this.n--; }
+  }
+  private resize(m: number) {
+    const old = this.chains.flat(); this.m = m;
+    this.chains = Array.from({ length: m }, () => []); this.n = 0;
+    for (const e of old) this.put(e.key, e.val);
+  }
+}
+```
+
+With `n` keys in `m` lists, the average list has `n/m` keys. Under uniform
+hashing the lengths are tightly concentrated around that average, so a
+search costs about `n/m` compares. Resizing whenever the average passes a
+constant keeps that constant. Notice what resizing does: every key must be
+rehashed, because its slot depends on `m`.
+
+#### Linear probing
+
+**Open addressing** stores the keys directly in the array. **Linear
+probing**, the simplest form, handles a collision by trying the next slot,
+then the next, wrapping around, until it finds the key or an empty slot.
+An empty slot ends a search: the key is absent.
+
+```ts
+export class LinearProbingST<V> {
+  m: number; n = 0; keys: (string | null)[]; vals: (V | null)[];
+  constructor(m = 16) { this.m = m; this.keys = new Array(m).fill(null); this.vals = new Array(m).fill(null); }
+  private slot(key: string) { return index(strHash(key), this.m); }
+  get(key: string): V | undefined {
+    for (let i = this.slot(key); this.keys[i] !== null; i = (i + 1) % this.m)
+      if (this.keys[i] === key) return this.vals[i]!;
+    return undefined;
+  }
+  put(key: string, val: V) {
+    if (this.n + 1 > this.m / 2) this.resize(2 * this.m);     // keep the table at most half full
+    let i = this.slot(key);
+    for (; this.keys[i] !== null; i = (i + 1) % this.m)
+      if (this.keys[i] === key) { this.vals[i] = val; return; }
+    this.keys[i] = key; this.vals[i] = val; this.n++;
+  }
+  delete(key: string) {
+    let i = this.slot(key);
+    while (this.keys[i] !== null && this.keys[i] !== key) i = (i + 1) % this.m;
+    if (this.keys[i] === null) return;
+    this.keys[i] = null; this.vals[i] = null; this.n--;
+    // Re-insert the rest of the cluster so no later key is stranded behind the new hole.
+    for (i = (i + 1) % this.m; this.keys[i] !== null; i = (i + 1) % this.m) {
+      const k = this.keys[i]!, v = this.vals[i]!;
+      this.keys[i] = null; this.vals[i] = null; this.n--; this.put(k, v);
+    }
+  }
+  private resize(m: number) {
+    const ks = this.keys, vs = this.vals; this.m = m;
+    this.keys = new Array(m).fill(null); this.vals = new Array(m).fill(null); this.n = 0;
+    for (let i = 0; i < ks.length; i++) if (ks[i] !== null) this.put(ks[i]!, vs[i]!);
+  }
+}
+```
+
+The cost depends on the **load factor** `α = n/m`, the fraction of slots in
+use, and on **clusters**, the runs of consecutive occupied slots. A new key
+that hashes anywhere into a cluster lands at its end and makes it longer,
+so big clusters grow faster than small ones. Knuth's classic analysis gives
+the average number of probes under uniform hashing: about
+`½(1 + 1/(1 − α))` for a search hit and `½(1 + 1/(1 − α)²)` for a miss or
+an insert. At half full that is 1.5 and 2.5. At 90% full a miss costs about
+50 probes. That is why the book resizes to keep `α` at or below one half.
+
+Deletion is the subtle part. You cannot simply empty the slot, because a
+key further along the cluster may have probed past this slot to get where
+it is; with a hole in the way, its search would stop early and miss it. The
+book's fix, used above, re-inserts every key after the hole up to the end
+of the cluster. Another common fix is a **tombstone**: a marker that means
+"deleted, keep probing", cleared on the next resize.
+
+### Worked example
+
+Ten three-letter words, their 32-bit hashes, and their slots for `m = 5`
+and `m = 11`:
+
+```text
+ant 96743 mod 5 = 3 mod 11 = 9
+bee 97410 mod 5 = 0 mod 11 = 5
+cat 98262 mod 5 = 2 mod 11 = 10
+dog 99644 mod 5 = 4 mod 11 = 6
+eel 100300 mod 5 = 0 mod 11 = 2
+fox 101583 mod 5 = 3 mod 11 = 9
+gnu 102510 mod 5 = 0 mod 11 = 1
+hen 103185 mod 5 = 0 mod 11 = 5
+yak 119395 mod 5 = 0 mod 11 = 1
+emu 100557 mod 5 = 2 mod 11 = 6
+chains m=5: 0: bee -> eel -> gnu -> hen -> yak | 1: - | 2: cat -> emu | 3: ant -> fox | 4: dog
+lp m=11 : 0:fox 1:gnu 2:eel 3:yak 4:. 5:bee 6:dog 7:hen 8:emu 9:ant 10:cat
+del cat : 0:. 1:gnu 2:eel 3:yak 4:. 5:bee 6:dog 7:hen 8:emu 9:ant 10:fox
+get emu 9 get gnu 6
+```
+
+For separate chaining I started with five chains (it resizes only past
+eight keys per chain on average, so it stayed at five), to show uneven
+luck: five of the ten words land in chain 0 and none in chain 1.
+Even a decent hash function produces chains of different lengths; the
+average is what the analysis promises, not every chain.
+
+For linear probing (11 slots, no resizing, so the table ends 91% full) the
+table is one big cluster from slot 5 round to slot 3, with a single gap at
+slot 4. Then the delete. `cat` sat at slot 10, and `fox`, which hashes to
+9, had wrapped round to slot 0 because 9 and 10 were taken. Emptying slot
+10 alone would leave `fox` unreachable: a search would start at 9, find
+`ant`, step to 10, find nothing, and stop. The re-insert loop takes `fox`
+out of slot 0 and puts it back, where it now lands at 10. Then `gnu`,
+`eel` and `yak` are re-inserted and land where they were. The last line
+confirms that the keys after the hole are still found.
+
+<Figure art={`
+ separate chaining, m = 5              linear probing, m = 11
+
+ [0] -> bee -> eel -> gnu -> hen -> yak  0 fox   (hash 9, wrapped)
+ [1]                                     1 gnu
+ [2] -> cat -> emu                       2 eel
+ [3] -> ant -> fox                       3 yak   (hash 1, probed 1, 2, 3)
+ [4] -> dog                              4  .    <- the only empty slot
+                                         5 bee
+ a search scans one list                 6 dog
+                                         7 hen   (hash 5, probed 5, 6, 7)
+                                         8 emu   (hash 6, probed 6, 7, 8)
+                                         9 ant
+                                        10 cat
+`} caption="The same ten keys in both kinds of table. Chaining keeps colliding keys in a list; linear probing keeps them in the array and lets clusters form, here one long run broken only at slot 4." />
+
+### Step by step
+
+The linear-probing inserts, one row per key, with the slots each one
+probed:
+
+<Trace
+  columns={["insert", "hash mod 11", "probed", "placed at"]}
+  rows={[
+    ["ant", "9", "9", "9"],
+    ["bee", "5", "5", "5"],
+    ["cat", "10", "10", "10"],
+    ["dog", "6", "6", "6"],
+    ["eel", "2", "2", "2"],
+    ["fox", "9", "9, 10, 0", "0"],
+    ["gnu", "1", "1", "1"],
+    ["hen", "5", "5, 6, 7", "7"],
+    ["yak", "1", "1, 2, 3", "3"],
+    ["emu", "6", "6, 7, 8", "8"],
+  ]}
+  caption="The first five inserts each cost one probe. As the table fills, keys start landing at the ends of clusters: hen, yak and emu each cost three probes, and every insert after them would cost more."
+/>
+
+Then the theory against measurement. I filled a table of 65,536 slots with
+random keys to four load factors and averaged the probes for every key
+present (hits) and 20,000 absent keys (misses):
+
+```text
+alpha 0.25: hit 1.17 (theory 1.17), miss 1.39 (theory 1.39)
+alpha 0.5: hit 1.49 (theory 1.50), miss 2.49 (theory 2.50)
+alpha 0.75: hit 2.49 (theory 2.50), miss 8.39 (theory 8.50)
+alpha 0.9: hit 5.29 (theory 5.50), miss 46.86 (theory 50.50)
+```
+
+The formulas predict the measurements to within a few percent. The miss
+column is the one to remember: going from half full to 90% full makes
+misses almost twenty times more expensive.
+
+For chaining, I put 8,000 random keys into 1,000 chains, average length 8,
+and counted how many chains had each length:
+
+```text
+m 1000 n 8000 max chain 16 hist {"0":1,"1":5,"2":7,"3":30,"4":62,"5":96,"6":107,"7":138,"8":143,"9":124,"10":104,"11":73,"12":45,"13":22,"14":25,"15":12,"16":6}
+```
+
+The lengths cluster around 8, the longest is 16, and only one chain is
+empty. That concentration, which the book proves with the Poisson
+approximation, is why chaining's average-case cost is also its typical
+cost.
+
+### Common mistake
+
+The worst hashing mistakes are not in the table; they are in the hash.
+Here is one I hit while writing this chapter. The benchmark in 3.5 counts
+words named like `w1a7`, short strings with a fixed prefix, and linear
+probing was more than 20 times slower than separate chaining. I measured the
+clusters directly, with the same 19,268 keys in a 65,536-slot table, 29%
+full:
+
+```text
+m = 2^16, h & (m-1)          : avg probes/insert 947.5, longest cluster 10794
+m = 2^16, mixed h            : avg probes/insert 2.2, longest cluster 52
+m = 65521 (prime), h mod m   : avg probes/insert 947.5, longest cluster 10794
+```
+
+The table was less than a third full, yet the average insert probed 947
+slots and one cluster was 10,794 slots long. The reason is that the base-31
+polynomial hash keeps **locality**: strings that differ only in their last
+character get hashes that differ by one, so a set of similar short strings
+fills a dense, contiguous range of hash values, which is exactly the input
+that makes linear probing build huge clusters. A prime modulus did not
+help at all, because it scatters keys whose hashes share a common factor,
+not runs of consecutive hashes. Separate chaining was immune, because a
+chain does not care about its neighbours.
+
+The fix was one line: put the hash through a **mixing step** (a few
+multiply and shift-xor operations, the same idea as Java's `HashMap`
+spreading the high bits down and as the finaliser of MurmurHash) before
+taking the slot. Average probes fell from 947 to 2.2. The lesson I took:
+uniform hashing is an assumption about your keys and your hash together,
+and real keys, with prefixes, sequential ids and common suffixes, are
+exactly where it fails.
+
+The other classic mistakes: overriding equality without overriding the
+hash (two equal keys land in different slots and the table holds both);
+hashing a mutable field; using `Math.abs(h) % m`; and deleting from a
+probing table by emptying the slot.
+
+### In real systems
+
+Hash tables are the default map nearly everywhere: JavaScript's `Map` and
+`Set`, Python's `dict`, Java's `HashMap`, Go's `map`, Redis hashes and the
+Redis keyspace itself. The variations are about the points above.
+
+- **Collision resolution.** Java's `HashMap` chains and converts long
+  chains to red–black trees. Python's `dict` uses open addressing with a
+  pseudo-random probe sequence instead of linear steps, which avoids
+  primary clustering. Rust's standard map and Google's SwissTable (Abseil)
+  use open addressing with small groups probed with SIMD instructions,
+  because probing contiguous memory is fast on modern CPUs.
+- **Hash flooding.** If an attacker knows the hash function, they can
+  submit thousands of keys that collide, for example as form fields or
+  JSON object keys, and turn every lookup linear. After public attacks on
+  web frameworks around 2011, language runtimes moved to seeded hash
+  functions such as SipHash, with a random seed per process.
+- **Resizing.** Doubling a table with a hundred million entries rehashes
+  all of them at once, a visible latency spike. Redis resizes
+  incrementally: it keeps the old and new tables and moves a few buckets on
+  every operation.
+- **Distributed hashing.** `hash(key) mod servers` reshuffles almost every
+  key when a server is added. **Consistent hashing** places servers and
+  keys on a ring and assigns each key to the next server clockwise, which
+  is a ceiling query on an ordered symbol table, so adding a server moves
+  only its neighbour's keys.
+
+### Check yourself
+
+<details>
+<summary>1. Why can't linear probing delete a key by setting its slot to null?</summary>
+
+A key later in the same cluster may have probed past that slot when it was
+inserted. A null now ends its search too early, so it becomes unreachable.
+Re-insert the rest of the cluster, or leave a tombstone.
+
+</details>
+
+<details>
+<summary>2. Why does linear probing need resizing well before the table is full, while chaining tolerates a load factor above 1?</summary>
+
+Linear probing's cost grows like `1/(1 − α)²` for misses and is undefined
+at `α = 1`; clusters merge as the table fills. Chaining's cost is about
+`α` itself, so eight keys per chain is still only about eight compares.
+
+</details>
+
+<details>
+<summary>3. Two objects are equal but have different hash codes. What does a hash table do with them?</summary>
+
+It almost certainly puts them in different slots, so `put` of the second
+adds a duplicate, and `get` with one may not find the value stored under
+the other. Equal keys must have equal hashes.
+
+</details>
+
+## 3.5 Searching Applications
+
+### In one sentence
+
+Once you have a fast symbol table, a surprising number of problems turn
+into one: sets and deduplication, dictionary lookups, indexes and inverted
+indexes, and sparse vectors and matrices are all "map a key to something"
+with a well-chosen key.
+
+### The idea
+
+#### Choosing an implementation
+
+The chapter ends with a choice, and the book's summary of it is the one I
+still use. If you need only `put`, `get` and `delete`, and you have a good
+hash function, use a hash table: it is faster by a constant factor and
+simpler to get fast. If you need any ordered operation (min, floor, rank,
+range), or a worst-case guarantee that does not depend on a hash
+assumption, use a red–black BST.
+
+<Compare left="Ordered symbol table (red–black BST)" right="Hash table" caption="The choice the chapter ends with. Neither is better; they answer different questions." rows={[
+  ["get, put: at most about 2 lg n, guaranteed", "get, put: constant on average, with a good hash"],
+  ["keys come out in order", "keys in no useful order"],
+  ["min, max, floor, ceiling, rank, select, range", "no ordered operations without a full scan"],
+  ["needs a compare function (a total order)", "needs hash and equality that agree"],
+  ["no resize pauses; memory grows by one node per key", "resizing rehashes every key at once"],
+  ["adversarial input cannot slow it down", "adversarial keys can, unless the hash is seeded"],
+]} />
+
+#### Sets
+
+A **set** is a symbol table with keys and no values. `add`, `contains` and
+`delete` are `put`, `get` and `delete`; the same two implementations give
+an ordered set (a red–black tree, supporting "the next element after x")
+and a hash set. Deduplication, whitelists and blacklists, "have I seen this
+before" in a crawler or a message consumer, and set algebra (union,
+intersection, difference) are all sets.
+
+```ts
+const ids = ['u7', 'u3', 'u7', 'u9', 'u3', 'u1'];
+const seen = new Set<string>();
+const firstSeen = ids.filter(x => (seen.has(x) ? false : (seen.add(x), true)));
+console.log('dedup', firstSeen.join(' '));
+```
+
+```text
+dedup u7 u3 u9 u1
+```
+
+One pass, constant time per item, and the first occurrence order is kept,
+which sorting and dropping neighbours would lose.
+
+#### Dictionary clients
+
+A **dictionary client** reads key–value pairs from somewhere (a CSV file,
+a config, an API) and answers lookups: a DNS-style table from names to
+addresses, a table from product codes to prices, from amino-acid codons to
+names. The interesting design decisions are which column is the key, what
+to do with duplicate keys (last one wins, by the API's convention), and
+whether the table needs order. A table of IP addresses mapped to countries
+needs a **floor** query, because you look up the start of the range that
+contains an address, which rules out a hash table.
+
+#### Indexing and inverted indexes
+
+An **index** maps a key to where something lives: a record id to a file
+offset, a username to a row. An **inverted index** maps each word to the
+set of documents (or positions) that contain it, which is a symbol table
+whose values are sets. A search for several words is the intersection of
+their sets.
+
+```ts
+const docs: Record<string, string> = { a: 'red fox jumps', b: 'lazy red dog', c: 'fox and dog play' };
+const inv = new Map<string, Set<string>>();
+for (const [d, text] of Object.entries(docs))
+  for (const w of text.split(' ')) { if (!inv.has(w)) inv.set(w, new Set()); inv.get(w)!.add(d); }
+const and = (...ws: string[]) =>
+  ws.map(w => inv.get(w) ?? new Set<string>()).reduce((x, y) => new Set([...x].filter(e => y.has(e))));
+```
+
+```text
+fox a,c dog b,c fox AND dog c red AND dog b
+```
+
+#### Sparse vectors and matrices
+
+A vector with a billion positions and three non-zero values should not
+take a billion slots. Store only the non-zero entries in a symbol table
+from index to value. A dot product then iterates over the smaller table and
+looks each index up in the other: the cost is proportional to the number of
+non-zeros, not the dimension.
+
+```ts
+class SparseVector {
+  m = new Map<number, number>(); n: number;
+  constructor(n: number) { this.n = n; }
+  put(i: number, v: number) { if (v === 0) this.m.delete(i); else this.m.set(i, v); }
+  get(i: number) { return this.m.get(i) ?? 0; }
+  dot(o: SparseVector) {
+    const [a, b] = this.m.size <= o.m.size ? [this, o] : [o, this];
+    let s = 0; for (const [i, v] of a.m) s += v * b.get(i); return s;
+  }
+}
+```
+
+A sparse matrix is an array of sparse row vectors. The book's example is the
+matrix–vector product behind ranking web pages by links: each page passes
+its rank, split evenly, to the pages it links to, and repeating the product
+converges to a steady state. With billions of pages and a handful of links
+per page, only the sparse representation is possible.
+
+### Worked example
+
+Two sparse vectors of dimension one billion: `x` has 2 at index 3, 4 at
+index 500,000,000 and 1 at index 999,999,999; `y` has 5 at index 3, 1 at
+index 7 and 3 at index 999,999,999. The program prints:
+
+```text
+dot 13
+```
+
+The dot product touches three entries: `2·5 + 4·0 + 1·3 = 13`. A dense
+version would multiply a billion pairs, almost all zero.
+
+Then a three-page link graph as a sparse matrix. Page 0 links to pages 1
+and 2, page 1 links to 2, and page 2 links back to 0. Starting from equal
+rank and multiplying repeatedly:
+
+```text
+step 1 0.333 0.167 0.500
+step 2 0.500 0.167 0.333
+step 3 0.333 0.250 0.417
+after 30 0.400 0.200 0.400
+```
+
+Page 1 ends with the least rank because only page 0 links to it, and only
+with half its weight. Pages 0 and 2 tie, which you can confirm by solving
+the three balance equations by hand: `r0 = r2`, `r1 = r0/2`,
+`r2 = r0/2 + r1`, with the ranks summing to 1.
+
+And the benchmark the whole chapter has been building towards: count word
+frequencies in a generated text with a skewed word distribution (a few
+very common words, a long tail of rare ones), with every implementation in
+the chapter and the built-in `Map` for reference.
+
+```text
+first 40,000 words, distinct 8608
+sequential search        2426 ms
+binary search arrays       32 ms
+BST                        22 ms
+red-black BST              23 ms
+separate chaining          13 ms
+linear probing             25 ms
+built-in Map                6 ms
+all 400,000 words, distinct 19268
+binary search arrays      206 ms
+BST                       210 ms
+red-black BST             202 ms
+separate chaining          45 ms
+linear probing           1067 ms
+built-in Map               36 ms
+```
+
+Reading the table: sequential search is out of the race at only 40,000
+words. The three ordered structures land close together, because with
+random-looking words the plain BST is already well balanced, and the
+binary search table stays competitive since most of its operations are
+updates to existing keys, not inserts. Separate chaining beats the trees by
+about four times. Linear probing is the outlier, and the reason is the
+clustering problem from 3.4's common mistake: these keys share a prefix,
+and my unmixed hash plus a power-of-two table built ten-thousand-slot
+clusters. The built-in `Map`, a carefully engineered hash table, is
+fastest of all. That last row is the honest conclusion: learn to build
+these, then use the library's.
+
+### Step by step
+
+Here is how the inverted-index query `fox AND dog` runs:
+
+<Trace
+  columns={["step", "operation", "result"]}
+  rows={[
+    ["1", "get(fox)", "{a, c}"],
+    ["2", "get(dog)", "{b, c}"],
+    ["3", "keep each element of {a, c} that is in {b, c}", "a: no, c: yes"],
+    ["4", "result", "{c}"],
+  ]}
+  caption="An AND query is a lookup per word and a set intersection. Iterating over the smaller set and probing the larger keeps the cost proportional to the smaller posting list, which is how search engines order the terms of a query."
+/>
+
+And the sparse dot product:
+
+<Trace
+  columns={["entry of x", "y.get(index)", "running sum"]}
+  rows={[
+    ["3 → 2", "5", "10"],
+    ["500,000,000 → 4", "0 (absent)", "10"],
+    ["999,999,999 → 1", "3", "13"],
+  ]}
+  caption="Three lookups instead of a billion multiplications. Both vectors have three entries here, so the code iterates over x; with unequal sizes it iterates over the smaller."
+/>
+
+### Common mistake
+
+The common mistake in applications is picking the structure before the
+queries. A team stores events in a hash map keyed by id, then needs "all
+events in the last hour", which a hash map can only answer by scanning
+everything. Or it stores IP ranges in a hash map and finds that lookups by
+an address inside a range need a floor. Write down every query the
+structure must answer, including the ones you expect next quarter, then
+choose.
+
+A second one is using an object as a map in JavaScript. Plain objects have
+inherited keys (`constructor`, `toString`, and `__proto__`, which is a
+security hole when keys come from users), convert every key to a string,
+and are slower for frequent inserts and deletes. `Map` and `Set` are the
+symbol tables; objects are records.
+
+### In real systems
+
+Almost every system component is a symbol table with a policy around it:
+
+- **Caches** (an LRU cache, Memcached, a CDN edge) are hash tables plus an
+  eviction order, usually a linked list threaded through the entries.
+- **Database indexes** are ordered symbol tables, almost always B-trees
+  (chapter 6), because range queries and sorted output matter and disk
+  reads come in pages. Hash indexes exist but answer only equality.
+- **Search engines** (Lucene, Elasticsearch, Postgres full-text search) are
+  inverted indexes: term to posting list, with intersections for AND
+  queries.
+- **Compilers** use symbol tables, the source of the name, to map
+  identifiers to their declarations, one table per scope.
+- **Routing tables** need a longest-prefix match, an ordered query that
+  tries (chapter 5) answer.
+- **Machine learning features** are sparse vectors: a bag-of-words document
+  is a map from word id to count.
+
+### Check yourself
+
+<details>
+<summary>1. Why can't a hash table map IP addresses to countries given as address ranges?</summary>
+
+The lookup key is an address inside a range, not the range's start. You
+need the largest range start less than or equal to the address, a floor
+query, which needs an ordered symbol table.
+
+</details>
+
+<details>
+<summary>2. Why iterate over the smaller vector in a sparse dot product?</summary>
+
+Every non-zero product needs an index present in both, so iterating over
+the smaller table and looking up in the larger finds them all, at a cost
+of the smaller size times one constant-time lookup.
+
+</details>
+
+<details>
+<summary>3. In the benchmark, why does the plain BST perform as well as the red–black tree?</summary>
+
+The words arrive in a random-looking order, so the plain BST is close to
+the random-tree shape and its height is logarithmic. The red–black tree's
+advantage is the guarantee, which shows only on ordered or adversarial
+input.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 3, Searching">
+<Level name="Beginner" depth={3}>
+
+At the smallest scale, a symbol table is a phone book: look up a name, get
+a number. In JavaScript it is `Map`. The whole chapter is about how a map
+finds things fast, and there are two ideas. Keep the keys **in order**, so
+you can halve the search space with every comparison (binary search,
+trees). Or **compute** where a key lives from the key itself (hashing).
+
+The smallest working example is counting words:
+
+```ts
+const counts = new Map<string, number>();
+for (const w of 'to be or not to be'.split(' ')) counts.set(w, (counts.get(w) ?? 0) + 1);
+// Map { 'to' => 2, 'be' => 2, 'or' => 1, 'not' => 1 }
+```
+
+Two lines, and it is the same code whether the map underneath is a tree or
+a hash table. That is what an API buys you. The beginner's mistake is to
+think the choice underneath does not matter: with a list underneath, the
+same two lines on a large file take minutes instead of milliseconds, as the
+2,426 ms against 6 ms row in the benchmark shows.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+In a real program, the symbol table is usually wrapped in a policy. The
+most common is a cache with a size limit that evicts the least recently
+used entry. JavaScript's `Map` remembers insertion order, so deleting and
+re-inserting a key on every access moves it to the back, and the front is
+always the least recently used:
+
+```ts
+class LRU<K, V> {
+  private m = new Map<K, V>(); cap: number;
+  constructor(cap: number) { this.cap = cap; }
+  get(k: K): V | undefined {
+    if (!this.m.has(k)) return undefined;
+    const v = this.m.get(k)!; this.m.delete(k); this.m.set(k, v); return v;
+  }
+  put(k: K, v: V) {
+    this.m.delete(k); this.m.set(k, v);
+    if (this.m.size > this.cap) this.m.delete(this.m.keys().next().value!);
+  }
+}
+```
+
+```text
+a b c
+after get a: b c a
+after put d: c a d
+```
+
+Reading `a` saved it; adding `d` evicted `b`, the least recently used.
+Under the hood this is a hash table with a linked list through its entries,
+the same design as Java's `LinkedHashMap`. The intermediate skill is
+seeing the symbol table inside the feature and asking which operations the
+feature needs: here, constant-time lookup plus "oldest entry", which a
+plain hash table cannot answer alone.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, the ordered operations solve distributed problems.
+**Consistent hashing** puts each server at many points on a ring of hash
+values (virtual nodes, to even out the load) and assigns each key to the
+first server point at or after the key's own point: a ceiling query on a
+red–black tree, wrapping to the minimum at the end of the ring. I built it
+on my `RedBlackBST`, with 100 virtual nodes per server, sent 30,000 keys,
+then added a fourth server:
+
+```ts
+owner(key: string): string {
+  const p = point(key);
+  let x = this.t.root, best: any = null;        // ceiling(p)
+  while (x) { if (p <= x.key) { best = x; x = x.left; } else x = x.right; }
+  if (!best) { x = this.t.root; while (x!.left) x = x!.left; best = x; } // wrap around
+  return best.val;
+}
+```
+
+```text
+3 servers {"s3":10422,"s2":8978,"s1":10600}
+4 servers {"s3":7625,"s4":8494,"s1":8124,"s2":5757} moved 8494 28.3%
+mod-n moved 75.2%
+```
+
+Adding a server moved exactly the 8,494 keys the new server took over, 28%
+of them, and nothing else. With `hash mod servers`, 75% of the keys would
+have moved, which for a cache cluster means three quarters of the cache
+going cold at once. The load is uneven (5,757 to 8,494), which is why real
+systems use more virtual nodes or weighted ones. Dynamo-style stores,
+Cassandra's token ring and many cache clients rest on this one ordered
+query.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+- `put` with a key already present replaces the value; it must not
+  increase `size` or add a node. Test it explicitly.
+- `floor` of a key smaller than every key, and `ceiling` of a key larger
+  than every key, have no answer. Decide whether to return `undefined` or
+  throw, and do the same in every implementation.
+- `select(k)` with `k` outside `0` to `n − 1` has no answer.
+- `delete` of a missing key is a no-op, not an error, and must not corrupt
+  sizes on the search path.
+- An empty table: `min`, `max` and `deleteMin` must be defined (nothing, or
+  an error) rather than crash on a missing root.
+- A range search with `lo` greater than `hi` returns nothing, not the keys
+  outside the range.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+- Keys in sorted order, the default shape of real data (timestamps,
+  sequential ids), turn a plain BST into a list. My run: 2,000 sorted keys,
+  height 1,999, and a stack overflow without a bigger stack.
+- Keys with a shared prefix and an unmixed polynomial hash turned a
+  29%-full linear-probing table into a single 10,794-slot cluster.
+- Floating-point keys: `NaN` is not equal to itself, so it breaks both
+  compare-based and equality-based tables, and `-0` equals `0` by `===` but
+  not by `Object.is`. `Map` uses SameValueZero, which treats `NaN` as equal
+  to `NaN`.
+- Object keys in a JavaScript `Map` use identity, so two separate objects
+  with the same fields are two keys. Build a string or numeric key instead.
+- A compare function that is not a total order (it treats `a < b` and
+  `b < a` as both false for unequal keys) makes a tree file equal-looking
+  keys in arbitrary places.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, most lookups are hash tables, and the problems are
+engineering rather than algorithmic: memory overhead per entry, resize
+pauses, hash flooding, and how well the table uses the CPU cache. A
+`Map` of ten million small entries uses far more memory than the data,
+because every entry carries a key, a value, a hash and links. For hot
+paths, an open-addressing table over typed arrays, or sorted arrays with
+binary search for read-only data, can cut memory several times.
+
+Ordered structures win where a query is a range or a nearest key: time
+series lookups, scheduling (the next job due), rate limiters that count
+events in a window, and any index that must return sorted output. On disk
+the ordered structure is a B-tree (chapter 6) or an LSM tree of sorted
+runs, because a disk or SSD reads whole pages, and a binary tree would
+cost one page read per level.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The useful habit is to ask "which operations, and what worst case?" before
+"which structure?". If the answer is equality only, take the hash table and
+write down its assumption: the keys and hash spread well, and an attacker
+cannot choose keys. If any query is ordered, or a guarantee matters more
+than a constant factor, take the tree.
+
+The second habit is measuring the shape of the structure, not only its
+speed. Height for trees, longest chain or cluster for hash tables. Those
+numbers explained every surprise in this chapter before the timings did.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, a symbol table decides what a system can answer
+cheaply for its whole life. A key–value store sharded by hash answers point
+lookups at any scale but cannot do a range scan without asking every
+shard; one sharded by key range answers range scans but must split and
+move hot ranges. Secondary indexes are more symbol tables, each one a
+write cost on every insert. A search service is an inverted index; a
+feature store is a map from entity to sparse vector; a session service is
+a hash table with expiry; a CDN is a distributed cache keyed by URL with
+consistent hashing in front.
+
+When I sketch a design, I name each symbol table, its key, its value, the
+queries it must answer, and whether it is ordered. Most design mistakes I
+have seen were a hash-shaped store asked for an ordered answer.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+Build in this order: the binary search table, the BST with sizes and all
+ordered operations, the red–black tree, then both hash tables with
+resizing and correct deletion. Keep one property test that runs random
+`put`, `get`, `delete`, `floor`, `rank` and `select` against a sorted
+array of keys, and run every implementation through it. Keep one validity
+check for the red–black invariants. Then run the experiments: sorted
+inserts into BST and red–black tree (record heights), probes against load
+factor, chains against load, and the word-count benchmark.
+
+Done when I can draw the three red–black fix-ups and the 2-3 tree each one
+mirrors from memory, derive why linear probing deletion needs the
+re-insert loop, and say in one sentence for any system I use whether its
+main index is ordered or hashed and why.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Is a red–black tree the same as an AVL tree?** No. Both are balanced
+BSTs. AVL trees keep the two subtree heights of every node within one, so
+they are more tightly balanced and slightly faster to search, but do more
+rotations on updates. Red–black trees allow height up to about `2 lg n`
+and do fewer rotations. Libraries mostly chose red–black trees; some
+databases and in-memory indexes use AVL trees.
+
+**Why does the book teach the left-leaning version?** Because the code is
+much shorter: three `if` statements on the way up the search path, and a
+direct correspondence with 2-3 trees. Classic red–black trees have more
+cases. The guarantees are the same.
+
+**When is a sorted array better than a tree?** When the data is built once
+and searched many times. It uses less memory (no links), it is
+cache-friendly, and binary search is as fast as a perfect tree. Many
+read-only indexes, and the immutable files of LSM-tree databases, are
+sorted arrays.
+
+**Is hashing really constant time?** On average, under the assumption that
+the hash spreads keys well, yes. Any single operation can be slow (a long
+chain, a long cluster, a resize), and a bad or attacked hash makes every
+operation slow. The amortised cost per operation, including resizing, is
+constant.
+
+**Should I ever implement my own hash table?** Rarely in application code.
+Reasons that come up: very large tables where memory per entry matters,
+special keys that the built-in map handles badly, or a need for a feature
+it lacks (ordered iteration by key, a custom eviction policy, persistence).
+Even then, start from a well-known design rather than inventing one.
+
+**Why is it called a symbol table?** From compilers and assemblers, where
+the first important use was mapping program symbols (identifiers) to their
+addresses and types.
+
+**What about tries?** A trie is a symbol table specialised to string keys,
+and it can beat both trees and hash tables for some string queries
+(prefix search, longest prefix). It is in chapter 5.
+
+## Key takeaways
+
+- A symbol table maps keys to values; its conventions (no duplicate keys, no null values, immutable keys, consistent equality) prevent whole classes of bugs.
+- Ordered symbol tables add min, max, floor, ceiling, rank, select and range search, which real systems need constantly.
+- Sequential search is linear for search and insert; binary search in a sorted array is `lg n` for search but linear for insert.
+- A BST is fast on random input (about `1.39 lg n` compares per search) and degenerates to a list on sorted input.
+- Subtree sizes make `rank` and `select` one-path operations; Hibbard deletion replaces a node with its successor.
+- A 2-3 tree stays perfectly balanced because it grows only at the root.
+- A left-leaning red–black tree is a 2-3 tree written as a BST; three fix-ups (rotate left, rotate right, flip colours) keep its height at most about `2 lg n`.
+- Hash tables give constant average time under uniform hashing; separate chaining keeps lists, linear probing keeps clusters, and both resize.
+- Linear probing costs about `½(1 + 1/(1 − α)²)` probes for a miss, so keep the table at most half full; deletion must re-insert the rest of the cluster or use tombstones.
+- The hash function matters more than the table: real keys with shared prefixes and sequential values break uniform hashing unless the hash is mixed.
+- Sets, dictionaries, indexes, inverted indexes, caches and sparse vectors are symbol tables with a well-chosen key.
+
+## Glossary
+
+- **2-3 tree:** a search tree whose nodes hold one key and two children or two keys and three children, kept perfectly balanced.
+- **Ceiling:** the smallest key greater than or equal to a given key.
+- **Cluster:** a run of consecutive occupied slots in an open-addressing hash table.
+- **Collision:** two different keys mapping to the same slot of a hash table.
+- **Consistent hashing:** assigning keys to the next server clockwise on a ring of hash values, so adding a server moves only its share of keys.
+- **Floor:** the largest key less than or equal to a given key.
+- **Hash function:** a function turning a key into an integer, used to pick a slot.
+- **Hibbard deletion:** deleting a node with two children by replacing it with its successor.
+- **Inverted index:** a symbol table from each word to the documents containing it.
+- **Left-leaning red–black BST:** a BST that encodes a 2-3 tree, with red links representing 3-nodes and leaning left.
+- **Linear probing:** open addressing that resolves collisions by trying the next slot.
+- **Load factor:** the number of keys divided by the number of slots, `α = n/m`.
+- **Open addressing:** storing keys directly in the hash table's array instead of in lists.
+- **Ordered symbol table:** a symbol table with comparable keys that supports min, max, floor, ceiling, rank, select and range queries.
+- **Rank:** the number of keys smaller than a given key.
+- **Rotation:** a local restructuring of a BST that changes which of two nodes is on top while keeping symmetric order.
+- **Select:** the key with a given rank.
+- **Separate chaining:** a hash table with a list of keys at each slot.
+- **Successor:** the next larger key; in a BST, the minimum of the right subtree.
+- **Symbol table:** a data structure of key–value pairs supporting insert and search by key.
+- **Symmetric order:** the BST rule that left subtrees hold smaller keys and right subtrees larger ones.
+- **Tombstone:** a marker left in a deleted slot of an open-addressing table so searches keep probing past it.
+- **Uniform hashing assumption:** the assumption that a hash function spreads keys over slots as if at random.
+
+## Exercises and self-check
+
+My own exercises; the book's exercises at the end of each section are
+worth a pass too.
+
+**Warm-up (by hand)**
+
+1. Insert `K D Q B F M T A` into an empty BST, draw it, and give its height,
+   `rank(G)`, `floor(G)`, `ceiling(G)` and `select(4)`.
+2. Delete `D` from your tree with Hibbard deletion and draw the result.
+3. Insert the same keys into a 2-3 tree, then into an LLRB, writing the
+   fix-ups each insert triggers. Check that flattening the red links gives
+   your 2-3 tree.
+4. Insert `ant bee cat dog eel fox` into a linear-probing table of 7 slots
+   using the hashes in 3.4 (take each hash mod 7). Then delete `cat` and
+   show which keys get re-inserted.
+
+**Build (in TypeScript)**
+
+5. Write `size(lo, hi)`, the number of keys in a range, for the BST, using
+   only `rank` and `contains`. Test it against a sorted array.
+6. Add `deleteMin` to the red–black tree. Read the book's approach first;
+   then write it, and run the validity check after every delete.
+7. Add tombstone deletion to the linear-probing table and compare its probe
+   counts with the re-insert version after 100,000 random deletes and
+   inserts at load factor 0.5.
+8. Write a generic property test that takes any ordered symbol table and
+   runs 100,000 random operations against a sorted array, checking every
+   result.
+
+**Measure**
+
+9. Insert a million keys in sorted order into your red–black tree and
+   record the height. Then insert them in random order. Explain why the
+   sorted height is smaller.
+10. Reproduce the clustering experiment: generate keys with a shared prefix,
+    measure the longest cluster with and without a mixing step, then repeat
+    with separate chaining.
+11. Measure linear probing's miss cost at load factors 0.3 to 0.95 and plot
+    it against `½(1 + 1/(1 − α)²)`.
+
+**Apply**
+
+12. Build an IP-to-country lookup from a list of ranges, using `floor` on
+    your red–black tree. Explain why a hash table cannot do it.
+13. Build an inverted index over a folder of text files that answers AND
+    and OR queries and returns line numbers.
+14. Implement a sliding-window rate limiter that answers "how many requests
+    from this user in the last 60 seconds" with an ordered structure, and
+    explain what a hash table would cost instead.
+
+<details>
+<summary>Answer to warm-up 1</summary>
+
+The tree is `K` at the root; `D` left with `B` (and `A` under it) and `F`;
+`Q` right with `M` and `T`. Height 3 (the path K, D, B, A). `rank(G)` is 4
+(`A B D F`), `floor(G)` is `F`, `ceiling(G)` is `K`, and `select(4)` is `K`.
+
+</details>
+
+<details>
+<summary>Answer to warm-up 2</summary>
+
+`D` has two children, so its successor, `F` (the minimum of its right
+subtree), replaces it. `F` has no children, so the result is `K` with left
+child `F` (children `B` with `A`, and nothing on the right) and the same
+right subtree.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to phase 3, data structures, of the
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>,
+and it is the one chapter of the book I would never skip. I would give it
+six sessions.
+
+<Timeline caption="Six sessions for chapter 3. Each ends with code, a drawing by hand, and a measurement." items={[
+  { when: "Session 1", what: "3.1: the API, sequential search and the binary search table with rank, floor and ceiling. Write the property test against a sorted array." },
+  { when: "Session 2", what: "3.2: the BST with sizes, all ordered operations and Hibbard deletion. Run the random and sorted height experiment." },
+  { when: "Session 3", what: "3.3: 2-3 trees on paper first, then the LLRB. Validity checker. Trace the A to G inserts by hand." },
+  { when: "Session 4", what: "3.4: hash functions, separate chaining, linear probing with resizing and deletion. Probe counts against the formulas." },
+  { when: "Session 5", what: "3.4 again: the clustering experiment, mixing, and hash flooding. Read how my language's built-in map handles each." },
+  { when: "Session 6", what: "3.5: sets, an inverted index, sparse vectors, consistent hashing, and the full word-count benchmark." },
+]} />
+
+I keep one `ch3/` folder with every implementation, the shared property
+test, the red–black validity check and the benchmark. The README records
+the heights, probe counts and timings, with one paragraph per structure on
+when I would choose it. After each session I close everything and rewrite
+`put` for the red–black tree, or `delete` for linear probing, from memory.
+
+Done when every implementation passes the same property test, the red–black
+tree passes its validity check after a million sorted inserts, I can trace
+2-3 splits and their red–black fix-ups by hand, and I can explain in two
+minutes why my language's `Map` is a hash table while its sorted map, if it
+has one, is a red–black tree.
