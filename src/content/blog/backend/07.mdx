@@ -1,0 +1,1170 @@
+---
+title: "Schema design, keys and constraints"
+series: "backend"
+seriesOrder: 7
+undated: true
+readTime: "about 30 min"
+description: "Design tables so each fact lives in one place, choose keys, wire foreign keys, and let constraints reject bad data, with every failure run on real Postgres."
+tags: ['databases', 'architecture', 'security']
+related: ['backend/06', 'backend/04']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+I once wrote a sign-up handler that checked whether an email was taken and
+then inserted it. It passed every test. Then two requests for the same
+email arrived twenty milliseconds apart, both checks saw nothing, and both
+inserts went through. The bug was not in the handler. It was in the schema,
+which had no rule saying emails are unique, so the database had no way to
+say no. This note is about designing tables so the database can say no:
+where each fact lives, how rows point at each other, and which rules belong
+in constraints rather than in code.
+
+Every statement here ran on Postgres 17, and every error message is the
+real one. The TypeScript ran on Node 22 with the `pg` driver.
+
+Reading time: about 30 minutes.
+
+## Before you start
+
+You should be comfortable with `select`, `insert`, `update` and joins, as
+in the previous note on SQL. You need a Postgres you can drop tables in;
+a local install or a container is enough. Nothing here needs an ORM, and I
+avoid one on purpose so the SQL is visible.
+
+The running example is a small team app: teams, members of teams with a
+role, and a room-booking table. It is small enough to read in one screen
+and has every kind of rule a real schema needs: uniqueness, references,
+allowed values, and "these two things must not overlap".
+
+```sql
+create table teams (
+  id   bigint generated always as identity primary key,
+  name text not null
+);
+
+create table members (
+  id         bigint generated always as identity primary key,
+  team_id    bigint not null references teams on delete cascade,
+  email      text not null,
+  deleted_at timestamptz,
+  role       text not null default 'member'
+             check (role in ('owner', 'admin', 'member'))
+);
+
+create unique index members_team_email_live
+  on members (team_id, lower(email)) where deleted_at is null;
+```
+
+By the end, every line of that schema will have a reason you can say out
+loud, and you will know what error each line produces when someone breaks
+its rule.
+
+## Note map
+
+<Flow steps={[
+  "One fact, one place: normalising so updates cannot disagree",
+  "Keys: what identifies a row, surrogate or natural",
+  "Foreign keys: references, and what happens on delete",
+  "Constraints: not null, check, unique, exclusion, and the race they close",
+  "Types that carry meaning: time, money, text and enumerations",
+  "From beginner to strategy, questions, takeaways, glossary, practice",
+]} caption="The order of this note. Each part adds one kind of rule to the same schema." />
+
+## One fact, one place
+
+### In one sentence
+
+A good schema stores each fact exactly once, so that changing it is one
+update and two copies can never disagree.
+
+### The idea
+
+A table is a set of claims. Each row says "this thing exists, with these
+properties". The design question is which table each property belongs in.
+The rule of thumb behind **normalisation** is: a column should describe the
+thing the row's key identifies, the whole key, and nothing but the key. If
+an orders table has a `customer_city` column, that column describes the
+customer, not the order. Every order by the same customer repeats the
+city, and the repeats can drift apart.
+
+That drift has a name, the **update anomaly**: changing a fact in one row
+but not its copies leaves the data contradicting itself. Its relatives are
+the **insert anomaly** (you cannot record a customer's city until they
+place an order, because the city lives on orders) and the **delete
+anomaly** (deleting a customer's last order deletes the only record of
+their city).
+
+Normalising means splitting such tables so each fact has one home, and
+linking the pieces with keys. The cost is joins at read time. The benefit
+is that writes cannot create contradictions. For a transactional
+application, where correctness of writes matters most, normalised is the
+default; denormalising is a deliberate later choice for read speed, with
+a plan to keep the copies in sync.
+
+### Worked example
+
+The simple case is a flat orders table that carries customer details:
+
+```sql
+create table flat_orders (
+  order_id int primary key, customer_email text, customer_city text, total int
+);
+insert into flat_orders values
+  (1, 'asha@x.io', 'Pune', 500), (2, 'asha@x.io', 'Pune', 900),
+  (3, 'ravi@x.io', 'Delhi', 300);
+```
+
+Asha moves to Mumbai. A support tool updates the order it was looking at:
+
+```sql
+update flat_orders set customer_city = 'Mumbai' where order_id = 2;
+select customer_email, array_agg(distinct customer_city) as cities_on_file
+from flat_orders group by 1 order by 1;
+```
+
+```text
+ customer_email | cities_on_file
+----------------+----------------
+ asha@x.io      | {Mumbai,Pune}
+ ravi@x.io      | {Delhi}
+```
+
+The database now holds two answers to "where does Asha live?" and has no
+way to know which is right. Nothing failed. Every statement succeeded.
+
+The realistic case is the same data, normalised:
+
+```sql
+create table n_customers (id int primary key, email text not null unique, city text);
+create table n_orders (
+  id int primary key,
+  customer_id int not null references n_customers,
+  total int not null
+);
+insert into n_customers values (1, 'asha@x.io', 'Pune'), (2, 'ravi@x.io', 'Delhi');
+insert into n_orders values (1, 1, 500), (2, 1, 900), (3, 2, 300);
+
+update n_customers set city = 'Mumbai' where id = 1;
+select c.email, c.city, count(*)
+from n_orders o join n_customers c on c.id = o.customer_id
+group by 1, 2 order by 1;
+```
+
+```text
+   email   |  city  | count
+-----------+--------+-------
+ asha@x.io | Mumbai |     2
+ ravi@x.io | Delhi  |     1
+```
+
+One update, one answer, and both of Asha's orders see it.
+
+### Step by step
+
+<Trace
+  columns={["design", "facts stored", "after Asha moves", "contradiction possible?"]}
+  rows={[
+    ["flat_orders", "city on every order", "one order says Mumbai, one says Pune", "yes"],
+    ["n_customers + n_orders", "city once, on the customer", "the one row says Mumbai", "no"],
+    ["flat, update all rows", "city on every order", "fine, until a concurrent insert copies the old city", "yes, rarely"],
+  ]}
+  caption="Three ways to hold the same facts. Only the design with one home per fact makes the contradiction impossible rather than unlikely."
+/>
+
+The third row matters. "Just update every copy" works until a request
+reads the old city and inserts a new order with it while the update runs.
+Copies can be kept in sync, but that is code you must write and test; one
+home needs no code.
+
+<Figure art={`
+  flat_orders                       n_customers        n_orders
+  +----+-----------+-------+       +----+-------+     +----+-----+
+  | id | email     | city  |       | id | city  |<----| id | cid |
+  +----+-----------+-------+       +----+-------+     +----+-----+
+  | 1  | asha@x.io | Pune  |       | 1  | Mumbai|     | 1  | 1   |
+  | 2  | asha@x.io | Mumbai|       | 2  | Delhi |     | 2  | 1   |
+  | 3  | ravi@x.io | Delhi |       +----+-------+     | 3  | 2   |
+  +----+-----------+-------+                          +----+-----+
+   two homes for one fact          one home, many orders point at it
+`} caption="Left, Asha's city is stored twice and has drifted. Right, it is stored once and orders reference the customer by key." />
+
+### Common mistake
+
+The common mistake is the opposite one: normalising facts that are not
+actually the same fact. An order's shipping address is not the customer's
+current address. It is the address the order was shipped to, and it must
+not change when the customer moves. Copying it onto the order is correct,
+because it is a different fact: "where this order went".
+
+The same applies to prices. An order line's `price_cents` is the price at
+the time of sale, not a reference to the product's current price. The test
+is to ask: if the source changes tomorrow, should this row change too? If
+no, it is a snapshot and belongs on the row.
+
+### In real systems
+
+Most production schemas are normalised for the core write path (users,
+orders, payments) and denormalised in specific, named places for reads: a
+`comment_count` column on posts, a search index, a reporting table. Each
+copy has an owner, a way it is kept in sync (a trigger, a job, an event),
+and an accepted staleness.
+
+### Check yourself
+
+<details>
+<summary>1. An invoices table stores the customer's tax ID. The customer later changes it. Should old invoices change?</summary>
+
+No. An invoice records the tax ID it was issued under; that is a snapshot,
+a different fact from "the customer's current tax ID". Store it on the
+invoice. The customer's current ID still lives once, on the customer.
+
+</details>
+
+<details>
+<summary>2. What is the insert anomaly in flat_orders?</summary>
+
+You cannot record a customer, or their city, until they place an order,
+because customer facts only exist as columns of order rows.
+
+</details>
+
+## Keys: what identifies a row
+
+### In one sentence
+
+Every table needs a primary key that identifies one row forever, and the
+usual choice is a meaningless generated number or UUID, with real-world
+identifiers kept as unique columns beside it.
+
+### The idea
+
+A **primary key** is a column, or set of columns, whose value is unique and
+never null, and which other rows use to point at this one. Postgres
+enforces both properties and builds an index for it.
+
+There are two kinds of key. A **natural key** is a real-world identifier
+that already exists: an email address, a country code, an ISBN. A
+**surrogate key** is a value the database invents and that means nothing
+outside it: an auto-incrementing number or a random UUID.
+
+Natural keys look attractive because they already exist, but most of them
+change. People change emails. Companies merge. Product codes get reissued.
+If the email is the primary key, every row in every table that references
+it must change too. A surrogate key never needs to change because it never
+meant anything. So the common design is a surrogate primary key plus a
+`unique` constraint on the natural identifier, which still prevents
+duplicates but lets the value change in one place.
+
+The exceptions are stable, standard codes, such as ISO country or currency
+codes, and **join tables**, where the key is the pair of foreign keys.
+
+For the surrogate itself there are two common choices.
+`bigint generated always as identity` is compact, fast to index, and
+ordered, but it reveals counts and order (a customer can guess how many
+orders you have) and needs the database to generate it. A **UUID** can be
+generated anywhere, including in the client or before the insert, and
+reveals nothing, but it is 16 bytes and random UUIDs (version 4) scatter
+inserts across the index. Time-ordered UUIDs (version 7) keep most of the
+benefits with better index locality.
+
+### Worked example
+
+The simple case is the identity column. `generated always` means the
+database always picks the value and rejects an explicit one unless you say
+`overriding system value`, which stops the classic bug of an import
+inserting ids that the sequence will later collide with.
+
+```sql
+create table teams (
+  id   bigint generated always as identity primary key,
+  name text not null
+);
+insert into teams (name) values ('Core'), ('Labs');
+select * from teams;
+```
+
+```text
+ id | name
+----+------
+  1 | Core
+  2 | Labs
+```
+
+The realistic case is a many-to-many relation. Notes have many tags, and
+tags have many notes. Neither table can hold the other's id, because each
+side has many. The relation is its own table whose primary key is the
+pair:
+
+```sql
+create table notes (id bigint generated always as identity primary key, title text not null);
+create table tags  (id bigint generated always as identity primary key, slug text not null unique);
+create table note_tags (
+  note_id bigint not null references notes on delete cascade,
+  tag_id  bigint not null references tags  on delete cascade,
+  primary key (note_id, tag_id)
+);
+create index on note_tags (tag_id);
+```
+
+The composite primary key does two jobs: it stops the same tag being
+attached to a note twice, and its index serves "tags for this note". The
+extra index on `tag_id` serves the other direction, "notes with this tag",
+because an index on `(note_id, tag_id)` cannot be used efficiently to look
+up by `tag_id` alone. The next note on indexes explains why.
+
+### Step by step
+
+<Compare left="Natural key as primary key" right="Surrogate key plus unique natural column" caption="Choosing what identifies a row." rows={[
+  ["email is the primary key", "id is the primary key; email is unique"],
+  ["email change touches every referencing row", "email change is one update"],
+  ["references carry a long text value", "references carry an 8-byte number"],
+  ["duplicates impossible", "duplicates still impossible, via unique"],
+  ["key visible in URLs, possibly private", "id in URLs reveals nothing personal"],
+]} />
+
+<Timeline items={[
+  { when: "Day 1", what: "users.email is the primary key; orders.user_email references it" },
+  { when: "Month 6", what: "a user asks to change their email; 40 tables reference it" },
+  { when: "Month 6", what: "the change needs on update cascade on every foreign key, or a migration" },
+  { when: "Fix", what: "add a surrogate id, backfill references, make email a unique column" },
+]} caption="How a natural primary key usually ages. The fix is a migration across every referencing table, which is why the surrogate is chosen on day one." />
+
+### Common mistake
+
+The common mistake is a table with no primary key at all, often a log or
+join table. Without one, duplicate rows creep in, there is no way to
+update or delete exactly one of them, and logical replication tools refuse
+the table. Every table gets a primary key, even if it is just an identity
+column.
+
+A second mistake is exposing sequential ids in public URLs where they leak
+something: `/invoices/1042` tells a customer roughly how many invoices
+exist and invites them to try `/invoices/1041`. The id alone is not a
+security hole if authorization is checked (that is note 12), but a
+random public identifier removes the temptation and the information.
+
+### In real systems
+
+A common pattern is an internal `bigint` primary key for joins plus a
+public UUID or short random identifier column, unique, used in URLs and
+APIs. Join tables use composite keys. Natural keys appear as primary keys
+only for small reference tables of stable standard codes.
+
+### Check yourself
+
+<details>
+<summary>1. Why does note_tags need a separate index on tag_id?</summary>
+
+The primary key index is ordered by `note_id` first, then `tag_id`. It can
+find all tags for a note quickly, but finding all notes for a tag would
+mean scanning the whole index. A separate index on `tag_id` serves that
+direction.
+
+</details>
+
+<details>
+<summary>2. When is a natural primary key reasonable?</summary>
+
+When the value is standardised and effectively never changes, such as an
+ISO currency code in a currencies table, and when it is short. Even then a
+surrogate does no harm.
+
+</details>
+
+## Foreign keys: references and deletes
+
+### In one sentence
+
+A foreign key makes the database guarantee that a reference points at a row
+that exists, and its `on delete` rule decides what happens to the
+referencing rows when that row goes away.
+
+### The idea
+
+`team_id bigint not null references teams` declares a **foreign key**: every
+value in `members.team_id` must match an `id` in `teams`. The database
+checks this on every insert and update of `members`, and on every delete or
+key change in `teams`. Without it, a bug or a manual fix can leave members
+pointing at a team that no longer exists, an **orphan**, and every query
+that joins them silently drops or mislabels those rows.
+
+The interesting decision is what happens when the referenced row is
+deleted. Postgres offers five answers:
+
+- `no action`, the default, and `restrict`: refuse the delete while
+  references exist. (The difference is only in timing: `no action` can be
+  deferred to the end of the transaction, `restrict` cannot.)
+- `cascade`: delete the referencing rows too.
+- `set null`: keep the referencing rows and set the column to `NULL`.
+- `set default`: set the column to its default value.
+
+Each one encodes a business rule. "A member cannot exist without a team" is
+`cascade`. "A task can lose its assignee and stay open" is `set null`. "A
+room with bookings cannot be deleted; cancel the bookings first" is
+`restrict`. Choosing the rule is a product decision, and writing it in the
+schema means every code path, script and admin console follows it.
+
+One practical detail catches almost everyone: Postgres automatically
+indexes the referenced side (it is a primary key) but not the referencing
+column. Every delete from the parent has to find matching children, and
+without an index on the child's foreign key column that is a full scan of
+the child table per deleted parent.
+
+### Worked example
+
+The simple case is the three rules on the team app. A member pointing at a
+missing team:
+
+```sql
+insert into members (team_id, email) values (99, 'z@x.io');
+```
+
+```text
+ERROR:  insert or update on table "members" violates foreign key constraint "members_team_id_fkey"
+DETAIL:  Key (team_id)=(99) is not present in table "teams".
+```
+
+Deleting a team cascades to its members:
+
+```sql
+select count(*) as members_before from members;  -- 4
+delete from teams where id = 2;
+select count(*) as members_after from members;   -- 3
+```
+
+Deleting a room with bookings is refused:
+
+```sql
+delete from rooms where id = 1;
+```
+
+```text
+ERROR:  update or delete on table "rooms" violates foreign key constraint "bookings_room_id_fkey" on table "bookings"
+DETAIL:  Key (id)=(1) is still referenced from table "bookings".
+```
+
+And `set null` on tasks, when a person leaves:
+
+```sql
+create table tasks (
+  id int primary key, title text not null,
+  assignee_id int references people on delete set null
+);
+insert into tasks values (1, 'Write the note', 1), (2, 'Review', 2), (3, 'Ship', 1);
+delete from people where id = 1;
+select * from tasks order by id;
+```
+
+```text
+ id |     title      | assignee_id
+----+----------------+-------------
+  1 | Write the note |
+  2 | Review         |           2
+  3 | Ship           |
+```
+
+The realistic case is the missing index. I built a parent table of 2,000
+rows and a child table of 400,000 rows referencing it with `on delete
+cascade`, then deleted 200 parents (which cascades to 40,000 children)
+inside a transaction I rolled back, before and after indexing the child's
+foreign key column:
+
+```text
+without an index on big_child(parent_id):  2813.569 ms
+with    an index on big_child(parent_id):    29.310 ms
+```
+
+Same delete, same rows, roughly a hundred times faster, because each
+parent's children are found through the index instead of a scan of 400,000
+rows. On a real table with millions of rows, the unindexed version is a
+delete that holds locks for minutes.
+
+### Step by step
+
+<Flow steps={[
+  "delete from teams where id = 2",
+  "Postgres finds members rows with team_id = 2 (index or scan)",
+  "rule is cascade: those members are deleted in the same statement",
+  "any table referencing members applies its own rule in turn",
+  "all of it commits or rolls back together",
+]} caption="What one parent delete does. Cascades chain through every referencing table, in the same transaction." />
+
+<Compare left="on delete rule" right="Business rule it encodes" caption="Pick the rule by asking what should happen to the children, then write it in the schema." rows={[
+  ["cascade", "the child has no meaning without the parent (members of a team)"],
+  ["restrict / no action", "the parent must not disappear while children exist (rooms with bookings)"],
+  ["set null", "the child survives and the link becomes 'unknown' (task assignee)"],
+  ["set default", "the child moves to a fallback parent (an 'unassigned' queue)"],
+]} />
+
+### Common mistake
+
+The common mistake is `cascade` everywhere because it makes deletes "just
+work". One accidental `delete from teams where ...` with a bad condition
+then removes members, their bookings, their comments, and everything else
+in the chain, in one statement, successfully. Use `cascade` where the
+children genuinely have no meaning alone, and `restrict` where a delete
+should be a deliberate, multi-step act.
+
+The other common mistake, covered above, is a foreign key with no index on
+the referencing column. A quick audit query lists foreign key columns with
+no index starting with them; it is worth running on any schema you inherit.
+
+### In real systems
+
+Many products never hard-delete parents at all. They **soft-delete** with a
+`deleted_at` column, so foreign keys keep pointing at a row that still
+exists, history stays intact, and restoring is an update. Hard deletes then
+happen later in a background job, for privacy or storage reasons, with
+cascades that were designed and tested for it. The cost of soft delete
+shows up in uniqueness, which the next part handles.
+
+### Check yourself
+
+<details>
+<summary>1. Comments reference posts. Posts can be deleted by their author. Which rule, and why?</summary>
+
+Usually `cascade`: a comment has no meaning without its post. If the
+product wants "post removed" placeholders with comments kept, soft-delete
+the post instead, and the foreign key never fires.
+
+</details>
+
+<details>
+<summary>2. Why did the delete take 2.8 seconds without the index?</summary>
+
+For each of the 200 deleted parents, Postgres had to find matching rows in
+a 400,000-row child table. Without an index on `parent_id`, that meant
+scanning the table, over and over. The index turns each lookup into a
+direct jump.
+
+</details>
+
+## Constraints: letting the database say no
+
+### In one sentence
+
+Constraints are rules the database enforces on every write from every
+client, and they are the only place a rule like "emails are unique" can be
+enforced correctly under concurrent requests.
+
+### The idea
+
+Validation at the boundary, from note 4, keeps malformed input out of the
+handler. Constraints are the second line: they keep invalid data out of the
+table no matter which path wrote it, including the admin script, the
+migration, the other service, and the handler with a bug. Postgres has five
+kinds:
+
+- `not null`: the column must have a value.
+- `check (expression)`: the expression must not be false for the row. Note
+  "not false": a check that evaluates to `NULL` passes, which is the
+  three-valued logic from the previous note again.
+- `unique`: no two rows share the value. It can be on several columns, on
+  an expression such as `lower(email)` through a unique index, and partial,
+  applying only to rows matching a `where`.
+- `primary key`: unique and not null.
+- `exclude`: no two rows may satisfy a condition together, such as "same
+  room and overlapping time".
+
+The key argument for constraints is concurrency. Application code that
+checks "is this email taken?" and then inserts has a gap between the read
+and the write. Two requests can both read "not taken" before either
+writes. Only the database sees both writes and can serialise them, and a
+unique constraint is how you ask it to.
+
+### Worked example
+
+The simple case is the race itself, run for real. A handler that checks
+first and then inserts, with a 20 millisecond gap standing in for the work
+a real handler does between the two:
+
+```ts
+async function signupCheckFirst(email: string) {
+  const { rowCount } = await pool.query('select 1 from signups where email = $1', [email]);
+  if (rowCount) return 'taken';
+  await new Promise((r) => setTimeout(r, 20)); // the gap a real handler has
+  await pool.query('insert into signups (email) values ($1)', [email]);
+  return 'created';
+}
+console.log('check-then-insert:',
+  await Promise.all([signupCheckFirst('k@x.io'), signupCheckFirst('k@x.io')]));
+```
+
+```text
+check-then-insert: [ 'created', 'created' ]
+rows for k@x.io: 2
+```
+
+Then the same two requests against a table with `unique (email)`, where
+the handler simply inserts and translates the violation:
+
+```ts
+async function signupConstraint(email: string) {
+  try {
+    await pool.query('insert into signups (email) values ($1)', [email]);
+    return 'created';
+  } catch (e: any) {
+    if (e.code === '23505') return 'taken';
+    throw e;
+  }
+}
+```
+
+```text
+constraint: [ 'created', 'taken' ]
+rows for k@x.io: 1
+```
+
+`23505` is Postgres's error code for a unique violation. The check in code
+can stay for a friendly early message, but the constraint is what makes
+the answer correct.
+
+The realistic case is the team app's rules, each broken on purpose. Emails
+are unique per team, case-insensitively, but only among members who have
+not been removed. That is a partial unique index on an expression:
+
+```sql
+create unique index members_team_email_live
+  on members (team_id, lower(email)) where deleted_at is null;
+
+insert into members (team_id, email) values (1, 'ASHA@x.io');
+```
+
+```text
+ERROR:  duplicate key value violates unique constraint "members_team_email_live"
+DETAIL:  Key (team_id, lower(email))=(1, asha@x.io) already exists.
+```
+
+Remove Asha with a soft delete, and the same invite now succeeds, because
+the old row is outside the index's `where`:
+
+```sql
+update members set deleted_at = now() where team_id = 1 and email = 'asha@x.io';
+insert into members (team_id, email) values (1, 'asha@x.io');  -- succeeds
+```
+
+The role check:
+
+```sql
+insert into members (team_id, email, role) values (1, 'z@x.io', 'superuser');
+```
+
+```text
+ERROR:  new row for relation "members" violates check constraint "members_role_check"
+DETAIL:  Failing row contains (6, 1, z@x.io, null, superuser).
+```
+
+And the booking rule, "a room cannot be booked twice at overlapping
+times", which no unique constraint can express because two different
+ranges can overlap. An exclusion constraint can:
+
+```sql
+create extension if not exists btree_gist;
+create table bookings (
+  id      bigint generated always as identity primary key,
+  room_id int not null references rooms on delete restrict,
+  during  tstzrange not null,
+  exclude using gist (room_id with =, during with &&)
+);
+insert into bookings (room_id, during)
+  values (1, '[2026-10-23 10:00+05:30, 2026-10-23 11:00+05:30)');
+insert into bookings (room_id, during)
+  values (1, '[2026-10-23 10:30+05:30, 2026-10-23 11:30+05:30)');
+```
+
+```text
+ERROR:  conflicting key value violates exclusion constraint "bookings_room_id_during_excl"
+DETAIL:  Key (room_id, during)=(1, ["2026-10-23 05:00:00+00","2026-10-23 06:00:00+00")) conflicts with existing key (room_id, during)=(1, ["2026-10-23 04:30:00+00","2026-10-23 05:30:00+00")).
+```
+
+The times in the error are shown in UTC because that session's time zone
+was UTC; 10:30 in India is 05:00 UTC. A back-to-back booking from 11:00 to
+12:00 succeeds, because `[` includes the start and `)` excludes the end, so
+`[10:00, 11:00)` and `[11:00, 12:00)` share no instant. Half-open ranges
+are what make adjacent bookings legal without special cases.
+
+### Step by step
+
+Constraint errors are useful to the API layer because each has a stable
+code and the constraint's name. A small mapper turns them into the problem
+responses from note 5:
+
+```ts
+function toProblem(err: any): Problem {
+  switch (err.code) {
+    case '23505': return { status: 409, title: 'Already exists', detail: err.constraint };
+    case '23503': return { status: 422, title: 'Unknown reference', detail: err.constraint };
+    case '23514': return { status: 422, title: 'Invalid value', detail: err.constraint };
+    case '23P01': return { status: 409, title: 'Overlaps another booking', detail: err.constraint };
+    default: throw err;
+  }
+}
+```
+
+Run against the same broken inputs:
+
+```text
+invite ASHA@x.io again -> 409 Already exists (members_team_email_live) code 23505
+invite to team 99 -> 422 Unknown reference (members_team_id_fkey) code 23503
+role superuser -> 422 Invalid value (members_role_check) code 23514
+book 10:30-11:30 -> 409 Overlaps another booking (bookings_room_id_during_excl) code 23P01
+book 12:00-13:00 -> 201
+```
+
+<Trace
+  columns={["request", "boundary validation", "constraint", "response"]}
+  rows={[
+    ["role: 'superuser'", "rejects (not in the enum)", "would reject too", "422"],
+    ["email: 'ASHA@x.io', already a member", "passes (well-formed)", "unique index rejects", "409"],
+    ["team_id: 99", "passes (a number)", "foreign key rejects", "422"],
+    ["booking overlapping another", "passes (valid range)", "exclusion rejects", "409"],
+    ["admin script sets role = 'root'", "never runs", "check rejects", "script fails loudly"],
+  ]}
+  caption="Two lines of defence. Boundary validation checks shape; constraints check facts that depend on other rows, and they also guard paths that never pass through the API."
+/>
+
+<Layers layers={[
+  { name: "Client form", note: "helpful hints; can be bypassed entirely" },
+  { name: "Boundary validation", note: "shape, types, ranges of one request" },
+  { name: "Handler logic", note: "rules that need other services or context" },
+  { name: "Constraints", note: "rules about rows: unique, references, overlaps; every writer" },
+]} caption="Where each rule lives. The lower the layer, the more writers it covers." />
+
+### Common mistake
+
+The common mistake is mapping every database error to 500, so a
+duplicate email shows the user "something went wrong" and pages someone at
+night. Map the constraint codes you expect, by constraint name where the
+message needs to be specific, and let the rest be 500.
+
+A second mistake is a `check` that silently passes `NULL`. `check (price >
+0)` accepts a `NULL` price, because `NULL > 0` is unknown, not false. If
+the value is required, the column also needs `not null`.
+
+### In real systems
+
+Teams name constraints deliberately (`members_team_email_live`) so error
+mapping and logs are readable. They add constraints to existing large
+tables with `not valid` first, which enforces the rule on new writes
+without scanning old rows, then `validate constraint` later, which scans
+without blocking writes. Note 10 on migrations covers that sequence.
+
+### Check yourself
+
+<details>
+<summary>1. Why can't "check that the email is free, then insert" be made safe by retrying faster?</summary>
+
+The gap between the read and the write is the problem, however short it
+is. Two requests can both read before either writes. Only a constraint (or
+a lock) makes the database serialise the two writes.
+
+</details>
+
+<details>
+<summary>2. Why is the unique index partial, with where deleted_at is null?</summary>
+
+Removed members keep their row for history. Without the `where`, a removed
+member's row would block re-inviting the same email forever. The partial
+index only enforces uniqueness among live members.
+
+</details>
+
+## Types that carry meaning
+
+### In one sentence
+
+A column's type is the first constraint on it, and choosing it well for
+time, money, text and fixed sets of values prevents whole families of bugs
+before any check runs.
+
+### The idea
+
+A type says what values are possible and how they compare, sort and do
+arithmetic. Four choices come up in every schema.
+
+**Time.** Postgres has `timestamp` (without time zone) and `timestamptz`
+(with time zone). The names mislead: `timestamptz` does not store a zone.
+It stores an absolute instant, converting input to UTC on the way in and
+to the session's zone on the way out. `timestamp` stores a wall-clock
+reading with no zone at all, "10:00 on 23 October", which means different
+instants in Pune and New York. For "when did this happen", always use
+`timestamptz`. Use `date` for calendar dates such as birthdays, and plain
+`timestamp` only for genuinely zone-free wall-clock values, which are rare.
+
+**Money.** Binary floating point cannot represent most decimal fractions
+exactly, so sums drift. Store money as integer minor units (cents, paise)
+in a `bigint`, or as `numeric` with a fixed scale, together with a currency
+code. Never as `float` or `real`.
+
+**Text.** In Postgres, `text` and `varchar(n)` are stored the same way.
+`varchar(n)` only adds a length limit, and changing that limit later is a
+migration. Many teams use `text` with a `check (length(x) <= n)`
+constraint, which is easier to change, or `varchar(n)` where a hard
+standard limit exists.
+
+**Fixed sets of values.** A status column can be a `check (status in
+(...))`, a Postgres `enum` type, or a foreign key to a lookup table. Checks
+are simple and easy to change in a migration. Enums are compact and
+ordered, but adding a value is a schema change and removing one is hard.
+A lookup table lets the set carry extra columns (a label, a sort order, an
+"is final" flag) and change without a schema migration.
+
+### Worked example
+
+The simple case is money as floats versus integers, in both Postgres and
+JavaScript:
+
+```sql
+select 0.1::float8 + 0.2::float8 as float_sum,
+       0.1::numeric + 0.2::numeric as numeric_sum,
+       10 + 20 as cents_sum;
+```
+
+```text
+      float_sum      | numeric_sum | cents_sum
+---------------------+-------------+-----------
+ 0.30000000000000004 |         0.3 |        30
+```
+
+```ts
+console.log(0.1 + 0.2, 10 + 20); // 0.30000000000000004 30
+```
+
+A float is off by a tiny amount, and tiny amounts add up across millions
+of line items and fail reconciliation. Integer cents are exact.
+
+The realistic case is time and the driver. I read one `timestamptz` and
+one `timestamp`, both written as 10:00 on 23 October, through `pg` in
+Node, and ran the same script with three different process time zones.
+The `timestamptz` value came back as the same instant every time,
+`2026-10-23T04:30:00.000Z`, because the database knew it was 10:00 in
+India. The plain `timestamp` did not:
+
+```text
+TZ=UTC:              naive 2026-10-23T10:00:00.000Z
+TZ=Asia/Kolkata:     naive 2026-10-23T04:30:00.000Z
+TZ=America/New_York: naive 2026-10-23T14:00:00.000Z
+```
+
+The driver has to guess a zone for a zoneless value, and it uses the
+server process's own zone. Deploy the same code to a machine set to UTC
+and every stored time shifts by five and a half hours. With `timestamptz`
+that cannot happen.
+
+The same script showed two more driver details worth knowing:
+
+```text
+big string 1
+small number 1
+amount string 12.50
+```
+
+`pg` returns `bigint` and `numeric` as strings by default, because
+JavaScript numbers lose precision above `Number.MAX_SAFE_INTEGER`
+(9007199254740991) and cannot hold exact decimals. Code that adds two
+`bigint` columns read this way gets string concatenation, `"1" + "1"` is
+`"11"`, unless it converts on purpose. Convert with `BigInt`, or with
+`Number` when you know the values are small, in one place: the data access
+layer.
+
+And the enum trade-off, run:
+
+```sql
+create type order_status as enum ('pending', 'paid', 'shipped');
+create table st (s order_status);
+insert into st values ('refunded');
+```
+
+```text
+ERROR:  invalid input value for enum order_status: "refunded"
+```
+
+```sql
+alter type order_status add value 'refunded';
+insert into st values ('refunded');  -- succeeds
+select enum_range(null::order_status);
+```
+
+```text
+           enum_range
+---------------------------------
+ {pending,paid,shipped,refunded}
+```
+
+Adding a value is one statement. Removing or renaming one is not: there is
+no `drop value`, so it means creating a new type and migrating every
+column that uses it.
+
+### Step by step
+
+<Compare left="Type choice that bites" right="Type choice that holds" caption="The four type decisions that come up in every schema." rows={[
+  ["timestamp for event times", "timestamptz; the driver cannot misplace the zone"],
+  ["float for money", "bigint minor units, or numeric, plus a currency column"],
+  ["varchar(50) for names", "text with a length check you can change"],
+  ["free text status", "check, enum or lookup table, chosen by how often the set changes"],
+]} />
+
+<Figure art={`
+  write '2026-10-23 10:00+05:30'
+
+  timestamptz  -> stored as instant 04:30 UTC
+               -> read in any zone: same instant
+
+  timestamp    -> stored as '10:00', zone discarded
+               -> read by a UTC server:  10:00 UTC
+               -> read by an IST server: 04:30 UTC
+               -> read by a NY server:   14:00 UTC
+`} caption="One input, two types. Only timestamptz keeps the instant; the zoneless type is reinterpreted by whoever reads it." />
+
+### Common mistake
+
+The common mistake is choosing types by habit from another database. In
+some databases `varchar(255)` has a performance reason; in Postgres it
+does not. In some, a "datetime" type is the only option; in Postgres,
+`timestamptz` is the right default. Read what the type means in the
+database you are using.
+
+### In real systems
+
+Schemas in mature teams standardise a few conventions: every table has
+`created_at timestamptz not null default now()`, money is integer minor
+units with a currency code, statuses use one chosen mechanism, and the
+data access layer converts `bigint` and `numeric` explicitly. Conventions
+written down once beat per-table debates.
+
+### Check yourself
+
+<details>
+<summary>1. A meeting is "every Monday at 09:00 in the user's city". Is timestamptz right for it?</summary>
+
+Not on its own. The rule is a wall-clock time plus a zone, which stays
+09:00 local across daylight-saving changes. Store the local time and the
+zone name (such as `Europe/London`), and compute each occurrence's instant
+as `timestamptz` when needed.
+
+</details>
+
+<details>
+<summary>2. Why does pg return bigint columns as strings?</summary>
+
+A Postgres `bigint` can hold values larger than JavaScript numbers can
+represent exactly. Returning a string avoids silent precision loss; the
+application chooses how to convert.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Schema design, keys and constraints">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, give every table a surrogate primary key, mark
+columns `not null` unless "unknown" is a real state, and add foreign keys
+for every reference.
+
+A worked example: a todo app with users and todos. `todos.user_id bigint
+not null references users on delete cascade`, `title text not null`,
+`done boolean not null default false`, `created_at timestamptz not null
+default now()`.
+
+The mistake at this level is leaving everything nullable and
+unreferenced because it is faster to get running. The fix is to start
+strict; loosening a constraint later is easy, tightening one over bad data
+is not.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, normalise by asking what each column describes,
+use unique constraints for natural identifiers, and choose `on delete`
+rules deliberately.
+
+A worked example: a shop where order lines snapshot the price, orders
+snapshot the shipping address, and the customer's current address lives
+once on the customer.
+
+The mistake is either copying current facts everywhere or referencing
+facts that should be snapshots. The fix is the question "if the source
+changes tomorrow, should this row change?"
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, express rules that span rows: partial and
+expression unique indexes, exclusion constraints, and composite foreign
+keys that include a tenant id.
+
+A worked example: `foreign key (team_id, project_id) references projects
+(team_id, id)` makes it impossible for a task in team 1 to reference a
+project in team 2, which is tenant isolation enforced by the schema.
+
+The mistake is enforcing cross-row rules only in application code. The
+fix is to find the constraint that says it, or a trigger when none does.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: an empty string versus `NULL`, case and whitespace in
+emails, a range whose end equals the next one's start, a `bigint` larger
+than JavaScript's safe integer.
+
+A worked example: `' Asha@x.io'` with a leading space gets past
+`lower(email)` uniqueness as a different value. Normalise at the boundary
+with trim and lower, and add `check (email = lower(trim(email)))` so the
+table cannot hold the unnormalised form.
+
+The mistake is assuming the constraint sees the value the user meant. The
+fix is normalising before storing and constraining the normal form.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: soft delete plus uniqueness plus restore. A member
+is removed, a new member with the same email is invited, then someone
+restores the old row, and the partial unique index rejects the restore.
+
+A worked example: the restore endpoint catches `23505` on
+`members_team_email_live` and returns 409 with "an active member already
+has this email", instead of a 500.
+
+The mistake is designing soft delete without designing restore. The fix is
+writing down what restore means when the slot has been reused.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, every constraint violation is either an expected user error
+mapped to a 4xx, or a bug that should alert. Logs include the constraint
+name, and dashboards count violations by name.
+
+A worked example: a spike in `members_team_id_fkey` violations after a
+deploy reveals a client sending stale team ids from a cache, found in
+minutes because the constraint name is in the log line.
+
+The mistake is generic error handling that hides which rule fired. The fix
+is named constraints and a mapper keyed on code and name.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that the schema is the most durable code you write. Handlers
+get rewritten; tables outlive them, and so does every row they let in.
+
+A worked example: before adding a column, write the sentence it encodes
+("every member has exactly one role, from this list") and check the
+schema says exactly that.
+
+The mistake is treating the schema as a storage detail behind the ORM. The
+fix is reviewing schema changes more carefully than code changes.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, decide which rules are local to one table, which span
+tables in one database, and which span services. Constraints cover the
+first two. Across services there is no foreign key, so references are
+checked at write time and reconciled later.
+
+A worked example: an orders service stores a `customer_id` owned by a
+separate accounts service. It validates the id on create, listens for
+"customer deleted" events, and runs a nightly job reporting orphans.
+
+The mistake is assuming cross-service references stay valid. The fix is
+explicit reconciliation with an owner.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is a small set of schema conventions applied everywhere,
+checked in review, and audited by queries: every table has a primary key,
+every foreign key is indexed, every event time is `timestamptz`, money is
+integer minor units, constraints are named.
+
+A worked example: a CI step runs audit queries against a freshly migrated
+database and fails the build if a foreign key lacks an index or a table
+lacks a primary key.
+
+Done when: you can design the tables for a new feature, say what each
+constraint encodes, predict the error each bad write produces, and map
+those errors to the right HTTP responses.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should every rule be a constraint?** Every rule about the data itself,
+yes, where Postgres can express it. Rules that need other services, the
+current user, or time-dependent policy belong in code, with constraints
+underneath for the parts that can be stated about rows.
+
+**Do constraints slow down writes?** Each one adds some work per write,
+and unique and foreign keys need indexes that must be maintained. For
+almost every application that cost is small next to the cost of bad data.
+Measure before removing one.
+
+**UUID or bigint for primary keys?** Either works. `bigint` identity is
+smaller and simpler; UUIDs can be generated anywhere and do not reveal
+counts. If you choose UUIDs for a large table, a time-ordered version
+keeps inserts friendlier to the index.
+
+**Is soft delete always better?** No. It complicates uniqueness, every
+query must remember the filter, and privacy rules may require real
+deletion. Use it where history or undo matters, and design the hard delete
+too.
+
+## Key takeaways
+
+- Store each fact once; snapshots such as prices and shipping addresses
+  are different facts and belong on their rows.
+- Use a surrogate primary key and keep natural identifiers as unique
+  columns.
+- Foreign keys prevent orphans; the `on delete` rule is a business
+  decision written in the schema.
+- Index every foreign key column; the parent-delete cost was about a
+  hundred times higher without it here.
+- Check-then-insert races; only a constraint makes uniqueness correct
+  under concurrency.
+- Partial and expression unique indexes handle soft delete and case.
+- Exclusion constraints with half-open ranges prevent overlaps.
+- Use `timestamptz` for instants and integer minor units for money.
+
+## Glossary
+
+- **Normalisation**: structuring tables so each fact has one home.
+- **Update anomaly**: copies of one fact disagreeing after a partial
+  update.
+- **Primary key**: the unique, non-null identifier of a row.
+- **Natural key**: an identifier with real-world meaning.
+- **Surrogate key**: a generated identifier with no outside meaning.
+- **Foreign key**: a column constrained to match a key in another table.
+- **Orphan**: a row referencing a row that no longer exists.
+- **Soft delete**: marking a row deleted instead of removing it.
+- **Partial index**: an index covering only rows that match a condition.
+- **Exclusion constraint**: a rule that no two rows satisfy a condition
+  together.
+- **Half-open range**: a range including its start and excluding its end.
+- **Minor units**: the smallest unit of a currency, such as cents.
+
+## Practice
+
+**Warm-up.** Recreate `members` and try each bad write from this note.
+Write down each error code and constraint name.
+
+**Build.** Design tables for a clinic: doctors, patients, appointments. A
+doctor cannot have overlapping appointments, a patient's email is unique
+case-insensitively, and deleting a doctor with future appointments is
+refused. Prove each rule with a failing insert or delete.
+
+**Stretch.** Add a `clinic_id` to every table and make it impossible, by
+schema alone, for an appointment to pair a doctor and a patient from
+different clinics. Then write the audit query that lists foreign key
+columns without an index.
