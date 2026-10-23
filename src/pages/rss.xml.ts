@@ -21,8 +21,6 @@ const seriesName = (id: string) => series.find((s) => s.id === id)?.name ?? id;
 export async function GET(context: APIContext) {
   const posts = await getCollection('blog');
   const container = await experimental_AstroContainer.create();
-
-  const items = [];
   const seriesOrder = (id: string) => series.findIndex((s) => s.id === id);
   const dated = posts.filter((post) => !post.data.undated && post.data.date);
   const undated = posts
