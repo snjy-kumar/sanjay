@@ -54,100 +54,180 @@ re-renders stop being invisible.
   steps={['Trigger: state or props change', 'Render: call the component function', 'Compare with the last output', 'Commit: patch the DOM', 'Browser paints', 'Effects run']}
 />
 
+One idea carries the whole phase: UI is a function of state. I write what the screen should look like for
+a given state; React works out what changed and patches the DOM. Almost every bug in this phase, a stale
+value, a double fetch, a list that scrambles, a re-render storm, comes from forgetting where a piece of state
+lives or when a render happens. So each topic below starts from that loop and traces it with real output.
+
+<Figure art={`
+  click "+"                                         React
+  ---------> setCount(c => c + 1)  ----> schedule a render of <Counter>
+                                         |
+                                         v
+                                   call Counter()        count = 1   (a fresh snapshot)
+                                   return <button>1</button>
+                                         |
+                                   diff against the last output: text 0 -> 1
+                                         |
+                                   commit: button.textContent = "1"   (one DOM write)
+                                         |
+                                   browser paints, then effects whose deps changed run
+`} caption="One click traced through React: the state setter schedules a render, the component function runs again with new values, and only the difference reaches the DOM." />
+
 #### Phase 2: Components and props
 
 <Figure art={`
-  <App>
-   +-- <Header title="Catalog" />
-   +-- <ProductList products={products}>
+  <App>                                  state: products, cart
+   +-- <Header title="Catalog" />         props only
+   +-- <SearchBar value={q} onChange={setQ} />
+   +-- <ProductList products={visible}>
    |     +-- <ProductCard product={p1} onAdd={add} />
    |     +-- <ProductCard product={p2} onAdd={add} />
-   +-- <Cart items={items} />
-  Data flows down as props. Events flow up as callbacks.
+   +-- <Cart items={cart} onRemove={remove} />
+
+   data flows DOWN as props            events flow UP as callbacks
 `} caption="A component tree. Props go down, callbacks come back up; nothing flows sideways." />
 
 <Levels label="Phase 2, components and props">
 
 <Level name="Beginner">
 
-A component is a function that returns JSX, a description of UI. Props are its inputs, passed like
-HTML attributes. Component names start with a capital letter.
+A component is a function that takes one object, its props, and returns JSX, a description of what to show.
+JSX is not HTML; it compiles to function calls. This:
+
+```tsx
+<ProductCard title="Lamp" price={1299} />
+```
+
+becomes, roughly, `jsx(ProductCard, { title: 'Lamp', price: 1299 })`. React calls `ProductCard` with that object and
+uses what it returns. That is why component names start with a capital letter: lowercase tags (`div`, `article`) are
+treated as HTML elements, capitalised ones as my functions.
 
 ```tsx
 type CardProps = { title: string; price: number };
-function ProductCard({ title, price }: CardProps) {
-  return <article><h3>{title}</h3><p>₹{price}</p></article>;
-}
-export default function App() {
-  return <ProductCard title="Notebook" price={120} />;
+
+export function ProductCard({ title, price }: CardProps) {
+  return (
+    <article className="card">
+      <h3>{title}</h3>
+      <p>₹{price.toLocaleString('en-IN')}</p>
+    </article>
+  );
 }
 ```
 
-Mistake: `<productCard />` in lowercase renders an unknown HTML tag and React warns
-`The tag <productCard> is unrecognized in this browser`. Fix: capitalise component names.
+Curly braces in JSX switch to JavaScript: `{title}` inserts a value, `{price.toLocaleString('en-IN')}` a computed one.
+Rendered with `price={129900}`, the paragraph shows `₹1,29,900`.
+
+Common mistake: changing a prop inside the component (`props.price = 0`). Props belong to the parent; the component
+only reads them. If a value needs to change over time inside the component, that is state, the next topic.
 
 </Level>
 
 <Level name="Intermediate">
 
-`children` is a prop too, which makes wrapper components. Callbacks as props let children report
-events. Conditional rendering uses `&&` or a ternary; lists use `map`.
+Children are a prop too. Whatever I put between the tags arrives as `children`, which makes wrapper components
+simple:
 
 ```tsx
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
-  return <section aria-labelledby={title}><h2 id={title}>{title}</h2>{children}</section>;
+  return (
+    <section aria-labelledby="panel-title">
+      <h2 id="panel-title">{title}</h2>
+      {children}
+    </section>
+  );
 }
-<Panel title="Cart">{items.length ? <CartList items={items} /> : <p>Your cart is empty.</p>}</Panel>
+
+<Panel title="Filters"><PriceFilter /><BrandFilter /></Panel>
 ```
+
+Callbacks are how a child talks to its parent. The parent owns the data and passes down a function; the child calls it:
+
+```tsx
+function ProductCard({ product, onAdd }: { product: Product; onAdd: (id: string) => void }) {
+  return <button onClick={() => onAdd(product.id)}>Add {product.title}</button>;
+}
+```
+
+The child does not know what "add" does; it only reports the event. That separation is what lets the same card work in
+the catalog and in search results.
+
+Mistake: `onClick={onAdd(product.id)}`. That calls `onAdd` during render (adding every product to the cart on every
+render) and passes its return value as the handler. Pass a function: `onClick={() => onAdd(product.id)}`.
 
 </Level>
 
 <Level name="Advanced">
 
-JSX compiles to function calls (`jsx(ProductCard, { title, price })`) that produce plain objects
-(elements). Props are read-only: a component must not mutate them. A component must be pure during
-render: same props and state, same output, no side effects.
+A good component boundary follows a reason to change. I split when a piece has its own state, its own reuse, or is big
+enough that reading it needs a scroll. I do not split just because JSX is long; a 60-line component that reads top to bottom
+is easier than six 10-line ones that pass eight props each.
+
+Prop design is API design. Prefer a few meaningful props over many booleans: `variant="danger"` instead of
+`isRed isBold hasBorder`. Boolean props combine into impossible states (`isLoading` and `isError` both true); a union type
+prevents them:
+
+```tsx
+type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' };
+
+export function Button({ variant = 'primary', className, ...rest }: ButtonProps) {
+  return <button className={`btn btn-${variant} ${className ?? ''}`} {...rest} />;
+}
+```
+
+Spreading `...rest` onto the real element means `type`, `disabled`, `aria-*` and `onClick` all work without me listing
+them, and TypeScript checks them.
 
 </Level>
 
 <Level name="Edge cases">
 
-`{count && <Badge />}` renders `0` when count is zero, because React renders numbers. Use
-`count > 0 &&` spelled out, or a ternary. `undefined`, `null` and booleans render nothing.
+Conditional rendering with `&&` and a number: `{items.length && <List />}` renders `0` on screen when the list is empty,
+because `0` is a valid React child. Use `{items.length > 0 && <List />}`. Returning `undefined` from a component was an
+error in older React; return `null` to render nothing. A prop named `key` or `ref` is not passed to the component as a
+normal prop (in older React `ref` needs `forwardRef`; in React 19 it can be a prop).
 
 </Level>
 
 <Level name="Corner cases">
 
-A prop that is an object created inline (`style={{ gap: 8 }}`) is a new object every render, which
-defeats memoization of the child. Harmless usually, but it matters once memo is involved.
+Prop drilling: a value passed through four components that do not use it, only to reach the fifth. It is not a bug,
+but every intermediate component now has to change when the value changes. Composition (pass the finished child down)
+usually fixes it before context is needed; both topics come later. Default values in destructuring only apply to
+`undefined`, not `null`: `({ size = 'md' })` with `size={null}` gives `null`.
 
 </Level>
 
 <Level name="Production level">
 
-Props are an API. Keep them few, name them for meaning (`onAdd`, not `handleClick2`), type them, and
-document them in the gallery.
+Components in a real codebase have typed props, sensible defaults, pass through native attributes where they wrap a
+native element, and are exported from a folder with a story or gallery entry. Names say what they are in the product
+(`ProductCard`), not how they look (`BlueBox`).
 
 </Level>
 
 <Level name="Mindset">
 
-Think in trees: what does this part of the screen need to know, and who should tell it?
+A component is a promise: given these props, I render this. The fewer and clearer the props, the easier the promise is
+to keep.
 
 </Level>
 
 <Level name="System design">
 
-Component boundaries are module boundaries. A good split mirrors the product's nouns: a card, a list,
-a filter bar.
+The component tree is the architecture of the front end. Where I draw boundaries decides where state lives, what can be
+reused, and what has to change together. I sketch the tree on paper for each page before coding it.
 
 </Level>
 
 <Level name="Strategy">
 
-Draw the component tree of the dashboard on paper before writing it. Done when every component has a
-typed props list I can explain.
+I port the Phase 1 todo app to React: one component per concern (input, list, item, filter bar), all typed, callbacks for
+every event, no state yet beyond the top.
+
+Done when I can sketch any screen as a tree, say what props each node gets and which callbacks go up, and the port runs
+with no type errors and no prop mutated anywhere.
 
 </Level>
 
@@ -156,16 +236,16 @@ typed props list I can explain.
 #### Phase 2: State
 
 <Flow
-  caption="What setState actually does: it schedules a new render with a new value; the current render keeps its old one."
-  steps={['Click', 'setCount(c => c + 1) queued', 'Handler finishes; count still old here', 'React re-renders', 'New render reads new count']}
+  caption="What happens when a setter runs: React does not change the variable, it schedules a new render with a new snapshot"
+  steps={['Event handler calls setCount(count + 1)', 'React queues the update', 'Handler finishes; count is still the old value here', 'React re-renders Counter', 'useState returns the new value', 'New JSX committed to the DOM']}
 />
 
 <Levels label="Phase 2, state">
 
 <Level name="Beginner">
 
-State is data a component remembers between renders. `useState` returns the current value and a setter;
-calling the setter re-renders the component.
+State is data a component remembers between renders and that changes the output when it changes. `useState` gives the
+current value and a setter:
 
 ```tsx
 function Counter() {
@@ -174,74 +254,133 @@ function Counter() {
 }
 ```
 
-Mistake: a normal variable `let count = 0` that resets every render and never updates the screen. Fix:
-`useState`.
+Why not a normal variable? A `let count = 0` inside the function is reset to 0 every time React calls the function, and
+changing it does not tell React to render again. `useState` stores the value outside the function, keyed to this
+component's position in the tree, and the setter asks for a re-render.
+
+Mistake: mutating state directly.
+
+```tsx
+const [todos, setTodos] = useState<Todo[]>([]);
+todos.push(newTodo);      // the array changed, but React was not told
+setTodos(todos);          // same array reference: React sees no change and may skip the render
+```
+
+The fix is a new array: `setTodos([...todos, newTodo])`.
 
 </Level>
 
 <Level name="Intermediate">
 
-State updates are snapshots: inside a handler, `count` is the value from that render. Multiple updates
-in one handler need the updater form. Objects and arrays are replaced, never mutated.
+State is a snapshot. Inside one render, `count` is a constant. This surprises everyone once:
 
 ```tsx
-setCount(count + 1); setCount(count + 1);       // adds 1
-setCount((c) => c + 1); setCount((c) => c + 1); // adds 2
-setTodos((ts) => [...ts, newTodo]);             // new array
+function handleClick() {
+  setCount(count + 1);
+  setCount(count + 1);
+  setCount(count + 1);
+  console.log(count);
+}
+```
+
+```text
+0          logged, because this render's count is 0
+1          shown after the render, not 3
+```
+
+All three calls computed `0 + 1`. To build on the previous value, pass an updater function, which React runs with the
+latest queued value:
+
+```tsx
+setCount(c => c + 1); setCount(c => c + 1); setCount(c => c + 1);   // 3
+```
+
+Updates for objects and arrays are immutable by convention: copy, then change the copy.
+
+```tsx
+setUser(u => ({ ...u, address: { ...u.address, city: 'Pune' } }));
+setTodos(ts => ts.map(t => (t.id === id ? { ...t, done: !t.done } : t)));
+setTodos(ts => ts.filter(t => t.id !== id));
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-React batches updates in a handler into one render. State is tied to a component's position in the
-tree; moving or changing the type at that position resets it, and a `key` change resets it on purpose.
-For complex transitions, `useReducer` keeps update logic in one pure function.
+Where state lives is the key decision. Put it in the lowest component that contains every component that reads it.
+Two siblings that need the same value: lift it to their parent and pass it down. Lifting too high (everything in `App`)
+makes every change re-render everything and makes components impossible to reuse; the
+<a href={withBase('/posts/react/04/')}>lifting state too early</a> note is that mistake in detail.
+
+When several values change together through named actions, `useReducer` makes the transitions explicit and testable
+without rendering:
+
+```tsx
+type Action = { type: 'added'; text: string } | { type: 'toggled'; id: string } | { type: 'removed'; id: string };
+
+function todosReducer(state: Todo[], action: Action): Todo[] {
+  switch (action.type) {
+    case 'added':   return [...state, { id: crypto.randomUUID(), text: action.text, done: false }];
+    case 'toggled': return state.map(t => (t.id === action.id ? { ...t, done: !t.done } : t));
+    case 'removed': return state.filter(t => t.id !== action.id);
+  }
+}
+
+const [todos, dispatch] = useReducer(todosReducer, []);
+dispatch({ type: 'added', text: 'Buy milk' });
+```
+
+The reducer is a pure function, so I can unit test it with plain inputs and outputs:
+`todosReducer([], { type: 'added', text: 'x' })` returns a one-item array, no rendering needed.
 
 </Level>
 
 <Level name="Edge cases">
 
-`todos.push(x); setTodos(todos)` does nothing: same array reference, React bails out. Setting state to
-the same value skips the re-render. `useState(expensive())` runs `expensive` every render; pass a
-function `useState(() => expensive())`.
+State resets when a component's position or type in the tree changes. Rendering `{isEdit ? <Form /> : <Form />}` keeps the
+same state (same type, same position), which surprises people; rendering a different component, or giving a different `key`,
+resets it. That is also the tool: `<ProfileForm key={userId} />` resets the form when the user changes.
 
 </Level>
 
 <Level name="Corner cases">
 
-Two inputs both reading `count`, plus an async handler that awaits before setting: the await resumes
-with the old snapshot, so a second click in between is lost. Use the updater form. Conditional
-rendering that swaps two components of the same type at the same spot keeps the state of the first,
-surprising users with old form contents; give them different keys.
+Initial state from a prop: `useState(props.initialName)` only uses the prop on the first render; later prop changes are
+ignored. Name it `initialX` so the behaviour is obvious, or use a `key` to reset. An expensive initial value
+(`useState(parseBigFile())`) recomputes on every render even though it is used once; pass a function,
+`useState(() => parseBigFile())`.
 
 </Level>
 
 <Level name="Production level">
 
-Keep state minimal and close to where it is used. The <a href={withBase('/posts/react/04/')}>lifting state
-too high</a> note shows the cost of the opposite: everything re-renders and props pass through layers
-that do not care.
+State is minimal (nothing that can be computed), typed, colocated with the component that uses it, and transitions with more
+than two related values use a reducer with tests. Server data is not hand-managed with `useState` at all in larger apps; a
+data library (TanStack Query, a router loader) owns caching and refetching.
 
 </Level>
 
 <Level name="Mindset">
 
-Ask "who owns this?" before "where do I put it?". The plan's AI note: models scaffold well and are bad
-at deciding who owns the state.
+Every piece of state is a question: what is the smallest set of facts from which the whole screen can be drawn?
 
 </Level>
 
 <Level name="System design">
 
-State has kinds: UI state (open, selected), form state, server cache, URL state. Each has a better home
-than a pile of `useState` calls, and Phase 2 meets them all.
+There are kinds of state: UI state (is this menu open), form state, URL state (filters, page), server state (records), and
+shared client state (the signed-in user). Each has a natural home: component, form library, URL, data cache, context. Putting
+each in its home prevents most state bugs before they start.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when I can predict the output of the double `setCount` puzzle and explain snapshots without notes.
+In the todo port I write down every piece of state, where it lives and why, convert the todo list to a reducer with unit tests,
+and trace the snapshot example in the console.
+
+Done when I can predict the logged and shown values for the triple-setter example, every update is immutable, and the reducer
+tests pass without rendering anything.
 
 </Level>
 
@@ -250,89 +389,128 @@ Done when I can predict the output of the double `setCount` puzzle and explain s
 #### Phase 2: Derived state
 
 <Compare
-  left="Stored twice (bug-prone)"
+  left="Stored twice (bug waiting)"
   right="Derived during render"
+  caption="Anything computable from props or state is computed, not stored. The second copy will drift."
   rows={[
-    ['const [fullName, setFullName] = useState(...)', 'const fullName = first + last'],
-    ['const [visible, setVisible] = useState(todos)', 'const visible = todos.filter(match)'],
-    ['const [count, setCount] = useState(items.length)', 'const count = items.length'],
-    ['an effect that syncs one state into another', 'no effect at all'],
+    ['const [visible, setVisible] = useState(filter(all, q))', 'const visible = all.filter(p => matches(p, q))'],
+    ['useEffect(() => setTotal(sum(cart)), [cart])', 'const total = sum(cart)'],
+    ['Two renders per change: render, effect, render', 'One render per change'],
+    ['Forget one setter and the list is stale', 'Cannot be stale: recomputed every render'],
   ]}
-  caption="If it can be computed from props or state, compute it. Storing it creates two sources of truth that drift."
 />
 
 <Levels label="Phase 2, derived state">
 
 <Level name="Beginner">
 
-Derived state is a value computed from other state or props. It should be a plain variable in the
-render, not its own `useState`. The <a href={withBase('/posts/react/01/')}>derived state note</a> is the
-case study.
+Derived state is any value that can be computed from other state or props: the filtered list from the full list and the
+search query, the cart total from the cart, "is the form valid" from the fields. The plan's first trap is storing it.
+Compute it during render instead:
 
 ```tsx
-const [todos, setTodos] = useState<Todo[]>([]);
-const [filter, setFilter] = useState<Filter>('all');
-const visible = todos.filter((t) => filter === 'all' || (filter === 'done') === t.done);
+function Catalog({ products }: { products: Product[] }) {
+  const [query, setQuery] = useState('');
+  const visible = products.filter(p => p.title.toLowerCase().includes(query.toLowerCase()));
+  return (
+    <>
+      <input value={query} onChange={e => setQuery(e.target.value)} aria-label="Search" />
+      <p>{visible.length} of {products.length}</p>
+      <ProductList products={visible} />
+    </>
+  );
+}
 ```
 
-Mistake: `useState(todos.filter(...))`, which captures the first value only and goes stale.
+Typing "la" with products Lamp, Laptop and Chair renders `2 of 3`. There is no `visible` state to keep in sync.
 
 </Level>
 
 <Level name="Intermediate">
 
-Store the minimal source: the selected id, not the selected object; the query, not the results.
+The broken version and its trace:
 
 ```tsx
-const [selectedId, setSelectedId] = useState<string | null>(null);
-const selected = products.find((p) => p.id === selectedId) ?? null; // always fresh
+const [query, setQuery] = useState('');
+const [visible, setVisible] = useState(products);
+useEffect(() => {
+  setVisible(products.filter(p => p.title.toLowerCase().includes(query.toLowerCase())));
+}, [query]);           // products missing from deps
 ```
+
+```text
+type "la"      render 1: visible = old list (wrong for one frame)
+               effect: setVisible(filtered)
+               render 2: visible = 2 items
+products prop updates from the server
+               render: visible still the old filtered list, because the effect only watches query
+```
+
+Two renders per keystroke, a flash of wrong data, and a stale list when the other input changes. The
+<a href={withBase('/posts/react/01/')}>derived state note</a> walks this exact bug. The fix deletes the state and the effect.
 
 </Level>
 
 <Level name="Advanced">
 
-Expensive derivations can use `useMemo`, but only after measuring. Resetting state when a prop changes
-is done with a `key`, not an effect.
+If the computation is genuinely expensive (thousands of items, a sort with a heavy comparator) and measured as slow, memoise
+it rather than storing it:
+
+```tsx
+const visible = useMemo(() => filterAndSort(products, query, sort), [products, query, sort]);
+```
+
+That is still derived: React recomputes when any input changes. The test is the Profiler, not intuition; most filters over a
+few hundred items take well under a millisecond.
+
+Derived state also covers "selected item": store `selectedId`, derive `selected = items.find(i => i.id === selectedId)`. Storing
+the whole selected object goes stale when the item is edited in the list.
 
 </Level>
 
 <Level name="Edge cases">
 
-A prop used as initial state (`useState(props.value)`) is read once; later prop changes are ignored.
-Name it `initialValue` so the intent is clear.
+When the derived value depends on a prop that should reset some state (a new product list should clear the selection), the
+answer is usually a `key` on the component or storing an ID that naturally becomes invalid, not an effect that resets state
+after the fact.
 
 </Level>
 
 <Level name="Corner cases">
 
-A stored "selected item" object plus an edit to that item in the list: the detail pane shows the old
-copy. Storing the id fixes both the stale copy and the deleted-item case (it becomes `null`).
+Sometimes a value really is state even though it looks derived: a "draft" copy of a record the user edits before saving. It
+starts from props but then diverges on purpose. Name it `draft`, initialise it once (or by key), and keep the original
+separately so "discard changes" works.
 
 </Level>
 
 <Level name="Production level">
 
-Most "it shows the old value" bugs in React apps are duplicated state. The gate asks me to fix one.
+In code review I look for `useState` paired with a `useEffect` that only calls its setter: that pattern is almost always derived
+state and gets flagged. Lint rules and the React docs' "You might not need an effect" page give the team a shared vocabulary.
 
 </Level>
 
 <Level name="Mindset">
 
-One fact, one place. Everything else is a view.
+A single source of truth is not a slogan; it is the reason the screen cannot disagree with itself.
 
 </Level>
 
 <Level name="System design">
 
-Normalised data in a store with selectors is the same idea at app scale (the Redux plan), and database
-views are the same idea in SQL.
+The same rule holds at every scale: in databases (normalisation), in caches (derived from a source and invalidated), in URL
+state (filters in the URL, results derived from it). Storing a copy is a decision to own the job of keeping it in sync.
 
 </Level>
 
 <Level name="Strategy">
 
-Audit every `useState` in the app: could it be computed? Done when none could.
+I search the port and the dashboard for every state variable and ask "can this be computed?", delete the ones that can, and
+time the remaining expensive computations before memoising any.
+
+Done when no state can be computed from other state, the search, filter and totals all derive during render, and I can fix a
+planted derived-state bug in minutes, which is part of Gate 2.
 
 </Level>
 
@@ -341,94 +519,142 @@ Audit every `useState` in the app: could it be computed? Done when none could.
 #### Phase 2: Effects, and when not to use them
 
 <Flow
-  caption="Do I need an effect? Most paths end at no."
-  steps={['Is it caused by a user event? put it in the handler', 'Is it computable from state? derive it', 'Is it resetting state on a prop change? use a key', 'Is it syncing with something outside React? effect']}
+  caption="An effect's life: it runs after the commit, cleans up before the next run, and cleans up for good on unmount"
+  steps={['Render and commit', 'Browser paints', 'Effect runs (deps changed)', 'Next render with new deps', 'Cleanup of the previous effect', 'Effect runs again', 'Unmount: final cleanup']}
 />
 
 <Levels label="Phase 2, effects and when not to use them">
 
 <Level name="Beginner">
 
-`useEffect` runs code after render to synchronise with something outside React: a subscription, a timer,
-a non-React widget, the document title, a network request.
+An effect synchronises a component with something outside React: a network request, a subscription, a timer, a browser API,
+the document title. It runs after React has updated the screen.
 
 ```tsx
 useEffect(() => {
-  document.title = `${count} items`;
+  document.title = `${count} new messages`;
 }, [count]);
 ```
 
-Mistake: an effect that watches state to respond to a click, the trap the plan names. See
-<a href={withBase('/posts/react/02/')}>useEffect used as an event handler</a>. Fix: do it in the handler.
+The dependency array lists every value from the component the effect uses. React compares each one with the last render
+(`Object.is`) and reruns the effect only if one changed. No array means "after every render"; an empty array means "after the
+first render only".
+
+The plan's trap is using `useEffect` as an event handler. If something happens because the user clicked, do it in the click
+handler:
+
+```tsx
+// wrong: an effect watching state that the click set
+useEffect(() => { if (submitted) { post(form); } }, [submitted]);
+// right
+async function handleSubmit() { await post(form); }
+```
+
+The <a href={withBase('/posts/react/02/')}>useEffect used as an event handler</a> note is the full story.
 
 </Level>
 
 <Level name="Intermediate">
 
-Cleanup undoes the effect before the next run and on unmount. Data fetching in an effect needs a guard
-against stale responses.
+Cleanup undoes what the effect did. It runs before the effect runs again and when the component unmounts:
 
 ```tsx
 useEffect(() => {
-  const ctrl = new AbortController();
+  const id = setInterval(() => setNow(Date.now()), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+Fetching in an effect needs cleanup too, or a slow response for an old query overwrites a fast response for the new one:
+
+```tsx
+useEffect(() => {
+  const controller = new AbortController();
   setStatus('loading');
-  fetch(`/api/products?q=${encodeURIComponent(query)}`, { signal: ctrl.signal })
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((data) => { setProducts(data); setStatus('success'); })
-    .catch((e) => { if (e.name !== 'AbortError') setStatus('error'); });
-  return () => ctrl.abort();
-}, [query]);
+  fetch(`/api/products?q=${encodeURIComponent(q)}`, { signal: controller.signal })
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(data => { setProducts(data); setStatus('success'); })
+    .catch(err => { if (err.name !== 'AbortError') setStatus('error'); });
+  return () => controller.abort();
+}, [q]);
+```
+
+```text
+type "la" -> request A starts
+type "lam" -> cleanup aborts A; request B starts
+B resolves -> products for "lam"   (A can never overwrite it)
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-The dependency array lists every reactive value the effect reads; the lint rule
-`react-hooks/exhaustive-deps` checks it. In development with Strict Mode, React mounts, unmounts and
-mounts again, running effects twice, to expose missing cleanup. Effects run after paint;
-`useLayoutEffect` runs before it, for measuring layout.
+In development with Strict Mode, React mounts, unmounts and remounts each component once, so every effect runs, cleans up,
+and runs again. It is deliberate: an effect that breaks when run twice (a double subscription, a double POST) has a missing
+cleanup that would also bite in production. The fix is cleanup, never disabling Strict Mode.
+
+The list of things that are not effects, from the React docs: computing values (derived state), handling user events
+(handlers), resetting state when a prop changes (a `key`), notifying the parent (call its callback in the handler that caused the
+change), and chains of effects that set state that triggers other effects (compute it all in one handler).
 
 </Level>
 
 <Level name="Edge cases">
 
-An empty dependency array means "on mount" only, so it sees the first render's values forever. An
-object or function dependency created in render changes every time, making the effect run every render.
+Objects and functions in the dependency array are new on every render, so the effect reruns every render:
+
+```tsx
+const options = { q, limit: 20 };
+useEffect(() => { search(options); }, [options]);     // runs every render
+```
+
+Depend on the primitives (`[q]`) and build the object inside the effect. Leaving a dependency out to stop the reruns creates a
+stale closure instead; the lint rule `react-hooks/exhaustive-deps` catches both.
 
 </Level>
 
 <Level name="Corner cases">
 
-An effect that sets state it depends on, plus a new object each time: an infinite loop, with React
-eventually warning `Maximum update depth exceeded`. Two effects syncing each other's state ping-pong.
+An effect that sets state unconditionally with a dependency that the state change affects loops forever:
+
+```text
+Warning: Maximum update depth exceeded. This can happen when a component calls setState inside useEffect,
+but useEffect either doesn't have a dependency array, or one of the dependencies changes on every render.
+```
+
+Reading the newest value of something inside an effect without making it a dependency (a callback prop used in a
+subscription) is a real need; the pattern is to keep the latest callback in a ref, or React's `useEffectEvent` where available.
 
 </Level>
 
 <Level name="Production level">
 
-In real apps, server data is usually fetched with a data library or the framework's loader, which
-handles caching, deduplication and races. Writing it by hand once teaches what those tools do.
+Server data is fetched through a data library or the router's loaders, which handle caching, deduplication, cancellation and
+refetching, so hand-written fetch effects are rare. The exhaustive-deps lint rule is an error, not a warning, and every
+suppression has a comment explaining why.
 
 </Level>
 
 <Level name="Mindset">
 
-Effects are an escape hatch. Each one should answer "what external system am I synchronising with?"
+Before writing `useEffect`, I ask what external system I am synchronising with. If the answer is "none", it is not an effect.
 
 </Level>
 
 <Level name="System design">
 
-Server state belongs to a cache with invalidation, not to component state. That split is the start of
-the caching ideas in Phase 4.
+Effects are where a component touches the world, so they are where races, leaks and duplicates live. Keeping them few and at
+the edges (custom hooks, data layers) keeps the rest of the UI pure and easy to test.
 
 </Level>
 
 <Level name="Strategy">
 
-Review every effect dependency, as the plan's AI note says. Done when every effect in the app names its
-external system and has cleanup where needed.
+I list every effect in the port, classify each (external sync or not), delete the ones that are not, add cleanup to the rest, and
+reproduce the fetch race with a throttled network in DevTools before fixing it.
+
+Done when every remaining effect names its external system, has a cleanup where needed, runs correctly twice in Strict Mode, and
+the race cannot be reproduced.
 
 </Level>
 
@@ -437,172 +663,238 @@ external system and has cleanup where needed.
 #### Phase 2: The rules of hooks
 
 <Figure art={`
-  render 1            render 2 (if cond flipped)
-  slot 0: useState    slot 0: useState
-  slot 1: useEffect   slot 1: useMemo      <-- React thinks this is the effect
-  slot 2: useMemo     slot 2: (missing)
-  Hooks are matched by call order, so the order must never change.
-`} caption="Why hooks cannot be conditional: React finds each hook's state by its position in the call order." />
+  render 1                 render 2 (condition now false)
+  useState('Ana')   #1     useState('Ana')   #1
+  if (show)                if (show)  -- skipped
+    useState(0)     #2
+  useEffect(...)    #3     useEffect(...)    #2   <-- React gives it slot #2's data
+                                                    (the number state), and everything
+                                                    after it is shifted
+`} caption="Why hooks cannot be conditional: React matches hooks to their stored data by call order, not by name." />
 
 <Levels label="Phase 2, the rules of hooks">
 
 <Level name="Beginner">
 
-Two rules: call hooks only at the top level of a component or custom hook (not in conditions, loops or
-after an early return), and only from React functions.
+Two rules. Call hooks only at the top level of a component or custom hook, never inside conditions, loops or nested functions.
+Call them only from React function components or custom hooks, never from plain functions or class components.
 
 ```tsx
-if (!user) return null;
-const [tab, setTab] = useState('info'); // breaks the rule: after an early return
+// wrong
+if (user) { const [draft, setDraft] = useState(user.name); }
+// right
+const [draft, setDraft] = useState(user?.name ?? '');
+if (!user) return <SignIn />;
 ```
 
-React reports `Rendered more hooks than during the previous render.` Fix: call hooks first, return
-early after.
+The reason is in the figure: React stores each component's hook data in a list and hands it back by position. If the number or
+order of calls changes between renders, values go to the wrong hooks. React detects some of this and throws:
+
+```text
+Error: Rendered fewer hooks than expected. This may be caused by an accidental early return statement.
+```
 
 </Level>
 
 <Level name="Intermediate">
 
-Custom hooks are functions starting with `use` that call other hooks, a way to reuse stateful logic.
+An early return before a hook is the most common violation, because it looks harmless:
+
+```tsx
+function Profile({ user }) {
+  if (!user) return null;               // hooks below run only sometimes
+  const [tab, setTab] = useState('posts');
+}
+```
+
+Move every hook above the first return. The ESLint plugin `eslint-plugin-react-hooks` enforces both rules; it is part of every
+project from day one.
+
+Custom hooks are functions whose names start with `use` and that call other hooks. They are how logic is reused:
 
 ```tsx
 function useLocalStorage<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => {
-    try { return JSON.parse(localStorage.getItem(key) ?? '') as T; } catch { return initial; }
+    const raw = localStorage.getItem(key);
+    return raw === null ? initial : (JSON.parse(raw) as T);
   });
   useEffect(() => { localStorage.setItem(key, JSON.stringify(value)); }, [key, value]);
   return [value, setValue] as const;
 }
 ```
 
+Each component that calls `useLocalStorage` gets its own state; a custom hook shares logic, not state.
+
 </Level>
 
 <Level name="Advanced">
 
-React stores hook state in a list on the component's fiber, indexed by call order, as the figure shows.
-The lint rule `react-hooks/rules-of-hooks` catches violations statically.
+The `use` prefix is not decoration; the lint rule uses it to know which functions follow hook rules. A function that calls no
+hooks should not start with `use`. Custom hooks are the right home for effects: `useDebouncedValue`, `useOnlineStatus`,
+`useProducts(query)`. Components then read like a description of what they need, not how it is fetched.
+
+React 19's `use(promise)` and `use(context)` are an exception: `use` may be called conditionally, because it does not store
+data by position in the same way. That is a deliberate, documented exception, not a loophole for other hooks.
 
 </Level>
 
 <Level name="Edge cases">
 
-Hooks in a loop with a fixed length still violate the rule, and break as soon as the length changes.
-Calling a custom hook conditionally breaks the same way.
+Hooks inside a `.map` over a list break as soon as the list length changes. Move the per-item logic into a child component that
+calls the hook once, and render one child per item.
 
 </Level>
 
 <Level name="Corner cases">
 
-A component called as a function (`{Row(props)}`) instead of rendered (`<Row />`) merges its hooks into
-the parent's list; a conditional call then breaks the parent.
+A custom hook that returns a new object or function every render causes every consumer's effects and memoised children to rerun.
+Stabilise returned functions with `useCallback` and returned objects with `useMemo` when consumers put them in dependency arrays.
 
 </Level>
 
 <Level name="Production level">
 
-The lint rules run in the editor and CI. Custom hooks are where shared behaviour lives, tested on their
-own.
+The hooks lint rules are errors in CI. Shared custom hooks live in one folder with tests using `renderHook` from Testing Library.
 
 </Level>
 
 <Level name="Mindset">
 
-Constraints with a clear reason are easier to keep. Know why the rule exists, not just the rule.
+The rules are not arbitrary style; they follow from how React stores state. Knowing the mechanism makes the rules obvious.
 
 </Level>
 
 <Level name="System design">
 
-Custom hooks are the reuse unit of React apps, the way modules are in Phase 1.
+Custom hooks are the unit of reusable behaviour in a React codebase, the way modules are in a backend. A good hook has a small,
+typed interface and hides its effects.
 
 </Level>
 
 <Level name="Strategy">
 
-Break the rule three ways and read each error. Done when I can explain the call-order diagram.
+I break the rules on purpose in a scratch component, read each error, then extract three custom hooks from the dashboard with
+tests.
+
+Done when the lint rule passes with no suppressions, I can explain the call-order mechanism from the figure, and three custom hooks
+have `renderHook` tests.
 
 </Level>
 
 </Levels>
-
 #### Phase 2: Lists and keys
 
-<Compare
-  left="key = index"
-  right="key = stable id"
-  rows={[
-    ['Delete row 1: row 2 inherits row 1 state', 'Each row keeps its own state'],
-    ['Sort: inputs keep old text in new rows', 'Rows move with their data'],
-    ['Insert at top: every row re-renders', 'Only the new row mounts'],
-  ]}
-  caption="Keys tell React which item is which between renders. An index describes a position, not an item."
-/>
+<Figure art={`
+  key = index                                  key = item.id
+  before         after deleting "A"            before          after deleting "A"
+  0: A [typed: x]  0: B [typed: x]  <-- wrong   a1: A [x]        b2: B [ ]
+  1: B [ ]         1: C [ ]                     b2: B [ ]        c3: C [ ]
+  2: C [ ]                                      c3: C [ ]
+  React keeps slot 0's DOM and state and        React removes a1's DOM and state;
+  just changes its text to B                    B and C keep their own
+`} caption="Keys tell React which item is which between renders. Index keys tie state to a position, so it lands on the wrong item." />
 
 <Levels label="Phase 2, lists and keys">
 
 <Level name="Beginner">
 
-Rendering a list with `map` needs a `key` on each item: a stable, unique id. See
-<a href={withBase('/posts/react/03/')}>missing and unstable list keys</a>.
+Lists render with `map`, and each item needs a `key`, a string or number that identifies that item among its siblings:
 
 ```tsx
-<ul>{todos.map((t) => <TodoRow key={t.id} todo={t} />)}</ul>
+<ul>
+  {todos.map(t => (
+    <li key={t.id}>{t.text}</li>
+  ))}
+</ul>
 ```
 
-Without keys React warns `Each child in a list should have a unique "key" prop.`
+Without a key, React warns in the console:
+
+```text
+Warning: Each child in a list should have a unique "key" prop.
+```
+
+The key goes on the outermost element returned from the `map` (or on the fragment: `<Fragment key={t.id}>`), not on something
+inside it.
+
+Mistake: `key={index}`, or `key={Math.random()}`. The first breaks on reorder and delete (the figure); the second gives every item
+a new identity on every render, so React destroys and recreates every row, losing focus and input state.
 
 </Level>
 
 <Level name="Intermediate">
 
-Keys must be stable across renders and unique among siblings. An index is acceptable only for a static
-list that never reorders, filters or has per-row state.
+Why keys matter, traced. Each todo row has an uncontrolled text input. I type "x" into the first row, then delete the first todo.
+With index keys, React sees keys 0, 1, 2 become 0, 1: it thinks the last item was removed and updates the text of the first two.
+The DOM input that held "x" is still at position 0, now labelled "B". With ID keys, React sees `a1` disappear, removes that row's
+DOM, and B and C keep theirs. The <a href={withBase('/posts/react/03/')}>missing and unstable list keys</a> note reproduces this
+with a sortable table.
+
+Where do IDs come from? From the data (database IDs), or generated once when the item is created (`crypto.randomUUID()` in the
+reducer), never during render.
 
 </Level>
 
 <Level name="Advanced">
 
-Reconciliation compares children by key: same key, update in place; new key, mount; missing key,
-unmount. Changing a key on purpose resets a component, a useful tool.
+A key is also a reset button for any component. Changing a component's key makes React treat it as a new component: state is
+discarded and effects rerun.
+
+```tsx
+<ChatThread key={contactId} contactId={contactId} />
+```
+
+Switching contacts now clears the draft message automatically, with no effect needed. Keys only need to be unique among
+siblings, not globally.
+
+For long lists (thousands of rows), rendering every row is slow regardless of keys; virtualisation (`@tanstack/react-virtual`)
+renders only the visible rows. Measure first: a few hundred simple rows are fine.
 
 </Level>
 
 <Level name="Edge cases">
 
-Duplicate keys produce a warning and rows that update the wrong DOM. `Math.random()` as a key remounts
-every row on every render, losing focus and state.
+Duplicate keys (two items with the same ID from a buggy API) make React drop or duplicate rows unpredictably and warn
+`Encountered two children with the same key`. Fix the data, or combine fields into a key that is genuinely unique. Index keys are
+acceptable for static lists that never reorder, filter or contain state, such as a fixed list of footer links.
 
 </Level>
 
 <Level name="Corner cases">
 
-Index keys plus a row with an uncontrolled input plus a delete: the text typed in the deleted row's
-neighbour appears to jump. Two boundaries meet: position-based identity and DOM-held state.
+Filtering a list keeps keys stable (good) but optimistic items created before the server assigns an ID need a temporary client ID,
+then a swap to the real ID. If the key changes at the swap, the row remounts and loses focus; keep a stable client key and store the
+server ID separately.
 
 </Level>
 
 <Level name="Production level">
 
-Ids come from the server or `crypto.randomUUID()`, never from render. Long lists get virtualisation, which
-depends on stable keys.
+The lint rule `react/jsx-key` catches missing keys; review catches index keys on dynamic lists. Lists have empty states, and long
+lists are paginated or virtualised.
 
 </Level>
 
 <Level name="Mindset">
 
-Identity and position are different things.
+A key answers "is this the same thing as last time?". Identity is a property of the data, not of where it sits on screen.
 
 </Level>
 
 <Level name="System design">
 
-Primary keys in Phase 3 are the same idea; the UI should use the database's identity.
+Stable identity runs through the whole stack: database primary keys, API IDs, cache keys, React keys. When identity is stable
+everywhere, updates, caching and animations just work.
 
 </Level>
 
 <Level name="Strategy">
 
-Reproduce the index-key bug on purpose, then fix it. Done when every list has a data-derived key.
+I reproduce the index-key bug with inputs in rows and a delete button, fix it with IDs, then use a key to reset a form when the
+selected record changes.
+
+Done when no dynamic list uses index or random keys, the reproduction shows the bug and the fix side by side, and the key-reset pattern
+replaces at least one effect.
 
 </Level>
 
@@ -611,90 +903,154 @@ Reproduce the index-key bug on purpose, then fix it. Done when every list has a 
 #### Phase 2: Controlled forms
 
 <Flow
-  caption="A controlled input: React state is the single source; the DOM only displays it."
-  steps={['User types', 'onChange(event)', 'setValue(event.target.value)', 'Re-render', 'input value = state']}
+  caption="A controlled input: React state is the single source of truth for what the field shows"
+  steps={['User types "a"', 'onChange fires with e.target.value', 'setName("a")', 'Re-render: value="a"', 'Input shows "a"', 'Validation derived from state']}
 />
 
 <Levels label="Phase 2, controlled forms">
 
 <Level name="Beginner">
 
-A controlled input takes its `value` from state and reports changes through `onChange`. See
-<a href={withBase('/posts/react/05/')}>controlled inputs done wrong</a>.
+A controlled input gets its value from state and reports changes through `onChange`:
 
 ```tsx
-const [name, setName] = useState('');
-<label>Name <input value={name} onChange={(e) => setName(e.target.value)} /></label>
+function NameField() {
+  const [name, setName] = useState('');
+  return (
+    <label>
+      Name
+      <input value={name} onChange={e => setName(e.target.value)} />
+    </label>
+  );
+}
 ```
 
-Mistake: `value` without `onChange` makes the input read-only, with a console warning about a `value`
-prop without an `onChange` handler.
+React state now decides what the field shows, so I can validate, transform or reset it from code. Wrapping the input in a
+`label` (or using `htmlFor` and `id`) also names it for screen readers.
+
+Mistake: `value={name}` with no `onChange`. The field becomes read-only and React warns:
+
+```text
+Warning: You provided a `value` prop to a form field without an `onChange` handler.
+```
 
 </Level>
 
 <Level name="Intermediate">
 
-A form with validation, submit handling and per-field errors, linked to inputs for screen readers.
+A whole form with one state object, derived validation, and a real `form` element so Enter submits:
 
 ```tsx
-function onSubmit(e: React.FormEvent) {
-  e.preventDefault();
-  const errs: Record<string, string> = {};
-  if (!form.email.includes('@')) errs.email = 'Enter an email address';
-  setErrors(errs);
-  if (Object.keys(errs).length === 0) save(form);
+type Fields = { title: string; price: string };
+
+function ProductForm({ onSave }: { onSave: (p: { title: string; price: number }) => Promise<void> }) {
+  const [fields, setFields] = useState<Fields>({ title: '', price: '' });
+  const [touched, setTouched] = useState<Partial<Record<keyof Fields, boolean>>>({});
+  const [status, setStatus] = useState<'idle' | 'saving' | 'error'>('idle');
+
+  const errors = {
+    title: fields.title.trim() === '' ? 'Title is required' : undefined,
+    price: Number.isNaN(Number(fields.price)) || Number(fields.price) <= 0 ? 'Enter a price above 0' : undefined,
+  };
+  const valid = !errors.title && !errors.price;
+
+  function update(e: React.ChangeEvent<HTMLInputElement>) {
+    setFields(f => ({ ...f, [e.target.name]: e.target.value }));
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setTouched({ title: true, price: true });
+    if (!valid) return;
+    setStatus('saving');
+    try { await onSave({ title: fields.title.trim(), price: Number(fields.price) }); setStatus('idle'); }
+    catch { setStatus('error'); }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} noValidate>
+      <label htmlFor="title">Title</label>
+      <input id="title" name="title" value={fields.title} onChange={update}
+        onBlur={() => setTouched(t => ({ ...t, title: true }))}
+        aria-invalid={touched.title && !!errors.title} aria-describedby="title-error" />
+      {touched.title && errors.title && <p id="title-error" role="alert">{errors.title}</p>}
+      {/* price field follows the same pattern */}
+      <button type="submit" disabled={status === 'saving'}>{status === 'saving' ? 'Saving…' : 'Save'}</button>
+      {status === 'error' && <p role="alert">Could not save. Try again.</p>}
+    </form>
+  );
 }
-<input id="email" aria-invalid={!!errors.email} aria-describedby="email-err" ... />
-{errors.email && <p id="email-err">{errors.email}</p>}
 ```
+
+Errors are derived, not stored. They show after a field is touched or on submit, not while the user is still typing the first
+character. Input values are always strings; convert at submit.
 
 </Level>
 
 <Level name="Advanced">
 
-Uncontrolled inputs with `defaultValue` and `FormData` are fine when I only need values on submit.
-Number inputs return strings; checkboxes use `checked`. Form libraries manage touched and dirty state
-and validation schemas.
+Controlled is not always right. For simple forms, uncontrolled inputs read with `FormData` on submit are less code and fewer
+renders:
+
+```tsx
+function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData(e.currentTarget));
+}
+```
+
+For big forms, a library (React Hook Form) keeps inputs uncontrolled for speed and adds validation with a Zod schema, the same
+schema the API uses in Phase 3. The <a href={withBase('/posts/react/05/')}>controlled inputs done wrong</a> note covers the
+switch-between-modes bug and the cursor-jumping bug.
 
 </Level>
 
 <Level name="Edge cases">
 
-Switching `value` from `undefined` to a string warns that a component is changing an uncontrolled input
-to be controlled; initialise with `''`. A number field cleared by the user is `''`, not `0`.
+`value={undefined}` makes an input uncontrolled; later setting a string makes it controlled, and React warns
+`A component is changing an uncontrolled input to be controlled`. Initialise with `''`, never `undefined` or `null`. Number inputs
+return strings and an empty string for invalid input; `type="number"` also changes on scroll wheel. Checkboxes use `checked`, not
+`value`.
 
 </Level>
 
 <Level name="Corner cases">
 
-Formatting the value in `onChange` (adding commas) plus a cursor in the middle: the cursor jumps to the
-end. Format on blur instead.
+Transforming input on every keystroke (forcing uppercase, formatting a phone number) moves the cursor to the end when the
+transformed string differs, which is maddening in the middle of a value. Format on blur, or keep the raw value and display a formatted
+version separately. Double submit: a fast double click sends two POSTs before `status` updates; disable the button on the first click
+and make the server idempotent.
 
 </Level>
 
 <Level name="Production level">
 
-Client validation is for the user's speed; the server validates again (Phase 3). Disable double submit,
-show progress, and keep the user's input when the request fails.
+Every field has a visible label, errors are linked with `aria-describedby` and announced, the first invalid field gets focus on submit,
+the submit button cannot double-submit, and validation runs again on the server, because client validation is only for the user's
+convenience.
 
 </Level>
 
 <Level name="Mindset">
 
-Forms are where users and data meet; design the failure messages first.
+A form is a conversation with the user. Tell them what is wrong, where, and how to fix it, at the moment it helps.
 
 </Level>
 
 <Level name="System design">
 
-Share one validation schema between client and server so the rules cannot drift.
+Sharing one schema between form and API keeps the rules in one place, and the server remains the authority. Forms are where the UI and
+the backend contract meet.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the dashboard's form validates, announces errors, survives a failed submit, and cannot submit
-twice.
+I build the product form controlled by hand with touched state and derived errors, then rebuild it with React Hook Form and Zod, and
+compare code and render counts.
+
+Done when the form works with keyboard only, errors are announced by a screen reader, double submit is impossible, and both versions
+pass the same tests.
 
 </Level>
 
@@ -703,92 +1059,128 @@ twice.
 #### Phase 2: Context
 
 <Figure art={`
-  <ThemeProvider value="dark">                 every consumer below
-    <Layout>                                   re-renders when value
-      <Sidebar>                                changes, even if the
-        <ThemeToggle />   <-- useContext       components between
-      </Sidebar>                               do not use it
-      <Main> <Card /> </Main>   <-- useContext
-    </Layout>
-  </ThemeProvider>
-`} caption="Context skips the props chain. Its cost: every consumer re-renders on every value change." />
+  <ThemeProvider value={theme}>               without context: theme passed through
+    <Layout>                                   Layout -> Sidebar -> Nav -> NavItem
+      <Sidebar>                                (three components that do not use it)
+        <Nav>
+          <NavItem />   useContext(ThemeContext) -> theme
+      <Main>
+        <Chart />       useContext(ThemeContext) -> theme
+
+  when value changes, every component that reads this context re-renders
+`} caption="Context delivers a value to any descendant without passing it through every level, at the cost of re-rendering every reader when it changes." />
 
 <Levels label="Phase 2, context">
 
 <Level name="Beginner">
 
-Context passes a value to any descendant without threading props through each level. Good for the
-theme, the current user, the locale.
+Context passes a value deep into the tree without props at every level. Three parts: create it, provide it, read it.
 
 ```tsx
-const ThemeContext = createContext<'light' | 'dark'>('light');
-function ThemeToggle() { const theme = useContext(ThemeContext); return <span>{theme}</span>; }
-<ThemeContext.Provider value="dark"><Layout /></ThemeContext.Provider>
+type Theme = 'light' | 'dark';
+const ThemeContext = createContext<Theme>('light');
+
+function App() {
+  const [theme, setTheme] = useState<Theme>('light');
+  return (
+    <ThemeContext.Provider value={theme}>
+      <Layout />
+    </ThemeContext.Provider>
+  );
+}
+
+function NavItem() {
+  const theme = useContext(ThemeContext);
+  return <a className={`nav-${theme}`}>Home</a>;
+}
 ```
+
+Good uses: the theme, the signed-in user, the locale. Mistake: putting everything in one global context because prop passing felt
+tedious. Every reader re-renders on every change, and every component becomes coupled to a global.
 
 </Level>
 
 <Level name="Intermediate">
 
-Wrap the context in a provider component and a custom hook that throws when used outside the provider.
+A custom provider and hook make context safe and readable:
 
 ```tsx
-const AuthContext = createContext<Auth | null>(null);
+type AuthValue = { user: User | null; signIn: (u: User) => void; signOut: () => void };
+const AuthContext = createContext<AuthValue | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const value = useMemo(() => ({ user, signIn: setUser, signOut: () => setUser(null) }), [user]);
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
 export function useAuth() {
-  const v = useContext(AuthContext);
-  if (!v) throw new Error('useAuth must be used inside AuthProvider');
-  return v;
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used inside AuthProvider');
+  return ctx;
 }
 ```
+
+The default `null` plus the throw turns "forgot the provider" into a clear error instead of `undefined` errors deep in a component.
+`useMemo` on the value keeps its identity stable when the provider re-renders for unrelated reasons.
 
 </Level>
 
 <Level name="Advanced">
 
-Consumers re-render when the provider's `value` changes by reference. An inline object
-(`value={{ user, logout }}`) is new every render, so memoize it or split state and actions into two
-contexts.
+Every component that reads a context re-renders when the provider's value changes identity, even if it only uses one field. Fixes, in
+order: split contexts by how often they change (`AuthUserContext` and `AuthActionsContext`, actions never change); keep fast-changing
+values (a mouse position, a text field) out of context; and for genuinely shared, frequently updated client state, a store with
+selectors (Zustand, or Redux as in <a href={withBase('/plans/redux/')}>the Redux plan</a>) that re-renders only components whose selected
+slice changed.
+
+Before context, try composition: if `Layout` takes `sidebar` and `main` as props (elements), `App` can create `<NavItem theme={theme} />`
+itself and the middle layers never see `theme`.
 
 </Level>
 
 <Level name="Edge cases">
 
-A consumer with no provider above gets the default value, silently. The throwing hook turns that into a
-clear error.
+A component outside the provider silently gets the default value. A second provider deeper in the tree overrides the outer one for its
+subtree, which is useful (a dark section in a light page) and confusing when accidental.
 
 </Level>
 
 <Level name="Corner cases">
 
-Fast-changing data (a text input's value) in a context near the root plus many consumers: every
-keystroke re-renders the whole app.
+`value={{ user, signOut }}` written inline creates a new object every render of the provider, so every reader re-renders whenever the
+provider's parent renders, even when `user` did not change. React DevTools' "why did this render" shows "context changed" and that is
+the clue; memoise the value.
 
 </Level>
 
 <Level name="Production level">
 
-Context is for low-frequency, widely needed values. Passing everything through it is a known mistake,
-which the React series covers in its later notes on context for every prop.
+Contexts are few, each with a custom hook and a provider, and tests render components inside a test provider with known values.
+Server data never goes into context by hand; the data library already shares it.
 
 </Level>
 
 <Level name="Mindset">
 
-Prop drilling through two levels is fine. Reach for context when the drilling hurts, not before.
+Context is a dependency injection tool, not a state manager. It answers "how does this value reach there", not "who owns it".
 
 </Level>
 
 <Level name="System design">
 
-Server state goes to a cache, URL state to the router, global client state to context or a store such
-as Redux (see <a href={withBase('/plans/redux/')}>the Redux plan</a>).
+Global state is a cost paid by every component that touches it. Choosing between props, composition, context, URL and a store is the
+front end's version of choosing module boundaries.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the app uses context for theme and auth only, and the Profiler shows typing does not
-re-render unrelated components.
+I add auth and theme contexts with custom hooks, measure renders with the Profiler before and after memoising and splitting, and
+remove one context by switching to composition.
+
+Done when each context has a reason, a hook and a test provider, and the Profiler shows a theme toggle does not re-render components
+that do not use the theme.
 
 </Level>
 
@@ -797,76 +1189,103 @@ re-render unrelated components.
 #### Phase 2: Memoization
 
 <Flow
-  caption="Measure first. Memoize only what the Profiler shows is slow, and only if its inputs are stable."
-  steps={['Feels slow', 'Record in React Profiler', 'Find the expensive component', 'Stabilise its props', 'memo, useMemo or useCallback', 'Record again: faster?']}
+  caption="Memoization is a measurement-driven fix, not a default"
+  steps={['Feel or see slowness', 'Profiler: record the interaction', 'Find the slow commit and the component', 'Ask why it rendered', 'Fix the cause (state placement, composition)', 'Only then memo, useMemo, useCallback', 'Profile again to confirm']}
 />
 
 <Levels label="Phase 2, memoization">
 
 <Level name="Beginner">
 
-`useMemo` caches a computed value between renders; `useCallback` caches a function; `memo` skips
-re-rendering a component when its props are unchanged.
+When a component renders, all its children render too, by default. Usually that is fast. Memoization skips work when inputs did not
+change: `useMemo` caches a computed value, `useCallback` caches a function, and `React.memo` skips re-rendering a component whose props
+are the same as last time.
 
 ```tsx
 const sorted = useMemo(() => [...products].sort(byPrice), [products]);
-const onAdd = useCallback((id: string) => addToCart(id), [addToCart]);
-const Row = memo(function Row({ item }: { item: Item }) { return <li>{item.name}</li>; });
+const handleAdd = useCallback((id: string) => setCart(c => [...c, id]), []);
+const ProductCard = memo(function ProductCard({ product, onAdd }: CardProps) { /* ... */ });
 ```
+
+The plan's trap is cargo-cult `useMemo`: wrapping everything "for performance". Each memo costs memory, a dependency comparison and
+readability, and wrong dependencies create stale values.
 
 </Level>
 
 <Level name="Intermediate">
 
-Memoization only helps when the inputs are actually stable and the work is actually expensive. Wrapping
-everything is the plan's named trap, cargo-cult `useMemo`, and the React series has a later note on it.
+How to measure. React DevTools, Profiler tab, record, type one character in the search box, stop. Each bar is a commit; each component
+shows its render time and, with "Record why each component rendered" enabled, the reason:
+
+```text
+Commit 3   14.2 ms
+  Catalog          0.4 ms   Hook 1 changed
+  ProductList      0.3 ms   Parent rendered
+  ProductCard x500 12.9 ms  Parent rendered
+```
+
+500 cards re-rendering on every keystroke is worth fixing. A commit under a couple of milliseconds is not.
 
 </Level>
 
 <Level name="Advanced">
 
-Dependencies compare with `Object.is`. A `memo` child receiving an inline arrow or object never skips.
-The React Compiler can add memoization automatically where it is safe, which changes the manual
-calculus but not the reasoning.
+`memo` only helps if props are actually stable. The trap inside the trap:
+
+```tsx
+<ProductCard product={p} onAdd={id => add(id)} />        // new function every render: memo never skips
+<ProductCard product={p} onAdd={handleAdd} />            // stable with useCallback: memo skips
+```
+
+So `memo`, `useCallback` and `useMemo` usually come together, or not at all. Often a structural fix is better: move the search state into
+`SearchBar` and the list's filtering below it so typing does not re-render the header and cart at all, or pass expensive subtrees as
+`children` so they are created by a parent that did not re-render.
+
+The React Compiler, where enabled, inserts this memoisation automatically, which makes hand-written memo even less necessary; the
+measuring habit stays.
 
 </Level>
 
 <Level name="Edge cases">
 
-`useMemo` with an empty dependency list caches the first value forever, a stale-value bug in disguise.
+`useMemo` is a performance hint, not a guarantee; React may discard the cache. Never put side effects or correctness logic in it.
+Dependencies compared with `Object.is` mean an object prop built inline (`style={{ color }}`) defeats `memo` on every render.
 
 </Level>
 
 <Level name="Corner cases">
 
-`useCallback` on a handler plus a `memo` child plus a prop object created inline in the same render: the
-callback is stable, the object is not, and the child re-renders anyway.
+`useCallback` with an empty dependency array that reads state captures the first render's value forever, a stale closure. Use the updater
+form of the setter (`setCart(c => ...)`) so the callback needs no state dependency, or include the dependency.
 
 </Level>
 
 <Level name="Production level">
 
-Performance work starts with a number from the Profiler or the Performance panel, as rule 10 says:
-measure before optimizing.
+Performance budgets for interactions (input responsiveness, INP), profiling before and after any memo in review, and a comment on
+non-obvious memos stating what was measured.
 
 </Level>
 
 <Level name="Mindset">
 
-Memoization is a cache, and every cache needs a reason and an invalidation story.
+Find out why something renders before deciding it should not. Most slowness is state in the wrong place, not missing memo.
 
 </Level>
 
 <Level name="System design">
 
-The same trade appears in HTTP caches and database query caches in Phases 3 and 4.
+Rendering cost scales with what re-renders times how expensive each render is. Architecture (state placement, composition, virtualisation)
+changes the first factor; memo changes the second.
 
 </Level>
 
 <Level name="Strategy">
 
-Remove all memoization, profile, then add back only what the numbers justify. Done when each remaining
-`useMemo` has a measured reason in a comment.
+I make a deliberately slow list (500 cards with a costly render), profile, fix it first by moving state, then by memo, and record both
+measurements.
+
+Done when every memo in my code has a profiler measurement behind it, and I can read a Profiler recording and say why each component rendered.
 
 </Level>
 
@@ -877,97 +1296,143 @@ Remove all memoization, profile, then add back only what the numbers justify. Do
 <Compare
   left="Configuration props"
   right="Composition"
+  caption="Two ways to build a flexible Card. Composition lets callers decide the content without new props."
   rows={[
-    ['Card with title, icon, footerText, showButton, buttonLabel', 'Card with children; Card.Header, Card.Footer'],
-    ['A new prop for each new use', 'The caller arranges the parts'],
-    ['Boolean props that combine badly', 'No impossible combinations'],
+    ['<Card title icon footer showClose closeLabel ... />', '<Card><Card.Header>...</Card.Header><Card.Body>...</Card.Body></Card>'],
+    ['Each new need adds a prop', 'New needs are new children'],
+    ['Abstracted before the second use', 'Extracted after the second use'],
+    ['Props drilled through layout', 'Layout receives finished elements'],
   ]}
-  caption="Composition grows by arrangement, configuration by flags. Flags multiply; arrangements do not."
 />
 
 <Levels label="Phase 2, composition">
 
 <Level name="Beginner">
 
-Composition builds UI by putting components inside other components with `children`, rather than adding
-props for every variation.
+Composition means building components by putting components inside each other, mainly through `children` and props that take elements.
+A `Modal` does not need to know what is inside it:
 
 ```tsx
-<Card>
-  <Card.Header>Notebook</Card.Header>
-  <p>₹120</p>
-  <Card.Footer><Button>Add</Button></Card.Footer>
-</Card>
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">{title}</h2>
+      {children}
+      <button onClick={onClose}>Close</button>
+    </div>
+  );
+}
+
+<Modal title="Delete product?" onClose={close}>
+  <p>This cannot be undone.</p>
+  <Button variant="danger" onClick={confirm}>Delete</Button>
+</Modal>
 ```
+
+The plan's trap: abstracting a component before the second use. The first time, write it inline. The second time, notice. The third
+time, extract with the shape both uses actually needed.
 
 </Level>
 
 <Level name="Intermediate">
 
-Slots: pass elements as named props (`icon={<SearchIcon />}`). Passing children also avoids prop
-drilling: the parent that owns the data renders the deep child directly.
+Slots: when a component has more than one area for content, pass elements as named props.
+
+```tsx
+function PageLayout({ sidebar, header, children }: { sidebar: React.ReactNode; header: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="layout">
+      <header>{header}</header>
+      <nav aria-label="Sections">{sidebar}</nav>
+      <main>{children}</main>
+    </div>
+  );
+}
+
+<PageLayout header={<UserMenu user={user} />} sidebar={<Filters />}>
+  <ProductGrid />
+</PageLayout>
+```
+
+`user` goes straight to `UserMenu`; `PageLayout` never sees it. That is how composition removes prop drilling.
 
 </Level>
 
 <Level name="Advanced">
 
-Compound components share implicit state through a private context (`Tabs`, `Tabs.List`, `Tabs.Panel`).
-Render props and hooks share behaviour without fixing markup.
+Compound components share implicit state through a private context, giving callers flexible markup with a coherent API:
+
+```tsx
+const TabsContext = createContext<{ active: string; setActive: (id: string) => void } | null>(null);
+
+function Tabs({ defaultTab, children }: { defaultTab: string; children: React.ReactNode }) {
+  const [active, setActive] = useState(defaultTab);
+  return <TabsContext.Provider value={{ active, setActive }}>{children}</TabsContext.Provider>;
+}
+function Tab({ id, children }: { id: string; children: React.ReactNode }) {
+  const ctx = useContext(TabsContext)!;
+  return <button role="tab" aria-selected={ctx.active === id} onClick={() => ctx.setActive(id)}>{children}</button>;
+}
+```
+
+For complex accessible widgets (tabs, menus, comboboxes) a headless library (Radix, React Aria) provides behaviour and ARIA while I own
+the styling; that is composition at library scale.
 
 </Level>
 
 <Level name="Edge cases">
 
-`children` can be a string, an array, `null` or a fragment; code that inspects children breaks on some
-of them. Avoid inspecting children.
+`React.Children.map` and `cloneElement` to inject props into children work, but break when a caller wraps a child in a fragment or
+another component. Context-based compound components are more robust.
 
 </Level>
 
 <Level name="Corner cases">
 
-A compound component used outside its parent plus a missing context: throw a clear error, as the context
-topic showed.
+A component accepting both `children` and a `render` prop, or both a slot and a config prop for the same area, has two ways to do one
+thing and will be used inconsistently. Pick one per area.
 
 </Level>
 
 <Level name="Production level">
 
-The plan's trap: abstracting a component before the second use. Write it twice, then extract the shared
-shape.
+Shared components have a gallery entry per variant, a documented composition API, and no prop that exists for a single caller.
 
 </Level>
 
 <Level name="Mindset">
 
-Duplication is cheaper than the wrong abstraction.
+Duplication is cheaper than the wrong abstraction. Wait until the pattern shows itself.
 
 </Level>
 
 <Level name="System design">
 
-Design systems are built from small composable primitives plus documented patterns, not one component
-per screen.
+Composition keeps components closed for modification and open for extension: new uses arrive as new children, not new props, so the
+shared component stays stable as the product grows.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the gallery's `Card`, `Tabs` and `Dialog` compose without boolean props that conflict.
+I find one over-configured component in the dashboard, rebuild it with slots or compound parts, and fix one prop-drilling path with
+composition instead of context.
+
+Done when no shared component has a prop used by only one caller, and the layout no longer receives data it does not render.
 
 </Level>
 
 </Levels>
-
 #### Phase 2: Accessibility
 
 <Layers
-  caption="Accessibility from the bottom up. Most of it is decided by the first layer."
+  caption="Accessibility in layers. Each layer is cheaper to get right than to retrofit."
   layers={[
-    { name: 'Semantic HTML', note: 'button, a, label, headings, landmarks, lists' },
-    { name: 'Keyboard', note: 'every action reachable with Tab, Enter, Space, Escape; visible focus' },
-    { name: 'Names and states', note: 'labels, alt text, aria-expanded, aria-invalid, live regions' },
-    { name: 'Perception', note: 'contrast, text resizing, motion, not colour alone' },
-    { name: 'Testing', note: 'screen reader pass, axe, Lighthouse, a keyboard-only session' },
+    { name: 'Semantic HTML', note: 'landmarks, headings in order, button for actions, a for navigation, label for inputs' },
+    { name: 'Keyboard', note: 'everything reachable with Tab, operable with Enter or Space, visible focus, no traps' },
+    { name: 'Names and states', note: 'every control has an accessible name; aria-expanded, aria-selected, aria-invalid where needed' },
+    { name: 'Announcements', note: 'errors and async results announced with role=alert or aria-live' },
+    { name: 'Visual', note: 'contrast 4.5:1 for text, no meaning by colour alone, works at 200% zoom and reduced motion' },
   ]}
 />
 
@@ -975,76 +1440,97 @@ Done when the gallery's `Card`, `Tabs` and `Dialog` compose without boolean prop
 
 <Level name="Beginner">
 
-Accessible means usable by people with different abilities and tools: screen readers, keyboards only,
-magnification. Start with the right HTML element; it brings keyboard support and a role for free.
+Accessibility means people using a keyboard, a screen reader, zoom, or other assistive technology can use the app. Most of it comes
+free from the right HTML element. The plan's trap is a wall of `div`s with no landmarks:
 
 ```tsx
-<button onClick={toggle} aria-expanded={open} aria-controls="filters">Filters</button>
-<div id="filters" hidden={!open}>...</div>
+// wrong: a div pretending to be a button
+<div className="btn" onClick={save}>Save</div>
+// right
+<button type="button" onClick={save}>Save</button>
 ```
 
-Mistake: `<div onClick>`, which a keyboard cannot reach. Fix: `button`.
+The `div` cannot be reached with Tab, does nothing on Enter or Space, and a screen reader announces it as plain text. The `button`
+does all three for free. Landmarks (`header`, `nav`, `main`, `footer`) and headings in order let screen-reader users jump around a page
+the way sighted users scan it.
 
 </Level>
 
 <Level name="Intermediate">
 
-Every input has a label; images have alt text; headings form an outline; focus is visible; the page has
-landmarks. Status changes that are not focused (saved, three results) go in a live region.
+The keyboard pass, as a procedure: unplug the mouse; press Tab from the address bar through the whole page; check every interactive
+element gets a visible focus ring in a sensible order; operate each with Enter, Space, arrows and Escape; open and close every dialog
+and menu. Write down every failure.
 
-```tsx
-<p role="status" aria-live="polite">{results.length} products found</p>
+The screen-reader pass: VoiceOver on macOS (Cmd+F5) or NVDA on Windows. Navigate by headings (VO+Cmd+H or H), by landmarks, through
+forms. Each control should announce a name, a role and a state:
+
+```text
+"Search, edit text"
+"Sort by price, collapsed, button"
+"Title is required, alert"
 ```
+
+Icon-only buttons need a name: `<button aria-label="Remove Lamp from cart"><TrashIcon aria-hidden="true" /></button>`.
 
 </Level>
 
 <Level name="Advanced">
 
-Focus management in single-page apps: after a route change, move focus to the new page's heading; when a
-dialog opens, move focus into it, trap Tab inside, close on Escape and return focus to the opener. The
-native `dialog` element with `showModal()` does most of this.
+Focus management in a single-page app: when a route changes, move focus to the new page's `h1` (or announce the title), or keyboard
+users stay focused on a link that no longer exists. A modal moves focus into itself on open, keeps Tab inside, closes on Escape, and
+returns focus to the button that opened it on close. The native `dialog` element with `showModal()` does most of this.
+
+ARIA's first rule is to not use ARIA if a native element does the job. Wrong ARIA is worse than none: `role="button"` on a `div`
+promises keyboard behaviour that I then have to implement by hand.
 
 </Level>
 
 <Level name="Edge cases">
 
-An icon-only button with no text has no accessible name; screen readers say just "button". Add
-`aria-label`. Placeholder text is not a label; it disappears when typing.
+Content that appears asynchronously (search results count, "Saved", an error) is silent to screen readers unless it is in a live region
+that existed before the change: `<p aria-live="polite">{count} results</p>`. Colour-only status (a red border for an error) fails for
+colour-blind users; add text and an icon.
 
 </Level>
 
 <Level name="Corner cases">
 
-A custom select built from divs plus a screen reader: no role, no state, no keyboard model. Use the
-native select, or a tested library. ARIA added wrongly is worse than none.
+`outline: none` in a CSS reset removes every focus ring. Use `:focus-visible` to show focus for keyboard users without showing it on
+mouse clicks. Disabled buttons cannot be focused, so their tooltip explaining why is unreachable; prefer an enabled button that explains
+the problem on click, or visible helper text.
 
 </Level>
 
 <Level name="Production level">
 
-The plan's proof requires a keyboard and screen-reader pass. I run VoiceOver (macOS) or NVDA (Windows)
-through the main journey and record what was confusing. Automated tools such as axe find about a third
-of issues; the manual pass finds the rest.
+Automated checks (axe in Playwright tests, the Lighthouse accessibility audit) catch roughly the mechanical issues: missing names,
+contrast, missing labels. They cannot judge whether the experience makes sense, so a manual keyboard and screen-reader pass happens before
+each release of a significant UI change.
 
 </Level>
 
 <Level name="Mindset">
 
-Accessibility is a feature, not a chore: rule 11. It is also how search engines and tests see the page.
+Accessibility is not a feature for a few users; it is whether the interface works. Keyboard and screen-reader users find the bugs that
+everyone eventually hits.
 
 </Level>
 
 <Level name="System design">
 
-Accessible primitives in the design system make every screen accessible by default; Testing Library
-queries by role, so accessible components are also the testable ones.
+Build accessibility into the design system's components (Button, Dialog, Field) once, and every page that uses them inherits it.
+Retrofitting a hundred pages is the expensive alternative.
 
 </Level>
 
 <Level name="Strategy">
 
-One full session per week with the mouse unplugged. Done when the main journey works by keyboard alone
-and with a screen reader, and axe reports no violations.
+I do the keyboard and screen-reader passes on the dashboard and write each failure as an issue, fix them, add axe checks to the end-to-end
+tests, and repeat the passes.
+
+Done when the proof holds: a full keyboard pass and a screen-reader pass with no blocking issue, landmarks and heading order correct, and
+axe reports zero violations on every page.
 
 </Level>
 
@@ -1053,86 +1539,113 @@ and with a screen reader, and axe reports no violations.
 #### Phase 2: Responsive CSS
 
 <Figure art={`
-  phone (one column)     tablet (two)            desktop (sidebar + grid)
-  +----------+           +---------+---------+   +------+-----+-----+-----+
-  | filters  |           | filters | card    |   |      | card| card| card|
-  | card     |           |         | card    |   | side | card| card| card|
-  | card     |           +---------+---------+   | bar  |     |     |     |
-  +----------+                                   +------+-----+-----+-----+
-  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr))
-`} caption="One grid rule adapts the catalog from one column to many, with no breakpoint for the cards themselves." />
+  320px (phone)           768px (tablet)               1200px (desktop)
+  +-----------+           +---------------------+      +-------+--------------------+
+  | header    |           | header              |      | head  |                    |
+  | [filter v]|           +--------+------------+      +-------+  grid: 4 columns   |
+  | card      |           |filters | card card  |      |filters|  card card card .. |
+  | card      |           |        | card card  |      |       |                    |
+  | card      |           +--------+------------+      +-------+--------------------+
+  one column, filters     two areas, 2 columns          sidebar + auto-fill grid
+  in a disclosure
+`} caption="One layout at three widths. Mobile first: the base CSS is the phone layout, and min-width queries add space." />
 
 <Levels label="Phase 2, responsive CSS">
 
 <Level name="Beginner">
 
-Responsive design makes one layout work on every screen. Start mobile-first: the narrow layout is the
-default, wider screens add columns with media queries.
+Responsive design means one page works from a small phone to a wide monitor. Three foundations. The viewport meta tag so phones do
+not pretend to be desktops: `<meta name="viewport" content="width=device-width, initial-scale=1">`. Fluid units (`%`, `rem`, `fr`)
+instead of fixed pixel widths. Media queries for the points where the layout needs to change.
 
 ```css
-.layout { display: grid; gap: 1rem; }
-@media (min-width: 48rem) { .layout { grid-template-columns: 16rem 1fr; } }
-.cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); }
+.grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+}
 ```
+
+That one rule gives one column on a phone and as many 14rem-minimum columns as fit on a desktop, with no media query.
+
+Mistake: designing at desktop width and squeezing it down. Start with the phone layout as the base CSS, then add with `min-width`.
 
 </Level>
 
 <Level name="Intermediate">
 
-Flexbox for one dimension (a toolbar), grid for two (a page). Relative units (`rem`, `%`, `ch`) and
-`clamp()` for fluid type: `font-size: clamp(1rem, 0.9rem + 0.5vw, 1.25rem)`.
+Mobile first, with layout areas:
+
+```css
+.layout { display: grid; grid-template-areas: "header" "filters" "main"; }
+@media (min-width: 48rem) {
+  .layout { grid-template-columns: 16rem 1fr; grid-template-areas: "header header" "filters main"; }
+}
+```
+
+Flexbox for one dimension (a row of buttons that wraps), Grid for two (page layout, card grids). `clamp()` for fluid type that
+scales between limits: `font-size: clamp(1rem, 0.9rem + 0.5vw, 1.25rem)`.
+
+Testing: DevTools device toolbar at 320, 375, 768, 1024 and 1440 pixels, and dragging the width slowly to find where things break.
+The breakpoints go where the content breaks, not at device names.
 
 </Level>
 
 <Level name="Advanced">
 
-Container queries size a component by its container, not the viewport, so a card works in a sidebar and
-a main column. Logical properties (`margin-inline`) support right-to-left languages.
+Container queries let a component respond to its own width instead of the viewport, so a `ProductCard` lays out differently in a narrow
+sidebar and a wide grid on the same screen:
 
 ```css
 .card-wrap { container-type: inline-size; }
-@container (min-width: 30rem) { .card { display: flex; } }
+@container (min-width: 28rem) { .card { display: grid; grid-template-columns: 8rem 1fr; } }
 ```
+
+Images: `max-width: 100%; height: auto`, explicit `width` and `height` attributes so the browser reserves space (no layout shift),
+`srcset` and `sizes` so phones download small files, and `loading="lazy"` below the fold.
 
 </Level>
 
 <Level name="Edge cases">
 
-Very long words, zoom at 200 percent, a phone in landscape, a 320 px wide screen, and user font size
-changes. Fixed heights cut off text when fonts grow.
+Long words and URLs overflow narrow containers: `overflow-wrap: anywhere`. A grid item containing a wide table or code block forces the
+whole column wider because grid items default to `min-width: auto`; set `min-width: 0` on the item. Touch targets need about 44 by 44
+CSS pixels.
 
 </Level>
 
 <Level name="Corner cases">
 
-`100vh` on mobile includes the area behind the browser's toolbar, so a full-height layout hides its
-bottom button; `100dvh` fixes it. Sticky header plus an anchor link: the heading lands under the header
-unless `scroll-margin-top` is set.
+`100vh` on mobile browsers includes the area behind the address bar, so a full-height panel is cut off; `100dvh` uses the dynamic
+viewport. Users zoom text to 200%: rem-based layouts reflow; pixel-based ones overlap.
 
 </Level>
 
 <Level name="Production level">
 
-Test on a real phone, not only device mode. Images get `width` and `height` to avoid layout shift, which
-Phase 4 measures.
+Visual regression screenshots at several widths in CI, no horizontal scroll at 320px as a checked rule, and Core Web Vitals (layout shift
+especially) measured on real mobile devices.
 
 </Level>
 
 <Level name="Mindset">
 
-Design for the content, not for device names. Add a breakpoint where the layout breaks.
+The layout should adapt to the content and the space, not to a list of devices.
 
 </Level>
 
 <Level name="System design">
 
-Layout primitives (stack, cluster, grid) in the design system keep pages consistent.
+Layout primitives (Stack, Cluster, Grid, Sidebar) as small components or utility classes make responsive behaviour consistent across pages,
+part of the design system next to tokens.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when every page works from 320 px to a wide desktop, at 200 percent zoom, with no horizontal scroll.
+I build the dashboard mobile first, use auto-fill grids and one container query, and check each page at five widths and at 200% zoom.
+
+Done when no page scrolls sideways at 320px, text zoom to 200% keeps everything usable, and images reserve their space.
 
 </Level>
 
@@ -1141,11 +1654,12 @@ Done when every page works from 320 px to a wide desktop, at 200 percent zoom, w
 #### Phase 2: Design tokens
 
 <Layers
-  caption="Tokens in three tiers. Components only use the top tier, so a theme change touches one file."
+  caption="Three tiers of tokens. Components use semantic tokens, never raw values."
   layers={[
-    { name: 'Component tokens', note: '--button-bg, --card-border: what a component uses' },
-    { name: 'Semantic tokens', note: '--color-text, --color-surface, --space-2: meaning' },
-    { name: 'Raw values', note: '#111, #fff, 0.5rem, IBM Plex Sans: the palette' },
+    { name: 'Primitive tokens', note: '--gray-900: #111; --space-4: 1rem; --radius-2: 6px' },
+    { name: 'Semantic tokens', note: '--color-text: var(--gray-900); --color-surface; --color-danger; --space-gap' },
+    { name: 'Component use', note: '.btn-danger uses var(--color-danger), never a hex code' },
+    { name: 'Themes', note: '[data-theme=dark] remaps semantic tokens; components do not change' },
   ]}
 />
 
@@ -1153,73 +1667,89 @@ Done when every page works from 320 px to a wide desktop, at 200 percent zoom, w
 
 <Level name="Beginner">
 
-Design tokens are named values for colour, spacing, type and radius, kept in one place and used
-everywhere. CSS custom properties are the simplest form.
+Design tokens are named values for design decisions: colours, spacing, font sizes, radii, shadows. Instead of `#1a1a1a` in forty files,
+there is one `--color-text`. In plain CSS they are custom properties:
 
 ```css
-:root { --ink: #111; --paper: #fff; --muted: #666; --space-1: 0.25rem; --space-2: 0.5rem; --radius: 4px; }
-.button { padding: var(--space-2); border-radius: var(--radius); color: var(--paper); background: var(--ink); }
+:root {
+  --color-text: #1a1a1a;
+  --color-surface: #ffffff;
+  --color-border: #d4d4d4;
+  --space-1: 0.25rem; --space-2: 0.5rem; --space-4: 1rem; --space-8: 2rem;
+  --font-size-body: 1rem; --font-size-h1: 2rem;
+  --radius: 6px;
+}
+.card { background: var(--color-surface); border: 1px solid var(--color-border); padding: var(--space-4); border-radius: var(--radius); }
 ```
 
-Mistake: hard-coded `#333` in thirty files. Fix: one token, used thirty times.
+Mistake: a token per one-off value (`--card-padding-left-on-tuesday`). A small scale (4, 8, 16, 32) forces consistency.
 
 </Level>
 
 <Level name="Intermediate">
 
-Semantic names (`--color-text`) over raw ones (`--grey-900`), so dark mode swaps values without touching
-components.
+Semantic names describe purpose, not appearance: `--color-danger`, not `--red`. That is what makes themes possible:
 
 ```css
-:root { --color-text: #111; --color-surface: #fff; }
-[data-theme='dark'] { --color-text: #eee; --color-surface: #111; }
+[data-theme="dark"] {
+  --color-text: #ededed;
+  --color-surface: #141414;
+  --color-border: #333;
+}
 ```
+
+Every component switches with no change to its CSS. A theme toggle sets `document.documentElement.dataset.theme`, and
+`prefers-color-scheme` gives the default.
 
 </Level>
 
 <Level name="Advanced">
 
-A spacing scale (4, 8, 12, 16, 24, 32) and a type scale reduce decisions. Tokens can be generated for
-CSS, TypeScript and design tools from one JSON source.
+Tokens can be a source of truth beyond CSS: a JSON file transformed by a tool (Style Dictionary) into CSS variables, a TypeScript object
+and design-tool variables, so design and code cannot drift. Contrast is checked at the token level: every text-on-surface pair meets 4.5:1
+in every theme, so components cannot produce a failing pair.
 
 </Level>
 
 <Level name="Edge cases">
 
-A token without a fallback in a context where it is undefined resolves to the property's initial value,
-silently (`var(--x, #111)` adds a fallback).
+Custom properties are inherited and resolved at use time, so a token redefined on a parent changes descendants (useful for a dark section),
+and an undefined token silently falls back to the property's initial value; give a fallback in critical places: `var(--color-text, #111)`.
 
 </Level>
 
 <Level name="Corner cases">
 
-Dark mode plus contrast: a muted grey that passes on white fails on near-black. Check contrast for each
-theme.
+Theme flash: the page renders light, then JavaScript applies dark. Set the theme attribute in a tiny inline script in the `head` before the
+body paints, reading from `localStorage` and `prefers-color-scheme`.
 
 </Level>
 
 <Level name="Production level">
 
-This site is the example: monochrome tokens and IBM Plex, applied everywhere through variables.
+A lint rule (stylelint) forbids raw colours outside the token file; the gallery shows every token; token changes are reviewed with screenshots.
 
 </Level>
 
 <Level name="Mindset">
 
-Constrain choices so the interface is consistent without effort.
+Every raw value is a decision made in one place that the rest of the product does not know about. Tokens make decisions shared.
 
 </Level>
 
 <Level name="System design">
 
-Tokens are the contract between design and code; a component library is not a design system without
-them.
+Tokens, then primitives (Button, Field, Stack), then patterns (forms, cards), then pages: a design system is layers, each using only the
+layer below.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when `grep` finds no raw colour or spacing value outside the token file.
+I extract every colour, space and size from the dashboard into about twenty-five tokens, add a dark theme, and check contrast for each pair.
+
+Done when no component CSS contains a raw colour or spacing value, the dark theme works with no component changes, and every text pair passes
+contrast.
 
 </Level>
 
@@ -1228,85 +1758,115 @@ Done when `grep` finds no raw colour or spacing value outside the token file.
 #### Phase 2: Loading, error and empty states
 
 <Figure art={`
-              +---------+
-   mount ---> | loading | --(slow > 300ms)--> show skeleton
-              +----+----+
-         ok   |         |  fail
-   +----------+         +-----------+
-   v                                v
-  items.length = 0?            +---------+  retry
-   yes -> EMPTY: say why,      |  error  | -------> loading
-          offer an action      +---------+
-   no  -> SUCCESS
-`} caption="Four states, not one. Every data-backed view draws all four." />
+              fetch products
+                    |
+     +--------------+--------------+----------------+
+     v              v              v                v
+  loading         error          empty            success
+  skeleton rows   "Couldn't load  "No products     the list
+  aria-busy       products."      match 'xyz'."
+                  [Try again]     [Clear filters]
+     ^                |
+     +---- retry -----+
+`} caption="Every data-driven view has four states, and the happy path is only one of them." />
 
 <Levels label="Phase 2, loading, error and empty states">
 
 <Level name="Beginner">
 
-Every view that loads data has at least four states: loading, error, empty and success. The happy path
-is only one of them.
+The plan's goal is an interface that is not "a demo that only works on the happy path". Every view that loads data can be loading, failed,
+empty or successful, and each needs designed UI. A union type makes impossible combinations unrepresentable:
 
 ```tsx
-if (state.status === 'loading') return <p aria-busy="true">Loading products…</p>;
-if (state.status === 'error') return <p role="alert">Could not load products. <button onClick={retry}>Try again</button></p>;
-if (state.products.length === 0) return <p>No products match “{query}”. <button onClick={clear}>Clear search</button></p>;
-return <ProductGrid products={state.products} />;
+type State<T> =
+  | { status: 'loading' }
+  | { status: 'error'; error: Error }
+  | { status: 'success'; data: T };
+
+function ProductsView({ state, query, onRetry, onClear }: Props) {
+  switch (state.status) {
+    case 'loading': return <SkeletonList rows={6} />;
+    case 'error':   return <ErrorPanel message="Couldn't load products." onRetry={onRetry} />;
+    case 'success':
+      if (state.data.length === 0) return <Empty message={`No products match "${query}".`} action={<button onClick={onClear}>Clear filters</button>} />;
+      return <ProductList products={state.data} />;
+  }
+}
 ```
+
+Mistake: `isLoading` and `error` and `data` as three separate states, which allows "loading and error at once" and a blank screen when
+none is set.
 
 </Level>
 
 <Level name="Intermediate">
 
-Model the states as a discriminated union (Phase 1), so the compiler forces each one. Empty states say
-why and what to do next.
+Each state, designed. Loading: a skeleton in the shape of the content (less layout shift than a spinner), shown only after a short delay
+(a few hundred milliseconds) so fast responses do not flash. Error: what happened in plain words, what to do, a retry button, and the
+technical details logged rather than shown. Empty: distinguish "nothing yet" (a first-run message with the action to create one) from
+"nothing matches" (the query shown and a way to clear filters).
+
+Testing the states: DevTools network throttling for loading, request blocking (right-click, Block request URL) for errors, and a test
+account with no data for empty.
 
 </Level>
 
 <Level name="Advanced">
 
-Avoid flashes: delay the spinner by a few hundred milliseconds, keep the previous results visible while
-refetching (stale state), and use skeletons that match the final layout. Error boundaries catch render
-errors and show a fallback instead of a blank page.
+Refetching shows stale data, not a skeleton: keep the previous list visible with a subtle indicator while the new one loads. Data libraries
+make this a flag (`placeholderData: keepPreviousData` in TanStack Query). React's `Suspense` with a data source that supports it lets a
+parent declare the loading UI for a whole subtree, and an error boundary catches render errors in a subtree:
+
+```tsx
+<ErrorBoundary fallback={<ErrorPanel message="This section failed to load." />}>
+  <Suspense fallback={<SkeletonList rows={6} />}>
+    <Products query={q} />
+  </Suspense>
+</ErrorBoundary>
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-An error on page two of a list: keep page one visible. A filter that empties the list differs from a
-truly empty account; they need different messages.
+Partial failure: the list loads but images fail; each image needs its own fallback. Pagination errors on page three should not wipe pages one
+and two. A 401 is not a generic error; it should send the user to sign in.
 
 </Level>
 
 <Level name="Corner cases">
 
-Refetch in progress plus an error: show the stale data with an error banner, not an error screen that
-hides what the user had.
+Offline: `navigator.onLine` and the `online` event can show a banner and retry when the connection returns. A mutation that fails after an
+optimistic update must roll back the UI and say so, or the user believes the change was saved.
 
 </Level>
 
 <Level name="Production level">
 
-Most apps demo the success state and ship the others broken. The plan's goal is an interface "not a demo
-that only works on the happy path"; these states are exactly that.
+Every data view's four states are in the component gallery, errors go to error tracking with context, and end-to-end tests cover the error and
+empty paths with mocked responses.
 
 </Level>
 
 <Level name="Mindset">
 
-Design the unhappy paths first; they are what users remember.
+Users spend more time in the non-happy states than designers expect. Design them first.
 
 </Level>
 
 <Level name="System design">
 
-API error shapes in Phase 3 should give the UI enough to choose a message.
+Consistent state components (Skeleton, ErrorPanel, Empty) are part of the design system, and a data layer that always returns a discriminated
+state makes every view handle all four.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when each data view shows all four states in the component gallery, triggered on demand.
+For every data view in the dashboard I list the four states, build each, and capture them in the gallery using throttling, blocking and an empty
+account.
+
+Done when no view can show a blank screen, every error offers a way forward, and the four states appear in the gallery for each data view.
 
 </Level>
 
@@ -1315,91 +1875,108 @@ Done when each data view shows all four states in the component gallery, trigger
 #### Phase 2: Routing and the multi-page app
 
 <Figure art={`
-  /                       Dashboard summary
-  /products?q=pen&sort=   Catalog: search and filters live in the URL
-  /products/:id           Detail page
-  /products/new           Form
-  /gallery                Component gallery
-  *                       Not found
-  <Layout> wraps them all: header, nav, <main>, footer
-`} caption="The dashboard's routes. Anything a user might share or bookmark goes in the URL." />
+  URL                               route tree                       renders
+  /                                 <Root> (layout: header, nav)     Dashboard
+  /products?q=lamp&sort=price         +-- index                      ProductsPage, filters from the URL
+  /products/42                        +-- products                   ProductDetail id=42
+  /products/new                       |     +-- :id                  ProductForm
+  /settings                           |     +-- new
+  /anything-else                      +-- settings                   Settings
+                                      +-- *                          NotFound
+`} caption="The URL is state. Routes map it to a tree of layouts and pages; search params hold filters so they survive reload and can be shared." />
 
 <Levels label="Phase 2, routing and the multi-page app">
 
 <Level name="Beginner">
 
-The build is a multi-page React app, a dashboard or a catalog, with search, filters, forms and routing.
-A client-side router maps URLs to components without full page reloads. With React Router:
+The build is a multi-page React app with routing. A client-side router (React Router) maps URLs to components without a full page reload:
 
 ```tsx
 const router = createBrowserRouter([
-  { path: '/', element: <Layout />, children: [
-    { index: true, element: <Dashboard /> },
-    { path: 'products', element: <Catalog /> },
-    { path: 'products/:id', element: <ProductPage /> },
-    { path: 'gallery', element: <Gallery /> },
-    { path: '*', element: <NotFound /> },
-  ] },
+  {
+    path: '/', element: <Root />, errorElement: <ErrorPage />,
+    children: [
+      { index: true, element: <Dashboard /> },
+      { path: 'products', element: <ProductsPage /> },
+      { path: 'products/:id', element: <ProductDetail /> },
+      { path: 'settings', element: <Settings /> },
+      { path: '*', element: <NotFound /> },
+    ],
+  },
 ]);
 ```
+
+`Root` renders the shared layout and an `<Outlet />` where the child page goes. Links use `<Link to="/products">`, which updates the URL
+and renders without reloading. Mistake: `<a href>` for internal links, which reloads the whole app and loses state.
 
 </Level>
 
 <Level name="Intermediate">
 
-Search and filters belong in the URL so reload, back and share work.
+Filters belong in the URL, so a filtered view survives reload, the back button works, and the link can be shared:
 
 ```tsx
-const [params, setParams] = useSearchParams();
-const q = params.get('q') ?? '';
-<input value={q} onChange={(e) => setParams({ q: e.target.value }, { replace: true })} />
+function ProductsPage() {
+  const [params, setParams] = useSearchParams();
+  const q = params.get('q') ?? '';
+  const sort = params.get('sort') ?? 'relevance';
+  return <SearchBox value={q} onChange={v => setParams(p => { p.set('q', v); return p; }, { replace: true })} />;
+}
 ```
+
+`replace: true` while typing avoids a history entry per keystroke. Route params (`useParams().id`) are always strings and may not exist; validate
+them and render `NotFound` for bad IDs.
 
 </Level>
 
 <Level name="Advanced">
 
-Data loaders fetch before rendering a route, nested layouts keep shared UI mounted, and lazy routes split
-the bundle. Frameworks such as Next.js or React Router's framework mode add server rendering.
+Loaders fetch data per route before rendering (React Router data APIs, TanStack Router), which removes waterfall effects in components and
+gives every route a loading and error boundary. Code splitting per route (`lazy`) keeps the initial bundle small. After navigation, move focus to
+the new page's heading and update `document.title`, so screen-reader users know the page changed.
 
 </Level>
 
 <Level name="Edge cases">
 
-`/products/abc` for a missing id needs a not-found state, not a crash. A deep link opened fresh must load
-its own data.
+Deploying a client-side-routed app to a static host: a reload on `/products/42` asks the server for that path, which does not exist as a file,
+and returns 404. Configure the host to serve `index.html` for unknown paths (a rewrite rule). Scroll position: new pages should start at the top,
+back navigation should restore position; routers provide `ScrollRestoration`.
 
 </Level>
 
 <Level name="Corner cases">
 
-A client-routed app on GitHub Pages plus a reload on `/products/1`: the static host returns 404 because
-no file exists at that path. Use a hash router, a `404.html` fallback, or pre-render.
+Unsaved form changes lost on navigation: block with a confirmation using the router's blocker API, and `beforeunload` for tab closes. A search
+param that a user edits by hand (`?sort=evil`) must be validated against allowed values, not used blindly.
 
 </Level>
 
 <Level name="Production level">
 
-Route changes announce themselves to screen readers (move focus to the `h1`), update the document title,
-and scroll to top.
+Every route has a title, an error element, and a not-found path; the host rewrite rule is in the repository; deep links are tested end to end.
 
 </Level>
 
 <Level name="Mindset">
 
-The URL is state, and the most shareable kind.
+If a user would want to bookmark it, share it or go back to it, it belongs in the URL.
 
 </Level>
 
 <Level name="System design">
 
-Route boundaries are natural code-splitting and data-loading boundaries.
+The route tree is the app's information architecture: nested layouts mirror nested navigation, and per-route loaders and code splitting make each
+page independently fast.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when every page can be bookmarked, reloaded and shared, and the back button never surprises.
+I build the dashboard's routes with a root layout, URL-driven filters, a 404, per-route error elements and focus on navigation, then deploy and
+test deep links.
+
+Done when every filter state is shareable by URL, reload works on every route in production, and the back button always does what a user expects.
 
 </Level>
 
@@ -1408,165 +1985,219 @@ Done when every page can be bookmarked, reloaded and shared, and the back button
 #### Phase 2: The component gallery
 
 <Flow
-  caption="A gallery entry: every component shown in every state that matters."
-  steps={['Component', 'Default', 'Variants', 'Loading, error, empty', 'Long text and edge data', 'Keyboard focus', 'Notes on usage']}
+  caption="How a component earns a place in the gallery"
+  steps={['Used in two places', 'Extracted with typed props', 'Every variant and state rendered', 'Keyboard and contrast checked', 'Test written', 'Gallery entry with usage notes']}
 />
 
 <Levels label="Phase 2, the component gallery">
 
 <Level name="Beginner">
 
-The plan asks for a component gallery page: one route that renders every shared component with its
-variants. It is my design system's catalogue and a visual test.
+The plan's build includes a component gallery page: one route (`/gallery`) that renders every shared component in every variant and state.
+It is documentation, a visual test and a design review tool at once.
 
 ```tsx
-export function Gallery() {
+function GalleryButton() {
   return (
-    <main><h1>Components</h1>
-      <section><h2>Button</h2><Button>Save</Button><Button variant="quiet">Cancel</Button><Button disabled>Saving…</Button></section>
-      <section><h2>ProductCard</h2><ProductCard product={sample} /><ProductCard product={{ ...sample, name: 'A'.repeat(120) }} /></section>
-    </main>
+    <section aria-labelledby="g-button">
+      <h2 id="g-button">Button</h2>
+      <div className="row">
+        <Button>Primary</Button>
+        <Button variant="secondary">Secondary</Button>
+        <Button variant="danger">Delete</Button>
+        <Button disabled>Disabled</Button>
+      </div>
+    </section>
   );
 }
 ```
+
+Mistake: a gallery showing only the default state. The value is in the hard states: disabled, loading, error, long text, empty.
 
 </Level>
 
 <Level name="Intermediate">
 
-Show states, not just variants: loading, error, empty, disabled, focused, long content.
+Each entry shows variants, states, a long-content stress case (a 60-character product title, a price of ₹1,00,00,000), both themes, and a short
+note on when to use it and when not to. Data views get all four states using fixed fake data, so the gallery never depends on the network.
 
 </Level>
 
 <Level name="Advanced">
 
-Storybook is the industry tool for this, with controls and visual testing. A hand-made page teaches the
-same thing first.
+Storybook is the industry tool for this, with stories per state, controls, and add-ons for accessibility checks and interaction tests. A
+hand-made gallery page is enough for this phase and teaches the same discipline; stories can come later. Screenshotting the gallery in CI with
+Playwright gives visual regression tests for every component in one page.
 
 </Level>
 
 <Level name="Edge cases">
 
-Right-to-left text, 200 percent zoom, and the dark theme in the gallery catch layout bugs early.
+Components that depend on context (auth, theme, router) need providers in the gallery, the same test providers the unit tests use.
 
 </Level>
 
 <Level name="Corner cases">
 
-A component that looks right alone but breaks inside a narrow container: add a narrow wrapper in the
-gallery.
+The gallery route shipping to production users is harmless if it uses fake data, but it adds bundle weight; lazy-load it or exclude it from
+production builds.
 
 </Level>
 
 <Level name="Production level">
 
-The gallery doubles as documentation and a regression check before a release.
+Pull requests that change a shared component update its gallery entry, and reviewers look at the gallery screenshots, not just the code.
 
 </Level>
 
 <Level name="Mindset">
 
-If a component cannot be shown alone, it depends on too much.
+If I cannot show a component's states side by side, I have not finished designing it.
 
 </Level>
 
 <Level name="System design">
 
-Components that render from props alone are galleryable, testable and reusable; the gallery enforces it.
+The gallery is the design system's catalogue: tokens, primitives, patterns, each documented in the order they depend on each other.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when every shared component is in the gallery in every state, and screenshots go in the README.
+I build the gallery in week 15 and add to it every week, starting with tokens and Button, ending with full data views in four states.
+
+Done when every shared component and token appears with all its states, the gallery passes axe, and it is screenshot-tested in CI.
 
 </Level>
 
 </Levels>
-
 #### Phase 2: Tests for five components
 
 <Compare
-  left="Tests implementation"
-  right="Tests behaviour"
+  left="Testing implementation"
+  right="Testing behaviour"
+  caption="Testing Library's rule: test what the user sees and does, so refactors do not break tests."
   rows={[
-    ['expect(state.count).toBe(1)', 'expect(screen.getByText(/1 item/)).toBeVisible()'],
-    ['finds .btn-primary by class', 'getByRole(button, name: Add to cart)'],
-    ['breaks on every refactor', 'breaks only when users would notice'],
+    ['expect(wrapper.state("open")).toBe(true)', 'expect(screen.getByRole("dialog")).toBeVisible()'],
+    ['container.querySelector(".btn-primary")', 'screen.getByRole("button", { name: "Save" })'],
+    ['fireEvent.change with a fake event', 'await user.type(field, "Lamp")'],
+    ['Snapshot of the whole tree', 'Assertions on the few things that matter'],
   ]}
-  caption="Testing Library's rule of thumb: test what the user sees and does."
 />
 
 <Levels label="Phase 2, tests for five components">
 
 <Level name="Beginner">
 
-The proof asks for tests on five components. With Vitest and React Testing Library, render the
-component, act like a user, assert on what is visible.
+The proof asks for tests for five components. Vitest runs them, React Testing Library renders components into a fake DOM (jsdom), and
+`user-event` simulates real typing and clicking. A first test:
 
 ```tsx
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-it('adds a todo', async () => {
-  render(<TodoApp />);
-  await userEvent.type(screen.getByRole('textbox', { name: /new todo/i }), 'Ship{enter}');
-  expect(screen.getByRole('listitem')).toHaveTextContent('Ship');
+import { Counter } from './Counter';
+
+test('increments when clicked', async () => {
+  const user = userEvent.setup();
+  render(<Counter />);
+  await user.click(screen.getByRole('button', { name: /clicked 0 times/i }));
+  expect(screen.getByRole('button', { name: /clicked 1 times/i })).toBeInTheDocument();
 });
 ```
+
+```text
+ ✓ src/Counter.test.tsx (1 test) 38ms
+ Test Files  1 passed (1)
+```
+
+Querying by role and name is also an accessibility check: if the test cannot find "the Save button", neither can a screen reader.
 
 </Level>
 
 <Level name="Intermediate">
 
-Pick the five that matter: the form (validation errors), the list (empty state, delete), the search
-(filters results), the dialog (focus, Escape), the data view (loading, error, success with a mocked
-fetch).
+Which five? Pick by risk, not by ease: the product form (validation, submit, error), the search and filter bar (URL changes), the product list
+(four states), the modal (focus, Escape, return focus) and the cart (totals derived correctly). For each, test the behaviours a user relies on:
+
+```tsx
+test('shows errors and does not submit an empty form', async () => {
+  const user = userEvent.setup();
+  const onSave = vi.fn();
+  render(<ProductForm onSave={onSave} />);
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(screen.getByText('Title is required')).toBeInTheDocument();
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+test('submits trimmed values', async () => {
+  const user = userEvent.setup();
+  const onSave = vi.fn().mockResolvedValue(undefined);
+  render(<ProductForm onSave={onSave} />);
+  await user.type(screen.getByLabelText('Title'), '  Lamp ');
+  await user.type(screen.getByLabelText('Price'), '1299');
+  await user.click(screen.getByRole('button', { name: 'Save' }));
+  expect(onSave).toHaveBeenCalledWith({ title: 'Lamp', price: 1299 });
+});
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Mock the network at the boundary with MSW rather than mocking `fetch` per test, so components run their
-real code. Use `findBy` queries for async appearance.
+Async UI: `findBy*` queries wait for something to appear; `waitFor` retries an assertion. Network calls are mocked at the network layer with
+MSW (Mock Service Worker), so components use their real fetch code against fake responses, including errors:
+
+```tsx
+server.use(http.get('/api/products', () => HttpResponse.json({ error: 'boom' }, { status: 500 })));
+render(<ProductsPage />);
+expect(await screen.findByText("Couldn't load products.")).toBeInTheDocument();
+```
+
+Components using context or the router render inside a `renderWithProviders` helper.
 
 </Level>
 
 <Level name="Edge cases">
 
-`getBy` throws if nothing is found; `queryBy` returns `null` for asserting absence. Tests that pass
-because the element exists twice need `getAllBy` or a narrower query.
+`act` warnings (`An update to X inside a test was not wrapped in act(...)`) mean the test finished while the component was still updating;
+await the final state with `findBy`. `getBy` throws when nothing is found; `queryBy` returns null, the right choice for asserting absence.
 
 </Level>
 
 <Level name="Corner cases">
 
-A test with a fake timer plus a userEvent that awaits real timers hangs; configure userEvent with
-`advanceTimers`.
+Timers (debounced search) need `vi.useFakeTimers()` with `userEvent.setup({ advanceTimers: vi.advanceTimersByTime })`, or tests wait for real
+time or pass before the debounce fires. jsdom does not do layout, so tests of responsive behaviour or scroll belong in Playwright.
 
 </Level>
 
 <Level name="Production level">
 
-Querying by role makes accessibility a tested property. These tests become part of Phase 4's CI gate.
+Tests run in CI on every pull request, are fast (seconds), avoid snapshots of whole trees, and include an axe check per component. Flaky tests
+are fixed or deleted, never retried until green.
 
 </Level>
 
 <Level name="Mindset">
 
-A test is a user who never gets tired.
+A good test fails when the behaviour breaks and passes when I refactor. If a refactor breaks tests that users would not notice, the tests were
+testing implementation.
 
 </Level>
 
 <Level name="System design">
 
-Component tests sit in the middle of the test pyramid Phase 4 builds out.
+Component tests sit in the middle of the pyramid: many fast unit tests for logic (reducers, formatters), component tests for behaviour, and a few
+Playwright tests for whole flows. Phase 4 builds this out.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when five components have behaviour tests, and breaking each component on purpose turns its test
-red.
+I write tests for the five riskiest components, then refactor each one (rename internals, split it) and confirm the tests still pass unchanged.
+
+Done when five components have behaviour tests covering their main path, an error path and an edge case, all querying by role or label, running
+in CI.
 
 </Level>
 
@@ -1575,17 +2206,34 @@ red.
 #### Phase 2: The gate, why a component re-renders
 
 <Flow
-  caption="The four reasons a component re-renders. Gate 2 asks me to name which one applies."
-  steps={['Its own state changed', 'Its parent re-rendered', 'A context it reads changed', 'A key change remounted it']}
+  caption="The four reasons a component renders, checked in this order"
+  steps={['Is it the first render (mount)?', 'Did its own state change?', 'Did its parent render (and it is not memoised with equal props)?', 'Did a context it reads change?', 'Otherwise: it did not render']}
 />
 
 <Levels label="Phase 2, Gate 2: re-renders, a stale closure and a derived-state bug">
 
 <Level name="Beginner">
 
-Gate 2: explain why a React component re-renders. Pass: fix a stale closure and a derived-state bug. A
-component re-renders when its state changes, its parent re-renders, or a context it uses changes. Props
-changing is not the cause by itself; the parent re-rendering is.
+Gate 2: explain why a component re-renders, and fix a stale closure and a derived-state bug. A component renders for exactly four reasons, the
+ones in the flow. Props changing is not a separate reason: props change because the parent rendered. So "why did `ProductCard` render?" is answered
+by walking up: its parent rendered because the parent's state changed because the user typed.
+
+I prove it with a render log:
+
+```tsx
+function ProductCard(props: CardProps) {
+  console.log('render ProductCard', props.product.id);
+  /* ... */
+}
+```
+
+```text
+type "l" in search
+render Catalog
+render ProductCard p1
+render ProductCard p2
+render ProductCard p3
+```
 
 </Level>
 
@@ -1594,59 +2242,83 @@ changing is not the cause by itself; the parent re-rendering is.
 The stale closure, the case in the <a href={withBase('/posts/react/06/')}>stale closures note</a>:
 
 ```tsx
-useEffect(() => {
-  const id = setInterval(() => setSeconds(seconds + 1), 1000); // captured seconds = 0
-  return () => clearInterval(id);
-}, []);
-// The counter sticks at 1.
-// Fix: setSeconds((s) => s + 1)
+function Timer() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setCount(count + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <p>{count}</p>;
+}
 ```
+
+```text
+0, 1, 1, 1, 1 ...
+```
+
+The interval's function was created during the first render and closed over that render's `count`, which is 0 forever. Every tick sets `0 + 1`.
+Two fixes: the updater form `setCount(c => c + 1)`, which needs no captured value, or adding `count` to the dependencies (which restarts the
+interval every second, worse here). The lint rule would have flagged the missing dependency.
 
 </Level>
 
 <Level name="Advanced">
 
-The derived-state bug: a `filtered` list held in state and updated by an effect lags one render and
-goes stale after an edit. Fix: compute it in render. React DevTools' Profiler "Why did this render?"
-setting confirms each explanation.
+The derived-state bug, as the gate might plant it:
+
+```tsx
+function Cart({ items }: { items: Item[] }) {
+  const [total, setTotal] = useState(sum(items));
+  return <p>Total ₹{total}</p>;
+}
+```
+
+Adding an item to the cart does not change the total, because `useState` used `items` only on the first render. The fix deletes state:
+`const total = sum(items)`. I explain it in the gate with the snapshot model: initial state is read once; render-time values are read every render.
 
 </Level>
 
 <Level name="Edge cases">
 
-A component re-renders but the DOM does not change: render is not commit. Re-renders are cheap until
-measured otherwise.
+Strict Mode in development renders components twice to find impure renders, so a render log shows doubled lines; that is not a bug in my code.
+React DevTools greys out duplicate logs from the second render.
 
 </Level>
 
 <Level name="Corner cases">
 
-A `memo` child still re-renders because a context it reads changed; memo only compares props.
+Setting state to the same value (`Object.is` equal) usually lets React bail out without rendering children, but it may still call the component
+once more before bailing. Do not build logic on render counts.
 
 </Level>
 
 <Level name="Production level">
 
-Most React performance and correctness bugs are one of these four reasons plus a closure.
+In real performance work, "why did this render" in the Profiler replaces console logs, and fixes are verified by measuring commit time, not
+render counts.
 
 </Level>
 
 <Level name="Mindset">
 
-Explain before fixing. A fix I cannot explain is a guess.
+React is predictable once the model is right: renders are function calls with a snapshot of state, and effects and callbacks remember the render
+they came from.
 
 </Level>
 
 <Level name="System design">
 
-Knowing the re-render triggers decides where state lives in the tree.
+Understanding renders lets me place state so that a change re-renders only the part of the tree that shows it; that is the front end's main
+performance lever.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when, given an unfamiliar component, I can say why it re-rendered, fix a stale closure and a
-derived-state bug without notes, and confirm with the Profiler.
+I take the gate cold: someone (or a model) plants a stale closure and a derived-state bug in a copy of my dashboard; I find and fix both, and explain
+three renders from a Profiler recording, without notes.
+
+Done when I can predict a render log before running it, fix both planted bugs within the hour, and explain each fix with the snapshot model.
 
 </Level>
 
@@ -1655,78 +2327,93 @@ derived-state bug without notes, and confirm with the Profiler.
 #### Phase 2: The README, the traps and the AI-era note
 
 <Compare
-  left="The trap"
-  right="The habit"
+  left="The plan's trap"
+  right="The habit that replaces it"
+  caption="Phase 2's five traps, each paired with the evidence that I avoided it."
   rows={[
-    ['Storing derived state', 'Compute it in render'],
-    ['useEffect as an event handler', 'Do it in the handler'],
-    ['Abstracting before the second use', 'Duplicate once, then extract'],
-    ['Cargo-cult useMemo', 'Profile first'],
-    ['A wall of divs with no landmarks', 'Semantic elements first'],
-    ['AI decides who owns the state', 'I decide; AI critiques'],
+    ['Storing derived state', 'Every useState justified; derived values computed in render'],
+    ['useEffect as an event handler', 'Each effect names its external system; actions live in handlers'],
+    ['Abstracting before the second use', 'Inline first, extract on the second or third use'],
+    ['Cargo-cult useMemo', 'Every memo has a Profiler measurement behind it'],
+    ['A wall of divs with no landmarks', 'Semantic HTML, landmarks, axe at zero, keyboard and screen-reader passes'],
   ]}
-  caption="The plan's five traps and its AI note, each with the replacing habit."
 />
 
 <Levels label="Phase 2, the README, the traps and the AI-era note">
 
 <Level name="Beginner">
 
-The proof's README: what the app does, how to run it, screenshots, and a short design rationale (why
-these components, where state lives, what was left out).
+The README is part of the proof: what the app does, screenshots (phone and desktop, light and dark), how to run it in three commands, the live link,
+and a short design rationale. The rationale is a few paragraphs: why these components, where state lives and why, the token scale, accessibility
+decisions, and what I would change next.
+
+```text
+## Design rationale
+State: filters live in the URL so views are shareable; server data in the query cache;
+only form drafts and UI toggles use component state.
+Tokens: a 4/8/16/32 spacing scale and 12 semantic colours, two themes, all pairs pass 4.5:1.
+```
 
 </Level>
 
 <Level name="Intermediate">
 
-A rationale paragraph per decision: "Search lives in the URL so results are shareable." It doubles as
-interview material in Phase 8.
+The AI-era note: AI is good at scaffolding a component and not good at deciding who owns the state. My review checklist for generated
+components: every `useState` (could it be derived? is it in the right component?), every `useEffect` (what external system? are dependencies
+complete? is there cleanup?), every list key, every interactive element's semantics. Then I ask the model to critique, not to replace:
+
+```text
+Prompt: Critique this component. For each piece of state, say whether it could be
+derived or should live elsewhere. For each effect, say whether it is needed. List
+accessibility problems. Do not rewrite it.
+```
 
 </Level>
 
 <Level name="Advanced">
 
-The AI-era note: AI scaffolds components well, and is bad at deciding who owns the state. I ask a model
-to critique one component per week ("find derived state, unnecessary effects and missing dependencies")
-and verify every claim.
+Generated components often store derived values, fetch in effects without cleanup, use `div` buttons and index keys, exactly the plan's traps.
+Reviewing them is good practice for the gate: each one is a planted bug.
 
 </Level>
 
 <Level name="Edge cases">
 
-AI-suggested `useEffect` fixes for warnings often silence the lint rule with an empty array. Reject them.
+A model's critique can be wrong (suggesting `useMemo` everywhere, or an effect to sync state). I check each suggestion against the mental model and
+the Profiler before accepting it.
 
 </Level>
 
 <Level name="Corner cases">
 
-A generated component that passes my tests but adds an effect that double-fetches in Strict Mode: tests
-miss it, the Network panel shows it.
+Generated code that passes my tests but fails the keyboard pass shows the limit of automated checks; the manual pass stays in the proof.
 
 </Level>
 
 <Level name="Production level">
 
-No console errors or warnings in development or production builds is part of the proof.
+The deployed app has no console errors or warnings (part of the proof), which I check in a production build, since development warnings differ.
 
 </Level>
 
 <Level name="Mindset">
 
-Ask AI to critique, not to replace judgment.
+Typing speed was never the bottleneck. Deciding where state lives, and noticing when it is wrong, is the skill this phase builds.
 
 </Level>
 
 <Level name="System design">
 
-The rationale is a lightweight design doc; Phase 4 and the Craft series expand it into ADRs.
+The front end built here becomes the client for Phase 3's API: the forms, states and routes already exist, so the backend phase replaces fake data
+with real endpoints.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the app is deployed, passes the keyboard and screen-reader pass, has no console errors, has
-five tested components, and the README has screenshots and a rationale.
+Write the README last week, with screenshots from the deployed app, and audit the code against the trap table before taking the gate.
+
+Done when the README has screenshots and a rationale, the console is clean in production, every trap has evidence, and Gate 2 is passed cold.
 
 </Level>
 
