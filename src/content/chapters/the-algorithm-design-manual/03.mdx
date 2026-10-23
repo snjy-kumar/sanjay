@@ -1,0 +1,1779 @@
+---
+book: the-algorithm-design-manual
+number: 3
+title: "Data Structures"
+description: "Arrays and linked structures, stacks and queues, dictionaries, binary search trees, priority queues, hashing and its tricks, and two war stories about picking the right structure, all in measured TypeScript."
+part: "Part I, Practical Algorithm Design"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A data structure is a way of organising data so that the operations you need
+are cheap. This chapter covers the handful of structures that solve most
+real problems: arrays, linked lists, stacks, queues, dictionaries built from
+search trees or hash tables, and priority queues. Its central claim, backed
+by two war stories, is that swapping one structure for another with the same
+interface but better costs can turn a program that cannot finish into one
+that runs in seconds, without changing anything else.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- Choose between an array and a linked structure from the operations a
+  program needs, and say what each costs.
+- Implement and use stacks, queues, dictionaries and priority queues, and
+  explain their interfaces separately from their implementations.
+- Build a binary search tree with search, insert, delete and traversal, and
+  explain why its shape decides its speed.
+- Implement a binary heap and use it for top-k and scheduling problems.
+- Explain hashing, collision resolution and load factor, and use hashing for
+  duplicate detection, canonicalisation and fingerprints.
+
+**What you should already know:** <a href={withBase('/books/the-algorithm-design-manual/02-algorithm-analysis/')}>chapter 2, Algorithm Analysis</a>
+for O, Θ and amortised cost; references or pointers in at least one
+language; recursion.
+
+**Reading time:** about eighty minutes straight through, four to five hours
+with the code and self-checks.
+
+All code is my own TypeScript run in Node 22 with
+`node --experimental-strip-types`; times are from my machine.
+
+## Chapter map
+
+<Flow caption="The chapter in order. It starts with the two ways to lay data out in memory, builds abstract containers and dictionaries on top of them, then specialises: trees for ordered data, heaps for priorities, hashing for speed, and a tour of specialised structures. Two war stories show the payoff." steps={[
+  "3.1 Contiguous vs linked: arrays, pointers, the trade-off",
+  "3.2 Containers: stacks and queues",
+  "3.3 Dictionaries: the search/insert/delete interface",
+  "3.4 Binary search trees: ordered dictionaries, balance",
+  "3.5 Priority queues: always the smallest next",
+  "3.6 War story: stripping triangulations",
+  "3.7 Hashing: collisions, duplicates, canonicalisation, compaction",
+  "3.8 Specialised structures: strings, geometry, graphs, sets",
+  "3.9 War story: string 'em up",
+]} />
+
+<Layers caption="Interfaces sit on top of implementations, which sit on top of memory layouts. The chapter's habit is to choose the interface from the problem and then the implementation from the costs." layers={[
+  { name: "Problem", note: "'find the next job by deadline', 'have I seen this before?'" },
+  { name: "Abstract data type", note: "priority queue, dictionary, stack, queue" },
+  { name: "Implementation", note: "binary heap, hash table, balanced tree, array with head index" },
+  { name: "Memory layout", note: "contiguous array or linked nodes with pointers" },
+]} />
+
+## 3.1 Contiguous vs. Linked Data Structures
+
+### In one sentence
+
+Every data structure is built from contiguous blocks of memory (arrays),
+linked pieces joined by pointers, or a mix, and that choice decides which
+operations are cheap.
+
+### The idea
+
+There are only two ways to put a collection in memory. **Contiguously
+allocated** structures sit in one block of adjacent memory cells: arrays,
+matrices, heaps, hash tables. **Linked** structures are separate chunks
+joined by **pointers**, values that hold the memory address of another
+chunk: lists, trees, graph adjacency lists. Most real structures combine
+both, such as an array of linked lists.
+
+#### Arrays
+
+An **array** is a fixed-size block of records, each found by its index. Its
+strengths follow from contiguity. Access by index is constant time, because
+the address of item i is the start address plus i times the record size. No
+memory is spent on links. Scanning is fast because neighbouring items sit in
+the same cache line, so memory access is nearly free once one item is
+loaded.
+
+Its weakness is the fixed size. The fix is the **dynamic array**, which
+doubles its capacity when full and copies everything across. Chapter 2's
+geometric-series argument shows the total copying for n insertions is under
+2n, so each append costs O(1) amortised. JavaScript's arrays, Java's
+ArrayList and Python's list all work this way.
+
+#### Pointers and linked structures
+
+A **linked list** is a chain of nodes, each holding an item and a pointer to
+the next node (and, in a doubly linked list, to the previous one). Searching
+walks the chain: O(n). Inserting at the front is O(1): make a new node point
+at the old head. Deleting a node you already have a pointer to is O(1) in a
+doubly linked list, because you can reach both neighbours and splice it out.
+
+```ts
+type Node = { v: number; next: Node | null };
+let head: Node | null = null;
+function pushFront(v: number) { head = { v, next: head }; }       // O(1)
+function find(v: number): Node | null {                             // O(n)
+  for (let p = head; p; p = p.next) if (p.v === v) return p;
+  return null;
+}
+```
+
+#### Comparison
+
+I measured the difference on 100,000 items:
+
+```text
+insert at front x100000: linked list 10.2 ms, array unshift 758 ms; array push 5.3 ms
+sum: list 1.69 ms, array 1.84 ms, equal=true
+list[99999] by walking: 1.20 ms; array index: O(1)
+```
+
+Inserting at the front of an array means shifting every item along, so
+100,000 front insertions cost about n²/2 moves: 758 ms against 10 ms for the
+list. Appending to the end of an array is the fastest of all. Summing is
+about equal at this size. Reaching the last item of the list means walking
+all 100,000 nodes, while the array jumps straight there.
+
+<Compare
+  left="Arrays (contiguous)"
+  right="Linked lists"
+  rows={[
+    ["index access in O(1)", "access by position is O(n): walk the chain"],
+    ["no space spent on pointers", "one or two pointers per item"],
+    ["excellent cache locality", "nodes scattered in memory"],
+    ["insert or delete in the middle is O(n)", "insert or delete at a known node is O(1)"],
+    ["resize by doubling, O(1) amortised append", "never needs resizing; no overflow"],
+    ["easy to split into halves by index", "splitting needs a walk to the middle"],
+  ]}
+  caption="The basic trade-off. Arrays win on access, space and locality; linked lists win on flexible insertion and deletion. In practice arrays win more often than textbooks suggest, because of cache effects."
+/>
+
+### Worked example
+
+**Simple: an undo history.** An editor keeps an undo history of the last
+100 actions. It needs append-at-end, remove-from-end (undo) and drop the
+oldest when full. A **circular buffer**, an array with a start index that
+wraps around, does all three in O(1) with no allocation per action. A linked
+list also works but allocates a node per action for no gain.
+
+**Realistic: a least-recently-used (LRU) cache.** A cache that evicts the
+least recently used entry needs to move any entry to the front when it is
+used and remove from the back when full. A doubly linked list does both in
+O(1) given a pointer to the node, and a hash map from key to node supplies
+that pointer. This pairing is the standard LRU design, and JavaScript's
+`Map` (which keeps insertion order) can stand in for both: delete and
+re-insert a key to move it to the end.
+
+### Step by step
+
+Deleting node B from a doubly linked list `A ⇄ B ⇄ C`, given a pointer to B:
+
+<Trace
+  columns={["step", "operation", "list as seen from A going forward", "list from C going back"]}
+  rows={[
+    ["0", "start", "A → B → C", "C → B → A"],
+    ["1", "B.prev.next = B.next (A now points to C)", "A → C", "C → B → A"],
+    ["2", "B.next.prev = B.prev (C now points back to A)", "A → C", "C → A"],
+    ["3", "drop B (garbage collected)", "A → C", "C → A"],
+  ]}
+  caption="Two pointer updates splice B out in constant time. A singly linked list cannot do this without first walking from the head to find B's predecessor."
+/>
+
+### Common mistake
+
+**The mistake:** choosing a linked list for "fast insertion" and then
+inserting at positions found by searching.
+
+**Why it fails:** the O(1) insertion assumes you already hold a pointer to
+the position. If you have to search for it first, the search is O(n) and
+the total is no better than an array, with worse constants because of
+scattered memory.
+
+**The fix:** use a linked list only when the program naturally holds
+pointers to the places it edits (an LRU cache, a free list, an editor's
+cursor). Otherwise, an array is usually faster.
+
+### In real systems
+
+Cache locality makes arrays the default in performance-sensitive code. Game
+engines store components in flat arrays ("structure of arrays") instead of
+objects linked by pointers. Columnar databases store each column as a
+contiguous array so a scan reads only the bytes it needs.
+
+Linked structures earn their place where items move around: operating
+system schedulers keep run queues as linked lists, memory allocators keep
+free lists, and the Linux kernel has a generic intrusive linked list used
+throughout. Hybrid structures, such as a linked list of arrays (an unrolled
+list, or the chunked deques in many standard libraries), get most of both.
+
+### Check yourself
+
+<details>
+<summary>Why is reading item i of an array constant time but of a linked list linear?</summary>
+
+The array's item i lives at a computable address (start plus i times the
+record size). The list's item i can only be found by following i pointers
+from the head.
+
+</details>
+
+<details>
+<summary>Why did 100,000 unshift calls take about 75 times longer than 100,000 list pushFront calls?</summary>
+
+Each unshift shifts every existing element along by one, so the total work
+is about n²/2 moves. Each pushFront is one allocation and one pointer
+assignment.
+
+</details>
+
+## 3.2 Containers: Stacks and Queues
+
+### In one sentence
+
+A container stores items and hands them back in an order determined only by
+when they arrived: a stack returns the newest first, a queue the oldest
+first.
+
+### The idea
+
+A **container** is an abstract data type that supports putting items in and
+taking items out, where the retrieval order does not depend on the items'
+values. The two that matter:
+
+- A **stack** supports push (add on top) and pop (remove from the top), so it
+  is **LIFO**, last in, first out. Think of a pile of plates.
+- A **queue** supports enqueue (add at the back) and dequeue (remove from the
+  front), so it is **FIFO**, first in, first out. Think of a checkout line.
+
+Both are easy with either an array or a linked list, and every operation is
+O(1). The choice between them is about which order the algorithm needs.
+Stacks suit nested structure: function calls, matching brackets, undo,
+depth-first search (chapter 7). Queues suit fairness and levels: request
+processing, breadth-first search, buffering between a fast producer and a
+slow consumer.
+
+<Figure art={`
+     stack (LIFO)                 queue (FIFO)
+     push  pop
+       |   ^                   enqueue          dequeue
+       v   |                     |                 ^
+     +-------+                   v                 |
+     |   D   |  <- top        +---+---+---+---+---+
+     +-------+                | E | D | C | B | A |
+     |   C   |                +---+---+---+---+---+
+     +-------+                 back             front
+     |   B   |
+     +-------+                A arrived first and
+     |   A   |                leaves first
+     +-------+
+`} caption="The two containers. A stack adds and removes at the same end; a queue adds at one end and removes at the other. Both run in constant time per operation." />
+
+### Worked example
+
+**Simple: matching brackets with a stack.** Push every opening bracket; on a
+closing bracket, pop and check that it matches. The string is balanced if
+every pop matches and the stack ends empty.
+
+```ts
+function balanced(s: string): boolean {
+  const st: string[] = [], pair: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  for (const c of s) {
+    if ('([{'.includes(c)) st.push(c);
+    else if (c in pair && st.pop() !== pair[c]) return false;
+  }
+  return st.length === 0;
+}
+```
+
+```text
+"(a[b]{c})" true
+"(a[b)]" false
+"((" false
+"f(x) = [1, {2}]" true
+```
+
+**Realistic: a queue that does not degrade.** JavaScript has no built-in
+queue, and the obvious `array.shift()` moves every remaining element on each
+dequeue. I compared it with a queue that keeps a head index and compacts the
+array only occasionally:
+
+```text
+200000 enqueue+dequeue: head-index queue 14 ms, array.shift 2874 ms
+```
+
+Two hundred times slower, because shift made the queue quadratic. Job
+queues and BFS implementations written with shift work fine in tests and
+stall in production.
+
+### Step by step
+
+The bracket checker on `(a[b)]`:
+
+<Trace
+  columns={["character", "action", "stack after (bottom to top)"]}
+  rows={[
+    ["(", "push", "("],
+    ["a", "ignore", "("],
+    ["[", "push", "( ["],
+    ["b", "ignore", "( ["],
+    [")", "pop gives [, expected ( : mismatch", "return false"],
+  ]}
+  caption="The checker fails at the first closing bracket whose partner is not on top of the stack. The stack holds exactly the brackets that are still open, innermost on top."
+/>
+
+### Common mistake
+
+**The mistake:** using `shift()` (or removing from the front of a Python
+list) as a queue's dequeue.
+
+**Why it fails:** removing from the front of a dynamic array shifts every
+remaining element, so each dequeue is O(n) and the queue is quadratic over
+n operations, as the 2.9-second measurement showed.
+
+**The fix:** use a real queue: a head index into an array (as above), a
+circular buffer, a linked list, or the language's deque (`collections.deque`
+in Python, `ArrayDeque` in Java).
+
+### In real systems
+
+Every running program has a stack: the call stack holds each active function
+call's local variables and return address, which is why deep recursion
+overflows it. Expression evaluators and parsers use explicit stacks, and the
+JVM and WebAssembly are stack machines.
+
+Queues are the backbone of distributed systems: message brokers (Kafka,
+RabbitMQ, SQS) are durable queues between services, and a queue's depth is
+one of the first metrics to watch, because a queue that grows means
+consumers are slower than producers. Web servers hold incoming connections
+in an accept queue for the same reason.
+
+### Check yourself
+
+<details>
+<summary>Which container does depth-first search use, and which breadth-first?</summary>
+
+Depth-first uses a stack (often the call stack, through recursion);
+breadth-first uses a queue.
+
+</details>
+
+<details>
+<summary>How can a queue be built from two stacks?</summary>
+
+Push onto an "in" stack. To dequeue, if the "out" stack is empty, pop
+everything from "in" onto "out" (reversing the order), then pop from "out".
+Each item moves at most twice, so operations are O(1) amortised.
+
+</details>
+
+## 3.3 Dictionaries
+
+### In one sentence
+
+A dictionary is the abstract data type for finding items by key, with
+search, insert and delete as its core operations and, in ordered versions,
+min, max, successor and predecessor as well.
+
+### The idea
+
+A **dictionary** stores items that each have a **key**, and supports
+**search** (given a key, return the item or report it missing), **insert**
+and **delete**. Some uses also need order: **max** and **min** (the largest
+and smallest keys), and **successor** and **predecessor** (the next key
+larger or smaller than a given one). A dictionary with those extra
+operations is an ordered dictionary.
+
+The interface is fixed; the implementation varies, and each one is cheap at
+some operations and expensive at others. The book's way of building
+intuition is to tabulate the costs for four simple implementations:
+unsorted and sorted arrays, and singly and doubly linked lists. Here is my
+version of that table for arrays, with the reasons:
+
+<Compare
+  left="Operation"
+  right="Unsorted array / sorted array"
+  rows={[
+    ["search(key)", "O(n), scan everything / O(log n), binary search"],
+    ["insert", "O(1), append / O(n), shift items to keep order"],
+    ["delete (given the position)", "O(1), move last item into the hole / O(n), shift to close the gap"],
+    ["min or max", "O(n), scan / O(1), first or last item"],
+    ["successor or predecessor", "O(n), scan for the next larger / O(1), next index"],
+  ]}
+  caption="No simple array is good at everything. The unsorted array makes updates cheap and queries expensive; the sorted array does the reverse. Trees and hash tables exist to escape this trade-off."
+/>
+
+Linked lists behave like the unsorted array for most operations, with two
+twists. A sorted list does not get binary search, because you cannot jump to
+the middle, so search stays O(n). And deletion given a node is O(1) only for
+a doubly linked list, which can reach the predecessor.
+
+### Worked example
+
+**Simple: a word-frequency counter.** Count how often each word appears in a
+text: for every word, search the dictionary; if found, increment; otherwise
+insert with count 1. With an unsorted array, each search is O(n) in the
+number of distinct words, so a text with m words and d distinct words costs
+O(md). With a hash table (section 3.7) it costs O(m) expected. For a book
+with 100,000 words and 10,000 distinct ones, that is a billion steps versus
+100,000.
+
+**Realistic: a leaderboard.** A game shows the top 10 players and lets a
+player see the rank just above and below theirs. That needs search by player
+(a hash map from player to score) and ordered operations on scores
+(successor and predecessor), which a hash table cannot do. Production
+systems use an ordered structure for scores, such as Redis's sorted sets,
+which combine a hash table with a skip list, an ordered linked structure
+with expected logarithmic operations.
+
+### Step by step
+
+Delete from an unsorted array in O(1), given the index of the item to
+remove. Array `[7, 2, 9, 4, 5]`, delete index 1 (the 2):
+
+<Trace
+  columns={["step", "array", "note"]}
+  rows={[
+    ["0", "7 2 9 4 5", "remove item at index 1"],
+    ["1", "7 5 9 4 5", "copy the last item into the hole"],
+    ["2", "7 5 9 4", "shrink the length by one"],
+  ]}
+  caption="Order does not matter in an unsorted array, so the hole can be filled by the last item instead of shifting everything. Two steps, whatever the size."
+/>
+
+### Common mistake
+
+**The mistake:** picking a dictionary implementation by its search cost alone.
+
+**Why it fails:** the right choice depends on the mix of operations. A sorted
+array has excellent search but O(n) inserts, which is a disaster for a
+dictionary that changes constantly, and a hash table cannot do successor or
+range queries at all.
+
+**The fix:** list the operations the program performs and roughly how often,
+then price each implementation on that mix.
+
+### In real systems
+
+Dictionaries are the most-used data structure in software. Every
+programming language has one built in (`Map` and objects in JavaScript,
+`dict` in Python, `HashMap` and `TreeMap` in Java), and the presence of both
+hashed and tree versions in Java's library is this section's trade-off made
+concrete. Key-value stores such as Redis, DynamoDB and etcd are dictionaries
+served over a network.
+
+The ordered/unordered distinction decides which store fits. Range queries
+("all orders from last Tuesday") need an ordered structure such as a B-tree
+or an LSM tree; pure lookups by ID can use hashing and scale out by
+partitioning keys across machines.
+
+### Check yourself
+
+<details>
+<summary>Which simple implementation gives O(1) min but O(n) insert?</summary>
+
+A sorted array: the minimum is the first item, but inserting means shifting
+everything after the insertion point.
+
+</details>
+
+<details>
+<summary>Why can't a sorted linked list use binary search?</summary>
+
+Binary search needs to jump to the middle in O(1). A linked list can only
+reach the middle by walking half the list, so each "jump" is O(n).
+
+</details>
+
+## 3.4 Binary Search Trees
+
+### In one sentence
+
+A binary search tree keeps keys in a tree where everything left of a node is
+smaller and everything right is larger, giving search, insert, delete and
+ordered operations in time proportional to the tree's height.
+
+### The idea
+
+Sorted arrays search fast and update slowly; linked lists update fast and
+search slowly. A **binary search tree** (BST) gets both by making the
+structure itself encode the order. Each node holds a key and pointers to a
+left and a right child. The rule, for every node, is that all keys in its left
+subtree are smaller and all keys in its right subtree are larger.
+
+That rule turns search into a walk: compare with the root, go left if the
+key is smaller, right if larger, and stop when you find it or fall off the
+tree. Each step goes one level down, so every operation costs O(h), where h
+is the **height**, the number of edges on the longest root-to-leaf path.
+
+<Figure art={`
+                    5
+                 /     \\
+               3         8
+             /   \\     /   \\
+            1     4   7     9
+             \\       /
+              2     6
+
+   search 6:  5 -> right (8) -> left (7) -> left (6)  found, 3 steps
+   in-order walk (left, node, right): 1 2 3 4 5 6 7 8 9
+`} caption="A binary search tree built by inserting 5, 3, 8, 1, 4, 7, 9, 2, 6. Search follows one path from the root; an in-order traversal visits the keys in sorted order." />
+
+#### 3.4.1 Implementing binary search trees
+
+**Search** is the walk above. **Insert** walks down as for a search and
+attaches the new node where the walk falls off. **Min** follows left
+pointers to the end; **max** follows right pointers. **Traversal** in order
+(left subtree, node, right subtree) visits keys in sorted order, which is
+how a BST sorts.
+
+```ts
+type T = { key: number; left: T | null; right: T | null };
+function insert(t: T | null, k: number): T {
+  if (!t) return { key: k, left: null, right: null };
+  if (k < t.key) t.left = insert(t.left, k); else t.right = insert(t.right, k);
+  return t;
+}
+const inorder = (t: T | null, out: number[] = []): number[] => {
+  if (t) { inorder(t.left, out); out.push(t.key); inorder(t.right, out); }
+  return out;
+};
+```
+
+**Delete** has three cases, by how many children the node has. With no
+children, remove it. With one child, link the child to the node's parent.
+With two children, replace the node's key with its **in-order successor**
+(the smallest key in its right subtree, which has no left child), then delete
+that successor from the right subtree, which is one of the easy cases.
+
+```ts
+function del(t: T | null, k: number): T | null {
+  if (!t) return null;
+  if (k < t.key) t.left = del(t.left, k);
+  else if (k > t.key) t.right = del(t.right, k);
+  else {
+    if (!t.left) return t.right;
+    if (!t.right) return t.left;
+    let s = t.right; while (s.left) s = s.left;   // in-order successor
+    t.key = s.key; t.right = del(t.right, s.key);
+  }
+  return t;
+}
+```
+
+```text
+inorder 1 2 3 4 5 6 7 8 9 height 3
+after delete 3: 1 2 4 5 6 7 8 9 root.left = 4
+after delete 5 (root): 1 2 4 6 7 8 9 new root = 6
+```
+
+#### 3.4.2 How good are binary search trees?
+
+Everything costs O(h), so the question is the height. With n keys, the best
+possible height is about lg n (a perfectly balanced tree), and the worst is
+n − 1 (a chain). Which you get depends on the insertion order. Inserting keys
+in sorted order makes every new key the right child of the last: a linked
+list with extra steps.
+
+Inserting in random order does much better: the expected height is
+O(log n). For very large n it approaches about 4.3 ln n, which is about
+3 lg n, a known result from the analysis of random trees. I measured it:
+
+```text
+n=1000: random-order height 22 (lg n = 10.0); sorted-order height for 1000 keys 999, built in 5 ms
+n=10000: random-order height 28 (lg n = 13.3); sorted-order height for 10000 keys 9999, built in 118 ms
+n=100000: random-order height 41 (lg n = 16.6); sorted-order height for 10000 keys 9999, built in 140 ms
+```
+
+Random order gives heights of two to two-and-a-half times lg n: fine.
+Sorted order gives the worst case exactly, and building it is quadratic:
+10,000 sorted keys took 118 ms, against a few milliseconds for 100,000
+random ones.
+
+#### 3.4.3 Balanced search trees
+
+Relying on random input order is a gamble, because real input is often
+sorted. **Balanced search trees** remove the gamble by restructuring
+themselves on every insert and delete, so the height stays O(log n) for any
+order. Red-black trees, AVL trees and B-trees do this with **rotations**,
+local rearrangements of a few pointers that change the shape without
+breaking the left-smaller, right-larger rule. The details are intricate; the
+book's advice, which I agree with, is to know they exist, use a library
+implementation, and understand the guarantee: every dictionary operation in
+O(log n) worst case.
+
+<Figure art={`
+   right rotation at y:
+
+          y                      x
+         / \\                    / \\
+        x   C      ===>        A   y
+       / \\                        / \\
+      A   B                      B   C
+
+   order is preserved: A < x < B < y < C in both
+   the left side got one level shorter, the right one level taller
+`} caption="A rotation, the basic move of every balanced tree. It changes two parent-child links and preserves the in-order sequence, so the tree is still a valid search tree with a different shape." />
+
+### Worked example
+
+**Simple: successor without a sort.** The successor of key k is the smallest
+key larger than k. If k's node has a right subtree, it is the minimum of that
+subtree. Otherwise, walk up until you come from a left child; that parent is
+the successor. In the tree above, the successor of 4 (no right subtree) is
+found by walking up: 4 is the right child of 3, and 3 is the left child of 5,
+so the successor is 5.
+
+**Realistic: a range query.** "All appointments between 9:00 and 11:00" on a
+BST keyed by time: search for 9:00, then repeatedly take the successor until
+passing 11:00. Cost: O(h + k) for k results. A hash table would have to scan
+everything. This is why databases index time columns with trees.
+
+### Step by step
+
+Deleting 5 (the root, two children) from the tree in the figure:
+
+<Trace
+  columns={["step", "action", "tree in order"]}
+  rows={[
+    ["0", "find 5: it is the root, with two children", "1 2 3 4 5 6 7 8 9"],
+    ["1", "find its in-order successor: go right to 8, then left to 7, left to 6; 6 has no left child", "—"],
+    ["2", "copy 6 into the root", "1 2 3 4 6 6 7 8 9 (temporarily)"],
+    ["3", "delete the old 6 from the right subtree: it is a leaf, so remove it", "1 2 3 4 6 7 8 9"],
+  ]}
+  caption="The two-child case reduces to an easy case. The successor is the leftmost node of the right subtree, which by construction has no left child, so removing it is trivial."
+/>
+
+### Common mistake
+
+**The mistake:** using an unbalanced BST on data that arrives sorted, such as
+timestamps or auto-increment IDs.
+
+**Why it fails:** each insertion extends a chain, so the tree degenerates
+into a linked list, every operation is O(n), and building it is O(n²), as the
+sorted-order measurement showed.
+
+**The fix:** use a balanced tree from a library (Java's `TreeMap` is a
+red-black tree; C++'s `std::map` usually is too), or shuffle the input if you
+build the tree once from a known set.
+
+### In real systems
+
+Balanced trees are everywhere that order matters. The Linux kernel's
+completely fair scheduler kept runnable tasks in a red-black tree keyed by
+virtual run time and took the leftmost as the next to run. Databases and
+file systems use B-trees, balanced trees with many keys per node to match
+disk pages, so a billion-row index is a few levels deep.
+
+Skip lists are the alternative that systems often pick for simplicity: an
+ordered linked list with random "express lanes" that gives expected
+O(log n) operations. Redis's sorted sets and several log-structured storage
+engines' in-memory tables use them.
+
+### Check yourself
+
+<details>
+<summary>What does an in-order traversal of a BST produce?</summary>
+
+The keys in sorted order: left subtree (all smaller), then the node, then the
+right subtree (all larger), recursively.
+
+</details>
+
+<details>
+<summary>Why is the two-child delete case replaced by the successor rather than any node?</summary>
+
+The successor is the next key in sorted order, so putting it at the node
+keeps everything on the left smaller and everything on the right larger. It
+is the leftmost node of the right subtree, so it has at most one child and is
+easy to remove.
+
+</details>
+
+## 3.5 Priority Queues
+
+### In one sentence
+
+A priority queue always hands back the item with the smallest (or largest)
+key, and a binary heap does insert and extract-min in O(log n) using nothing
+but an array.
+
+### The idea
+
+A **priority queue** is a container whose retrieval order depends on the
+items' keys, not their arrival times. Its operations are **insert**,
+**find-min** (look at the smallest) and **extract-min** (remove and return the
+smallest). Use it whenever a program repeatedly asks "what is the most urgent
+thing now?" while new things keep arriving: event simulation, scheduling,
+Dijkstra's shortest paths (chapter 8), merging sorted streams.
+
+Implementations trade costs as usual. An unsorted array inserts in O(1) but
+finds the minimum in O(n). A sorted array finds it in O(1) but inserts in
+O(n). A balanced BST does both in O(log n). The **binary heap**, covered in
+full in chapter 4, does insert and extract-min in O(log n) and find-min in
+O(1), and it lives in a plain array: the children of index i are at 2i + 1
+and 2i + 2, and every parent is no larger than its children.
+
+```ts
+class MinHeap {
+  a: number[] = [];
+  push(x: number) {
+    const a = this.a; a.push(x); let i = a.length - 1;
+    while (i > 0) {                             // bubble up
+      const p = (i - 1) >> 1;
+      if (a[p] <= a[i]) break;
+      [a[p], a[i]] = [a[i], a[p]]; i = p;
+    }
+  }
+}
+```
+
+Extract-min moves the last element to the root and sifts it down, swapping
+with the smaller child until neither child is smaller. Both directions walk
+one path of a tree of height lg n.
+
+<Figure art={`
+   array:  [ 1 | 3 | 9 | 7 | 5 ]
+   index:    0   1   2   3   4
+
+   as a tree (children of i at 2i+1, 2i+2):
+
+                1
+              /   \\
+             3     9
+            / \\
+           7   5
+
+   every parent is no larger than its children;
+   the minimum is always at index 0
+`} caption="A binary heap is a tree laid out level by level in an array. No pointers are stored: parent and child positions are computed from the index." />
+
+### Worked example
+
+**Simple: watching the heap form.** Pushing 7, 3, 9, 1, 5:
+
+```text
+push 7 -> [7]
+push 3 -> [3,7]
+push 9 -> [3,7,9]
+push 1 -> [1,3,9,7]
+push 5 -> [1,3,9,7,5]
+pops: 1 3 5 7 9
+```
+
+The array is not sorted, but its first element is always the minimum, and
+popping repeatedly yields sorted order (that is heapsort, chapter 4).
+
+**Realistic: top-k of a stream.** Find the 10 largest of a million values.
+Sorting everything costs n log n. A min-heap of size 10 holds the best 10 so
+far: for each new value larger than the heap's minimum, pop the minimum and
+push the new value. Each step is O(log 10), so the total is O(n log k).
+
+```text
+top-10 of 1e6: heap 157 ms, sort 3267 ms, same=true
+```
+
+Twenty times faster, and it uses constant memory, so it works on a stream
+that never ends: top queries per minute, largest transactions today.
+
+### Step by step
+
+Pushing 1 into the heap `[3, 7, 9]`:
+
+<Trace
+  columns={["step", "array", "i (position of the new item)", "parent compared", "action"]}
+  rows={[
+    ["0", "3 7 9 1", "3", "index 1 holds 7", "1 is smaller than 7: swap"],
+    ["1", "3 1 9 7", "1", "index 0 holds 3", "1 is smaller than 3: swap"],
+    ["2", "1 3 9 7", "0", "none (root)", "stop"],
+  ]}
+  caption="The new item bubbles up one level per swap until its parent is smaller or it reaches the root. The path from a leaf to the root has at most lg n steps."
+/>
+
+### Common mistake
+
+**The mistake:** implementing "process the most urgent item" by sorting the
+whole list each time a new item arrives, or by scanning for the minimum.
+
+**Why it fails:** with n items and m arrivals, re-sorting costs m · n log n
+and scanning costs m · n. A heap costs m · log n.
+
+**The fix:** use a heap. Most standard libraries have one (`heapq` in Python,
+`PriorityQueue` in Java, `std::priority_queue` in C++); in JavaScript, write
+the 30-line class or use a small library.
+
+### In real systems
+
+Priority queues schedule work everywhere: operating system schedulers,
+timers in event loops (Node.js keeps timers in priority structures keyed by
+expiry), and job queues with priorities. Network routers use them for
+quality-of-service, and discrete-event simulations are a priority queue of
+future events.
+
+Top-k with a bounded heap is the standard method for "heavy hitters"
+dashboards and for merging k sorted files (put the head of each file in a
+heap, repeatedly pop the smallest and push the next from the same file),
+which is the core of external sorting in databases.
+
+### Check yourself
+
+<details>
+<summary>Where are the children of the item at index 4 in an array heap?</summary>
+
+At indices 9 and 10 (2 × 4 + 1 and 2 × 4 + 2). Its parent is at index 1, the
+floor of (4 − 1)/2.
+
+</details>
+
+<details>
+<summary>Why does top-k use a min-heap to find the largest values?</summary>
+
+The heap holds the current best k, and the question for each new value is
+"is it bigger than the worst of my best?" The worst of the best is the
+minimum, which a min-heap gives in O(1).
+
+</details>
+
+## 3.6 War Story: Stripping Triangulations
+
+### In one sentence
+
+A graphics program that broke 3D models into triangle strips was too slow
+because it found the next triangle to process by scanning, and replacing the
+scan with a priority queue made it fast without changing the heuristic.
+
+### The idea
+
+The story, in outline and in my words. Graphics hardware draws surfaces as
+triangles, and sending them as **strips**, sequences where each new triangle
+shares an edge with the previous one, means each triangle after the first
+costs one new vertex instead of three. Splitting a model into as few strips
+as possible makes rendering faster. Finding the minimum number of strips is
+a hard problem, so the team used a greedy heuristic: repeatedly start a
+strip from a good triangle (roughly, one with few remaining neighbours, which
+is otherwise likely to be stranded) and extend it.
+
+The heuristic's quality was fine. Its speed was not: to find the best next
+starting triangle, the program examined every remaining triangle, so each
+strip cost O(n) just to begin and the whole run was quadratic. Large models
+took far too long. The fix kept the heuristic and changed the data structure:
+keep triangles in a priority queue keyed by their number of remaining
+neighbours, and update the keys of a strip's neighbours as it consumes
+triangles. Each step became logarithmic, and the program became fast enough
+for interactive use.
+
+The lesson the book draws: when a program's logic is right but it is too
+slow, look for a repeated "find the best" or "find this" operation done by
+scanning, and give it a proper data structure.
+
+### Worked example
+
+**Simple: why degree-first is a sensible greedy.** A triangle with only one
+remaining neighbour has one way to join a strip; if its neighbour is used up
+first, it is left as a strip of length one. Starting with low-degree
+triangles uses them before they are stranded. That is the same "do the most
+constrained thing first" principle as many scheduling heuristics.
+
+**Realistic: my simulation.** I built a grid of triangles (two per square,
+each adjacent to up to three others) and ran the core loop of such a
+heuristic: repeatedly take the remaining triangle with the fewest remaining
+neighbours, remove it, and decrement its neighbours' counts. Once with a
+linear scan for the minimum, once with a **bucket queue** (one set per
+possible degree, 0 to 3), the simplest priority queue when keys are small
+integers.
+
+```text
+800 triangles: scan work 640,000 (5 ms), bucket-queue work 3,120 (0.8 ms)
+3200 triangles: scan work 10,240,000 (20 ms), bucket-queue work 12,640 (2.7 ms)
+12800 triangles: scan work 163,840,000 (305 ms), bucket-queue work 50,880 (5.5 ms)
+```
+
+Quadrupling the triangles multiplied the scan's work by 16 (quadratic) and
+the bucket queue's by 4 (linear). Real models have millions of triangles,
+where the scan's n² is about 10¹² steps and the queue's work is a few
+million.
+
+### Step by step
+
+The bucket queue's state for a tiny strip of four triangles in a row, A–B–C–D
+(A and D have one neighbour, B and C have two):
+
+<Trace
+  columns={["step", "take", "buckets after (degree: triangles)", "why"]}
+  rows={[
+    ["0", "—", "1: A D   2: B C", "initial degrees"],
+    ["1", "A (bucket 1)", "1: D B   2: C", "B lost neighbour A, moves to bucket 1"],
+    ["2", "D (bucket 1)", "1: B C", "C lost neighbour D, moves to bucket 1"],
+    ["3", "B (bucket 1)", "0: C", "C lost neighbour B, moves to bucket 0"],
+    ["4", "C (bucket 0)", "empty", "done"],
+  ]}
+  caption="Each removal touches only the removed triangle's neighbours, a constant number of bucket moves. No step looks at the whole set, which is what turned the quadratic scan into linear work."
+/>
+
+### Common mistake
+
+**The mistake:** concluding that a slow heuristic needs a cleverer heuristic,
+when the problem is how it finds things.
+
+**Why it fails:** the heuristic's quality and its running time are separate.
+Rewriting the logic risks worse results and may keep the same slow scan.
+
+**The fix:** profile, find the repeated search or minimum, and replace it
+with a dictionary or priority queue that supports the same question in
+logarithmic or constant time.
+
+### In real systems
+
+Mesh processing libraries and game engines still generate strips or their
+modern successor, optimised index orders for vertex caches, using greedy
+heuristics with priority structures. More generally, this is the most
+common performance fix in real code: a profiler shows a hot loop that
+searches a list, and a hash map or heap removes it.
+
+Graph algorithms in production (shortest paths in routing, schedulers that
+pick the least-loaded machine) depend on the same move. Dijkstra's algorithm
+with a linear scan is O(V²); with a heap it is O((V + E) log V), which is
+what makes routing on road networks with millions of nodes feasible.
+
+### Check yourself
+
+<details>
+<summary>What changed between the slow and the fast versions of the strip program?</summary>
+
+Only the data structure used to find the next starting triangle: a scan was
+replaced with a priority queue whose keys were updated as triangles were used.
+
+</details>
+
+<details>
+<summary>When is a bucket queue better than a heap?</summary>
+
+When keys are small integers in a known range (like degrees 0 to 3). Each
+operation is then O(1) instead of O(log n).
+
+</details>
+
+## 3.7 Hashing
+
+### In one sentence
+
+A hash function turns a key into an array index, so a hash table can search,
+insert and delete in constant expected time, and the same idea powers
+duplicate detection, canonicalisation and compact fingerprints.
+
+### The idea
+
+A **hash function** maps a key to an integer in a fixed range, ideally
+spreading different keys evenly across that range. A **hash table** is an
+array of m slots, and an item with key k goes in slot h(k). If the hash
+spreads keys well, searching for k means looking in one slot: O(1) expected.
+
+For strings, a standard hash treats the characters as digits in a large
+base and reduces modulo m, computed with **Horner's rule** (multiply the
+running value by the base and add the next character) so no large numbers
+appear:
+
+```ts
+function strHash(s: string, m: number): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % m;
+  return h;
+}
+// strHash('algorithm', 101) = 76, strHash('logarithm', 101) = 94
+```
+
+The two anagrams land in different slots because position matters; a hash
+that just added up the characters would put every anagram in the same slot.
+
+#### 3.7.1 Collision resolution
+
+Two keys that hash to the same slot are a **collision**, and with more keys
+than slots, or just bad luck, collisions are certain. The birthday paradox
+(chapter 6) says that with m slots, a collision is likely after only about
+√m keys. There are two standard ways to cope.
+
+**Chaining:** each slot holds a linked list (or small array) of the items that
+hash there. Search scans one chain. With n items in m slots, the **load
+factor** α = n/m is the average chain length, so expected search cost is
+O(1 + α).
+
+**Open addressing:** all items live in the array itself. On a collision, probe
+other slots in a fixed sequence (linear probing tries the next slot, then the
+next) until an empty one appears. It uses no extra memory and has excellent
+cache behaviour, but it slows down sharply as the table fills, and deletion
+needs care (a marker, often called a tombstone, so later searches do not stop
+early).
+
+I measured both on 10,007 slots with random keys:
+
+```text
+load 0.5: chaining { maxChain: 5, empty: 6100, avgSuccessfulProbes: 1.25 }  linear probing avg probes to insert 1.53
+load 0.75: chaining { maxChain: 7, empty: 4759, avgSuccessfulProbes: 1.38 }  linear probing avg probes to insert 2.55
+load 0.9: chaining { maxChain: 7, empty: 4092, avgSuccessfulProbes: 1.45 }  linear probing avg probes to insert 5.71
+```
+
+Chaining degrades gently: even at load 0.9, a successful search averages 1.45
+probes. Linear probing is fine at half full and nearly four times worse at
+90 percent, because occupied slots clump into runs that new keys must walk
+past. That is why open-addressing tables resize at a load around 0.5 to 0.75.
+
+<Figure art={`
+   chaining (m = 7)                 linear probing (m = 7)
+   slot                             slot
+    0 | 14                           0 | 14
+    1 | 8 -> 22 -> 15                1 | 8
+    2 | -                            2 | 22    <- wanted 1, taken; moved on
+    3 | 3                            3 | 3
+    4 | -                            4 | 15    <- wanted 1, then 2, 3: moved on
+    5 | -                            5 | -
+    6 | -                            6 | -
+   keys 8, 22, 3, 14, 15 with h(k) = k mod 7
+`} caption="The same five keys under the two schemes. Chaining keeps colliding keys in a list at their slot; linear probing pushes them to the next free slot, which is how runs (clusters) build up." />
+
+#### 3.7.2 Duplicate detection via hashing
+
+Hashing answers "have I seen this before?" in O(1) expected per item: insert
+each item, and report a duplicate when the slot already has it. The book's
+examples are of this kind: is this document already in a large corpus, is
+this web page a copy of one already crawled, has this part of a file already
+been stored. I compared a hash set against sorting for a million random
+numbers:
+
+```text
+dup check 1e6: Set 320 ms (false), sort 119 ms (false)
+```
+
+The sort won here, which surprised me until I looked at why: sorting a
+`Float64Array` is a tight native loop over contiguous numbers, while the
+`Set` allocates and hashes as it goes. Asymptotically hashing is O(n) and
+sorting O(n log n); in practice, for plain numbers in memory, a typed-array
+sort is very hard to beat. For strings, objects and streams, hashing wins
+easily, because you can check each item as it arrives.
+
+#### 3.7.3 Other hashing tricks
+
+Because a good hash function behaves like a random function of its key, it is
+useful beyond tables. Two families of tricks matter most.
+
+**Canonicalisation.** Many problems ask whether two things are "the same"
+under some equivalence, such as anagrams or rotations of a string. Reduce each
+thing to a **canonical form**, a single standard representative of its class,
+and hash or compare that. For anagrams, the sorted letters are canonical:
+
+```ts
+const groups = new Map<string, string[]>();
+for (const w of words) {
+  const key = [...w].sort().join('');           // canonical form
+  groups.set(key, [...(groups.get(key) ?? []), w]);
+}
+// listen,silent,enlist,inlets,tinsel | google,gogole | banana
+```
+
+One pass groups everything, instead of comparing every pair of words.
+
+**Compaction.** A long object (a document, a file, a database row) can be
+replaced by its hash, a **fingerprint** of a few bytes. Two equal objects
+always have equal fingerprints; two different ones almost certainly differ.
+Comparing fingerprints instead of whole objects makes comparison O(1) after
+one pass to compute them. The price is a tiny probability of a false match,
+which a good 64- or 128-bit hash makes negligible and a cryptographic hash
+makes practically impossible to arrange on purpose.
+
+### Worked example
+
+**Simple: why table size matters.** Keys that are multiples of 100, hashed by
+k mod m:
+
+```text
+keys multiples of 100, m=1000: { maxChain: 100, empty: 990, avgSuccessfulProbes: 50.5 }  m=1009 (prime): { maxChain: 1, empty: 9, avgSuccessfulProbes: 1 }
+```
+
+With m = 1,000, every key lands in one of only 10 slots (the multiples of
+100 modulo 1,000), so chains have 100 items and the table behaves like a
+list. With the prime 1,009, the same keys spread perfectly. A prime table
+size, or a hash that mixes the bits well before reducing, protects against
+patterned keys.
+
+**Realistic: deduplicating uploads.** A file-storage service hashes every
+uploaded file with a cryptographic hash such as SHA-256. If the hash already
+exists, it stores a reference instead of a second copy. Backup tools apply
+the same idea to chunks of files, so a 10 GB file with one changed paragraph
+costs a few kilobytes of new storage.
+
+### Step by step
+
+Inserting 8, 22, 3, 14, 15 into a linear-probing table of size 7, h(k) = k
+mod 7:
+
+<Trace
+  columns={["key", "h(k)", "slots probed", "placed in", "table (slots 0–6)"]}
+  rows={[
+    ["8", "1", "1", "1", "- 8 - - - - -"],
+    ["22", "1", "1 (taken), 2", "2", "- 8 22 - - - -"],
+    ["3", "3", "3", "3", "- 8 22 3 - - -"],
+    ["14", "0", "0", "0", "14 8 22 3 - - -"],
+    ["15", "1", "1, 2, 3 (taken), 4", "4", "14 8 22 3 15 - -"],
+  ]}
+  caption="Linear probing in action. Key 15 hashes to slot 1 but must walk past a run of three occupied slots. Runs grow as the table fills, which is why probe counts climb steeply above about 70 percent load."
+/>
+
+### Common mistake
+
+**The mistake:** writing your own hash function with a weak pattern, such as
+summing character codes, or using a table size that shares factors with
+patterns in the keys.
+
+**Why it fails:** collisions concentrate, chains or probe runs grow long, and
+the table degrades to a linear scan. Worse, if attackers can choose keys,
+they can force every key into one slot, a known denial-of-service attack on
+web servers that hashed request parameters.
+
+**The fix:** use the language's built-in hash tables, which use well-mixed
+hashes and, in many runtimes, a random seed per process. If you must write
+one, use a tested function and a prime or power-of-two size with bit mixing.
+
+### In real systems
+
+Hash tables are the workhorse of systems code: language runtimes
+(JavaScript objects and `Map`, Python dicts), database hash joins, caches like
+Memcached, and routing tables. Distributed systems extend the idea with
+**consistent hashing**, which assigns keys to servers so that adding a server
+moves only a small fraction of keys.
+
+Fingerprints run version control and storage: git names every file and
+commit by a hash of its contents, so identical files are stored once and any
+change to history changes the hashes. Content-addressed storage, package
+lock files and deduplicating backups all rely on the same compaction trick.
+
+### Check yourself
+
+<details>
+<summary>What is the load factor, and why does it matter more for open addressing than for chaining?</summary>
+
+It is n/m, items per slot. Chaining's cost grows linearly with it; open
+addressing's grows much faster as the table fills, because occupied slots
+form runs that every new probe must walk past.
+
+</details>
+
+<details>
+<summary>How would you group strings that are rotations of each other, such as "abc", "bca", "cab"?</summary>
+
+Canonicalise each string to its lexicographically smallest rotation, then
+group by that key in a hash map.
+
+</details>
+
+## 3.8 Specialized Data Structures
+
+### In one sentence
+
+Beyond the basic structures, a handful of specialised families handle
+strings, geometry, graphs and sets, and knowing they exist is most of the
+skill.
+
+### The idea
+
+The basic structures treat keys as opaque values to compare or hash. Many
+problems have keys with structure that a specialised structure can exploit.
+The book surveys four families here and treats each fully in its catalogue
+(Part II), so this section is a map.
+
+- **String data structures.** A **trie** stores strings character by
+  character down a tree, so all strings with a common prefix share a path;
+  autocomplete is a walk to the prefix and a traversal below it. A **suffix
+  tree** or **suffix array** indexes every suffix of a text, which allows
+  substring search in time proportional to the pattern length.
+- **Geometric data structures.** Points and regions in the plane or space,
+  indexed so that "what is near this point?" or "what overlaps this box?" is
+  fast: **kd-trees** split space alternately by each coordinate; **quadtrees**
+  and **R-trees** divide space into nested regions.
+- **Graph data structures.** Adjacency matrices and adjacency lists, the
+  subject of chapter 7, chosen by how dense the graph is.
+- **Set data structures.** A **bit vector** represents a subset of 0 to n − 1
+  as n bits, giving O(1) membership and fast union and intersection with
+  word-wide bitwise operations. **Union-find** (chapter 8) tracks a partition
+  into disjoint sets under merges.
+
+<Compare
+  left="Question"
+  right="Specialised structure"
+  rows={[
+    ["all words starting with 'pre'", "trie"],
+    ["does this pattern occur in a large fixed text?", "suffix array or suffix tree"],
+    ["the restaurants within 1 km", "kd-tree, quadtree or geohash index"],
+    ["which map tiles overlap this view?", "R-tree"],
+    ["is item 4,213 in the set? intersect two sets fast", "bit vector or bitmap"],
+    ["are these two nodes in the same group yet?", "union-find"],
+  ]}
+  caption="Specialised questions and the structures built for them. Each turns a scan over everything into a walk proportional to the answer or to the key's length."
+/>
+
+<Figure art={`
+   trie for: car, cat, cart, dog
+               (root)
+              /      \\
+             c        d
+             |        |
+             a        o
+            / \\       |
+           r*  t*     g*
+           |
+           t*         * marks the end of a word
+
+   prefix "ca": walk c -> a, then list everything below: car, cart, cat
+`} caption="A trie stores shared prefixes once. Lookup time depends on the length of the word, not on how many words are stored." />
+
+### Worked example
+
+**Simple: a bit-vector set.** The set `{1, 4, 6}` in a universe of 0 to 7 is
+the byte `01010010` read with bit 1, bit 4 and bit 6 set. Intersecting with
+`{4, 5, 6}` (`01110000`) is one AND: `01010000`, which is `{4, 6}`. For a
+universe of 64 elements, a whole set operation is one machine instruction.
+
+**Realistic: search engines.** An inverted index maps each word to the list
+of documents containing it. Queries with several words intersect those lists.
+Engines store the lists compressed and, for common words, as bitmaps, so
+intersecting the lists for "fast" and "sort" across millions of documents
+is mostly bitwise ANDs. Roaring bitmaps, a compressed bitmap format, are
+used for exactly this in several search and analytics systems.
+
+### Step by step
+
+Looking up "cart" in the trie above:
+
+<Trace
+  columns={["step", "character", "move", "node marks a word?"]}
+  rows={[
+    ["1", "c", "root → c", "no"],
+    ["2", "a", "c → a", "no"],
+    ["3", "r", "a → r", "yes (car)"],
+    ["4", "t", "r → t", "yes: cart found"],
+  ]}
+  caption="Four steps for a four-letter word, whatever the number of words in the trie. A missing word fails at the first character with no child, or ends at a node without the end mark."
+/>
+
+### Common mistake
+
+**The mistake:** forcing a geometric or string question into a general
+dictionary, for instance storing points in a hash table and scanning them all
+to answer "what is nearby?".
+
+**Why it fails:** hashing destroys order and locality, so nearness queries
+become full scans, O(n) per query.
+
+**The fix:** recognise the family (string, geometry, graph, set) and look up
+the specialised structure. Part II of the book is organised for exactly this
+lookup.
+
+### In real systems
+
+Every mapping and ride-hailing service runs geometric indexes: PostGIS uses
+R-trees over GiST, and many systems bucket coordinates with geohashes or
+hexagonal grids. Tries appear in IP routing tables (longest-prefix match) and
+in autocomplete. Suffix arrays are used in genome tools and in full-text
+indexes, and bitmaps in analytics databases.
+
+The habit to build is to treat the catalogue as a reference: when a question
+has structure (prefixes, coordinates, connectivity, membership in small
+universes), look for the structure designed for it before writing a scan.
+
+### Check yourself
+
+<details>
+<summary>What does a trie make fast that a hash table cannot do at all?</summary>
+
+Prefix queries: listing or counting all keys that start with a given prefix,
+in time proportional to the prefix length plus the number of results.
+
+</details>
+
+<details>
+<summary>Why are bit vectors fast for set intersection?</summary>
+
+Each machine word holds 64 elements' membership, and a single AND instruction
+intersects all 64 at once.
+
+</details>
+
+## 3.9 War Story: String 'em Up
+
+### In one sentence
+
+A DNA-sequencing computation was bottlenecked on a dictionary of substrings,
+and moving through a series of better dictionary implementations, guided by
+profiling, made previously impossible inputs routine.
+
+### The idea
+
+The story, in outline and in my words. The project explored a technique for
+reading DNA, then experimental, in which a sequence is reconstructed from the
+set of all its short substrings of a fixed length. Reconstructing a candidate
+sequence involved, over and over, asking whether a string was among the
+known substrings: a dictionary search, performed an enormous number of
+times.
+
+The first implementation used a balanced binary search tree. Profiling
+showed the program spent almost all its time in dictionary lookups, each
+costing many character comparisons along a path of string keys. The team
+tried a sequence of replacements, each tuned to the actual shape of the
+data and queries, ending with a string-specialised structure (a compressed
+form of a suffix tree) that answered substring questions in time
+proportional to the query's length. The result was a speed-up of orders of
+magnitude on the same machine, which allowed much larger experiments.
+
+The lessons the book draws: the right data structure can matter more than
+anything else in a program; profile to find out where time goes; and once
+you know the bottleneck is a dictionary, the choice of dictionary is an
+engineering decision worth real effort.
+
+### Worked example
+
+**Simple: why lookups dominated.** If a reconstruction tries millions of
+candidate extensions and each needs a lookup, then lookup cost multiplies
+everything. Halving the lookup cost halves the program; reducing it from
+O(k log n) character comparisons to O(k) can make it ten or twenty times
+faster.
+
+**Realistic: my dictionary comparison.** I built the set of every 12-letter
+substring of a random 200,000-letter DNA string and ran 20,000 membership
+queries (half present, half random) through three dictionaries:
+
+```text
+199989 k-mers, 20000 queries: linear scan ~8.3 s (extrapolated), sorted+binary search 16 ms, hash set 3.6 ms; hits 10126 = 10126
+```
+
+The linear scan would take over 8 seconds (I timed 200 queries and
+extrapolated). Binary search on a sorted array took 16 ms, about 18 string
+comparisons per query. A hash set took under 4 ms. Same answers, three
+orders of magnitude apart.
+
+<Timeline caption="A typical path of dictionary improvements for a lookup-bound program, of the kind the story describes. Each step is guided by profiling the previous one." items={[
+  { when: "Start", what: "list or unsorted array: O(n) per lookup" },
+  { when: "Step 1", what: "balanced tree: O(log n) comparisons, each up to k characters" },
+  { when: "Step 2", what: "hash table: O(k) to hash, O(1) expected probes" },
+  { when: "Step 3", what: "string-specialised index (suffix tree or array): O(k), and substring queries too" },
+]} />
+
+### Step by step
+
+Profiling-driven replacement, as a loop I follow on my own code:
+
+<Trace
+  columns={["round", "profile says", "change", "effect"]}
+  rows={[
+    ["1", "95 percent of time in list search", "list → sorted array + binary search", "lookups go from O(n) to O(log n)"],
+    ["2", "most time in string comparisons in the search", "sorted array → hash set", "one hash and about one comparison per lookup"],
+    ["3", "time now in building strings for each query", "query by index into the text instead of slicing", "fewer allocations"],
+    ["4", "lookups no longer on top", "stop", "the bottleneck moved; optimise elsewhere or ship"],
+  ]}
+  caption="A profiling loop in the spirit of the war story (my own steps on my own simulation, not the book's). Each round removes the current bottleneck; you stop when the dictionary is no longer what the profile shows."
+/>
+
+### Common mistake
+
+**The mistake:** optimising the part of the program you assume is slow rather
+than the part the profiler shows.
+
+**Why it fails:** intuition about bottlenecks is often wrong, especially when
+a cheap-looking operation is called millions of times.
+
+**The fix:** profile first. If one operation dominates, change its data
+structure before touching anything else.
+
+### In real systems
+
+Bioinformatics tools live this story: read aligners index reference genomes
+with suffix arrays and FM-indexes (compressed suffix-array variants) so that
+billions of short reads can be located quickly. k-mer counting tools use
+specialised hash tables and probabilistic structures to fit into memory.
+
+Outside biology, the pattern is routine performance work: a service whose
+latency is dominated by a lookup moves from a database query, to a cache, to
+an in-process hash map, each step found by profiling the last.
+
+### Check yourself
+
+<details>
+<summary>What made dictionary choice so important in this story?</summary>
+
+The program performed a vast number of lookups, so the lookup cost multiplied
+everything else. Any improvement to it improved the whole program in
+proportion.
+
+</details>
+
+<details>
+<summary>Why can a balanced tree of strings be slower than its O(log n) suggests?</summary>
+
+Each of the log n comparisons compares strings, which can cost up to k
+character comparisons, and following pointers through a tree has poor cache
+behaviour.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 3, Data Structures">
+
+<Level name="Beginner" depth={3}>
+
+At the smallest level, this chapter says: choose how to store data by what
+you need to do with it. If you mostly read by position, use an array. If you
+need "the newest first", use a stack; "the oldest first", a queue; "find by
+key", a dictionary; "the smallest next", a priority queue.
+
+The smallest worked version is a to-do app. Tasks shown in order of entry
+fit an array. "Undo the last change" is a stack of changes. "Find a task by
+ID" is a map from ID to task. "Show the most urgent first" is a heap keyed by
+due date. Four structures, each matched to one question.
+
+The beginner's mistake is to use an array for everything and search it with
+`find` or `includes`. That works with 20 tasks and fails with 20,000. If you
+can name the structure for each of those four questions and say what each
+operation costs, you have the beginner level.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you separate interface from implementation. A
+dictionary is an interface; a hash table, a balanced tree and a sorted array
+are implementations, with different costs for search, insert, delete and
+ordered operations. You choose by the mix of operations, not the name.
+
+You implement the core structures yourself at least once: a linked list with
+insert and delete, a queue with a head index or circular buffer, a BST with
+the three delete cases, and an array heap with bubble-up and sift-down. Doing
+so makes their costs obvious rather than memorised.
+
+A worked case: a rate limiter that allows each user 100 requests per minute.
+A map from user to a queue of request timestamps works: on each request,
+dequeue timestamps older than a minute and check the queue's length. Using
+`shift()` for the dequeue would make the limiter quadratic under load; a real
+queue keeps it constant per request.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level you reason about the costs behind the big-O. Hash
+tables are O(1) expected, not worst case, and depend on the hash function and
+load factor. BSTs are O(h), and h depends on balance. Heaps are logarithmic
+but cache-friendly because they live in arrays. Linked structures have the
+same O as arrays for scans but pay for scattered memory.
+
+You combine structures to get operations no single one supports. An LRU
+cache pairs a hash map with a doubly linked list. An indexed priority queue
+pairs a heap with a map from item to heap position so keys can be decreased
+(Dijkstra's algorithm needs this). A leaderboard pairs a hash map with an
+ordered structure.
+
+A worked case: the bounded top-k heap. Keeping the best k of n values costs
+O(n log k) time and O(k) memory, and my run found the top 10 of a million
+twenty times faster than sorting. The design choice is a min-heap for the
+largest values, because the eviction question is about the worst of the best.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Sorted input is the classic edge case for unbalanced trees: it produces a
+chain, and my 10,000 sorted inserts built a tree of height 9,999. Timestamps,
+auto-increment IDs and alphabetised imports all arrive sorted, so an
+unbalanced BST on such data is a latent bug.
+
+Patterned keys are the edge case for hash tables. Multiples of 100 in a table
+of size 1,000 used only 10 slots; a prime size fixed it. Real keys have
+patterns (IDs with common suffixes, pointer addresses aligned to 8 or 16
+bytes), which is why good hash functions mix bits before reducing.
+
+High load is the edge case for open addressing: average probes rose from 1.5
+at half full to 5.7 at 90 percent in my measurement. Tables must resize
+before that, and the resize itself is an O(n) pause.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Empty structures: pop on an empty stack, dequeue on an empty queue,
+extract-min on an empty heap and delete from an empty tree all need a defined
+result (undefined, an exception, or a sentinel), and code that assumes
+non-empty fails here first.
+
+Duplicate keys in a BST need a rule. My insert sends equal keys right, so
+duplicates are kept; a set would ignore them; a multimap might store a count.
+Delete must agree with insert's rule, or it removes the wrong copy.
+
+Deletion in open addressing is a subtle corner case. Simply emptying a slot
+breaks searches for keys that probed past it. The fix is a tombstone marker,
+which later inserts may reuse and which searches must skip over, and too
+many tombstones eventually force a rebuild.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production you mostly use library structures, and the skill is knowing
+their real behaviour. JavaScript's `Map` keeps insertion order; `Array.shift`
+is linear on large arrays; `Set` of numbers is slower than a typed-array sort
+for bulk duplicate checks (my run: 320 ms against 119 ms); objects used as
+maps have prototype keys to watch for.
+
+Profiling decides where to change structures. Both war stories are this:
+the logic was right and one repeated lookup or minimum-finding dominated the
+time. Replacing a scan with a heap, map or index is the most common
+performance fix there is.
+
+Hash flooding is a production security concern. If attackers control keys
+(request parameters, JSON field names), a predictable hash lets them force
+collisions and make a server do quadratic work. Runtimes defend with seeded
+hashes; your own hash tables should use them.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is to see every repeated question in a program as a request for
+a data structure. "Have I seen this?" asks for a hash set. "What is next by
+priority?" asks for a heap. "What is near this?" asks for a spatial index.
+Seeing the question is most of the work.
+
+Abstraction is a tool for change. If code uses a priority queue through its
+interface, swapping a scan-based implementation for a heap changes one class.
+The strip-triangulation fix was exactly that kind of swap.
+
+A worked example of the mindset: a code review shows `users.filter(u =>
+blocked.includes(u.id))`. The question being asked repeatedly is "is this ID
+blocked?", which asks for a set. Building `new Set(blocked)` first changes
+O(nm) to O(n + m).
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+The same structures reappear at system scale. A message queue is a durable
+queue; Redis is a networked dictionary with sorted sets and lists; a
+database index is a B-tree; a cache is a hash table with an eviction policy.
+Choosing a system component is often choosing a data structure with network
+and durability attached.
+
+Ordered versus unordered access is the first design question for storage.
+Key-value lookups partition well by hashing keys across machines; range
+queries need ordered partitioning (by key range) and ordered indexes. Picking
+the wrong one forces scatter-gather queries across every shard.
+
+Fingerprints scale deduplication and integrity. Content-addressed storage,
+git objects and backup chunking store data under its hash, so equal data is
+stored once and corruption is detectable. The compaction trick in section
+3.7 is the core of these designs.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is a short decision procedure. First, write the operations the
+program needs and their rough frequencies. Second, choose the abstract type
+(container, dictionary, ordered dictionary, priority queue, specialised).
+Third, choose the implementation from the costs, preferring library ones.
+Fourth, measure the real workload and replace whatever the profiler shows.
+
+Keep a cost table in your head: array index O(1), list search O(n), hash
+operations O(1) expected, balanced-tree operations O(log n), heap insert and
+extract O(log n), heap find-min O(1). With that table, most structure
+choices take a minute.
+
+Done when you can take any program you have written, list the repeated
+questions it asks of its data, name the structure each deserves with its
+costs, and show with a measurement that switching at least one of them made
+the program faster.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**When should I write my own data structure?** Rarely in application code;
+library ones are tested, tuned and fast. Write your own to learn, when the
+library lacks one (JavaScript has no heap), or when profiling shows a
+specialised structure (bucket queue, trie, bitmap) would beat a general one.
+
+**Is a hash table always faster than a tree?** For single-key lookups, usually,
+but not always: small sorted arrays and B-trees have better cache behaviour,
+and hashing has to compute the hash. Trees win outright when you need order:
+ranges, successor, min and max.
+
+**Why does JavaScript have Map if objects already work as dictionaries?**
+`Map` accepts any key type, keeps insertion order, has a size property, and
+does not inherit prototype keys. For dynamic dictionaries it is the safer and
+usually faster choice.
+
+**What is the difference between a heap and a sorted array?** A sorted array
+keeps everything in order, so insertion is O(n). A heap keeps only enough
+order to find the minimum, so insertion and extraction are O(log n). If you
+need full order once, sort; if you need "the next smallest" repeatedly with
+insertions in between, use a heap.
+
+**Do linked lists matter any more?** Less than textbooks suggest, because
+cache misses make them slow to scan. They matter where you hold pointers to
+nodes and splice often: LRU caches, allocator free lists, kernel queues.
+
+**How big should a hash table be?** Big enough to keep the load factor below
+the implementation's threshold (around 0.75 for chaining, 0.5 to 0.7 for open
+addressing); libraries resize automatically by doubling.
+
+## Key takeaways
+
+- Data lives either contiguously (arrays) or linked by pointers; arrays win on
+  access, memory and cache locality, linked structures on splicing at known
+  positions.
+- Stacks (LIFO) and queues (FIFO) are O(1) per operation; implement a queue
+  with a head index or circular buffer, never with `shift()`.
+- A dictionary is an interface; its implementations trade search against
+  update, and only trees support ordered operations efficiently.
+- BST operations cost O(height); random insertion keeps the height
+  logarithmic, sorted insertion makes it linear, and balanced trees guarantee
+  O(log n).
+- A binary heap is a priority queue in a plain array with O(log n) insert and
+  extract-min; a bounded heap finds top-k in O(n log k).
+- Hash tables give O(1) expected operations if the hash spreads keys and the
+  load factor stays low; chaining degrades gently, open addressing sharply.
+- Hashing also powers duplicate detection, canonicalisation and fingerprints.
+- Specialised structures (tries, suffix arrays, kd-trees, bit vectors) exist
+  for structured keys; recognise the family and look them up.
+- The war stories' lesson: when the logic is right and the program is slow,
+  profile and change the data structure.
+
+## Glossary
+
+- **Contiguous structure:** one block of adjacent memory, such as an array.
+- **Linked structure:** separate chunks joined by pointers, such as a list or
+  tree.
+- **Pointer:** a value holding the memory address of another object.
+- **Dynamic array:** an array that doubles its capacity when full, giving
+  O(1) amortised append.
+- **Container:** a type whose retrieval order depends on arrival, not value.
+- **Stack (LIFO):** last in, first out.
+- **Queue (FIFO):** first in, first out.
+- **Dictionary:** a type supporting search, insert and delete by key.
+- **Successor / predecessor:** the next larger / smaller key.
+- **Binary search tree:** a tree in which left descendants are smaller and
+  right descendants larger than each node.
+- **Height:** the number of edges on the longest root-to-leaf path.
+- **Rotation:** a local pointer rearrangement that rebalances a tree while
+  preserving order.
+- **Priority queue:** a container returning the smallest (or largest) key
+  first.
+- **Binary heap:** an array-based tree in which each parent is no larger than
+  its children.
+- **Hash function:** a function mapping keys to integers in a fixed range.
+- **Collision:** two keys hashing to the same slot.
+- **Chaining / open addressing:** keeping colliding items in per-slot lists /
+  in other slots of the array.
+- **Load factor:** items divided by slots.
+- **Canonical form:** a standard representative of an equivalence class.
+- **Fingerprint:** a short hash standing in for a large object.
+- **Trie:** a tree of characters storing strings by shared prefixes.
+- **Bit vector:** a set over a small universe stored as one bit per element.
+
+## Exercises and self-check
+
+**Warm-up.** Implement a circular-buffer queue of fixed capacity with
+enqueue, dequeue and size, and test it by comparing against a simple array
+queue on a million random operations.
+
+**Build.** Implement an LRU cache with get and put in O(1) using a `Map` and
+a doubly linked list (not relying on `Map`'s order). Test eviction order with
+a small capacity, then measure a million operations.
+
+**Stretch.** Implement a hash table with linear probing, tombstone deletion
+and resizing at load 0.7. Measure average probes for successful and
+unsuccessful search at loads 0.3 to 0.9, and compare with chaining.
+
+<details>
+<summary>1. An unsorted array that also remembers its current minimum gives O(1) insert and O(1) find-min. What is the catch?</summary>
+
+Extract-min becomes O(n): after removing the minimum, the array must be
+scanned to find the new one. A heap balances this at O(log n) for both insert
+and extract-min.
+
+</details>
+
+<details>
+<summary>2. Why is array.shift() a poor dequeue?</summary>
+
+It shifts every remaining element, so each dequeue is O(n) and n dequeues are
+O(n²).
+
+</details>
+
+<details>
+<summary>3. What are the three cases of BST deletion?</summary>
+
+No children (remove), one child (link the child to the parent), two children
+(replace with the in-order successor and delete that).
+
+</details>
+
+<details>
+<summary>4. Insert 4, 2, 6, 1, 3, 5, 7 into an empty BST. What is the height?</summary>
+
+2: the tree is perfectly balanced, with 4 at the root, 2 and 6 below it, and
+the rest as leaves.
+
+</details>
+
+<details>
+<summary>5. In an array heap, where is the parent of index 9?</summary>
+
+Index 4, the floor of (9 − 1)/2.
+
+</details>
+
+<details>
+<summary>6. Why does linear probing slow down so sharply as the table fills?</summary>
+
+Occupied slots form contiguous runs (clusters), and a key hashing anywhere in
+a run must probe to its end; runs merge and grow quickly as load rises.
+
+</details>
+
+<details>
+<summary>7. How would you detect duplicate files among a million?</summary>
+
+Compute a cryptographic hash (fingerprint) of each file, insert into a hash
+set or sort the hashes, and report equal hashes; optionally confirm with a
+byte comparison.
+
+</details>
+
+<details>
+<summary>8. What is the common lesson of both war stories?</summary>
+
+The program was slow because of a repeated operation on a poor data
+structure; profiling found it and a better structure fixed it without
+changing the algorithm's logic.
+
+</details>
+
+## How I'd study this chapter
+
+I would implement every structure in this chapter once, in TypeScript, with
+tests against a simple reference (an array that I scan), because the costs
+only become intuitive when I have written the loops myself. The order I would
+follow: linked list, queue with head index, BST with delete, array heap, and
+a hash table with both chaining and linear probing.
+
+Then I would run the measurements on this page myself (front insertion,
+shift versus head index, sorted versus random BST heights, probe counts by
+load) and write down the numbers next to the predictions. For the war
+stories, I would build my own small simulation of each and profile it. This
+chapter is the data-structures core of <a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of my learning plan</a>,
+and the <a href={withBase('/books/the-algorithm-design-manual/')}>book</a>
+returns to every structure here in later chapters.
+
+Done when I can name the right structure for any repeated question in my own
+code, implement it from memory with its costs, and show a measured
+improvement from switching at least one structure in a real program.
