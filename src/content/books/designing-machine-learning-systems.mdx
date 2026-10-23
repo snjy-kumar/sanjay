@@ -1,0 +1,1983 @@
+---
+title: "Designing Machine Learning Systems, chapter by chapter"
+description: "Chip Huyen's Designing Machine Learning Systems, all eleven chapters from beginner to strategy: data, features, training, deployment, drift and MLOps."
+edition: "first edition (O'Reilly Media, May 2022)"
+tocVerified: true
+tocSources:
+  - "https://www.oreilly.com/library/view/designing-machine-learning/9781098107956/"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+The <a href={withBase('/plans/software-ai-developer/')}>software AI developer roadmap</a>
+lists this as a reference for phases 7 and 8: production ML, data, monitoring and
+drift. *AI Engineering* teaches me to build on top of a foundation model; this
+book teaches the discipline underneath, from the era when every team trained its
+own model. Most of it still applies to an LLM product: data pipelines, leakage,
+offline versus online evaluation, batch versus online prediction, distribution
+shift, monitoring, testing in production, and the human side.
+
+I am a web developer first, so I read it as a systems book with a model inside,
+not as a statistics book. Examples below are in Python where the topic is
+numerical and TypeScript where it is about services. Everything on this page is
+my paraphrase and my own examples.
+
+## How I would learn it
+
+I would not read this before *AI Engineering*. I read it as the second pass in
+phase 8, when my AI feature is live and I start asking what happens to it over
+time. The book is organised as the lifecycle of one ML system, so I build one
+small classic ML system alongside it: a model that predicts whether a support
+ticket will be escalated, trained on synthetic tickets, served behind an API,
+monitored for drift and retrained on a schedule.
+
+For each chapter I write the decision it asks me to make (which data format,
+which sampling method, batch or online, how often to retrain) as a short decision
+record in that project, with the alternatives I rejected. The book is about
+design decisions, so the artefact I keep is decisions.
+
+<Timeline items={[
+  { when: 'phase 8, week 43', what: 'Chapters 1 and 2: when ML is the right tool, objectives, requirements, framing. Write the framing doc for the escalation model.' },
+  { when: 'phase 8, weeks 44 to 45', what: 'Chapters 3 to 5: data engineering, training data, features and leakage. Build the dataset and the feature pipeline.' },
+  { when: 'phase 8, week 46', what: 'Chapter 6: baselines, training and offline evaluation, with slices and calibration.' },
+  { when: 'phase 8, weeks 47 to 48', what: 'Chapters 7 and 8: deploy, choose batch or online prediction, then monitor for drift.' },
+  { when: 'phase 8, weeks 49 to 50', what: 'Chapters 9 to 11: retraining, test in production, platform, and the human and responsible side.' },
+]} caption="When I read each chapter, alongside one small ML system that goes through the whole lifecycle." />
+
+Every chapter below climbs the same nine levels, from what it is to how I would
+learn it and know I have.
+
+## The book as a lifecycle
+
+<Layers layers={[
+  { name: 'Chapters 1 and 2, framing', note: 'when to use ML, objectives, requirements, problem framing' },
+  { name: 'Chapters 3 to 5, data', note: 'storage, formats, dataflow, sampling, labels, imbalance, features, leakage' },
+  { name: 'Chapter 6, models', note: 'model selection, ensembles, tracking, distributed training, offline evaluation' },
+  { name: 'Chapters 7 to 9, production', note: 'deployment, compression, drift, monitoring, continual learning, testing in production' },
+  { name: 'Chapters 10 and 11, the organisation', note: 'infrastructure, platforms, build or buy, UX, teams, responsible AI' },
+]} caption="The eleven chapters follow one system from idea to a platform. I use the same order for my own build." />
+
+## Chapters 1 and 2, framing the system
+
+### 1. Overview of Machine Learning Systems
+
+**Covers:** When machine learning is the right tool, typical use cases, how ML in research differs from ML in production, and how ML systems differ from traditional software.
+
+<Figure art={`
+ Is there a pattern to learn?             no  -> write rules
+   | yes
+ Is there data (or a way to get it)?      no  -> collect first, or rules
+   | yes
+ Will it repeat often, at scale?          no  -> a human or a rule is cheaper
+   | yes
+ Is a wrong prediction cheap enough?      no  -> human in the loop or no ML
+   | yes
+ Will the pattern change over time?       yes -> ML, with retraining planned
+`} caption="When ML is worth it. Each no is a cheaper alternative that should win." />
+
+<Levels label="Chapter 1, Overview of Machine Learning Systems">
+
+<Level name="Beginner">
+
+Machine learning learns a pattern from existing data so it can predict on
+unseen data. It fits when the pattern is complex, data exists, the task repeats
+at scale, mistakes are cheap, and the pattern changes over time so rules would
+need constant rewriting. An ML system is not just the model: it includes the
+data pipelines, features, serving, monitoring and the people who maintain it.
+
+```ts
+// a rule beats a model when the pattern is simple and stable
+const isLikelySpam = (s: string) => /free money|click here/i.test(s);
+```
+
+Common mistake: reaching for ML when a regex or a lookup table solves the
+problem. Fix: write the simplest rule first and measure how far it gets.
+
+</Level>
+
+<Level name="Intermediate">
+
+Research and production want different things. Research optimises for
+state-of-the-art accuracy on a fixed benchmark, with compute spent mostly on
+training. Production has many stakeholders (product wants engagement, sales
+wants revenue, platform wants low latency, legal wants fairness), cares about
+fast inference, works with shifting and messy data, and must be explainable and
+fair. A model with half a point more accuracy that is ten times slower usually
+loses.
+
+```ts
+const candidates = [
+  { name: 'big-ensemble', accuracy: 0.912, p99Ms: 480 },
+  { name: 'gradient-boosted', accuracy: 0.905, p99Ms: 12 },
+];
+const ok = candidates.filter((c) => c.p99Ms <= 50); // the latency requirement decides first
+console.log(ok.map((c) => c.name)); // [ 'gradient-boosted' ]
+```
+
+Common mistake: picking models by a leaderboard metric alone. Fix: list every
+stakeholder's requirement, then optimise within them.
+
+</Level>
+
+<Level name="Advanced">
+
+ML systems differ from traditional software because code and data are both
+inputs to behaviour. In normal software I test code; in ML the data changes the
+system's behaviour without any code change. That brings new problems: versioning
+data as well as code, testing data quality, detecting when live data no longer
+looks like training data, and models that are large and slow to serve. Data also
+carries risk: bias, privacy and poisoning.
+
+<Compare left="Traditional software" right="ML system" rows={[
+  ['behaviour comes from code', 'behaviour comes from code plus data'],
+  ['test the code', 'test code, data, and model behaviour'],
+  ['version the code', 'version code, data, features and models'],
+  ['correct stays correct until changed', 'accuracy decays as the world changes'],
+]} caption="What changes when a model is inside the system." />
+
+Common mistake: versioning the model file but not the data that trained it.
+Fix: every model artefact records the dataset version and the code commit.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. Zero data at launch: start with rules or human decisions and
+log the outcomes, so data accumulates. A very rare event (fraud at 0.1 percent):
+a model that always says "not fraud" is 99.9 percent accurate and useless. A task
+with a fixed, fully known rule set (tax brackets): ML adds error for no benefit.
+
+```py
+y = [0] * 999 + [1]
+pred = [0] * 1000
+print(sum(a == b for a, b in zip(y, pred)) / 1000)  # 0.999 accuracy, catches 0 fraud
+```
+
+Common mistake: reporting accuracy on a rare-event problem. Fix: report recall and
+precision on the rare class.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. A rare event plus a high cost of error: a missed fraud case
+costs real money and a false alarm costs a customer, so the threshold is a
+business decision, not a modelling one. A changing pattern plus no feedback
+labels: the world drifts and I have no ground truth to notice, because the labels
+arrive weeks later.
+
+Common mistake: picking a threshold of 0.5 by default. Fix: choose the threshold
+from the costs of each error type, with the people who pay them.
+
+</Level>
+
+<Level name="Production level">
+
+In production the model is usually a small part of the code. Around it are data
+collection, validation, feature computation, serving, monitoring and retraining.
+Each is a place where the system fails silently: a feature pipeline returns
+zeros, predictions still come out, nothing errors.
+
+```ts
+if (features.every((v) => v === 0)) metrics.inc('features_all_zero'); // silent failure made loud
+```
+
+Common mistake: monitoring only that the service is up. Fix: monitor inputs and
+outputs too, because an ML service fails by being wrong, not by being down.
+
+</Level>
+
+<Level name="Mindset">
+
+Think in systems, not models. The habit is to ask what happens around the model
+(where data comes from, who consumes predictions, what happens when it is wrong)
+before asking which model to use.
+
+Common mistake: starting with the algorithm. Fix: start with the decision the
+prediction will drive and its cost of error.
+
+</Level>
+
+<Level name="System design">
+
+An ML system has a data side (collection, storage, features), a model side
+(training, evaluation, registry), and a serving side (prediction service,
+monitoring, feedback), joined by pipelines that run on different schedules.
+
+<Flow steps={['events and logs', 'data pipeline', 'features', 'training', 'model registry', 'prediction service', 'monitoring', 'labels and feedback', 'retraining']} caption="The loop every ML system runs. The model is one box." />
+
+Common mistake: no path from production outcomes back to training. Fix: log
+predictions with ids so labels can be joined later.
+
+</Level>
+
+<Level name="Strategy">
+
+I go through my own phase 7 and 8 features and, for each, answer the "when to use
+ML" questions in writing. Then I pick the escalation-prediction project and write
+its one-page framing. Done when I can name, for one feature, the rule-based
+alternative, the cost of each error type, and why ML is or is not worth it.
+
+</Level>
+
+</Levels>
+
+### 2. Introduction to Machine Learning Systems Design
+
+**Covers:** Linking business objectives to ML objectives; the four requirements (reliability, scalability, maintainability, adaptability); the iterative design process; framing ML problems by task type and objective function; and the debate between better algorithms and more data.
+
+<Flow steps={['business objective', 'ML objective and metric', 'framing: task type', 'data and features', 'train and evaluate', 'deploy', 'monitor', 'back to framing']} caption="The design process is a loop. Each pass can send me back to reframe the problem." />
+
+<Levels label="Chapter 2, Introduction to Machine Learning Systems Design">
+
+<Level name="Beginner">
+
+A company does not want a model with high accuracy; it wants more revenue, fewer
+support tickets or fewer fraud losses. So the first step is to tie an ML metric
+to a business metric. Then the system must be reliable (correct even when things
+go wrong), scalable (handles more traffic, more models), maintainable (others can
+understand and change it), and adaptable (can be updated as data changes).
+
+```md
+Business: reduce support cost.
+ML objective: predict tickets that will escalate, so they go to a senior agent first.
+Metric: recall on escalations at 80% precision.
+Link: each early-routed escalation saves about one hand-off.
+```
+
+Common mistake: optimising a model metric nobody can connect to the business.
+Fix: write the link sentence before training anything.
+
+</Level>
+
+<Level name="Intermediate">
+
+Framing decides the task type. Classification predicts a category (binary,
+multiclass, multilabel); regression predicts a number. The same problem can be
+framed either way: predicting which app a user opens next as a classification
+over hundreds of apps is brittle when apps are added; framing it as a regression
+score per (user, app) pair handles new apps without retraining the output layer.
+
+Objective functions are what training minimises: squared error for regression,
+cross-entropy for classification. When I care about several goals (relevance and
+quality), I can train one model per objective and combine their scores, so the
+weights can change without retraining.
+
+```py
+def rank_score(relevance, quality, alpha=0.7):
+    return alpha * relevance + (1 - alpha) * quality
+# change alpha in config, not by retraining
+```
+
+Common mistake: training one model on a blended loss and retraining every time
+the business changes its priorities. Fix: decouple objectives into separate
+models when the weights will change.
+
+</Level>
+
+<Level name="Advanced">
+
+Underneath, framing determines what can go wrong. Multiclass with many classes
+and few examples per class leads to a long tail of rare classes. Multilabel needs
+a threshold per label. Regression needs a decision rule to become an action. The
+iterative process means the first framing is a hypothesis: after a pass of data,
+training and deployment, I often learn the problem should be framed differently.
+
+The mind-versus-data debate asks whether progress comes from better algorithms
+and structure or from more data and compute. In practice both matter, but in
+production data quality and quantity usually give the bigger wins, and the
+right inductive structure makes the data go further.
+
+```py
+# multilabel needs a threshold per label, tuned on validation data
+thresholds = {"billing": 0.4, "bug": 0.55, "account": 0.5}
+labels = [l for l, p in probs.items() if p >= thresholds[l]]
+```
+
+Common mistake: one global threshold for every label. Fix: tune per label on a
+validation set, using the business cost of each error.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A new class appears after launch: a classifier cannot predict
+what it has never seen. A label with no examples in one region: the model's
+prediction there is a guess. Reliability with no ground truth: I cannot tell if
+the model is wrong until labels arrive. Scale with one model versus hundreds (one
+per customer): maintainability becomes the main requirement.
+
+Common mistake: assuming the class list is fixed forever. Fix: include an
+"other" class and monitor how often it is predicted.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Decoupled objectives plus a feedback loop: the quality model
+promotes certain content, users engage with it, engagement data trains the
+relevance model, and the two models reinforce each other into a narrow feed. A
+regression framing plus a cold-start item: a new app with no history gets a low
+score everywhere and never gets shown, so it never collects data.
+
+Common mistake: no exploration for new items. Fix: reserve a small share of
+traffic for new or random items, and track it.
+
+</Level>
+
+<Level name="Production level">
+
+In production the four requirements become concrete checks. Reliability:
+validation on inputs and outputs, fallbacks when the model is unavailable.
+Scalability: autoscaling, and managing hundreds of models with a registry.
+Maintainability: code, data and model versioned, reproducible training, shared
+conventions. Adaptability: retraining pipelines and fast safe deploys.
+
+```ts
+const p = await predict(ticket).catch(() => null);
+const route = p === null ? ruleBasedRoute(ticket) : p.escalate > 0.7 ? 'senior' : 'standard';
+```
+
+Common mistake: no fallback when the model service fails. Fix: a rule-based
+default that keeps the product working.
+
+</Level>
+
+<Level name="Mindset">
+
+Design is iterative and objective-driven. The habit is to start from the business
+goal, frame the simplest version, ship it, and let production tell me how to
+reframe.
+
+Common mistake: perfecting the first framing in a notebook for months. Fix: a
+rough end-to-end pass first.
+
+</Level>
+
+<Level name="System design">
+
+The four requirements map to parts of the system: reliability to validation and
+fallbacks, scalability to serving and registry, maintainability to versioning
+and pipelines, adaptability to retraining and deployment.
+
+<Layers layers={[
+  { name: 'Adaptability', note: 'retraining pipeline, fast safe deploys' },
+  { name: 'Maintainability', note: 'versioned code, data, models; reproducible training' },
+  { name: 'Scalability', note: 'autoscaling serving, model registry' },
+  { name: 'Reliability', note: 'input validation, output checks, fallbacks' },
+]} caption="Each requirement has a home in the system. Reliability is the base the rest stand on." />
+
+Common mistake: treating adaptability as "we can retrain manually". Fix: an
+automated pipeline that can retrain and evaluate without a hero.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the framing doc for the escalation model with the business link, the
+task type, two alternative framings and why I rejected them, the objective, and
+one check per requirement. Done when the framing doc has a metric tied to a
+business outcome, a fallback, and a decoupled-objectives decision with a reason.
+
+</Level>
+
+</Levels>
+
+## Chapters 3 to 5, data
+
+### 3. Data Engineering Fundamentals
+
+**Covers:** Data sources; formats (JSON, row-major versus column-major, text versus binary); data models (relational, NoSQL, structured versus unstructured); storage engines and processing (transactional and analytical, ETL); modes of dataflow (through databases, services, and real-time transport); and batch versus stream processing.
+
+<Figure art={`
+ row-major (CSV, Postgres rows)       column-major (Parquet)
+ +----+------+-----+                  id:    1   2   3
+ | id | city | amt |  read one row    city:  A   B   A    read one column
+ |  1 |  A   | 10  |  = one seek      amt:  10  25   7    = one seek
+ |  2 |  B   | 25  |                  (compresses well: same type,
+ |  3 |  A   |  7  |                   similar values side by side)
+ +----+------+-----+
+`} caption="Row-major is fast for writing and reading whole records; column-major is fast for scanning a few columns across many rows." />
+
+<Levels label="Chapter 3, Data Engineering Fundamentals">
+
+<Level name="Beginner">
+
+ML data comes from user input, system logs, internal databases, and third
+parties. It is stored in formats: JSON is human-readable and flexible, CSV is
+simple rows, Parquet is a binary column format. A data model describes how data
+is organised: relational (tables with a schema) or NoSQL (documents, graphs, key
+values).
+
+```json
+{"ts":"2026-10-01T10:00:00Z","user":"u1","event":"ticket_opened","priority":"high"}
+{"ts":"2026-10-01T10:05:00Z","user":"u2","event":"ticket_opened","priority":"low"}
+```
+
+Common mistake: storing training data as one giant JSON array. Fix: JSON lines
+for logs, Parquet for analysis.
+
+</Level>
+
+<Level name="Intermediate">
+
+Row-major formats store each record contiguously, which suits writing and
+reading whole records. Column-major formats store each column contiguously, which
+suits analytics that read a few columns over many rows. Text formats are
+readable; binary formats are compact and fast. In pandas, a DataFrame is
+column-major, so iterating rows is slow and column operations are fast.
+
+```py
+import pandas as pd, time
+df = pd.DataFrame({"a": range(1_000_000), "b": range(1_000_000)})
+t = time.time(); s = sum(r.a for r in df.itertuples()); print("rows", round(time.time() - t, 2))
+t = time.time(); s = df["a"].sum(); print("column", round(time.time() - t, 4))
+# rows 0.4   column 0.001  (exact numbers vary by machine)
+```
+
+Common mistake: looping over DataFrame rows. Fix: vectorised column operations.
+
+</Level>
+
+<Level name="Advanced">
+
+Storage engines are optimised for transactional processing (many small reads and
+writes, low latency, ACID) or analytical processing (large scans and aggregates).
+The line has blurred, and modern systems often separate storage from compute.
+ETL extracts from sources, transforms (clean, join, validate) and loads into a
+target; ELT loads raw data first and transforms later, which is flexible but
+turns into a swamp without discipline.
+
+Data flows between processes in three ways: through a database (simple, but
+both sides must reach it, and it is slow for real-time), through services via
+requests (REST or RPC, coupling caller to callee), and through real-time
+transport (a log or pub/sub such as Kafka), where producers write events and
+consumers read them asynchronously.
+
+```ts
+// request-driven: the caller waits and is coupled to the callee's uptime
+const price = await fetch('http://pricing/quote?item=42').then((r) => r.json());
+// event-driven: the producer publishes and moves on
+await bus.publish('ticket.opened', { id: 't-9', priority: 'high' });
+```
+
+Common mistake: chaining many services by synchronous requests for an ML
+pipeline. Fix: publish events to a log so consumers can be added and replayed.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A schema change in a source table (a column renamed): the
+pipeline keeps running and writes nulls. A JSON field that is sometimes a string
+and sometimes a number: the column type flips between files. Late events in a
+stream: a click arrives after its window closed. A huge CSV with a comma inside a
+quoted field: a naive split shifts every column.
+
+```py
+"a,\"b,c\",d".split(",")   # ['a', '"b', 'c"', 'd']  wrong
+import csv, io
+next(csv.reader(io.StringIO('a,"b,c",d')))  # ['a', 'b,c', 'd']  right
+```
+
+Common mistake: parsing CSV by splitting on commas. Fix: a real CSV parser and a
+schema check on load.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Batch features plus streaming features: the same feature
+computed by two different code paths gives slightly different values, and the
+model sees one in training and the other in serving. Event-driven dataflow plus
+at-least-once delivery: a retry delivers the same event twice and a count
+feature doubles.
+
+```ts
+const seen = new Set<string>();
+bus.subscribe('ticket.opened', (e) => { if (seen.has(e.id)) return; seen.add(e.id); counts[e.user]++; });
+```
+
+Common mistake: assuming each event is delivered exactly once. Fix: idempotent
+consumers keyed by event id.
+
+</Level>
+
+<Level name="Production level">
+
+In production data pipelines need schemas, validation and ownership. A schema
+registry or typed contracts catch breaking changes at write time. Data quality
+checks (row counts, null rates, value ranges) run on every batch. Each dataset
+has an owner who is told when it breaks.
+
+```ts
+const Ticket = z.object({ id: z.string(), priority: z.enum(['low', 'high']), createdAt: z.coerce.date() });
+const bad = rows.filter((r) => !Ticket.safeParse(r).success);
+if (bad.length / rows.length > 0.01) throw new Error(`ticket batch rejected: ${bad.length} invalid rows`);
+```
+
+Common mistake: pipelines that accept anything. Fix: reject or quarantine
+batches that fail validation, and alert the owner.
+
+</Level>
+
+<Level name="Mindset">
+
+Data is a product with consumers. The habit is to treat every dataset like an
+API: a schema, a contract, a version and an owner.
+
+Common mistake: "the data team will fix it". Fix: whoever produces the data owns
+its contract.
+
+</Level>
+
+<Level name="System design">
+
+Batch processing handles large historical data on a schedule (static features
+like a user's 30-day average); stream processing handles events as they arrive
+(dynamic features like clicks in the last five minutes). Many systems need both,
+which risks two implementations of the same feature.
+
+<Compare left="Batch" right="Stream" rows={[
+  ['bounded data, scheduled runs', 'unbounded data, continuous'],
+  ['hours of latency is fine', 'seconds or less'],
+  ['simple to reason about and replay', 'needs windows, state, late-event handling'],
+  ['static features', 'dynamic features'],
+]} caption="Batch and stream processing. A unified definition of each feature avoids two implementations drifting apart." />
+
+Common mistake: separate teams writing the batch and stream versions of a
+feature. Fix: one feature definition compiled to both, or one code path.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the escalation project's event schema, store raw events as JSON lines,
+convert a day of them to Parquet, and compare file size and a column scan. Then I
+build one batch feature and one streaming feature and a test that both give the
+same value for the same events. Done when the pipeline rejects an invalid batch
+in a test and both feature paths agree.
+
+</Level>
+
+</Levels>
+
+### 4. Training Data
+
+**Covers:** Sampling (nonprobability, simple random, stratified, weighted, reservoir and importance sampling); labelling (hand labels, natural labels, and what to do without labels); class imbalance and how to handle it; and data augmentation (label-preserving transformations, perturbation, synthesis).
+
+<Flow steps={['population of events', 'sample (stratified, reservoir, weighted)', 'label (hand, natural, weak)', 'fix imbalance (resample, reweight)', 'augment', 'split by time or entity']} caption="From raw events to training data. Every step can bias the model without anyone noticing." />
+
+<Levels label="Chapter 4, Training Data">
+
+<Level name="Beginner">
+
+Training data is a sample of the world, so how it is sampled decides what the
+model learns. Simple random sampling gives each item the same chance. Stratified
+sampling samples within each group, so small groups are not lost. Labels can come
+from humans (hand labels) or from the system itself (natural labels, like whether
+a user clicked).
+
+```py
+import random
+random.seed(0)
+tickets = list(range(10_000))
+sample = random.sample(tickets, 500)      # simple random
+```
+
+Common mistake: using whatever data is easiest to get (convenience sampling).
+Fix: write down how the sample was drawn and what it leaves out.
+
+</Level>
+
+<Level name="Intermediate">
+
+Weighted sampling gives some items more chance, for example recent data. Reservoir
+sampling keeps a uniform sample of k items from a stream of unknown length, in
+one pass and fixed memory. Importance sampling lets me estimate statistics of one
+distribution using samples from another, by reweighting.
+
+```py
+import random
+def reservoir(stream, k):
+    res = []
+    for i, x in enumerate(stream):
+        if i < k: res.append(x)
+        else:
+            j = random.randint(0, i)
+            if j < k: res[j] = x
+    return res
+print(len(reservoir(range(1_000_000), 100)))  # 100, each item had equal chance
+```
+
+Natural labels have a feedback loop length: a click is labelled in seconds, a
+loan default in months. When labels are scarce, there is weak supervision
+(heuristic labelling functions), semi-supervision (spread labels from a few
+examples), transfer learning (start from a pretrained model) and active learning
+(ask humans to label the examples the model is least sure of).
+
+Common mistake: ignoring the feedback delay and training on recent data whose
+labels are not in yet. Fix: only train on events old enough to have final labels.
+
+</Level>
+
+<Level name="Advanced">
+
+Class imbalance hurts three ways: the model sees too few minority examples to
+learn them, it can reach high accuracy by ignoring them, and the minority class
+often has the highest cost of error. Fixes come in three families: better
+metrics (precision, recall, F1, per-class scores, precision-recall curves rather
+than accuracy), data-level methods (oversample the minority, undersample the
+majority, synthesise minority examples), and algorithm-level methods
+(cost-sensitive loss, class weights, focal loss).
+
+```py
+from collections import Counter
+y = [0] * 950 + [1] * 50
+w = {c: len(y) / (2 * n) for c, n in Counter(y).items()}
+print(w)  # {0: 0.526..., 1: 10.0}  -> pass as class_weight to the loss
+```
+
+Augmentation creates new examples: label-preserving transformations (synonym
+swaps for text, crops for images), perturbation (small noise, which also makes
+models more robust), and synthesis (templates or generative models).
+
+Common mistake: resampling before splitting, so copies of the same minority
+example sit in both train and test. Fix: split first, resample only the training
+set.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A minority class with five examples: oversampling copies the
+same five, and the model memorises them. A natural label that is never observed
+(a user who did not click might not have seen the item at all). Stratified
+sampling with a stratum of one item. Hand labels from one annotator: their bias
+becomes the ground truth.
+
+```py
+# label disagreement check across two annotators
+agree = sum(a == b for a, b in zip(ann1, ann2)) / len(ann1)
+print(f"agreement {agree:.0%}")  # agreement 71%  -> the guideline needs work
+```
+
+Common mistake: treating "not clicked" as "not relevant". Fix: only count
+negatives that were actually shown to the user.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Imbalance plus time: the minority rate changes month to
+month, so class weights tuned last quarter are wrong now. Active learning plus a
+biased model: it asks for labels only near its own decision boundary, so whole
+regions the model is confidently wrong about never get labelled. Weak supervision
+plus correlated heuristics: two labelling functions that share a cause agree for
+the wrong reason, and the label model overweights them.
+
+Common mistake: trusting agreement between heuristics as evidence of
+correctness. Fix: validate weak labels against a small hand-labelled set.
+
+</Level>
+
+<Level name="Production level">
+
+In production training data has lineage: where each row came from, which
+labelling method, which guideline version, which annotator. When a model fails
+on a slice, lineage lets me find whether the cause was sampling, labels or
+imbalance. Splits respect time and entities: train on the past, test on the
+future, and keep one user's rows in one split.
+
+```py
+train = df[df.ts < "2026-09-01"]
+test  = df[df.ts >= "2026-09-01"]          # time split, not random
+overlap = set(train.user_id) & set(test.user_id)
+print(len(overlap))                        # decide: drop them, or split by user instead
+```
+
+Common mistake: random splits on time-ordered data, so the model peeks at the
+future. Fix: split by time for anything that will predict the future.
+
+</Level>
+
+<Level name="Mindset">
+
+The training set is a set of decisions, each of which can bias the model. The
+habit is to document how data was sampled and labelled as carefully as how the
+model was trained.
+
+Common mistake: treating labels as truth. Fix: measure annotator agreement and
+label noise.
+
+</Level>
+
+<Level name="System design">
+
+<Figure art={`
+  events --> sampler --> label sources --+--> label store (with lineage)
+                         | hand          |          |
+                         | natural  -----+          v
+                         | weak rules               split by time/entity
+                         | active learning <--- model uncertainty
+`} caption="Where labels come from and how they are tracked. Active learning closes a loop from the model back to the annotators." />
+
+Common mistake: labels in spreadsheets with no link to the data version. Fix: a
+label store keyed by example id and guideline version.
+
+</Level>
+
+<Level name="Strategy">
+
+I generate 10,000 synthetic tickets with a 5 percent escalation rate, implement
+reservoir and stratified sampling, train a baseline with and without class
+weights, and compare per-class recall. Done when I can show a time-based split,
+annotator agreement on 50 hand labels, and the effect of imbalance handling on
+minority recall.
+
+</Level>
+
+</Levels>
+
+### 5. Feature Engineering
+
+**Covers:** Learned versus engineered features; common operations (missing values, scaling, discretisation, encoding categorical features, feature crossing, discrete and continuous positional embeddings); data leakage, its common causes and how to detect it; and engineering good features (importance and generalisation).
+
+<Figure art={`
+ time --->  |------ training window ------|  prediction time  |-- label --|
+            features may use ONLY this    ^                   ^
+                                          |                   |
+                      leakage = any feature computed with data from here on
+`} caption="The leakage rule in one line: a feature may only use information available at prediction time." />
+
+<Levels label="Chapter 5, Feature Engineering">
+
+<Level name="Beginner">
+
+A feature is an input the model uses. Deep learning can learn features from raw
+data, but most production models still need engineered ones: counts, ratios,
+time since the last event. Common operations: fill or flag missing values, scale
+numbers to similar ranges, bucket continuous values, and encode categories as
+numbers.
+
+```py
+import math
+def scale(x, lo, hi): return (x - lo) / (hi - lo)
+print(scale(75, 0, 100), round(math.log1p(1_000_000), 2))  # 0.75 13.82
+```
+
+Common mistake: feeding raw values with wildly different ranges (age and income)
+to a model sensitive to scale. Fix: scale, or log-transform skewed values.
+
+</Level>
+
+<Level name="Intermediate">
+
+Missing values have three kinds: missing for no reason, missing because of
+another observed variable, and missing because of the value itself (high earners
+skip the income question). Deleting rows or filling with the mean can each bias
+the model; often the best feature is a "was missing" flag plus a fill.
+
+Categorical features with many or changing values (user ids, product ids) do not
+fit one-hot encoding. The hashing trick maps each category into a fixed number of
+buckets, so new categories get a bucket without retraining the encoder. Feature
+crossing combines two features (city times hour) to capture interactions.
+
+```py
+import hashlib
+def bucket(cat: str, n=1024):
+    return int(hashlib.md5(cat.encode()).hexdigest(), 16) % n
+print(bucket("brand:acme"), bucket("brand:new-brand-2026"))  # both land in 0..1023
+```
+
+Positional embeddings tell a sequence model where each token is, either learned
+per position or computed with sine and cosine functions of the position.
+
+Common mistake: one-hot encoding a category with a million values. Fix: hashing,
+or learned embeddings.
+
+</Level>
+
+<Level name="Advanced">
+
+Data leakage is when a feature contains information about the label that will not
+be available at prediction time. It makes offline scores look great and
+production fail. Common causes: random splits on time-correlated data, scaling
+with statistics computed on the whole dataset before splitting, filling missing
+values with the global mean, duplicates across splits, group leakage (one
+patient's scans in both train and test), and features produced by the label
+process itself (a "refund issued" flag when predicting refunds).
+
+```py
+from sklearn.preprocessing import StandardScaler
+# wrong: scaler sees the test set
+# X = StandardScaler().fit_transform(X_all); split(X)
+# right: fit on train only
+sc = StandardScaler().fit(X_train)
+X_train, X_test = sc.transform(X_train), sc.transform(X_test)
+```
+
+Detection: compare feature importance (a single feature that is suspiciously
+predictive is a leak suspect), check correlation of each feature with the label,
+run ablations, and review how each feature is computed relative to prediction
+time.
+
+Common mistake: celebrating a huge jump from one new feature. Fix: treat it as a
+leak until proven otherwise.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A category never seen in training: one-hot encoding fails or
+maps it to all zeros. A feature that is constant in training: useless, and it can
+break scaling (division by zero range). A feature computed over "the last 30
+days" for a user who joined yesterday. A timestamp in a different time zone in
+one source.
+
+```py
+lo, hi = 5, 5
+try: (5 - lo) / (hi - lo)
+except ZeroDivisionError as e: print("constant feature:", e)  # constant feature: division by zero
+```
+
+Common mistake: assuming every feature has a range. Fix: drop constant features
+and guard divisions.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Hashing plus a rare, important category: it collides with a
+frequent one and gets its signal drowned. A missing-value flag plus a source
+system change: the source starts sending empty strings instead of nulls, the flag
+stops firing, and the model sees a new kind of "present" value. Feature crossing
+plus sparse data: most crossed buckets have no examples, so the model overfits
+the few it has.
+
+Common mistake: treating empty string, null and "N/A" as different values. Fix:
+normalise missing representations at the pipeline boundary.
+
+</Level>
+
+<Level name="Production level">
+
+In production the same feature code must run in training and serving, or the
+model is trained on one thing and served another (train-serve skew). Features are
+logged at prediction time, so I can train on exactly what the model saw. Feature
+importance is monitored: if importance shifts a lot, the data or a pipeline
+changed.
+
+```ts
+// log the features exactly as served, keyed by prediction id
+log.info('prediction', { id, modelVersion, features, score });
+```
+
+Common mistake: recomputing features for training from today's tables. Fix: train
+on logged, point-in-time features.
+
+</Level>
+
+<Level name="Mindset">
+
+Every feature is a claim about what is knowable at prediction time. The habit is
+to ask "when is this value known?" for each one.
+
+Common mistake: adding features until the score stops rising. Fix: each feature
+must generalise; more features also mean more pipelines to break.
+
+</Level>
+
+<Level name="System design">
+
+Features live in a pipeline with a definition, a batch computation, sometimes a
+stream computation, a store for serving, and point-in-time correct history for
+training.
+
+<Flow steps={['feature definition', 'batch and stream compute', 'online store (serving)', 'offline store (point-in-time history)', 'training reads history', 'serving reads online']} caption="One definition, two stores. Point-in-time history is what prevents leakage in training data." />
+
+Common mistake: features defined separately in a notebook and in the service.
+Fix: one definition shared by both paths.
+
+</Level>
+
+<Level name="Strategy">
+
+I build six features for the escalation model, one deliberately leaky (time to
+resolution, which is only known afterwards), and show the inflated offline score,
+then remove it. I add missing flags and a hashed category. Done when a leakage
+test fails on the leaky feature, scaling is fit on train only, and the same
+feature function is used in training and serving.
+
+</Level>
+
+</Levels>
+
+## Chapter 6, models
+
+### 6. Model Development and Offline Evaluation
+
+**Covers:** Model development and training (evaluating and choosing models, ensembles, experiment tracking and versioning, distributed training, AutoML) and offline evaluation (baselines, and methods such as perturbation, invariance and directional expectation tests, calibration, confidence measurement, and slice-based evaluation).
+
+<Flow steps={['baselines: random, majority, rule, human', 'simple model', 'track every run', 'better model if it beats baselines', 'evaluate: slices, calibration, perturbation', 'register the winner']} caption="Model development in order. A model that cannot beat a simple baseline is not finished, whatever its score." />
+
+<Levels label="Chapter 6, Model Development and Offline Evaluation">
+
+<Level name="Beginner">
+
+Start with the simplest model that could work and compare it with baselines: a
+random guess, always predicting the most common class, a simple rule, and if
+possible a human. A number only means something next to a baseline. Track every
+experiment: code version, data version, parameters, metrics.
+
+```py
+from collections import Counter
+y_test = [0]*90 + [1]*10
+majority = Counter(y_test).most_common(1)[0][0]
+print(sum(y == majority for y in y_test) / len(y_test))  # 0.9: the bar any model must clear
+```
+
+Common mistake: starting with the biggest, newest model. Fix: a simple model
+first; it is a baseline and often good enough.
+
+</Level>
+
+<Level name="Intermediate">
+
+Choosing a model means weighing more than accuracy: training and inference cost,
+latency, interpretability, data needs, and how well it handles the data's quirks.
+Ensembles combine several models (bagging, boosting, stacking) and usually
+improve accuracy at the cost of complexity and latency; they are common in
+competitions and rarer in production.
+
+Experiment tracking records the loss curves, metrics, hyperparameters, hardware
+usage and artefacts of every run. Versioning data is harder than versioning code
+because data is large, and because diffs of data are not meaningful line by line.
+
+```py
+run = {"commit": "3f2a91c", "data": "tickets@v5", "model": "gbdt", "params": {"depth": 6, "lr": 0.1},
+       "metrics": {"recall@p80": 0.62, "auc": 0.88}}
+# one record per run; never overwrite
+```
+
+Common mistake: tuning hyperparameters on the test set. Fix: tune on validation;
+look at test once at the end.
+
+</Level>
+
+<Level name="Advanced">
+
+Distributed training splits work when data or models are too big: data
+parallelism copies the model to each worker and splits the batch (with
+synchronous or asynchronous gradient updates); model parallelism splits the
+model's layers or tensors across devices; pipeline parallelism overlaps the
+stages. AutoML searches hyperparameters or architectures automatically, which
+costs compute and can overfit the validation set if searched too hard.
+
+Offline evaluation goes beyond one number. Perturbation tests add noise to inputs
+and check the prediction does not swing wildly. Invariance tests change an input
+that should not matter (a name, a gender) and check the prediction stays the
+same. Directional expectation tests change an input that should move the
+prediction one way (more prior escalations should raise the risk). Calibration
+checks that a predicted 70 percent happens 70 percent of the time. Slice-based
+evaluation reports metrics per subgroup.
+
+```py
+def calibration(probs, ys, bins=5):
+    out = []
+    for b in range(bins):
+        lo, hi = b / bins, (b + 1) / bins
+        idx = [i for i, p in enumerate(probs) if lo <= p < hi]
+        if idx: out.append((round(lo, 1), round(sum(ys[i] for i in idx) / len(idx), 2), len(idx)))
+    return out
+# [(0.0, 0.03, 410), (0.2, 0.31, 120), (0.4, 0.38, 60), (0.6, 0.71, 40), (0.8, 0.86, 30)]
+```
+
+Common mistake: using model scores as probabilities without checking
+calibration. Fix: measure it, and calibrate (Platt scaling, isotonic) if needed.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A slice with very few examples: its metric is noise. An input
+of all zeros or all missing: what does the model predict? A single extreme value:
+does one outlier flip the prediction? A test set from the same week as the
+training set: overly optimistic.
+
+```py
+base = model.predict_proba([x])[0][1]
+x2 = dict(x, customer_name="Priya")       # invariance: name must not matter
+assert abs(model.predict_proba([x2])[0][1] - base) < 0.01
+```
+
+Common mistake: only testing typical inputs. Fix: a small suite of perturbation,
+invariance and directional tests, run like unit tests.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Overall improvement plus a slice regression: the new model
+is better on average and worse for a small but important group, the classic
+Simpson-like trap. Calibration plus class reweighting: training with class
+weights shifts the predicted probabilities, so a well-ranked model becomes
+badly calibrated. An ensemble plus a latency budget: each member fits the budget,
+together they do not.
+
+```py
+for s in slices:
+    print(s, old[s], new[s], "REGRESSION" if new[s] < old[s] - 0.02 else "")
+```
+
+Common mistake: reweighting classes and then reading scores as probabilities. Fix:
+recalibrate after reweighting.
+
+</Level>
+
+<Level name="Production level">
+
+In production a model is promoted by a checklist, not a feeling: beats baselines,
+no slice regressions above a tolerance, calibration checked, behavioural tests
+pass, latency and size within budget, and the run is reproducible from its
+tracked record.
+
+```yaml
+promote_if:
+  recall_at_p80: ">= 0.60"
+  slice_regression_max: 0.02
+  calibration_ece: "<= 0.05"
+  p99_latency_ms: "<= 20"
+  behaviour_tests: all_pass
+```
+
+Common mistake: promoting the run with the best validation score after hundreds
+of searches. Fix: confirm on a fresh test set once, and accept some optimism
+bias.
+
+</Level>
+
+<Level name="Mindset">
+
+A model's score is a claim that needs context: compared to what, on which data,
+for whom. The habit is to ask for the baseline and the slices before believing a
+number.
+
+Common mistake: debugging a model without looking at its errors. Fix: read the
+worst errors per slice.
+
+</Level>
+
+<Level name="System design">
+
+Model development sits between the data pipeline and the registry. The tracker
+and registry make every model traceable to its code and data.
+
+<Layers layers={[
+  { name: 'Model registry', note: 'promoted models with metrics and lineage' },
+  { name: 'Evaluation suite', note: 'baselines, slices, calibration, behaviour tests' },
+  { name: 'Experiment tracker', note: 'every run, parameters, metrics, artefacts' },
+  { name: 'Training jobs', note: 'single machine or distributed' },
+  { name: 'Versioned data', note: 'datasets and features at a point in time' },
+]} caption="The model development stack. Nothing reaches the registry without passing the evaluation suite." />
+
+Common mistake: a registry that stores files but no lineage. Fix: each entry
+points to its run, data version and commit.
+
+</Level>
+
+<Level name="Strategy">
+
+I train four baselines and two real models for the escalation task, track every
+run, and write the evaluation suite: per-slice recall, a calibration table, three
+invariance tests and two directional tests. Done when a promotion script reads
+the tracked run, checks every criterion, and refuses a model that regresses one
+slice.
+
+</Level>
+
+</Levels>
+
+## Chapters 7 to 9, production
+
+### 7. Model Deployment and Prediction Service
+
+**Covers:** Four deployment myths; batch versus online prediction, moving from batch to online, and unifying batch and streaming pipelines; model compression (low-rank factorisation, knowledge distillation, pruning, quantisation); and ML in the cloud and on the edge, including compiling models for devices and running them in browsers.
+
+<Compare left="Batch prediction" right="Online prediction" rows={[
+  ['precompute for all items on a schedule', 'compute on request'],
+  ['cheap per prediction, high throughput', 'low latency needed per call'],
+  ['stale between runs', 'uses the freshest inputs'],
+  ['wastes work on items nobody requests', 'only computes what is asked'],
+  ['good: daily recommendations email', 'good: fraud check at checkout'],
+]} caption="Batch and online prediction. Many systems use both: batch for the long tail, online for fresh signals." />
+
+<Levels label="Chapter 7, Model Deployment and Prediction Service">
+
+<Level name="Beginner">
+
+Deploying a model means making its predictions available to the product. The
+simplest way is an HTTP endpoint that loads the model and returns a prediction.
+The book lists myths to drop: that a company deploys only one or two models
+(real companies run many), that performance stays the same if nothing changes
+(it decays), that models rarely need updating (they need it often), and that
+scale is someone else's problem.
+
+```ts
+import express from 'express';
+const app = express(); app.use(express.json());
+const model = await loadModel('models/escalation@v3');
+app.post('/predict', (req, res) => res.json({ escalate: model.predict(featurise(req.body)), model: 'escalation@v3' }));
+app.listen(8080);
+```
+
+Common mistake: deploying once and walking away. Fix: plan retraining and
+monitoring as part of the deploy.
+
+</Level>
+
+<Level name="Intermediate">
+
+Batch prediction computes predictions periodically and stores them for lookup;
+online prediction computes them when a request arrives. Online prediction with
+only batch features uses precomputed features; online prediction with streaming
+features uses fresh events too, which is where the value is for fast-changing
+signals. Moving from batch to online needs a fast inference path and a streaming
+feature pipeline.
+
+```ts
+// hybrid: precomputed for popular items, online for the rest
+const cached = await kv.get(`pred:${item.id}`);
+const score = cached ?? (await onlineModel.predict(await features(item)));
+```
+
+Common mistake: using online prediction for something that changes once a day.
+Fix: batch it, store it, and serve lookups.
+
+</Level>
+
+<Level name="Advanced">
+
+Compression makes models smaller and faster. Low-rank factorisation replaces big
+weight matrices with products of smaller ones. Knowledge distillation trains a
+small student to mimic a large teacher. Pruning removes weights or whole units
+that contribute little. Quantisation stores weights in fewer bits (16-bit, 8-bit
+integers), reducing memory and often speeding up inference, sometimes with
+quantisation-aware training to limit quality loss.
+
+```py
+import numpy as np
+w = np.random.randn(1000).astype(np.float32)
+scale = np.abs(w).max() / 127
+q = np.round(w / scale).astype(np.int8)
+print(w.nbytes, q.nbytes, float(np.abs(w - q * scale).max()))  # 4000 1000 ~0.015
+```
+
+Unifying batch and streaming means one feature definition used by both training
+(over history) and serving (over live events), so the model does not see
+different features in each.
+
+Common mistake: compressing a model and only checking average accuracy. Fix:
+recheck slices and calibration; compression often hurts the tail.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A cold start for a brand-new item: batch predictions do not
+exist yet. A request during a model reload: it hits a half-loaded model or
+fails. A huge batch job that runs longer than its schedule interval: runs
+overlap. A device without the expected instruction set: the compiled model will
+not run on the edge.
+
+```ts
+let current = await loadModel(v);           // swap atomically on reload
+async function reload(next: string) { const m = await loadModel(next); current = m; }
+```
+
+Common mistake: reloading in place while requests are served. Fix: load the new
+model fully, then swap the reference.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Batch predictions plus a fast-changing input: a user's
+precomputed recommendations ignore the purchase they made a minute ago, so they
+are shown the thing they just bought. Edge deployment plus a model update: half
+the devices run the old model for weeks, and the server sees two populations of
+predictions.
+
+Common mistake: assuming every client runs the latest model. Fix: include the
+model version with every prediction and support old versions for a known window.
+
+</Level>
+
+<Level name="Production level">
+
+In production the prediction service has the usual service concerns (health
+checks, autoscaling, timeouts, rollback) plus ML concerns: the model version in
+every response, logged inputs and outputs, a fallback when the model fails, and
+shadow or canary rollout of new versions (chapter 9).
+
+```ts
+const pred = await withTimeout(model.predict(f), 30).catch(() => ({ escalate: rule(f), fallback: true }));
+log.info('prediction', { id, model: version, fallback: !!pred.fallback });
+```
+
+Common mistake: a prediction service without a timeout. Fix: a strict timeout and
+a fallback answer.
+
+</Level>
+
+<Level name="Mindset">
+
+Deployment is the start of a model's life, not the end of the project. The habit
+is to choose the prediction mode from how fresh the answer must be and how often
+it is asked for.
+
+Common mistake: choosing online prediction because it sounds modern. Fix: let
+freshness requirements decide.
+
+</Level>
+
+<Level name="System design">
+
+<Figure art={`
+  cloud                                     edge
+  +----------------------------+            +-------------------------+
+  | batch job --> prediction   |            | compiled, quantised     |
+  |               store --+    |            | model on device or in   |
+  | online service <-------+---+-- app ---> | the browser (WASM/WebGL)|
+  | (streaming features)       |            | no network, no server   |
+  +----------------------------+            +-------------------------+
+  cost: servers, network                    cost: device limits, updates
+`} caption="Where inference runs. The edge removes latency and server cost but makes updates and monitoring harder." />
+
+Common mistake: moving to the edge without a way to collect metrics. Fix:
+lightweight telemetry with the model version.
+
+</Level>
+
+<Level name="Strategy">
+
+I deploy the escalation model twice: as a nightly batch job writing to a table,
+and as an online endpoint with a timeout and fallback. Then I quantise it and
+compare size, latency and per-slice recall. Done when both modes serve the same
+model version, the reload is atomic under load, and I can say with numbers which
+mode fits the product.
+
+</Level>
+
+</Levels>
+
+### 8. Data Distribution Shifts and Monitoring
+
+**Covers:** Causes of ML system failures (software failures and ML-specific failures); data distribution shifts (covariate shift, label shift, concept drift, general shifts), how to detect them and how to address them; and monitoring and observability (ML-specific metrics, the monitoring toolbox, observability).
+
+<Figure art={`
+  P(X, Y) = P(Y | X) P(X)        or        P(X | Y) P(Y)
+  covariate shift : P(X) changes,   P(Y | X) the same
+  label shift     : P(Y) changes,   P(X | Y) the same
+  concept drift   : P(Y | X) changes  (same input, new right answer)
+`} caption="The three named shifts, written as which part of the joint distribution moves." />
+
+<Levels label="Chapter 8, Data Distribution Shifts and Monitoring">
+
+<Level name="Beginner">
+
+ML systems fail in two ways. Software failures are the usual ones: dependency
+errors, deployment mistakes, hardware, downtime. ML-specific failures are
+quieter: production data differs from training data, edge cases, and degenerate
+feedback loops where the model's own predictions shape the data it learns from.
+A distribution shift is when the data the model sees in production stops looking
+like the data it was trained on.
+
+```py
+train_mean, live_mean = 42.0, 57.3   # average ticket length in words
+print(f"shift {100 * (live_mean - train_mean) / train_mean:.0f}%")  # shift 36%
+```
+
+Common mistake: assuming accuracy at launch is accuracy forever. Fix: monitor
+inputs and outputs from day one.
+
+</Level>
+
+<Level name="Intermediate">
+
+Covariate shift: the inputs change but the relationship stays (a new marketing
+campaign brings younger users). Label shift: the outputs' frequencies change (an
+outage causes many more escalations). Concept drift: the same input now has a
+different right answer (after a policy change, "refund request" no longer
+escalates). General shifts also include feature changes (a unit changes from
+seconds to milliseconds) and label schema changes (a new class).
+
+Detection is easy with labels (watch accuracy) and harder without them (watch
+inputs and predictions). Statistical tests compare a reference window to a
+current window: summary statistics, two-sample tests such as Kolmogorov-Smirnov,
+and measures like population stability index.
+
+```py
+from scipy.stats import ks_2samp
+stat, p = ks_2samp(train_lengths, live_lengths)
+print(round(stat, 3), p < 0.01)   # 0.21 True -> the length distribution moved
+```
+
+Common mistake: alerting on every statistically significant difference. Fix: with
+big samples, everything is significant; alert on effect size that matters.
+
+</Level>
+
+<Level name="Advanced">
+
+Time windows matter: a shift seen over a day may be weekly seasonality; a shift
+seen over a month may hide a sudden change on one day. Cumulative windows smooth
+too much; sliding windows show recent change. High-dimensional inputs (text,
+embeddings) need dimensionality reduction before testing, or monitoring the
+prediction distribution instead.
+
+Addressing shift: retrain on recent data (with a window chosen by experiment),
+train on large and diverse data so the model is robust, or design the system so
+features are less sensitive (use ranks instead of raw counts, use stable
+categories). Monitoring has three layers of ML metrics: accuracy-related (when
+labels arrive), predictions (distribution, rate of each class), features
+(missing rate, ranges, distributions), and raw inputs.
+
+```ts
+const window = recent(predictions, { hours: 24 });
+const rate = window.filter((p) => p.escalate).length / window.length;
+if (Math.abs(rate - baselineRate) > 0.05) alert('escalation prediction rate moved', { rate, baselineRate });
+```
+
+Common mistake: monitoring only accuracy, which arrives weeks late. Fix: monitor
+predictions and features as early warnings.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A feature whose unit changed (minutes to seconds): every value
+is 60 times larger, ranges catch it immediately. A new category value never seen
+in training. A day with very little traffic: statistics are noisy. A holiday:
+real shift that will reverse next week.
+
+```py
+expected = {"low", "high"}
+unseen = set(live_priority) - expected
+if unseen: print("new categories:", unseen)   # new categories: {'urgent'}
+```
+
+Common mistake: treating every alert as drift. Fix: check pipelines and schema
+first; most "drift" is a bug upstream.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. A degenerate feedback loop plus concept drift: the model
+recommends what it already recommends, users click what they are shown, and the
+data never reveals that tastes changed. Label shift plus a fixed threshold: the
+escalation rate doubles, and the threshold tuned for the old rate floods senior
+agents. Seasonality plus a sliding window: the detector learns that the holiday
+spike is normal and misses a real shift right after.
+
+Common mistake: a reference window that moves with the data. Fix: keep a fixed
+reference (training data) and a recent one, and compare both.
+
+</Level>
+
+<Level name="Production level">
+
+In production monitoring uses logs, dashboards and alerts, with care about alert
+fatigue: every alert needs an owner, a threshold that matters, and a runbook.
+Observability goes further: the system is instrumented so that when something is
+wrong, I can find out why from the outside, by drilling into slices, features
+and model versions.
+
+```yaml
+alerts:
+  - name: feature_missing_rate
+    expr: missing_rate{feature="customer_tier"} > 0.05 for 30m
+    runbook: docs/runbooks/feature-missing.md
+  - name: prediction_rate_shift
+    expr: abs(escalate_rate - baseline) > 0.05 for 6h
+```
+
+Common mistake: dozens of alerts nobody acts on. Fix: few alerts, each with an
+owner and a runbook, and delete the ones that never lead to action.
+
+</Level>
+
+<Level name="Mindset">
+
+A model is a snapshot of a world that keeps moving. The habit is to expect decay
+and design the detection before it happens.
+
+Common mistake: blaming the model first. Fix: check software and data pipelines
+first, then the distribution, then the model.
+
+</Level>
+
+<Level name="System design">
+
+<Flow steps={['raw inputs', 'feature checks: missing, range, new values', 'prediction distribution', 'accuracy when labels arrive', 'alerts with runbooks', 'retrain or fix pipeline']} caption="Monitoring from earliest signal to latest. The earlier checks are cheaper and faster but less certain." />
+
+Common mistake: monitoring that lives only in the serving service. Fix: monitor
+the data pipelines too, since most failures start there.
+
+</Level>
+
+<Level name="Strategy">
+
+I simulate three shifts in my escalation project (longer tickets, a doubled
+escalation rate, a policy change that flips one category) and build detectors for
+each: a feature range check, a prediction-rate alert and a KS test. Done when
+each simulated shift fires the right alert, a fake unit change is caught within
+one batch, and every alert has a runbook.
+
+</Level>
+
+</Levels>
+
+### 9. Continual Learning and Test in Production
+
+**Covers:** Continual learning (stateless retraining versus stateful training, why do it, its challenges, the four stages of adoption, and how often to update); and testing in production (shadow deployment, A/B testing, canary release, interleaving experiments, and bandits).
+
+<Timeline items={[
+  { when: 'stage 1', what: 'Manual, stateless retraining: someone retrains when they remember.' },
+  { when: 'stage 2', what: 'Automated retraining on a schedule, from scratch.' },
+  { when: 'stage 3', what: 'Automated, stateful training: finetune the previous model on new data.' },
+  { when: 'stage 4', what: 'Continual learning triggered by events or drift, not only the clock.' },
+]} caption="The four stages of continual learning. Most teams should reach stage 2 before thinking about stage 4." />
+
+<Levels label="Chapter 9, Continual Learning and Test in Production">
+
+<Level name="Beginner">
+
+Continual learning means updating the model regularly as new data arrives, so it
+keeps up with the world. Stateless retraining trains a new model from scratch
+each time; stateful training continues training the existing model on new data,
+which is cheaper and faster. Testing in production means checking a new model
+with real traffic before fully trusting it.
+
+```sh
+# stage 2: a scheduled retrain, from scratch, on the last 90 days
+0 3 * * 1  node jobs/retrain.mjs --window 90d --register-if-better
+```
+
+Common mistake: retraining often without evaluating each new model. Fix: every
+retrain goes through the same evaluation gate as the first model.
+
+</Level>
+
+<Level name="Intermediate">
+
+Why update: to adapt to shifts, to handle rare events (a sale day), and to solve
+cold start for new users and items. Challenges: getting fresh labels quickly,
+evaluating each update fast enough, and the algorithms that are hard to update
+incrementally. How often to update is an empirical question: train on data
+windows of different ages and measure how fast performance decays.
+
+```py
+for days_old in [0, 7, 14, 30, 60]:
+    print(days_old, evaluate(train_until(today - days_old), test_on(today)))
+# 0 0.88 | 7 0.87 | 14 0.85 | 30 0.80 | 60 0.71  -> retrain at least every two weeks
+```
+
+Shadow deployment runs the new model beside the old one, logging its predictions
+without showing them. A/B testing routes part of traffic to the new model and
+compares outcomes. Canary release sends a small share of traffic first, then
+more if healthy.
+
+Common mistake: picking a retraining frequency by habit. Fix: measure the value of
+fresh data with a decay experiment.
+
+</Level>
+
+<Level name="Advanced">
+
+A/B tests need randomisation by the right unit (usually user, not request),
+enough samples for the expected effect, and a pre-registered metric. Interleaving
+shows a user results from two ranking models mixed in one list and sees which
+model's items they pick; it needs far fewer users to detect a preference. Bandits
+(epsilon-greedy, Thompson sampling, upper confidence bound) shift traffic toward
+the better model while the experiment runs, trading statistical cleanliness for
+less regret.
+
+```ts
+function epsilonGreedy(stats: Record<string, { wins: number; n: number }>, eps = 0.1) {
+  const arms = Object.keys(stats);
+  if (Math.random() < eps) return arms[Math.floor(Math.random() * arms.length)];
+  return arms.reduce((a, b) => (stats[a].wins / (stats[a].n || 1) >= stats[b].wins / (stats[b].n || 1) ? a : b));
+}
+```
+
+Common mistake: stopping an A/B test as soon as it looks significant. Fix: fix the
+sample size in advance, or use a method designed for continuous monitoring.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A canary with 1 percent of traffic at night: too few requests
+to see anything. Labels that arrive in 30 days: an A/B test on that label cannot
+finish in a week. A stateful update on a tiny batch of new data: the model
+overfits to it. A new model that fails to load: shadow mode catches it with no
+user impact.
+
+```ts
+if (Math.random() < 0.05) shadowModel.predict(f).then((p) => log.info('shadow', { id, p })).catch((e) => log.warn('shadow_fail', { e }));
+```
+
+Common mistake: shadow traffic that can affect users (for example by writing to
+the same table). Fix: shadow output is logged only, never acted on.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Continual learning plus a degenerate feedback loop: the model
+trains on data its own predictions created, and an error compounds every cycle.
+Bandits plus delayed rewards: the bandit keeps sending traffic to an arm whose
+bad outcomes have not arrived yet. A/B tests plus network effects: users in group
+A talk to users in group B, so the groups are not independent.
+
+Common mistake: retraining on outcomes only from items the model chose to show.
+Fix: keep some exploration traffic and log propensities, so training data is not
+only the model's own choices.
+
+</Level>
+
+<Level name="Production level">
+
+In production the retraining pipeline is automated end to end: pull data, build
+features, train, evaluate, compare with the current model, register, deploy
+through shadow and canary, and roll back automatically on bad metrics.
+
+<Flow steps={['new data window', 'train', 'offline eval vs current', 'shadow', 'canary 5%', 'ramp to 100%', 'auto-rollback on alert']} caption="A safe update path. Each stage can stop the rollout." />
+
+Common mistake: a retrain pipeline that deploys straight to 100 percent. Fix:
+shadow and canary stages with automatic rollback.
+
+</Level>
+
+<Level name="Mindset">
+
+Offline evaluation is necessary and not sufficient; production is the real test.
+The habit is to design every model change as an experiment with a hypothesis, a
+metric and a way to undo it.
+
+Common mistake: treating a deploy as final. Fix: every deploy has a rollback and a
+comparison against the previous version.
+
+</Level>
+
+<Level name="System design">
+
+Continual learning connects the training pipeline, the registry, the deployment
+system and the experimentation platform. The experiment platform owns traffic
+splitting, assignment logging and metric computation.
+
+<Layers layers={[
+  { name: 'Experimentation', note: 'assignment by user, logging, metrics, stopping rules' },
+  { name: 'Deployment', note: 'shadow, canary, ramp, rollback' },
+  { name: 'Registry', note: 'versions, lineage, current and candidate' },
+  { name: 'Training pipeline', note: 'scheduled or triggered, stateless or stateful' },
+]} caption="The parts continual learning needs. Without the top layer, updates are guesses." />
+
+Common mistake: assignment done ad hoc per feature. Fix: one assignment service so
+users are not in conflicting experiments.
+
+</Level>
+
+<Level name="Strategy">
+
+I run the decay experiment on my escalation data to pick a retraining interval,
+automate a weekly stateless retrain, then add shadow mode and a canary with an
+automatic rollback rule, and simulate one bad model to prove rollback works.
+Done when the interval is chosen from measured decay and a deliberately worse
+model is stopped at the canary stage without manual help.
+
+</Level>
+
+</Levels>
+
+## Chapters 10 and 11, the organisation
+
+### 10. Infrastructure and Tooling for MLOps
+
+**Covers:** Storage and compute (public cloud versus private data centres); the development environment (setup, standardisation, and containers from dev to prod); resource management (cron, schedulers and orchestrators, data science workflow management); the ML platform (model deployment, model store, feature store); and build versus buy.
+
+<Layers layers={[
+  { name: 'ML platform', note: 'deployment, model store, feature store' },
+  { name: 'Resource management', note: 'cron, schedulers, orchestrators, workflow tools' },
+  { name: 'Development environment', note: 'IDE, notebooks, versioning, CI, containers' },
+  { name: 'Storage and compute', note: 'data lake or warehouse, CPUs and GPUs, cloud or own hardware' },
+]} caption="The four layers of ML infrastructure, from the bottom up. Each upper layer depends on the ones below." />
+
+<Levels label="Chapter 10, Infrastructure and Tooling for MLOps">
+
+<Level name="Beginner">
+
+ML infrastructure is the tools and platforms that let a team develop and run ML
+systems. At the bottom are storage (where data lives) and compute (where jobs
+run). Then the development environment: editors, notebooks, version control, CI.
+Then resource management: tools that schedule and run jobs. On top, an ML
+platform that standardises deployment, model storage and features.
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
+COPY . .
+CMD ["python", "-m", "serve", "--model", "escalation@v3"]
+```
+
+Common mistake: "it works on my laptop" for training code. Fix: the same container
+image for development, training and serving.
+
+</Level>
+
+<Level name="Intermediate">
+
+Public cloud gives elastic compute and managed services, with costs that grow
+with scale; private data centres cost upfront but can be cheaper at large steady
+scale. Standardising dev environments (same versions, same tools, ideally remote
+dev boxes) removes a whole class of bugs. Containers package code and
+dependencies so a job runs the same everywhere.
+
+Cron runs jobs on a schedule but knows nothing about dependencies. Schedulers
+handle dependencies, retries and queues. Orchestrators manage where jobs run
+across machines. Workflow tools define pipelines as graphs of steps (data
+extraction, features, training, evaluation) with retries and caching.
+
+```py
+# a pipeline as a dependency graph, the shape every workflow tool shares
+steps = {"extract": [], "features": ["extract"], "train": ["features"], "evaluate": ["train"], "register": ["evaluate"]}
+```
+
+Common mistake: a chain of cron jobs that assume the previous one finished. Fix: a
+workflow tool that knows the dependencies.
+
+</Level>
+
+<Level name="Advanced">
+
+The ML platform has three components. Model deployment: a standard way to turn a
+registered model into a service or batch job. Model store: models with their
+metadata, including code, data, features, parameters, metrics and owner, not just
+the weight file. Feature store: shared feature definitions, computation, an
+online store for serving and an offline store for point-in-time training data,
+which also prevents train-serve skew.
+
+Build versus buy depends on the company's stage, whether the tool is a
+competitive advantage, and the maturity of available tools. Buying is faster and
+cheaper early; building pays when the need is unique or the scale makes vendor
+cost painful. Integration cost is always underestimated in both directions.
+
+```yaml
+model_store_entry:
+  name: escalation
+  version: 7
+  code: git@3f2a91c
+  data: tickets@v9
+  features: [ticket_len, prior_escalations_30d, tier_hashed]
+  metrics: { recall_at_p80: 0.64 }
+  owner: sanjay
+```
+
+Common mistake: a model store that is a folder of `.pkl` files. Fix: metadata per
+model, enough to reproduce and to roll back.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A GPU job that fails at hour 9 of 10 with no checkpoint. A
+pinned dependency that is removed from the package index. A cloud quota limit hit
+on the night of a retrain. A feature store with no entry for a new user: the
+online lookup returns nothing.
+
+```py
+# checkpoint so a failure costs one epoch, not the whole run
+for epoch in range(start, epochs):
+    train_one_epoch()
+    save_checkpoint(f"ckpt/epoch-{epoch}.pt")
+```
+
+Common mistake: long jobs without checkpoints. Fix: checkpoint and resume.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Spot instances plus no checkpoints: cheap compute is
+reclaimed and the job restarts forever. A feature store plus two teams defining
+the same feature differently: the store has `user_activity` and `user_activity_v2`
+and nobody knows which is right. A notebook plus production: a model trained in a
+notebook with hidden state cannot be reproduced.
+
+Common mistake: allowing duplicate feature definitions. Fix: feature ownership and
+review, the same as code.
+
+</Level>
+
+<Level name="Production level">
+
+In production the infrastructure is code: environments, pipelines, schedules and
+permissions are versioned and reviewed. Costs are tracked per team and per job.
+Every scheduled pipeline has alerts for failure and for silent success (it ran
+but produced zero rows).
+
+```ts
+if (outputRows === 0) alert('pipeline succeeded with zero rows', { job: 'features-daily' });
+```
+
+Common mistake: alerting only on failures. Fix: alert on suspicious success too.
+
+</Level>
+
+<Level name="Mindset">
+
+Good infrastructure makes the right thing the easy thing. The habit is to notice
+repeated manual steps and turn them into platform features once three teams need
+them, not before.
+
+Common mistake: building a platform before having a second use case. Fix: build
+for the second user, generalise for the third.
+
+</Level>
+
+<Level name="System design">
+
+<Figure art={`
+  notebooks / IDE --> git + CI --> container image
+                                        |
+           workflow tool (DAG) ---------+--> training on compute
+                |                                   |
+          feature store <---- features ----         v
+          (online + offline)               model store (with lineage)
+                |                                   |
+                +------------> prediction service <-+
+`} caption="How the platform pieces connect. Containers and stores are the shared contracts between steps." />
+
+Common mistake: each team wiring its own path from notebook to production. Fix: a
+paved road, with exceptions allowed but costly.
+
+</Level>
+
+<Level name="Strategy">
+
+I containerise my escalation project, express its pipeline as a dependency graph
+with retries, add a minimal model store entry with full metadata, and write a
+build-versus-buy note for a feature store at my scale. Done when one command
+rebuilds the model from a clean machine and the model store entry is enough to
+reproduce it.
+
+</Level>
+
+</Levels>
+
+### 11. The Human Side of Machine Learning
+
+**Covers:** User experience (consistency, handling mostly correct predictions, failing smoothly); team structure (cross-functional teams, end-to-end data scientists); and responsible AI (case studies of irresponsible AI and a framework for responsible AI).
+
+<Compare left="Raw model behaviour" right="Designed experience" rows={[
+  ['different answer each visit', 'stable unless something important changed'],
+  ['one confident answer, sometimes wrong', 'several options the user can pick from'],
+  ['slow model blocks the page', 'fast fallback, better answer when ready'],
+  ['silent failure', 'clear, useful degraded state'],
+]} caption="The same model can feel unreliable or trustworthy depending on the product around it." />
+
+<Levels label="Chapter 11, The Human Side of Machine Learning">
+
+<Level name="Beginner">
+
+Users experience predictions, not models. Three problems show up. Inconsistency:
+the same user sees different predictions and loses trust. Mostly correct
+predictions: an answer that is nearly right can be worse than none if the user
+cannot fix it. Slow or failed predictions: the product must keep working. ML is
+also built by teams with different skills, and it affects people, so it has to be
+responsible.
+
+```ts
+// consistency: keep a prediction stable for a session unless inputs change a lot
+const key = `${user.id}:${hash(coarse(features))}`;
+const pred = (await cache.get(key)) ?? (await model.predict(features));
+```
+
+Common mistake: re-predicting on every page view so a recommendation list shuffles
+constantly. Fix: decide when predictions may change and cache otherwise.
+
+</Level>
+
+<Level name="Intermediate">
+
+For mostly correct predictions, show several candidates and let the user choose,
+or make the output easy to edit; the user's choice is also a label. For smooth
+failing, use a fast backup (a simpler model or a rule) when the main model is slow
+or unsure, and show the better answer if it arrives in time.
+
+```ts
+const fast = rule(f);
+const best = await Promise.race([model.predict(f), sleep(150).then(() => null)]);
+render(best ?? fast);
+```
+
+Team structure: ML work needs data engineers, ML engineers, platform and product
+people. Separate teams with hand-offs are slow and lose context; end-to-end data
+scientists who own the whole pipeline need good tooling, otherwise they drown in
+infrastructure.
+
+Common mistake: a single "AI team" that throws models over a wall to engineering.
+Fix: cross-functional ownership of the product outcome, with a platform that
+removes the infrastructure burden.
+
+</Level>
+
+<Level name="Advanced">
+
+Responsible AI means thinking about fairness, privacy, transparency and
+accountability throughout, not at the end. The book uses case studies of systems
+that went wrong publicly to show how harm comes from ordinary decisions: what
+data was collected, which proxy metric was optimised, who was in the evaluation
+set, and whether anyone could appeal. A framework: discover sources of bias at
+each stage (training data, labels, features, objective, evaluation), understand
+the trade-offs (privacy versus accuracy, compactness versus fairness), act early,
+create model cards, and establish processes for mitigating harm.
+
+```md
+## Model card: escalation@v7
+Intended use: order the support queue. Not for staff evaluation.
+Data: redacted tickets 2025-2026, English and Hindi.
+Known gaps: recall is lower on Hindi tickets (0.55 vs 0.66).
+Owner and appeal: support-tools channel; agents can override every prediction.
+```
+
+Common mistake: assuming removing a sensitive column removes bias. Fix: proxies
+(postcode, name) carry the same signal; measure outcomes per group.
+
+</Level>
+
+<Level name="Edge cases">
+
+One boundary each. A user with no history: the model's output for them is the
+least reliable and should look least certain. A model that is 99 percent right
+on a task where the 1 percent is a person being denied something. A group with
+very few examples in the evaluation set: fairness metrics for it are noise.
+
+```py
+for g, rows in groups.items():
+    print(g, len(rows), round(recall(rows), 2))
+# en 1800 0.66 | hi 240 0.55 | other 12 0.42  <- too few to conclude, collect more
+```
+
+Common mistake: reporting fairness only for large groups. Fix: report counts and
+collect data for small groups.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two boundaries meet. Consistency plus fairness: caching a prediction keeps it
+stable, including a wrong, biased one, so the user cannot escape it. Smooth
+failing plus accountability: the fallback rule is used often, nobody evaluates
+it, and it carries its own bias. An end-to-end owner plus a responsible-AI review:
+one person both builds and approves the model.
+
+Common mistake: evaluating the model and never the fallback. Fix: the fallback
+is part of the system and gets the same checks.
+
+</Level>
+
+<Level name="Production level">
+
+In production responsible AI is a process: a model card for each model, a review
+before launch for high-impact uses, per-group monitoring, a way for affected
+people to appeal or override, and an incident process when harm is found. UX
+choices are tested like model choices, with experiments.
+
+```ts
+log.info('override', { predictionId, by: agent.id, from: pred.escalate, to: decision }); // overrides are feedback and audit
+```
+
+Common mistake: no way to override the model. Fix: every automated decision has a
+human override, and overrides are logged and reviewed.
+
+</Level>
+
+<Level name="Mindset">
+
+The people using and affected by the system are part of it. The habit is to ask
+"who is hurt when this is wrong, and can they tell?" for every prediction.
+
+Common mistake: treating fairness as a compliance checkbox. Fix: treat it as a
+quality metric with slices, like any other.
+
+</Level>
+
+<Level name="System design">
+
+<Flow steps={['decide intended use', 'audit data for gaps', 'evaluate per group', 'model card', 'launch review', 'per-group monitoring', 'appeals and overrides', 'incident review']} caption="Responsible AI across the lifecycle. Each step is cheaper the earlier it happens." />
+
+Common mistake: a launch review with no power to block. Fix: a named owner who can
+say no, with criteria agreed in advance.
+
+</Level>
+
+<Level name="Strategy">
+
+I write a model card for the escalation model, measure recall per language, add
+a session-stable cache and a fast fallback, log overrides, and run one UX
+experiment (showing top two categories versus one). Done when the model card is
+published in the repo, per-group metrics are on the dashboard, and an override
+path exists and is logged.
+
+</Level>
+
+</Levels>
+
+## Epilogue
+
+The book closes with an epilogue. I read it as a reminder of the book's frame:
+an ML system is a system first, and its design decisions are made in context.
+
+## Misreadings to avoid
+
+- **"This book is outdated because of LLMs."** Data pipelines, leakage, drift,
+  monitoring, testing in production and responsible AI apply to an LLM product
+  just as much.
+- **"Better models are the main lever."** Most gains in the book come from data,
+  framing, features and the system around the model.
+- **"Drift means retrain."** Most alerts are pipeline bugs; check the data first.
+- **"Accuracy is the metric."** It hides rare classes and slices; use per-class
+  and per-slice metrics tied to a business objective.
+- **"Continual learning means stage 4 now."** Reaching reliable scheduled
+  retraining with an evaluation gate is the real milestone.
+
+## Done with this book when
+
+- [ ] My escalation model has a framing doc that ties its metric to a business
+      outcome and names its rule-based fallback.
+- [ ] Its dataset uses a time split, has measured label agreement, and handles
+      imbalance with a measured effect.
+- [ ] A leakage test catches a deliberately leaky feature.
+- [ ] It is served in batch and online modes from one model version, with a
+      timeout and a fallback.
+- [ ] Simulated covariate shift, label shift and concept drift each fire the
+      right alert, with a runbook.
+- [ ] A deliberately worse model is stopped by the canary and rolled back
+      automatically.
+- [ ] A model card and per-group metrics exist, and overrides are logged.
