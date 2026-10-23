@@ -1,0 +1,1825 @@
+---
+book: introduction-to-algorithms
+number: 4
+title: "Divide-and-Conquer"
+description: "Recursive and Strassen matrix multiplication, then the four ways to solve a recurrence: substitution, recursion trees, the master method with its proof, and Akra-Bazzi for uneven splits."
+part: "Part I, Foundations"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Chapter 2 used divide and conquer once, for merge sort, and solved its
+recurrence by drawing a picture. This chapter turns that one trick into a
+method. It shows divide and conquer on a harder problem, multiplying
+matrices, where the obvious split gains nothing and a clever one gains a
+lot. Then it gives four tools for solving the recurrences that every
+recursive algorithm produces, from a careful guess to a theorem you can
+apply in ten seconds.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- describe any divide-and-conquer algorithm as divide, conquer and combine, and write its recurrence before writing its code;
+- multiply square matrices by the triple loop, by an eight-product recursion and by Strassen's seven-product recursion, and say why only the last one is faster;
+- prove a guessed bound with the substitution method, including the trick of subtracting a lower-order term when the induction almost works;
+- draw a recursion tree, sum it level by level, and see whether the cost sits at the root, at the leaves or evenly across levels;
+- apply the master theorem's three cases on sight, check the regularity condition, and recognise the recurrences it cannot solve;
+- follow the proof of the master theorem and use the Akra-Bazzi method for recurrences with uneven splits.
+
+**You should already know:** <a href={withBase('/books/introduction-to-algorithms/02-getting-started/')}>chapter 2</a>
+(merge sort and its recursion tree) and
+<a href={withBase('/books/introduction-to-algorithms/03-characterizing-running-times/')}>chapter 3</a>
+(O, Ω, Θ, and the rules for logarithms and geometric sums). Proof by
+induction is used throughout.
+
+**Reading time:** about 90 minutes to read, and four or five sessions of
+one to two hours to work the proofs and run the code. Sections 4.6 and
+4.7 are starred in the book, which marks them as optional on a first
+pass; I cover them in full here, but a first reading can skim them.
+
+## Chapter map
+
+The chapter has two halves. Sections 4.1 and 4.2 are the algorithms:
+matrix multiplication by divide and conquer, first the plain way and then
+Strassen's way. Sections 4.3 to 4.7 are the analysis: four methods for
+turning a recurrence into a Θ bound, ordered from most general and most
+manual to most automatic, plus the proof that the automatic one is right.
+
+<Layers caption="The chapter as a stack. The top two layers produce recurrences; the lower layers are the tools that solve them, from the manual substitution method down to the general Akra-Bazzi formula." layers={[
+  { name: "4.1 Multiplying square matrices", note: "triple loop Θ(n³); eight half-size products, still Θ(n³)" },
+  { name: "4.2 Strassen's algorithm", note: "seven products and extra additions: Θ(n^lg 7), about n^2.81" },
+  { name: "4.3 The substitution method", note: "guess the answer, prove it by induction" },
+  { name: "4.4 The recursion-tree method", note: "draw the calls, sum each level, find a good guess" },
+  { name: "4.5 The master method", note: "compare f(n) with the watershed n^(log_b a): three cases" },
+  { name: "4.6 Proof of the continuous master theorem", note: "why the three cases are right, for real-valued n" },
+  { name: "4.7 Akra-Bazzi recurrences", note: "uneven splits, solved with an exponent p and an integral" },
+]} />
+
+<Flow steps={["Write the algorithm as divide, conquer, combine", "Write the recurrence T(n) = a·T(n/b) + f(n)", "Try the master method", "If it fails, draw a recursion tree to guess", "Prove the guess by substitution", "For uneven splits, use Akra-Bazzi"]} caption="The order I reach for the tools in practice. The master method answers most cases at once; the tree and substitution handle the rest; Akra-Bazzi handles splits of different sizes." />
+
+The vocabulary is small. A **recurrence** is an equation that describes
+a function in terms of its own values on smaller inputs, such as
+T(n) = 2T(n/2) + n. Its **base case** says what happens on small inputs,
+usually that T(n) is a constant there. A **divide-and-conquer** algorithm
+has three steps: **divide** the problem into subproblems that are smaller
+copies of it, **conquer** each subproblem recursively (or directly, once
+it is small enough), and **combine** the subanswers into the answer. The
+recurrence's three parts map onto those steps: a is how many subproblems,
+n/b is how big each one is, and f(n), which the book calls the
+**driving function**, is the cost of dividing plus combining.
+
+A point the book makes early and I want to keep: when a recurrence has
+no base case written down, the convention is that T(n) is constant for
+every n below some fixed size. That convention is what lets us drop the
+base case from almost every recurrence in this chapter. It works because
+an algorithm's running time on a constant-size input is a constant,
+whatever that constant is. If a recurrence ever needed a non-constant
+base case, the convention would break, and the book says so when it
+happens.
+
+## 4.1 Multiplying square matrices
+
+### In one sentence
+
+Splitting each n × n matrix into four n/2 × n/2 blocks turns one big
+product into eight smaller ones, which is correct and elegant but costs
+exactly as much as the triple loop.
+
+### The idea
+
+#### The problem and the obvious algorithm
+
+Multiplying two n × n matrices A and B gives a matrix C whose entry in
+row i, column j is the sum, over k from 1 to n, of A's entry (i, k) times
+B's entry (k, j). Each of the n² entries of C is a dot product of length
+n. That definition is the algorithm: three nested loops over i, j and k,
+for n³ scalar multiplications and about as many additions. Its running
+time is Θ(n³).
+
+The book writes the problem slightly differently, as C = C + A·B, adding
+the product into a matrix C that already holds something. That form is
+convenient for the recursion, because the recursive version adds partial
+products into blocks of C. When C starts at zero it is plain
+multiplication.
+
+#### Splitting into blocks
+
+Now assume n is an exact power of 2. Cut each matrix into four blocks of
+size n/2 × n/2: top left, top right, bottom left, bottom right. Block
+matrices multiply exactly like 2 × 2 matrices of numbers, with each
+"number" now a block. The top-left block of C is A11·B11 + A12·B21, the
+top-right is A11·B12 + A12·B22, and so on. That is eight block products
+and four block additions.
+
+<Figure art={`
+   A                 B                 C = A·B
+ +-----+-----+     +-----+-----+     +-------------------+-------------------+
+ | A11 | A12 |     | B11 | B12 |     | A11·B11 + A12·B21 | A11·B12 + A12·B22 |
+ +-----+-----+  x  +-----+-----+  =  +-------------------+-------------------+
+ | A21 | A22 |     | B21 | B22 |     | A21·B11 + A22·B21 | A21·B12 + A22·B22 |
+ +-----+-----+     +-----+-----+     +-------------------+-------------------+
+`} caption="Block multiplication. Each block of C needs two block products, so the four blocks need eight. Read each block of C as the 2 × 2 rule applied to blocks instead of numbers." />
+
+The divide step is just bookkeeping. The book makes a point that matters
+for the running time: if you copy the blocks into new matrices, the
+divide step costs Θ(n²); if you compute index ranges into the original
+matrices instead, it costs Θ(1). Either way the recurrence ends up with
+the same answer here, but the distinction comes back in Strassen.
+
+#### The recurrence
+
+Each call does eight recursive calls on half-size matrices, plus constant
+work to set up indices (the additions happen inside the recursive calls,
+because each call adds into C). So:
+
+T(n) = 8T(n/2) + Θ(1), with T(1) = Θ(1).
+
+The recursion tree has 8 children per node and lg n levels, so it has
+8^(lg n) = n^(lg 8) = n³ leaves. Each leaf is one scalar multiplication.
+The answer is Θ(n³): the same as the triple loop. The recursion just
+reorders the same n³ multiplications.
+
+The lesson is a sharp one. Divide and conquer is not automatically fast.
+It is fast when the combine step is cheap relative to the work saved, or
+when, as in the next section, the split itself removes work. Here, eight
+half-size problems is exactly as much work as the original problem,
+because (n/2)³ times 8 is n³.
+
+### Worked example
+
+#### A simple example: 2 × 2 by hand
+
+Take A with rows (2, 1) and (3, 4), and B with rows (5, 6) and (7, 8).
+At n = 2 the blocks are single numbers. The top-left of C is 2·5 + 1·7 =
+17. The top-right is 2·6 + 1·8 = 20. The bottom-left is 3·5 + 4·7 = 43.
+The bottom-right is 3·6 + 4·8 = 50. Eight multiplications, four
+additions, and C has rows (17, 20) and (43, 50).
+
+#### A realistic example: counting multiplications in code
+
+I wrote both versions and counted the scalar multiplications each one
+performs. The recursive one cuts the matrices into quadrants and adds
+pairs of block products:
+
+```ts
+// matmul.ts (excerpt): the 8-product recursion. quad() copies a block; add() adds two blocks.
+function dcMul(A: M, B: M): M {
+  const n = A.length;
+  if (n === 1) { mults++; return [[A[0][0] * B[0][0]]]; }
+  const h = n / 2, [a, b, c, d] = [quad(A,0,0,h), quad(A,0,h,h), quad(A,h,0,h), quad(A,h,h,h)];
+  const [e, f, g, k] = [quad(B,0,0,h), quad(B,0,h,h), quad(B,h,0,h), quad(B,h,h,h)];
+  const C11 = add(dcMul(a, e), dcMul(b, g)), C12 = add(dcMul(a, f), dcMul(b, k));
+  const C21 = add(dcMul(c, e), dcMul(d, g)), C22 = add(dcMul(c, f), dcMul(d, k));
+  return [...C11.map((r, i) => [...r, ...C12[i]]), ...C21.map((r, i) => [...r, ...C22[i]])];
+}
+```
+
+Run against the triple loop on the same inputs:
+
+```text
+n=2  loop=8  d&c=8  n^3=8  same=true
+n=4  loop=64  d&c=64  n^3=64  same=true
+n=8  loop=512  d&c=512  n^3=512  same=true
+n=16  loop=4096  d&c=4096  n^3=4096  same=true
+n=32  loop=32768  d&c=32768  n^3=32768  same=true
+```
+
+The counts are identical, exactly n³, and the products match. My version
+copies blocks with `slice`, so its divide step is Θ(n²), not the Θ(1) of
+index arithmetic. That changes the recurrence to T(n) = 8T(n/2) + Θ(n²),
+which, as section 4.5 will show, is still Θ(n³): the eight-way branching
+dominates either way.
+
+### Step by step
+
+#### Solving T(n) = 8T(n/2) + c by unrolling
+
+Unroll the recurrence one level at a time and watch the pattern:
+
+<Trace
+  columns={["level", "subproblems", "size each", "work at this level"]}
+  rows={[
+    ["0", "1", "n", "c"],
+    ["1", "8", "n/2", "8c"],
+    ["2", "64", "n/4", "64c"],
+    ["i", "8^i", "n/2^i", "8^i · c"],
+    ["lg n (leaves)", "8^(lg n) = n³", "1", "n³ · Θ(1)"],
+  ]}
+  caption="The eight-way recursion, level by level. The work per level grows by a factor of 8, so the leaves hold almost all of it."
+/>
+
+Line by line: at level i there are 8^i calls, each on a matrix of size
+n/2^i. Each call does c work of its own, so level i costs 8^i·c. The
+levels form a geometric series with ratio 8, and a growing geometric
+series is dominated by its last term. The last level, i = lg n, has
+8^(lg n) calls. Using the identity a^(log_b n) = n^(log_b a) from
+chapter 3, that is n^(lg 8) = n³. The total is Θ(n³).
+
+### Common mistake
+
+The common mistake is to think that "it is recursive and splits in half,
+so it must be n lg n". That reasoning works for merge sort because merge
+sort makes two half-size calls, and 2 × (n/2) is n: the total size per
+level stays the same. Here each level has eight calls of size n/2, and in
+matrix terms the work of a size-m problem is m³, so the per-level work
+grows. The fix is to always count the subproblems and their size, write
+the recurrence, and solve it, never to guess from the shape.
+
+A second mistake is in the code: forgetting that this version needs n to
+be a power of 2. On a 3 × 3 matrix, `h` is 1.5 and the slices go wrong
+silently. The fix is to pad to the next power of 2 with zeros (correct,
+but up to about 8 times the work in the worst case, since padding can
+nearly double n), or to split into ⌈n/2⌉ and ⌊n/2⌋ blocks and handle
+non-square blocks.
+
+### In real systems
+
+No production library multiplies matrices with this eight-way recursion
+as written. But the block idea is everywhere. Fast matrix libraries tile
+the matrices into blocks that fit in cache, multiply block by block, and
+get large speedups from memory locality while doing the same n³
+arithmetic. A cache-oblivious version of this exact recursion, which
+splits until blocks fit in whatever cache exists, is a classic research
+result. And distributed matrix multiplication on clusters splits by
+blocks so each machine owns a few.
+
+### Check yourself
+
+**If the divide step copies blocks and costs Θ(n²), does the eight-way
+recursion get slower asymptotically?**
+
+<details>
+<summary>Answer</summary>
+
+No. T(n) = 8T(n/2) + Θ(n²) is still Θ(n³), because n² grows slower than
+the n³ coming from the leaves. The copying adds a constant factor, not a
+higher order.
+
+</details>
+
+**How many leaves does the recursion tree have for n = 16?**
+
+<details>
+<summary>Answer</summary>
+
+8^(lg 16) = 8⁴ = 4,096, which is 16³. Each leaf is one scalar
+multiplication.
+
+</details>
+
+## 4.2 Strassen's algorithm for matrix multiplication
+
+### In one sentence
+
+By spending extra block additions, Strassen's algorithm gets away with
+seven half-size products instead of eight, which drops the running time
+from Θ(n³) to Θ(n^lg 7), about n^2.81.
+
+### The idea
+
+#### Why one fewer product matters so much
+
+The recurrence for the eight-way recursion was T(n) = 8T(n/2) + Θ(1).
+Strassen's recurrence is T(n) = 7T(n/2) + Θ(n²). The Θ(n²) is the cost
+of adding and subtracting blocks, which is more than before. The 7 is one
+fewer recursive call. That trade is worth it, because the number of
+calls is multiplied at every level of the recursion, while the extra
+additions are paid only once per call.
+
+At depth i there are 7^i calls instead of 8^i. At the bottom that is
+7^(lg n) = n^(lg 7) leaves instead of n³. Since lg 7 is about 2.807, the
+algorithm does asymptotically fewer multiplications. The additions cost
+Θ(n²) per call; summed over the tree, they also come to Θ(n^lg 7),
+because the per-level addition cost grows by a factor of 7/4 per level
+and the leaves dominate.
+
+#### The four steps
+
+The book presents the algorithm in four steps, and the structure is more
+useful to remember than the exact formulas:
+
+1. Divide A, B and C into n/2 × n/2 blocks (Θ(1) with index arithmetic).
+2. Make ten matrices, each the sum or difference of two blocks of A or of
+   B. That is ten additions of n/2 × n/2 matrices: Θ(n²).
+3. Recursively compute seven products, each of a block (or a sum from
+   step 2) of A times a block (or a sum) of B.
+4. Combine the seven products, with more additions and subtractions, into
+   the four blocks of C: Θ(n²).
+
+The seven products are chosen so that every term of the four blocks of C
+appears, and every unwanted cross term cancels. Nothing in the algorithm
+needs multiplication to be commutative, so it works with blocks, which do
+not commute. That is the key detail: a trick that only worked for
+numbers could not recurse.
+
+<Compare left="Eight-product recursion" right="Strassen" caption="The two recursions side by side. Strassen pays more at each node to branch less, and the branching factor is what decides the exponent." rows={[
+  ["8 recursive products per call", "7 recursive products per call"],
+  ["4 block additions (inside the calls)", "18 block additions and subtractions"],
+  ["T(n) = 8T(n/2) + Θ(1)", "T(n) = 7T(n/2) + Θ(n²)"],
+  ["Θ(n³)", "Θ(n^lg 7), about n^2.81"],
+  ["Simple, numerically friendly", "More rounding error with floating point"],
+  ["Works on any ring, needs no subtraction", "Needs subtraction, so a ring rather than a semiring"],
+]} />
+
+#### Where it came from, and where it went
+
+Strassen published the algorithm in 1969. It surprised people because the
+cubic bound had looked natural. Since then, a line of algorithms has
+pushed the exponent lower, and the book mentions this history briefly;
+the later algorithms are of theoretical interest only, with constants too
+large to use. The book also notes the practical side: Strassen's constant
+factor is larger than the plain loop's, it has worse memory locality and
+it loses more precision with floating point, so in practice it only pays
+off on large dense matrices, and implementations switch to the ordinary
+method below a crossover size.
+
+### Worked example
+
+#### A simple example: the 2 × 2 case by hand
+
+Use the same A (rows 2, 1 and 3, 4) and B (rows 5, 6 and 7, 8). With one
+standard choice of the seven products, written with my own names:
+
+- p1 = a11 · (b12 − b22) = 2 · (6 − 8) = −4
+- p2 = (a11 + a12) · b22 = 3 · 8 = 24
+- p3 = (a21 + a22) · b11 = 7 · 5 = 35
+- p4 = a22 · (b21 − b11) = 4 · (7 − 5) = 8
+- p5 = (a11 + a22) · (b11 + b22) = 6 · 13 = 78
+- p6 = (a12 − a22) · (b21 + b22) = −3 · 15 = −45
+- p7 = (a11 − a21) · (b11 + b12) = −1 · 11 = −11
+
+Then combine. Top-left: p5 + p4 − p2 + p6 = 78 + 8 − 24 − 45 = 17.
+Top-right: p1 + p2 = −4 + 24 = 20. Bottom-left: p3 + p4 = 35 + 8 = 43.
+Bottom-right: p5 + p1 − p3 − p7 = 78 − 4 − 35 + 11 = 50. Seven
+multiplications, eighteen additions and subtractions, the same C as
+before.
+
+#### A realistic example: Strassen in TypeScript
+
+The code mirrors the four steps. Each product is a recursive call:
+
+```ts
+// strassen.ts (excerpt): q() takes a block, add()/sub() combine blocks.
+const p1 = strassen(a11, sub(b12, b22)), p2 = strassen(add(a11, a12), b22);
+const p3 = strassen(add(a21, a22), b11), p4 = strassen(a22, sub(b21, b11));
+const p5 = strassen(add(a11, a22), add(b11, b22)), p6 = strassen(sub(a12, a22), add(b21, b22));
+const p7 = strassen(sub(a11, a21), add(b11, b12));
+const c11 = add(sub(add(p5, p4), p2), p6), c12 = add(p1, p2);
+const c21 = add(p3, p4), c22 = sub(sub(add(p5, p1), p3), p7);
+```
+
+Counting multiplications and checking against the triple loop:
+
+```text
+n=2  strassen mults=7  n^lg7=7  n^3=8  correct=true
+n=4  strassen mults=49  n^lg7=49  n^3=64  correct=true
+n=8  strassen mults=343  n^lg7=343  n^3=512  correct=true
+n=16  strassen mults=2401  n^lg7=2401  n^3=4096  correct=true
+n=32  strassen mults=16807  n^lg7=16807  n^3=32768  correct=true
+n=64  strassen mults=117649  n^lg7=117649  n^3=262144  correct=true
+[ [ 17, 20 ], [ 43, 50 ] ]
+```
+
+The multiplication count is exactly 7^(lg n), which equals n^(lg 7). At
+n = 64 Strassen does fewer than half the multiplications of the loop. But
+my implementation is slower in wall-clock time than the triple loop at
+these sizes, because every level allocates new arrays for eighteen
+additions. That is the constant factor the book warns about, made
+visible: the count of multiplications is not the running time.
+
+### Step by step
+
+#### Why the top-right block is right
+
+Take c12 = p1 + p2. Expand: p1 = a11·b12 − a11·b22 and p2 = a11·b22 +
+a12·b22. Adding, the a11·b22 terms cancel and leave a11·b12 + a12·b22,
+which is exactly the top-right block of the product. Notice that every
+product kept its left factor from A and its right factor from B. That is
+why the derivation is valid for blocks.
+
+#### Why the top-left block is right
+
+The top-left block needs a11·b11 + a12·b21. Expand the four products:
+
+<Trace
+  columns={["product", "expanded", "running sum after adding it"]}
+  rows={[
+    ["+p5", "a11b11 + a11b22 + a22b11 + a22b22", "a11b11 + a11b22 + a22b11 + a22b22"],
+    ["+p4", "a22b21 − a22b11", "a11b11 + a11b22 + a22b22 + a22b21"],
+    ["−p2", "−a11b22 − a12b22", "a11b11 + a22b22 + a22b21 − a12b22"],
+    ["+p6", "a12b21 + a12b22 − a22b21 − a22b22", "a11b11 + a12b21"],
+  ]}
+  caption="Building the top-left block of C from four of Strassen's products. Read the last column: each row cancels some unwanted cross terms until only a11·b11 + a12·b21 is left."
+/>
+
+#### Solving the recurrence
+
+T(n) = 7T(n/2) + cn². At depth i there are 7^i calls on size n/2^i, each
+doing c(n/2^i)² work, so level i costs cn²·(7/4)^i. The ratio 7/4 is
+above 1, so the series grows and the last level dominates: there are lg n
+levels and the last costs about cn²·(7/4)^(lg n) = cn²·n^(lg 7 − 2) =
+c·n^(lg 7). The total is Θ(n^lg 7). The master method in section 4.5
+gives the same answer in one line.
+
+### Common mistake
+
+The common mistake is to implement Strassen all the way down to 1 × 1
+blocks, as my teaching version does, and conclude that Strassen is a
+fraud because it runs slower. The algorithm's advantage is asymptotic
+and its overhead is large. The fix used by every serious implementation
+is a cutoff: recurse with Strassen only while n is above some threshold
+found by measurement, and switch to a tuned ordinary multiply below it.
+
+A second mistake is to apply it to floating-point matrices where accuracy
+matters without checking. The subtractions can cancel large terms and
+amplify rounding error. The fix is to measure the error on your data, or
+to keep the plain method when the numbers are ill-conditioned. With
+integers (or exact arithmetic) the issue disappears, but intermediate
+sums can overflow a fixed-width type sooner than the plain method would.
+
+### In real systems
+
+Most BLAS libraries, the low-level linear algebra kernels behind numerical
+software and machine-learning frameworks, use carefully blocked versions
+of the cubic algorithm tuned to the cache and vector units, not Strassen.
+Strassen-like schemes do appear in some libraries for very large
+matrices, and the same "fewer multiplications, more additions" idea is
+the core of Karatsuba multiplication for big integers, which every
+arbitrary-precision arithmetic library uses: three half-size products
+instead of four.
+
+### Check yourself
+
+**Karatsuba multiplies two n-digit numbers with three half-size products
+and Θ(n) extra work. What is its running time?**
+
+<details>
+<summary>Answer</summary>
+
+T(n) = 3T(n/2) + Θ(n), which is Θ(n^lg 3), about n^1.585, compared with
+Θ(n²) for the schoolbook method's four products.
+
+</details>
+
+**Why must Strassen's formulas never swap the order of a product?**
+
+<details>
+<summary>Answer</summary>
+
+Because the entries are blocks, and matrix multiplication is not
+commutative. A formula that relied on a·b = b·a would be wrong one level
+up.
+
+</details>
+
+## 4.3 The substitution method for solving recurrences
+
+### In one sentence
+
+Guess the form of the answer, then prove it by induction, choosing the
+constants as the proof demands.
+
+### The idea
+
+#### Two steps: guess, then verify
+
+The substitution method is the most general of the four tools and the
+most manual. Step one: guess the form of the solution, with unknown
+constants, such as "T(n) ≤ c·n lg n for all n at least n₀". Step two: use
+mathematical induction to show the guess holds, and find constants that
+make it work. It is called substitution because the inductive step
+substitutes the guess into the right-hand side of the recurrence for the
+smaller values.
+
+The method proves an upper bound and a lower bound separately. To show
+Θ, you do it twice: once with "at most c·g(n)" and once with "at least
+c·g(n)". Often only the upper bound is interesting, because the lower
+bound is obvious from the top-level work.
+
+#### The inductive hypothesis and the base case
+
+The induction works on n. The inductive hypothesis assumes the bound
+holds for every value smaller than n (strong induction), and the step
+shows it holds for n. The base cases are where the convention from the
+chapter start does real work. Since T(n) is a constant for small n, we
+can choose n₀ and c large enough that the bound holds on all the base
+values at once. The book stresses that you are free to pick n₀, so a
+base case like T(1) that would break the bound (lg 1 = 0, so c·1·lg 1 =
+0, which is less than any positive T(1)) is not a problem: start the
+induction at a larger n₀ and cover the small values by choice of c.
+
+#### Making a good guess
+
+There is no recipe for guessing, and the book is honest about that. The
+practical sources of guesses are: a recurrence you have seen before (one
+that looks like merge sort probably has merge sort's answer), a
+recursion tree (section 4.4), and loose bounds that you tighten. For the
+last one, prove a very loose upper bound and a very loose lower bound,
+then bring them together until they meet.
+
+#### The trap: proving the wrong statement
+
+The most important warning in this section is about asymptotic notation
+inside the induction. The induction must prove the exact form, with the
+exact same constant, that the hypothesis assumed. If you assume T(m) ≤
+c·m for smaller m and derive T(n) ≤ c·n + n, you have NOT proved T(n) ≤
+c·n. Writing "c·n + n = O(n), done" is the classic false proof: the
+constant grew by 1 at every level, and over lg n levels it grows without
+bound.
+
+#### Subtracting a lower-order term
+
+Sometimes the guess is right but the induction fails by a little: you
+get T(n) ≤ c·n + 1 when you needed T(n) ≤ c·n. The fix the book teaches
+is counter-intuitive: strengthen the hypothesis by subtracting a
+lower-order term, such as guessing T(n) ≤ c·n − d. A stronger hypothesis
+gives you more to work with in the inductive step, and the extra
+subtraction absorbs the leftover. Proving something stronger is often
+easier, because you assume something stronger too.
+
+#### Changing variables
+
+A recurrence with an awkward argument can sometimes be turned into a
+familiar one by renaming. The classic shape is a square root:
+T(n) = 2T(√n) + lg n. Set m = lg n, so n = 2^m and √n = 2^(m/2). Define
+S(m) = T(2^m). The recurrence becomes S(m) = 2S(m/2) + m, which is merge
+sort's: S(m) = Θ(m lg m). Translating back, T(n) = Θ(lg n · lg lg n).
+
+### Worked example
+
+#### A simple example: merge sort's recurrence
+
+Claim: T(n) = 2T(⌊n/2⌋) + n has T(n) ≤ 2n lg n for n at least 2, taking
+T(1) = 1. Before proving, I check the claim and its cousins numerically:
+
+```ts
+// recur.ts (excerpt): evaluate the recurrence exactly and test guesses.
+function T(n: number): number {
+  if (n <= 1) return 1;
+  if (memo.has(n)) return memo.get(n)!;
+  const v = 2 * T(Math.floor(n / 2)) + n; memo.set(n, v); return v;
+}
+let bad = 0; for (let n = 2; n <= 2e5; n++) if (T(n) > 2 * n * Math.log2(n)) bad++;
+let first = -1; for (let n = 2; n <= 2e5; n++) if (T(n) > 10 * n) { first = n; break; }
+```
+
+```text
+n=2  T=4  n lg n=2  T/(n lg n)=2.000
+n=16  T=80  n lg n=64  T/(n lg n)=1.250
+n=1000  T=9120  n lg n=9966  T/(n lg n)=0.915
+n=1024  T=11264  n lg n=10240  T/(n lg n)=1.100
+n=100000  T=1656000  n lg n=1660964  T/(n lg n)=0.997
+n=1000000  T=19191232  n lg n=19931569  T/(n lg n)=0.963
+n where T(n) > 2 n lg n, 2..200000: 0
+first n with T(n) > 10n: 1024
+```
+
+Two things show up. The ratio to n lg n hovers near 1, so Θ(n lg n) is
+the right guess, and c = 2 is a safe constant. And the tempting false
+claim "T(n) = O(n) with c = 10" breaks at n = 1,024. Any fixed c breaks
+eventually, which is exactly why the "c·n + n = O(n)" proof is wrong.
+
+#### A realistic example: the subtract-a-term fix
+
+Take T(n) = 2T(n/2) + 1 (a recursive maximum-finder that splits the
+array and compares the two halves' answers). The answer is Θ(n). Try to
+prove T(n) ≤ c·n: substituting gives T(n) ≤ 2·c·(n/2) + 1 = c·n + 1. The
+"+1" ruins it. Now guess T(n) ≤ c·n − d instead. Substituting gives
+T(n) ≤ 2(c·n/2 − d) + 1 = c·n − 2d + 1, and that is at most c·n − d
+whenever d ≥ 1. The stronger guess goes through.
+
+### Step by step
+
+#### The merge sort upper bound, line by line
+
+Prove T(n) ≤ c·n lg n for all n ≥ 2, where T(n) = 2T(⌊n/2⌋) + n.
+
+<Trace
+  columns={["step", "what we write", "why"]}
+  rows={[
+    ["1", "Assume T(m) ≤ c·m lg m for every m with 2 ≤ m < n", "strong inductive hypothesis"],
+    ["2", "T(n) = 2T(⌊n/2⌋) + n ≤ 2c⌊n/2⌋ lg⌊n/2⌋ + n", "substitute the hypothesis at m = ⌊n/2⌋ (valid when n ≥ 4)"],
+    ["3", "≤ 2c(n/2) lg(n/2) + n", "⌊n/2⌋ ≤ n/2 and lg is increasing"],
+    ["4", "= c·n lg n − c·n lg 2 + n = c·n lg n − c·n + n", "lg(n/2) = lg n − 1"],
+    ["5", "≤ c·n lg n", "holds when c ≥ 1, since then −c·n + n ≤ 0"],
+    ["6", "Base cases n = 2 and n = 3: T(2) = 4, T(3) = 5", "computed directly"],
+    ["7", "Need 4 ≤ c·2 lg 2 = 2c and 5 ≤ c·3 lg 3 ≈ 4.75c", "pick c = 2: both hold"],
+  ]}
+  caption="The substitution proof for merge sort's recurrence. Step 5 is the moment of truth: the leftover must be at most zero with the same constant c."
+/>
+
+Why are n = 2 and n = 3 the base cases? For n at least 4, ⌊n/2⌋ is at
+least 2, so the hypothesis applies to it. For n = 2 or 3, ⌊n/2⌋ = 1, and
+the bound says nothing about T(1) (lg 1 = 0). So those two are checked by
+hand, and c = 2 makes every step valid. That matches what the program
+found: zero violations of T(n) ≤ 2n lg n.
+
+#### The false proof, line by line
+
+Here is what goes wrong when you try to "prove" T(n) = O(n) for the same
+recurrence. Assume T(m) ≤ c·m for smaller m. Then T(n) ≤ 2c⌊n/2⌋ + n ≤
+c·n + n. Someone writes "= O(n)" and stops. The error: the hypothesis
+said c·n, with this exact c, and we derived c·n + n, which is strictly
+bigger. The induction has not closed. The program's output shows the
+consequence for c = 10: the bound fails from n = 1,024 on.
+
+### Common mistake
+
+The mistake, stated once more because it is so common: using O inside
+the inductive step. The fix is mechanical. Never write O, Ω or Θ inside a
+substitution proof. Replace the notation by explicit constants (c, d, n₀)
+before you start, carry them through every line, and only at the end say
+"therefore T(n) = O(...)".
+
+A second mistake is giving up when the induction fails by a lower-order
+term. The instinct is to try a bigger function (n lg n instead of n).
+Usually the right move is the opposite: keep the same function, subtract
+a lower-order term, and try again.
+
+### In real systems
+
+You rarely write a substitution proof at work. But the habit behind it
+shows up whenever you claim a bound on a recursive process: a retry loop
+that halves its batch, a tree-walk in a planner, a recursive file-system
+scan. "I think it's linear; does the step hold with the same constant?"
+is how you catch the cases where cost silently creeps up per level, which
+is the production version of c·n + n.
+
+### Check yourself
+
+**What is wrong with: "assume T(m) ≤ c·m², get T(n) ≤ c·n² + n², so
+T(n) = O(n²)"?**
+
+<details>
+<summary>Answer</summary>
+
+The constant grew from c to c + 1 in one step, so the hypothesis was not
+proved for n. The induction never closes. Either the guess is wrong or
+it needs a stronger form.
+
+</details>
+
+**Solve T(n) = 2T(√n) + 1 by changing variables.**
+
+<details>
+<summary>Answer</summary>
+
+With m = lg n and S(m) = T(2^m), S(m) = 2S(m/2) + 1 = Θ(m), so T(n) =
+Θ(lg n).
+
+</details>
+
+## 4.4 The recursion-tree method for solving recurrences
+
+### In one sentence
+
+Draw every recursive call as a node labelled with its own cost, add up
+each level, then add up the levels.
+
+### The idea
+
+#### A picture of the recursion
+
+A recursion tree makes the recurrence concrete. The root is the
+top-level call, labelled with the driving function's cost f(n). Its a
+children are the subproblems, each labelled with f(n/b). Their children
+are labelled f(n/b²), and so on, down to leaves of constant size. The
+total cost of the algorithm is the sum of every label in the tree.
+
+Summing a whole tree at once is hard. Summing one level is easy, because
+every node on a level has the same size. So the method is: compute the
+cost of level i, find how many levels there are, and add the per-level
+costs. The result is usually a geometric series, and chapter 3 (plus the
+book's appendix A) taught how to sum those.
+
+#### What a recursion tree is for
+
+The book is clear that a recursion tree is best used to generate a good
+guess, which you then verify with substitution. Drawing a tree involves
+sloppiness that is fine for guessing: ignoring floors and ceilings,
+assuming n is a power of b, and treating a sum as exact. If you are
+careful enough, the tree is itself a proof; usually it is not, and that is
+fine.
+
+#### The three shapes
+
+Every recursion tree for T(n) = aT(n/b) + f(n) falls into one of three
+patterns, and spotting the pattern is the main skill:
+
+- **Root-heavy.** Per-level costs shrink geometrically as you go down. The
+  root's cost dominates: T(n) = Θ(f(n)).
+- **Balanced.** Every level costs about the same. Multiply by the number
+  of levels: T(n) = Θ(f(n) · lg n).
+- **Leaf-heavy.** Per-level costs grow geometrically as you go down. The
+  leaves dominate: T(n) = Θ(number of leaves) = Θ(n^(log_b a)).
+
+These three shapes are the master method's three cases in picture form.
+
+#### Counting levels and leaves
+
+If each step divides the size by b and recursion stops at size 1, the
+depth is log_b n, so there are log_b n + 1 levels. The number of nodes
+at depth i is a^i, and at the bottom it is a^(log_b n), which by the log
+identity equals n^(log_b a). That expression, n^(log_b a), is the
+number of leaves, and it is the most important quantity in the chapter.
+
+### Worked example
+
+#### A simple example: T(n) = 3T(n/4) + n²
+
+This is a root-heavy tree. The root costs n². Its three children each
+cost (n/4)² = n²/16, so level 1 costs 3n²/16. Level 2 costs (3/16)²·n²,
+and so on. The ratio 3/16 is below 1, so the series is bounded by the
+first term times 1/(1 − 3/16) = 16/13, about 1.23. My program sums the
+tree for n = 256:
+
+```text
+T(n) = 3T(n/4) + n^2, n = 256
+  depth 0: nodes=1 size=256.00 level cost=65536.0
+  depth 1: nodes=3 size=64.00 level cost=12288.0
+  depth 2: nodes=9 size=16.00 level cost=2304.0
+  depth 3: nodes=27 size=4.00 level cost=432.0
+  depth 4: nodes=81 size=1.00 level cost=81.0
+  total=80641.0  n^2=65536  ratio=1.230
+```
+
+The total is 1.230 times the root's cost, exactly the 16/13 the series
+predicts. The answer is T(n) = Θ(n²): the root does most of the work.
+
+<Figure art={`
+ depth 0                       n²                          n²
+                     /          |          \
+ depth 1        (n/4)²       (n/4)²       (n/4)²         (3/16)·n²
+                / | \        / | \        / | \
+ depth 2     (n/16)² ...  nine nodes in all  ...         (3/16)²·n²
+                 .              .              .
+                 .              .              .
+ leaves      Θ(1) Θ(1) ...  3^(log_4 n) = n^0.79 leaves  Θ(n^0.79)
+                                                         -----------
+                                       total at most (16/13)·n² = Θ(n²)
+`} caption="The recursion tree for T(n) = 3T(n/4) + n². The right column is each level's total. It shrinks by 3/16 per level, so the root dominates." />
+
+#### A second example: the balanced and leaf-heavy shapes
+
+The same program on merge sort's recurrence and on the eight-way matrix
+recursion shows the other two shapes:
+
+```text
+T(n) = 2T(n/2) + n, n = 64
+  depth 0: nodes=1 size=64.00 level cost=64.0
+  ...every level costs 64.0...
+  depth 6: nodes=64 size=1.00 level cost=64.0
+  total=448
+T(n) = 8T(n/2) + 1, n = 16
+  depth 0: nodes=1 size=16.00 level cost=1.0
+  depth 1: nodes=8 size=8.00 level cost=8.0
+  depth 2: nodes=64 size=4.00 level cost=64.0
+  depth 3: nodes=512 size=2.00 level cost=512.0
+  depth 4: nodes=4096 size=1.00 level cost=4096.0
+  total=4681  n^3=4096
+```
+
+Merge sort is balanced: 7 levels of 64 each, 448 = 64 · (lg 64 + 1),
+so Θ(n lg n). The matrix recursion is leaf-heavy: the leaves alone cost
+4,096 = 16³ and the rest adds only 585, so Θ(n³).
+
+#### A realistic example: an uneven split
+
+The book also draws a tree for a recurrence whose children are different
+sizes. The cleanest version is T(n) = T(n/3) + T(2n/3) + n. Each level's
+sizes add up to n (n/3 + 2n/3 = n), so every full level costs n. But the
+tree is lopsided: the n/3 branch hits the bottom after log₃ n levels,
+while the 2n/3 branch goes on for log_(3/2) n levels. So the levels near
+the top cost n, and the levels near the bottom cost less, because some
+branches have already ended.
+
+The upper bound is n per level times log_(3/2) n levels, which is
+O(n lg n). The lower bound is n per level for the log₃ n full levels,
+which is Ω(n lg n). Both are Θ(n lg n) up to constants, so the answer is
+Θ(n lg n). Section 4.7's method confirms it, and my measurement in that
+section shows the ratio to n lg n settling near 1.03.
+
+### Step by step
+
+#### Summing T(n) = 3T(n/4) + cn² exactly
+
+<Trace
+  columns={["step", "what we write", "why"]}
+  rows={[
+    ["1", "Depth i has 3^i nodes of size n/4^i", "each node has 3 children, each a quarter the size"],
+    ["2", "Each costs c(n/4^i)², so level i costs (3/16)^i · cn²", "multiply node count by node cost"],
+    ["3", "Depth runs from 0 to log_4 n", "size reaches 1 when 4^i = n"],
+    ["4", "Leaves: 3^(log_4 n) = n^(log_4 3) ≈ n^0.79 nodes, Θ(1) each", "log identity from chapter 3"],
+    ["5", "Total ≤ cn² · sum over i of (3/16)^i + Θ(n^0.79)", "extend the finite sum to infinity: an upper bound"],
+    ["6", "= (16/13)cn² + Θ(n^0.79) = O(n²)", "geometric series with ratio 3/16"],
+    ["7", "And T(n) ≥ cn² from the root alone, so T(n) = Θ(n²)", "lower bound is free here"],
+  ]}
+  caption="The recursion-tree sum written as a derivation. Step 5 is the useful trick: an infinite decreasing geometric series bounds the finite one from above."
+/>
+
+Then, to be rigorous, verify with substitution: assume T(m) ≤ d·m² for
+smaller m. Then T(n) ≤ 3d(n/4)² + cn² = (3/16)d·n² + cn², which is at most
+d·n² when d ≥ (16/13)c. The induction closes with the same d, and the
+guess from the tree is proved.
+
+### Common mistake
+
+The common mistake is to count levels wrong, or to forget the leaves.
+In a leaf-heavy tree, the leaves are the whole answer. Someone who sums
+the internal levels and stops misses the n^(log_b a) term. The fix: always
+write two lines, the sum of the internal levels and the cost of the
+leaves, and add them.
+
+The second mistake is with uneven trees: multiplying the root level's
+cost by the depth of the shallowest branch (too small) or treating every
+level as full down to the deepest branch and calling it exact. The fix is
+to give an upper bound and a lower bound separately, as in the
+T(n/3) + T(2n/3) example, and check that they match.
+
+### In real systems
+
+Recursion trees are how I reason about any fan-out process. A service
+that calls three downstream services, each of which calls three more,
+has a recursion tree; its total request count is the leaves term, and
+the latency is the depth. A build system that splits a monorepo into
+modules and builds dependencies recursively has a tree whose per-level
+cost tells you whether the time goes into the top-level link step
+(root-heavy) or the leaf compilations (leaf-heavy). Knowing which tells
+you what to optimise.
+
+### Check yourself
+
+**For T(n) = 4T(n/2) + n, what are the level costs and the answer?**
+
+<details>
+<summary>Answer</summary>
+
+Level i has 4^i nodes of size n/2^i, costing 2^i·n. The costs double per
+level, so it is leaf-heavy: 4^(lg n) = n² leaves, T(n) = Θ(n²).
+
+</details>
+
+**Why does a recursion tree usually need a substitution proof after
+it?**
+
+<details>
+<summary>Answer</summary>
+
+Because drawing it involves approximations: ignoring floors and
+ceilings, assuming exact powers and summing loosely. The tree gives the
+guess; substitution makes it a proof.
+
+</details>
+
+## 4.5 The master method for solving recurrences
+
+### In one sentence
+
+For T(n) = aT(n/b) + f(n), compare the driving function f(n) with the
+watershed function n^(log_b a): whichever grows polynomially faster wins,
+and if they tie, you pay a log factor.
+
+### The idea
+
+#### The form it solves
+
+The master method solves recurrences of exactly one shape:
+T(n) = aT(n/b) + f(n), where a is at least 1, b is a constant greater
+than 1, and f(n) is asymptotically positive (positive for all large n).
+The book calls such a recurrence a **master recurrence**. It describes an
+algorithm that splits a size-n problem into a subproblems of size n/b and
+spends f(n) dividing and combining. The subproblem sizes n/b need not be
+integers here; floors and ceilings turn out not to matter, which section
+4.6 and the end of 4.7 justify.
+
+#### The watershed function
+
+The key quantity is n^(log_b a), which the book names the **watershed
+function**. It is the number of leaves of the recursion tree, so it is
+the total cost if all the work were at the leaves. The theorem compares
+f(n), the root's cost, against it:
+
+- **Case 1.** If f(n) = O(n^(log_b a − ε)) for some constant ε above 0,
+  so f grows polynomially slower than the watershed, then
+  T(n) = Θ(n^(log_b a)). The leaves win.
+- **Case 2.** If f(n) = Θ(n^(log_b a) · lg^k n) for some constant k at
+  least 0, so f matches the watershed up to a polylog factor, then
+  T(n) = Θ(n^(log_b a) · lg^(k+1) n). Every level costs about the same,
+  and there are about lg n levels.
+- **Case 3.** If f(n) = Ω(n^(log_b a + ε)) for some constant ε above 0,
+  so f grows polynomially faster, AND f satisfies the **regularity
+  condition** a·f(n/b) ≤ c·f(n) for some constant c below 1 and all large
+  n, then T(n) = Θ(f(n)). The root wins.
+
+The fourth edition states case 2 with the lg^k factor built in. With
+k = 0 it is the familiar f(n) = Θ(n^(log_b a)) giving Θ(n^(log_b a) lg n).
+With k = 1 it handles recurrences like T(n) = 2T(n/2) + n lg n, which
+older presentations of the theorem left in a gap between the cases.
+
+<Flow steps={["Compute w = log_b a", "Compare f(n) with n^w", "f polynomially smaller: case 1, Θ(n^w)", "f = Θ(n^w · lg^k n), k ≥ 0: case 2, Θ(n^w · lg^(k+1) n)", "f polynomially larger and regular: case 3, Θ(f(n))", "Otherwise: the method does not apply"]} caption="The master method as a decision path. Read it top to bottom: the first test that matches gives the answer, and falling off the end means using another tool." />
+
+#### "Polynomially" smaller and larger
+
+The word that matters in cases 1 and 3 is polynomially. It is not
+enough for f to be smaller than the watershed; it must be smaller by a
+factor of n^ε for some fixed ε. The function n/lg n is smaller than n,
+but only by a log factor, not a polynomial one. So T(n) = 2T(n/2) +
+n/lg n is not in case 1, not in case 2 (k would be −1), and not in case 3.
+It falls into a **gap**, and the master method says nothing about it.
+Its real answer is Θ(n lg lg n), which a recursion tree finds.
+
+#### The regularity condition
+
+Case 3 has an extra condition: a·f(n/b) ≤ c·f(n) with c below 1. In
+words, the total driving cost of the a children is a constant fraction
+less than the parent's. That makes the per-level costs shrink
+geometrically, which is what lets the root dominate. For ordinary
+polynomial f, such as f(n) = n^k with k greater than log_b a, the condition
+holds automatically: a·(n/b)^k = (a/b^k)·n^k, and a/b^k is below 1
+exactly when k is greater than log_b a. The condition matters for odd
+driving functions that oscillate.
+
+### Worked example
+
+#### A simple example: five recurrences in five lines
+
+- Merge sort, T(n) = 2T(n/2) + Θ(n): w = log₂ 2 = 1, f = Θ(n¹), case 2
+  with k = 0, so Θ(n lg n).
+- Binary search, T(n) = T(n/2) + Θ(1): w = log₂ 1 = 0, n⁰ = 1, f = Θ(1),
+  case 2, so Θ(lg n).
+- Eight-way matrix recursion, T(n) = 8T(n/2) + Θ(1): w = 3, f is
+  polynomially smaller, case 1, so Θ(n³).
+- Strassen, T(n) = 7T(n/2) + Θ(n²): w = lg 7 ≈ 2.807, and n² = O(n^(2.807 −
+  0.8)), case 1, so Θ(n^lg 7).
+- T(n) = 4T(n/2) + n³: w = 2, f is polynomially larger, regularity holds
+  (4(n/2)³ = n³/2), case 3, so Θ(n³).
+
+#### A realistic example: a classifier in code
+
+I wrote a small function that applies the master method to driving
+functions of the form n^k · lg^j n:
+
+```ts
+// master.ts (excerpt): classify T(n) = a T(n/b) + Θ(n^k lg^j n).
+function master(a: number, b: number, k: number, j = 0): string {
+  const w = Math.log(a) / Math.log(b), eps = 1e-9;
+  const fs = `n^${k}${j ? ` lg^${j} n` : ""}`, ws = `n^${+w.toFixed(3)}`;
+  if (k < w - eps) return `a=${a} b=${b} f=${fs}: watershed ${ws}, case 1 -> Θ(${ws})`;
+  if (Math.abs(k - w) <= eps) {
+    if (j > -1) return `a=${a} b=${b} f=${fs}: watershed ${ws}, case 2 -> Θ(n^${+w.toFixed(3)} lg^${j + 1} n)`;
+    return `a=${a} b=${b} f=${fs}: matches watershed but j <= -1, master method does not apply`;
+  }
+  return `a=${a} b=${b} f=${fs}: watershed ${ws}, case 3 (check regularity) -> Θ(${fs})`;
+}
+```
+
+```text
+a=2 b=2 f=n^1: watershed n^1, case 2 -> Θ(n^1 lg^1 n)
+a=1 b=2 f=n^0: watershed n^0, case 2 -> Θ(n^0 lg^1 n)
+a=8 b=2 f=n^2: watershed n^3, case 1 -> Θ(n^3)
+a=7 b=2 f=n^2: watershed n^2.807, case 1 -> Θ(n^2.807)
+a=9 b=3 f=n^1: watershed n^2, case 1 -> Θ(n^2)
+a=3 b=4 f=n^1 lg^1 n: watershed n^0.792, case 3 (check regularity) -> Θ(n^1 lg^1 n)
+a=2 b=2 f=n^1 lg^1 n: watershed n^1, case 2 -> Θ(n^1 lg^2 n)
+a=2 b=2 f=n^1 lg^-1 n: matches watershed but j <= -1, master method does not apply
+a=4 b=2 f=n^3: watershed n^2, case 3 (check regularity) -> Θ(n^3)
+```
+
+The exponent comparison is the whole decision when f is a power times a
+log power: if k differs from w, the log factor cannot close a polynomial
+gap, so the case is decided by k alone. Only when k equals w does j
+matter. The third-from-last line, n lg n against watershed n, is the
+fourth edition's extended case 2. The second-to-last is a genuine gap.
+
+### Step by step
+
+#### Why the three cases, from the tree
+
+Write the total as the leaves plus the internal levels:
+T(n) = Θ(n^(log_b a)) + the sum over j from 0 to log_b n − 1 of
+a^j · f(n/b^j). Everything in the master theorem is about that sum.
+
+<Trace
+  columns={["case", "what the level-j term looks like", "the sum is dominated by", "result"]}
+  rows={[
+    ["1", "a^j f(n/b^j) grows as j increases (by a factor near b^ε per level)", "the deepest levels, comparable to the leaves", "Θ(n^(log_b a))"],
+    ["2", "a^j f(n/b^j) ≈ n^(log_b a) lg^k(n/b^j): about equal per level", "all log_b n levels together", "Θ(n^(log_b a) lg^(k+1) n)"],
+    ["3", "a^j f(n/b^j) ≤ c^j f(n): shrinks geometrically", "the root, level 0", "Θ(f(n))"],
+  ]}
+  caption="The three cases as three behaviours of the per-level sum. Compare the second column with the three tree shapes of section 4.4: they are the same idea."
+/>
+
+In case 2 with k = 0, each level costs about n^(log_b a) and there are
+about log_b n levels, giving n^(log_b a) lg n. With k at least 1, the
+level costs are n^(log_b a) times lg^k of a shrinking size; summing lg^k
+over the levels gives a lg^(k+1) n factor, the same way that summing i^k
+for i from 1 to m gives about m^(k+1).
+
+### Common mistake
+
+The commonest mistake is applying case 1 or 3 when f differs from the
+watershed only by a log factor. T(n) = 2T(n/2) + n lg n is not case 3,
+even though n lg n is bigger than n; it is case 2 with k = 1, so
+Θ(n lg² n), not Θ(n lg n). The fix is to ask "is the gap at least n^ε?"
+every time, and to treat log factors as belonging to case 2.
+
+The second mistake is forgetting the regularity check in case 3, or
+applying the master method to a recurrence that is not of its form:
+T(n) = T(n − 1) + n (subtract, not divide; the answer is Θ(n²)), or
+T(n) = T(n/3) + T(2n/3) + n (two different sizes). Neither is a master
+recurrence. The fix is to check the form before reaching for the cases.
+
+### In real systems
+
+The master method is the tool I actually use when reviewing a recursive
+design. A tiling engine that splits an image into four quadrants and
+merges with linear work in the edge length; a spatial index that splits
+space into eight octants; a parallel reduction that splits in two with
+constant combine cost. Each is one line of the master method, and the
+case tells you where the time goes: the leaves (make the base case fast),
+the root (make the combine fast), or evenly (both matter).
+
+### Check yourself
+
+**Solve T(n) = 9T(n/3) + n².**
+
+<details>
+<summary>Answer</summary>
+
+w = log₃ 9 = 2, f = Θ(n²), case 2 with k = 0: Θ(n² lg n).
+
+</details>
+
+**Does the master method solve T(n) = 2T(n/2) + n/lg n?**
+
+<details>
+<summary>Answer</summary>
+
+No. f is smaller than n by only a log factor, so it is in the gap between
+cases 1 and 2. The answer, Θ(n lg lg n), needs a recursion tree.
+
+</details>
+
+## 4.6 Proof of the continuous master theorem
+
+### In one sentence
+
+Treat n as a real number so that n/b^j needs no rounding, sum the
+recursion tree exactly, then bound that sum in each of the three cases.
+
+### The idea
+
+#### Why a continuous version
+
+The book proves the master theorem in a cleaner setting first. In the
+**continuous master theorem**, n is a real number, the recurrence
+T(n) = aT(n/b) + f(n) holds for n at or above some threshold, and T is a
+positive constant-bounded value below it. With real n, n/b is exactly
+n/b, so the tree has no rounding. The proof is then in two parts: a lemma
+that writes T(n) as an exact sum, and a lemma that bounds the sum in each
+case.
+
+#### Part one: T as a sum
+
+Unroll the recurrence until the argument drops below the threshold. If
+the recursion goes down about log_b n levels, then T(n) equals the cost
+of the leaves, which is Θ(n^(log_b a)) because there are a^(log_b n) =
+n^(log_b a) of them and each costs Θ(1), plus the sum g(n) of a^j·f(n/b^j)
+over the internal levels j. This is exactly what the recursion tree
+showed; the lemma just makes it precise for real n.
+
+#### Part two: bounding the sum
+
+Then the book bounds g(n) under each case's assumption:
+
+- **Case 1.** f(n/b^j) is at most a constant times (n/b^j)^(log_b a − ε).
+  Multiply by a^j and simplify: a^j/b^(j·log_b a) = 1, leaving
+  n^(log_b a − ε) times (b^ε)^j. That is a growing geometric series with
+  ratio b^ε, and summing it to about log_b n terms gives a constant
+  times n^(log_b a − ε) times n^ε, which is O(n^(log_b a)). So the sum
+  is no bigger than the leaves.
+- **Case 2.** f(n/b^j) is Θ of (n/b^j)^(log_b a) times lg^k(n/b^j). The
+  a^j cancels the denominator again, so each term is n^(log_b a) times
+  lg^k(n/b^j). Summing lg^k over the log_b n levels is Θ(lg^(k+1) n). So
+  g(n) = Θ(n^(log_b a) lg^(k+1) n), which beats the leaves.
+- **Case 3.** Regularity says a·f(n/b) ≤ c·f(n). Apply it j times:
+  a^j·f(n/b^j) ≤ c^j·f(n). The sum is at most f(n) times the geometric
+  series 1 + c + c² + ..., which is f(n)/(1 − c). It is at least f(n)
+  (the root). So g(n) = Θ(f(n)), and since f is polynomially bigger than
+  the leaves, T(n) = Θ(f(n)).
+
+#### Back to integers
+
+The real-valued theorem leaves a question: actual algorithms have floors
+and ceilings, such as merge sort's ⌈n/2⌉ and ⌊n/2⌋. The fourth edition
+handles this using the machinery of section 4.7, which shows that, under
+a mild condition on f, perturbing the arguments by floors and ceilings
+does not change the asymptotic solution. So the master theorem applies to
+the recurrences real code produces.
+
+### Worked example
+
+#### A simple example: case 3's geometric series, with numbers
+
+For T(n) = 2T(n/2) + n², regularity says 2(n/2)² = n²/2 ≤ c·n² with
+c = 1/2. Level j costs at most (1/2)^j·n², and the levels sum to at most
+2n². The root alone is n². So T(n) is between n² and 2n² plus the leaves
+(Θ(n)), which is Θ(n²).
+
+#### A realistic example: floors and ceilings measured
+
+To see the "back to integers" claim, I evaluated merge sort's exact
+integer recurrence, T(n) = T(⌊n/2⌋) + T(⌈n/2⌉) + n with T(1) = 0, for
+every n up to a hundred thousand:
+
+```ts
+// floors.ts (excerpt)
+function T(n: number): number {
+  if (n === 1) return 0;
+  if (memo.has(n)) return memo.get(n)!;
+  const v = T(Math.floor(n / 2)) + T(Math.ceil(n / 2)) + n; memo.set(n, v); return v;
+}
+```
+
+```text
+n=7  T=20  n lg n=19.7
+n=8  T=24  n lg n=24.0
+n=9  T=29  n lg n=28.5
+n=1000  T=9976  n lg n=9965.8
+n=1023  T=10229  n lg n=10228.6
+n=1024  T=10240  n lg n=10240.0
+n=1025  T=10252  n lg n=10251.4
+over n = 2..100000, T/(n lg n) stays in [1.000, 1.052]
+```
+
+At powers of 2 the recurrence equals n lg n exactly. In between, the
+ratio never leaves a band from 1.000 to 1.052. The floors and ceilings
+change the constant by at most about 5 percent and the growth rate not at
+all, which is what the proof promises.
+
+### Step by step
+
+#### Case 1's sum, line by line
+
+<Trace
+  columns={["step", "expression", "reason"]}
+  rows={[
+    ["1", "g(n) = Σ over j of a^j f(n/b^j)", "the internal levels of the tree"],
+    ["2", "≤ C · Σ a^j (n/b^j)^(w − ε), with w = log_b a", "case 1 assumption on f, constant C"],
+    ["3", "= C · n^(w − ε) · Σ (a · b^ε / b^w)^j", "pull n out; regroup the powers of j"],
+    ["4", "= C · n^(w − ε) · Σ (b^ε)^j", "b^w = a, so a/b^w = 1"],
+    ["5", "≤ C · n^(w − ε) · (b^(ε·log_b n)) / (b^ε − 1)", "geometric series with ratio b^ε greater than 1, about log_b n terms"],
+    ["6", "= (C / (b^ε − 1)) · n^(w − ε) · n^ε = O(n^w)", "b^(ε·log_b n) = n^ε"],
+  ]}
+  caption="The case 1 bound in six lines. The trick at step 4 is that a and b^w cancel, which is the definition of the watershed exponent w."
+/>
+
+The pattern is worth remembering: in every case, a^j and b^(j·w) cancel,
+because a = b^w. What is left is a simple geometric or polylog sum.
+
+### Common mistake
+
+The mistake in reading this proof is to think the "Θ(1) per leaf" step
+is trivial. It depends on the base-case convention: T is bounded by a
+constant below the threshold. If the base case were itself expensive,
+say each leaf did Θ(lg n) work, the leaf term would be n^(log_b a) lg n
+and the cases would shift. The fix is to check the base case cost when a
+recursion stops at a size that grows with n.
+
+### In real systems
+
+You will not prove the master theorem at work. But the proof's central
+move, "write the total as leaves plus a per-level sum, and see whether
+the sum grows, stays level or shrinks", is the right way to read any
+profile of a recursive system. A flame graph of a recursive renderer is
+a recursion tree with measured costs on the nodes.
+
+### Check yourself
+
+**In the case 3 proof, where is the regularity condition used?**
+
+<details>
+<summary>Answer</summary>
+
+To bound a^j·f(n/b^j) by c^j·f(n), which makes the per-level costs a
+decreasing geometric series bounded by f(n)/(1 − c).
+
+</details>
+
+**Why does the proof work with real n first?**
+
+<details>
+<summary>Answer</summary>
+
+So that n/b^j is exact and the tree has no rounding. The integer case is
+handled afterwards by showing floors and ceilings do not change the
+asymptotic answer.
+
+</details>
+
+## 4.7 Akra-Bazzi recurrences
+
+### In one sentence
+
+For recurrences that split into subproblems of different fractional
+sizes, find the exponent p that balances the split, then T(n) is n^p times
+one plus an integral of the driving function.
+
+### The idea
+
+#### The form
+
+An **Akra-Bazzi recurrence** has the form T(n) = f(n) + the sum over i
+from 1 to k of a_i·T(n/b_i), with every a_i positive, every b_i greater
+than 1, and f non-negative. Merge sort is the case k = 1. The split
+T(n/3) + T(2n/3) + n has k = 2, a₁ = a₂ = 1, b₁ = 3 and b₂ = 3/2. The
+median-of-medians selection algorithm from chapter 9 gives
+T(n/5) + T(7n/10) + n, another k = 2 case. The master method cannot touch
+these, because the subproblems are different sizes.
+
+#### The exponent p
+
+The method first finds the unique real number p that solves
+a₁/b₁^p + a₂/b₂^p + ... + a_k/b_k^p = 1. The left side decreases as p
+grows, so there is exactly one solution. For a master recurrence (k = 1)
+the equation is a/b^p = 1, so p = log_b a: the watershed exponent. In
+general, p plays the watershed's role: n^p is the "balanced" amount of
+work.
+
+#### The formula
+
+Then T(n) = Θ(n^p · (1 + the integral from 1 to n of f(x)/x^(p+1) dx)).
+The integral measures how f compares to n^p, the way the master method's
+cases do, but continuously. If f is polynomially smaller than n^p, the
+integral converges to a constant and T(n) = Θ(n^p). If f is about n^p,
+the integral is about ln n and T(n) = Θ(n^p lg n). If f is polynomially
+bigger, the integral is about f(n)/n^p and T(n) = Θ(f(n)).
+
+#### The condition on f
+
+The method needs f to satisfy a **polynomial-growth condition**: roughly,
+f(n) does not jump by more than a constant factor when n changes by a
+constant factor. Polynomials and polylog times polynomial satisfy it;
+exponentials such as 2^n do not. The book also uses this condition to
+show that replacing n/b_i by its floor or ceiling does not change the
+answer, which is what lets section 4.6's result apply to integer
+recurrences.
+
+### Worked example
+
+#### A simple example: T(n) = T(n/3) + T(2n/3) + n
+
+Solve (1/3)^p + (2/3)^p = 1. At p = 1 the left side is 1/3 + 2/3 = 1, so
+p = 1. Then the integral of x/x² = 1/x from 1 to n is ln n. T(n) =
+Θ(n · (1 + ln n)) = Θ(n lg n), matching the recursion-tree guess from
+section 4.4.
+
+#### A realistic example: solving for p numerically
+
+Usually p is not a nice number. I solve for it by bisection and check the
+uneven-split recurrence numerically:
+
+```ts
+// akra.ts (excerpt): find p with Σ a_i · (fraction_i)^p = 1 by bisection.
+function solveP(terms: [number, number][]): number {
+  let lo = -10, hi = 10;
+  for (let it = 0; it < 200; it++) {
+    const mid = (lo + hi) / 2;
+    const s = terms.reduce((acc, [a, frac]) => acc + a * frac ** mid, 0);
+    if (s > 1) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+```
+
+```text
+n=100  T/(n lg n)=0.921
+n=1000  T/(n lg n)=0.976
+n=10000  T/(n lg n)=1.010
+n=100000  T/(n lg n)=1.029
+n=1000000  T/(n lg n)=1.029
+T(n/3)+T(2n/3): p=1.000000
+T(n/5)+T(7n/10): p=0.839780
+2T(n/2): p=1.000000
+T(n/2)+2T(n/4): p=1.000000
+```
+
+For the selection recurrence, p is about 0.84, below 1. With f(n) = n,
+the integrand is x/x^1.84 = x^(−0.84), whose integral from 1 to n grows
+like n^0.16. So T(n) = Θ(n^0.84 · n^0.16) = Θ(n): linear-time selection,
+which is chapter 9's main result, falls out of one equation. And the
+ratio T/(n lg n) for the 1/3, 2/3 split settles near 1.03, confirming
+Θ(n lg n).
+
+### Step by step
+
+#### The selection recurrence through Akra-Bazzi
+
+<Trace
+  columns={["step", "work", "result"]}
+  rows={[
+    ["1", "Identify a₁ = 1, b₁ = 5, a₂ = 1, b₂ = 10/7, f(n) = n", "two uneven subproblems"],
+    ["2", "Solve (1/5)^p + (7/10)^p = 1", "p ≈ 0.84 (at p = 1 the sum is 0.9, too small, so p is below 1)"],
+    ["3", "Integral of x/x^(p+1) = x^(−p) from 1 to n", "(n^(1−p) − 1)/(1 − p) = Θ(n^(1−p))"],
+    ["4", "T(n) = Θ(n^p · (1 + Θ(n^(1−p))))", "substitute into the formula"],
+    ["5", "= Θ(n)", "n^p · n^(1−p) = n"],
+  ]}
+  caption="Akra-Bazzi on the median-of-medians recurrence. Step 2 is where the intuition lives: the two subproblems together cover only 90 percent of n, so the tree shrinks and the root's linear work dominates."
+/>
+
+The intuition behind step 2 is the cleanest part. The two subproblems
+have sizes adding up to 9n/10, less than n. So each level of the tree
+does at most 9/10 of the previous level's work, a decreasing geometric
+series, and the root's n dominates. When the fractions add to exactly 1
+(the 1/3 + 2/3 case), each level costs n and we get n lg n.
+
+### Common mistake
+
+The common mistake is to approximate an uneven split by an even one:
+"T(n/3) + T(2n/3) is roughly 2T(n/2)". Here it gives the right answer by
+luck, but for T(n/5) + T(7n/10) + n it would suggest n lg n when the
+truth is linear, and for splits whose fractions add to more than 1 it
+can be wrong in the other direction. The fix is to add the fractions
+first: below 1, the root dominates; exactly 1, n lg n for linear f;
+above 1, solve for p.
+
+### In real systems
+
+Uneven splits are what real recursive algorithms produce. Quicksort with
+a pivot that lands at 10 percent splits 1:9. A k-d tree splits at the
+median of a sample, which is never exactly half. A rope or piece-table
+editor splits text at an edit position. Akra-Bazzi says that as long as
+the split fractions are bounded away from 0 and 1 and add to 1, the cost
+stays Θ(n lg n). That is why "balanced enough" is good enough.
+
+### Check yourself
+
+**For T(n) = T(n/2) + 2T(n/4) + n, find p and the solution.**
+
+<details>
+<summary>Answer</summary>
+
+(1/2)^p + 2(1/4)^p = 1 at p = 1 (1/2 + 1/2). With f(n) = n the integral
+is ln n, so T(n) = Θ(n lg n). My bisection output agrees: p = 1.
+
+</details>
+
+**What is p for a master recurrence aT(n/b) + f(n)?**
+
+<details>
+<summary>Answer</summary>
+
+log_b a, the watershed exponent, since a/b^p = 1 exactly when b^p = a.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Divide-and-Conquer">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, divide and conquer is one sentence: break the
+problem into smaller copies of itself, solve those, and stitch the
+answers together. The running time of such an algorithm is described by a
+recurrence, an equation that says "the cost on n equals the cost on the
+pieces plus the cost of splitting and stitching".
+
+A smallest worked example: finding the largest number in an array by
+splitting it in half, finding the largest in each half, and returning the
+bigger of the two. Its recurrence is T(n) = 2T(n/2) + 1, because there
+are two halves and one comparison to combine them. On 8 numbers that is
+7 comparisons, the same as a simple loop. Divide and conquer did not make
+it faster, which is the first lesson.
+
+The beginner's mistake is to believe that splitting in half always gives
+a log factor. It only does when the split reduces the total work per
+level. Write the recurrence and solve it before believing any claim of
+speed.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, you solve recurrences fluently. Given an
+algorithm, you write T(n) = aT(n/b) + f(n), compute log_b a, and apply the
+master method. You know the four standard answers by heart: binary search
+Θ(lg n), merge sort Θ(n lg n), the eight-way matrix recursion Θ(n³),
+Strassen Θ(n^lg 7).
+
+A worked example in code: the Karatsuba idea applied to my own toy
+"multiply two digit arrays" function. The schoolbook split into halves
+makes four half-size products, T(n) = 4T(n/2) + Θ(n) = Θ(n²), no gain over
+the schoolbook method. Karatsuba's trick computes the middle term from
+one extra product of sums, so three products: T(n) = 3T(n/2) + Θ(n) =
+Θ(n^1.585). I check it the same way I checked Strassen: count the
+single-digit multiplications for n = 2, 4, ..., 64 and confirm they are
+3^(lg n).
+
+The intermediate mistake is to apply the master method outside its form.
+T(n) = T(n − 1) + n is not a master recurrence; it is a sum, n(n + 1)/2,
+so Θ(n²). The fix is to check that the subproblem size is n divided by a
+constant, not n minus a constant.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, you can prove what you claim. You can verify a
+guess by substitution with explicit constants, strengthen the hypothesis
+by subtracting a lower-order term when the induction misses by a little,
+change variables to turn T(n) = 2T(√n) + lg n into a merge-sort recurrence,
+and follow the proof of the continuous master theorem: leaves plus a
+per-level sum, with a and b^w cancelling.
+
+A worked example: prove T(n) = 4T(n/2) + n is O(n²). The naive guess
+T(n) ≤ c·n² gives T(n) ≤ 4c(n/2)² + n = c·n² + n, which fails. Guess
+T(n) ≤ c·n² − d·n instead: T(n) ≤ 4(c(n/2)² − d(n/2)) + n = c·n² − 2d·n + n,
+which is at most c·n² − d·n when d ≥ 1. The stronger hypothesis closes
+the induction.
+
+The advanced mistake is to stop at the master method when the
+recurrence is in a gap. T(n) = 2T(n/2) + n/lg n is Θ(n lg lg n): level j
+costs n/lg(n/2^j) = n/(lg n − j), and summing 1/(lg n − j) over the lg n
+levels is a harmonic sum, Θ(lg lg n). The fix is to drop back to the
+recursion tree whenever no case fits cleanly.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases are single boundaries. The first is n not a power of b. The
+eight-way matrix code assumes n is a power of 2; on n = 3 it computes
+`h = 1.5` and slices incorrectly. The fix is padding to the next power
+of 2, or splitting into ⌈n/2⌉ and ⌊n/2⌋ blocks. Padding at most doubles
+n, which multiplies Θ(n³) work by at most 8 and Θ(n^lg 7) by at most 7.
+
+The second edge case is a = 1. Then log_b a = 0, the watershed is n⁰ = 1,
+and the recursion is a single chain, not a tree. Binary search is the
+example: case 2 with k = 0 gives Θ(lg n). A chain with f(n) = n, as in
+T(n) = T(n/2) + n, is case 3 and gives Θ(n): n + n/2 + n/4 + ... = 2n.
+
+The third is the base case itself. The convention says T is constant for
+small n. If the base case is "n is at most 16, use insertion sort", the
+base costs 16² operations, still a constant, so the asymptotic answer
+does not change. But if the base size grows with n (stop at √n), the
+leaves are no longer Θ(1) each and the master theorem does not apply
+as stated.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two boundaries. One: Strassen on small integers
+that overflow. Strassen's sums like (a11 + a22)·(b11 + b22) can exceed a
+32-bit integer range even when every entry of the final product fits. In
+JavaScript, numbers are 64-bit floats, so integers past 2^53 silently
+lose precision. A test with random small entries passes; a test with
+entries near the limit fails. The fix is to check the range of
+intermediate sums, or to use `BigInt` for exact results.
+
+Two: floors, ceilings and a tiny base case together. For merge sort's
+recurrence with T(1) = 0, the measured ratio to n lg n stayed between
+1.000 and 1.052. But with T(1) = 0 and a recurrence like T(n) =
+T(⌊n/2⌋) + 1, n = 1 gives 0 and n = 2 gives 1, and an inductive claim like
+T(n) ≤ c·lg n must start at n₀ = 2, because lg 1 = 0 and the bound can
+fail at n = 1 when T(1) is positive. The fix is to choose n₀ and check
+the base values by hand, as in section 4.3.
+
+Three: case 3 with a driving function that fails regularity. A
+driving function that oscillates, being large at even n and small at odd
+n, can be polynomially larger than the watershed on average yet break
+a·f(n/b) ≤ c·f(n) at some sizes. The theorem then says nothing. Real
+algorithms rarely produce such f, but a cost model with a periodic
+expensive step (a rebuild every power of 2) can.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, the asymptotic winner is often not the deployed one.
+Matrix libraries ship blocked cubic multiplication tuned to cache and
+SIMD width, because Strassen's extra additions, worse locality and
+weaker numerical behaviour cost more than its saved multiplications at
+common sizes. Big-integer libraries do ship Karatsuba, with a cutoff
+below which schoolbook multiplication wins, and switch to even faster
+methods for huge numbers.
+
+The second production concern is recursion depth and memory. A
+recursive algorithm in JavaScript allocates a stack frame per call and,
+in naive code like mine, new arrays per level. Strassen as I wrote it
+allocates about eighteen temporary matrices per call. At n = 1,024 that
+is a lot of garbage. Real implementations preallocate scratch space and
+work on index ranges into the original arrays, which is the "Θ(1) divide
+step" the book mentions in 4.1.
+
+The third is measuring. When I claim a recursive service or job is
+Θ(n lg n), I test it with the doubling method from chapter 3: run at n,
+2n, 4n, and check that time roughly doubles plus a little. A leaf-heavy
+recursion that I thought was balanced shows up immediately as a ratio
+near 4 or 8 instead of 2.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is: write the recurrence before the code.
+When I sketch a recursive solution, I immediately ask how many
+subproblems, how big, and how much work outside the calls. Those three
+numbers tell me the running time before I have written anything.
+
+The second habit is to look for the cheap trade. Strassen and Karatsuba
+both trade one expensive operation (a recursive multiplication) for
+several cheap ones (additions). The same move shows up far from
+matrices: precomputing a sum to avoid a repeated scan, or one extra
+cache lookup to avoid a database call. Reducing the branching factor
+beats speeding up the branches.
+
+The mistake in mindset is treating the master theorem as a lookup table
+and forgetting the tree behind it. The fix is to always be able to say
+in words where the work goes: at the leaves, at the root, or spread
+evenly. That sentence is what makes the answer usable for optimisation.
+
+</Level>
+<Level name="System design" depth={3}>
+
+Divide and conquer is how large systems split work. MapReduce-style
+batch jobs divide data into shards (divide), process each shard on a
+worker (conquer), and merge results (combine). The recurrence describes
+the total work; the depth of the tree describes the critical path, which
+is the parallel running time. A combine step that is linear in the data
+at every level gives total work Θ(n lg n) for a two-way split, but a
+critical path of only Θ(n), since each level's merge can itself be
+parallelised in better designs.
+
+A concrete example: a search engine that fans a query out to a hundred
+index shards and merges their top results. The fan-out is a one-level
+tree with a = 100. The combine step, merging a hundred top-k lists, costs
+Θ(k lg 100) with a heap. If shards themselves fan out to sub-shards, the
+tree gets deeper, and each extra level adds latency on the critical path
+while keeping total work proportional to the leaves.
+
+The mistake in design is a combine step that grows with the total data
+rather than the per-node result. If every level re-reads everything
+below it, the recurrence becomes leaf-heavy in time and the system slows
+as it grows. The fix is to make each node return a summary (a top-k
+list, a partial sum) so that combine cost stays small.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+My strategy for this chapter is to learn the tools in the order I will
+use them: master method first (it solves most cases), recursion tree
+second (it explains the master method and solves the rest), substitution
+third (it turns a guess into a proof), Akra-Bazzi last (for uneven
+splits). I read 4.1 and 4.2 for the algorithms, then solve twenty
+recurrences, then go back to the proofs.
+
+I build the small toolkit from this page: the multiplication counters,
+the level-sum printer, the master classifier and the p solver. For each
+recurrence I solve by hand, I run the evaluator and check the ratio to my
+answer settles near a constant. A ratio that drifts means my answer is
+off by a log factor.
+
+Done when I can, without notes: solve any master recurrence in under a
+minute and name its case; write a substitution proof with explicit
+constants, including one that needs a subtracted lower-order term; draw
+and sum the recursion tree for T(n) = 3T(n/4) + n²; derive Strassen's
+top-right block from its products; and solve T(n) = T(n/5) + T(7n/10) + n
+with Akra-Bazzi.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Do I need to know Strassen's seven formulas by heart?</summary>
+
+No. What matters is the structure: ten sums, seven products, recombine,
+and the reason the 7 matters more than the extra additions. If you need
+the formulas, you can derive them by trying to cancel cross terms, or
+look them up. Knowing why 7T(n/2) + Θ(n²) beats 8T(n/2) + Θ(1) is the
+durable part.
+
+</details>
+
+<details>
+<summary>Which method should I use first on a new recurrence?</summary>
+
+The master method, if the recurrence has the form aT(n/b) + f(n). If it
+doesn't, or if f falls in a gap, draw a recursion tree. Use substitution
+when you need a proof or when the tree's approximations make you unsure.
+Use Akra-Bazzi when the subproblems have different sizes.
+
+</details>
+
+<details>
+<summary>Why are floors and ceilings allowed to be ignored?</summary>
+
+Because they change each subproblem's size by less than 1, and for
+reasonable driving functions that changes the total by at most a
+constant factor. My measurement on merge sort's exact recurrence showed
+a ratio to n lg n between 1.000 and 1.052. The fourth edition proves it
+using the polynomial-growth condition from section 4.7.
+
+</details>
+
+<details>
+<summary>What is the difference between the driving function and the watershed function?</summary>
+
+The driving function f(n) is the work done at one node outside the
+recursive calls: the root's cost. The watershed function n^(log_b a) is
+the number of leaves: the total cost if only the leaves cost anything.
+The master theorem is a comparison between the two.
+
+</details>
+
+<details>
+<summary>Is there a matrix multiplication algorithm faster than Strassen?</summary>
+
+Yes, asymptotically. Since 1969 a series of algorithms has lowered the
+exponent below 2.81, and the best known bounds are below 2.4. None of
+them is practical, because their constants are enormous. Whether the
+exponent can reach 2 is an open problem.
+
+</details>
+
+<details>
+<summary>Why does the substitution method fail if I use O in the inductive step?</summary>
+
+Because O hides a constant, and the induction must keep the same constant
+at every step. "c·n + n = O(n)" quietly turns c into c + 1. Repeat that
+lg n times and the constant is unbounded. Write the constants explicitly.
+
+</details>
+
+<details>
+<summary>Do I have to read 4.6 and 4.7 on the first pass?</summary>
+
+They are starred, meaning optional. On a first pass I would read 4.6's
+idea (leaves plus a level sum, three ways the sum behaves) and 4.7's
+formula and one example. The full proofs can wait for a second pass.
+
+</details>
+
+## Key takeaways
+
+- Divide and conquer is divide, conquer, combine; its running time is a recurrence T(n) = aT(n/b) + f(n).
+- Splitting does not by itself make an algorithm faster: the eight-way matrix recursion is still Θ(n³).
+- Strassen's algorithm trades one recursive product for extra additions, giving Θ(n^lg 7), about n^2.81.
+- The substitution method guesses a bound and proves it by induction with the same explicit constants throughout.
+- When the induction misses by a lower-order term, strengthen the guess by subtracting that term.
+- A recursion tree's per-level costs shrink, stay level or grow, which means the root, every level or the leaves dominate.
+- The master method compares f(n) with the watershed n^(log_b a); a polynomial gap decides cases 1 and 3, and a match up to lg^k n gives case 2.
+- Case 3 also needs the regularity condition, and some recurrences fall in gaps the master method cannot solve.
+- Akra-Bazzi handles uneven splits: find p with Σ a_i/b_i^p = 1, then integrate f(x)/x^(p+1).
+- Floors and ceilings do not change the asymptotic answer for reasonable driving functions.
+
+## Glossary
+
+- **Divide and conquer**: solve a problem by splitting it into smaller copies, solving them recursively and combining the results.
+- **Recurrence**: an equation that defines a function in terms of its values on smaller inputs.
+- **Base case**: the smallest inputs, solved directly; by convention T(n) is constant there.
+- **Driving function f(n)**: the work a call does outside its recursive calls, dividing and combining.
+- **Master recurrence**: a recurrence of the form T(n) = aT(n/b) + f(n), with a at least 1 and b greater than 1.
+- **Watershed function**: n^(log_b a), the number of leaves of the recursion tree.
+- **Regularity condition**: a·f(n/b) ≤ c·f(n) for a constant c below 1, required for case 3.
+- **Strassen's algorithm**: matrix multiplication with seven half-size products, Θ(n^lg 7).
+- **Substitution method**: guess the solution's form, then prove it by induction.
+- **Recursion tree**: a tree of recursive calls labelled with their costs, summed level by level.
+- **Changing variables**: renaming the argument (for example m = lg n) to turn an unfamiliar recurrence into a familiar one.
+- **Continuous master theorem**: the master theorem for real-valued n, proved first to avoid rounding.
+- **Akra-Bazzi recurrence**: T(n) = f(n) + Σ a_i·T(n/b_i), with subproblems of different sizes.
+- **Polynomial-growth condition**: f changes by at most a constant factor when n changes by a constant factor.
+- **Karatsuba multiplication**: big-integer multiplication with three half-size products, Θ(n^lg 3).
+
+## Exercises and self-check
+
+My own exercises. Do a selection of the book's exercises after each
+section, and the chapter-end problems on a second pass.
+
+**Warm-up (by hand)**
+
+1. Write the recurrence for a function that finds both the minimum and
+   the maximum of an array by splitting in half. Solve it exactly for
+   n = 8.
+2. Solve with the master method: T(n) = 3T(n/3) + n, T(n) = 4T(n/2) + n²,
+   T(n) = 2T(n/4) + √n, T(n) = 5T(n/2) + n³.
+3. Draw the recursion tree for T(n) = 2T(n/2) + n² to depth 3 and write
+   each level's total.
+4. Compute Strassen's seven products by hand for A with rows (1, 2) and
+   (3, 4) and B the identity matrix, and check that C equals A.
+
+**Build (write and test code)**
+
+5. Implement Karatsuba multiplication on arrays of decimal digits. Count
+   single-digit multiplications for n = 2 to 128 and compare with n².
+6. Add a cutoff to Strassen: below size s, use the triple loop. Time it
+   for n = 64, 128, 256 and several s, and find the fastest s on your
+   machine.
+7. Write an evaluator for any recurrence of the form aT(⌊n/b⌋) + f(n)
+   and use it to check every answer from exercise 2 by the ratio test.
+
+**Stretch (change the problem)**
+
+8. A divide-and-conquer algorithm splits into three subproblems of size
+   n/2 but its combine step costs n lg n. Which case, and what answer?
+   What if it splits into four?
+9. Suppose a cleverer matrix scheme multiplied 3 × 3 block matrices with
+   22 block products. Would it beat Strassen? Compare log₃ 22 with lg 7.
+10. Solve T(n) = T(n/2) + T(n/3) + T(n/6) + n with Akra-Bazzi, then check
+    numerically.
+
+**Self-check**
+
+<details>
+<summary>1. What is the running time of the eight-way matrix recursion, and why?</summary>
+
+Θ(n³). T(n) = 8T(n/2) + Θ(1) has 8^(lg n) = n³ leaves, and the leaves
+dominate.
+
+</details>
+
+<details>
+<summary>2. Why does Strassen's Θ(n²) addition cost not spoil its bound?</summary>
+
+Because n² is polynomially smaller than n^lg 7, so the recurrence is in
+case 1 and the leaves, n^lg 7 of them, dominate.
+
+</details>
+
+<details>
+<summary>3. What does the master method say about T(n) = 2T(n/2) + n lg n?</summary>
+
+Case 2 with k = 1: Θ(n lg² n).
+
+</details>
+
+<details>
+<summary>4. When do you subtract a lower-order term in a substitution proof?</summary>
+
+When the inductive step gives the right form plus a small leftover, such
+as c·n + 1 when c·n was needed. Guessing c·n − d gives the slack to
+absorb it.
+
+</details>
+
+<details>
+<summary>5. What is the watershed exponent for T(n) = 7T(n/3) + n²?</summary>
+
+log₃ 7, about 1.77. Since 2 is bigger, it is case 3 (regularity holds:
+7(n/3)² = (7/9)n²), so Θ(n²).
+
+</details>
+
+<details>
+<summary>6. What does Akra-Bazzi give for T(n) = T(n/4) + T(3n/4) + n?</summary>
+
+The fractions add to 1, so p = 1 and the integral is ln n: Θ(n lg n).
+
+</details>
+
+<details>
+<summary>7. Solve T(n) = T(√n) + 1.</summary>
+
+With m = lg n and S(m) = T(2^m), S(m) = S(m/2) + 1 = Θ(lg m), so
+T(n) = Θ(lg lg n).
+
+</details>
+
+<details>
+<summary>8. Name a recurrence the master method cannot solve and say why.</summary>
+
+T(n) = 2T(n/2) + n/lg n: f differs from the watershed n by only a log
+factor with a negative power, so it is in the gap between cases 1 and 2.
+
+</details>
+
+## How I'd study this chapter
+
+I would give this chapter five sessions in
+<a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of the traditional core roadmap</a>,
+right after chapter 3, because it uses chapter 3's notation and log
+identities on every line.
+
+<Timeline caption="Five sessions for chapter 4." items={[
+  { when: "Session 1", what: "Read 4.1 and 4.2. Multiply 2 × 2 matrices by hand both ways. Write the eight-way and Strassen versions and count multiplications." },
+  { when: "Session 2", what: "Read 4.3. Do the merge sort substitution proof on paper, then the subtract-a-term proof for T(n) = 4T(n/2) + n. Run the recurrence evaluator." },
+  { when: "Session 3", what: "Read 4.4. Draw three trees by hand: root-heavy, balanced, leaf-heavy. Run the level-sum printer and check my sums." },
+  { when: "Session 4", what: "Read 4.5. Solve twenty recurrences with the master method in one sitting, checking each with the classifier and the evaluator." },
+  { when: "Session 5", what: "Read 4.6 and 4.7. Redo the case 1 proof in my own words. Solve three uneven splits with Akra-Bazzi and the p solver. Do the self-check without notes." },
+]} />
+
+I keep `chapter-04.ts` with the multiplication counters, the recurrence
+evaluator, the level-sum printer, the master classifier and the p solver,
+and I reuse them in every later chapter that has a recursive algorithm:
+quicksort in chapter 7, selection in chapter 9, and the dynamic
+programming chapters, where the recurrence is the whole design.
+
+Done when I can look at any recursive function, write its recurrence in
+under a minute, solve it with the right tool, say where the work goes,
+and confirm the answer with a ratio that settles to a constant.
