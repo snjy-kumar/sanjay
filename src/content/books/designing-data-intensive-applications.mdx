@@ -1,0 +1,2275 @@
+---
+title: "Designing Data-Intensive Applications, chapter by chapter"
+description: "Kleppmann and Riccomini's second edition, all 14 chapters from beginner to strategy: storage, encoding, replication, sharding, transactions, consensus, streams."
+edition: "second edition (O'Reilly, 2026)"
+tocVerified: true
+tocSources:
+  - "https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/"
+  - "https://martin.kleppmann.com/2026/03/24/designing-data-intensive-applications-2e.html"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import Compare from '../../components/book/Compare.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This book is cited more than almost any other on the site. In the <a href={withBase('/plans/traditional-software-developer/')}>traditional core</a>
+it supplies the depth for phase 8, databases (replication, sharding, transactions and the trade-offs between
+them) and comes back for phase 10, distributed systems. It is on the reading list in
+<a href={withBase('/plans/books-that-still-matter/')}>the books that still matter</a>, in the
+<a href={withBase('/plans/software-developer/')}>software developer path</a>, and in phase 4 of the
+<a href={withBase('/plans/software-ai-developer/')}>software and AI developer plan</a>.
+
+Where *Database Internals* opens the engine, this book stands one level up: it explains what each kind of
+data system promises, what it costs, and how to combine several into one application. The second edition,
+with Chris Riccomini joining Martin Kleppmann, adds cloud architecture, sync engines and local-first software,
+durable execution, vector embeddings, DataFrames and formal methods, and splits the old partitioning material
+into a chapter on sharding.
+
+## How I would learn it
+
+I read it in two passes. In phase 8 I read chapters 1 to 8 closely beside Postgres and my own key-value store,
+and I reproduce every anomaly and failure the chapters describe. In phase 10 I read chapters 9 to 13 beside
+the distributed systems work, building small versions of replication, logical clocks, a log-based broker and
+change data capture. Chapter 14 I read whenever I am about to build something that uses people's data.
+
+<Timeline items={[
+  { when: 'week 38', what: 'Chapters 1 to 3: trade-offs, nonfunctional requirements, data models. Measure percentiles on my own service.' },
+  { when: 'week 39', what: 'Chapters 4 and 5: storage, retrieval and encoding, beside Database Internals Part I.' },
+  { when: 'week 40', what: 'Chapters 6 and 7: replication and sharding, with a Postgres primary and replica.' },
+  { when: 'week 41', what: 'Chapter 8: transactions, every anomaly reproduced. Then the phase 8 gate.' },
+  { when: 'phase 10', what: 'Chapters 9 to 14: distributed trouble, consensus, batch, streams, the philosophy, ethics.' },
+]} caption="When I read each group of chapters." />
+
+Every chapter below climbs the same nine levels, and each level has a worked example, what I would see when
+I run it, and the common mistake with its fix.
+
+## The book's layers
+
+The contents list I verified shows fourteen chapters with no part divisions. The grouping below is mine; it
+follows the arc the book takes from one machine to many to whole systems of derived data.
+
+<Layers layers={[
+  { name: 'Foundations', note: 'chapters 1 to 5: trade-offs, requirements, data models, storage, encoding' },
+  { name: 'Distributed data', note: 'chapters 6 to 10: replication, sharding, transactions, faults, consensus' },
+  { name: 'Derived data', note: 'chapters 11 to 13: batch, streams, the philosophy of streaming systems' },
+  { name: 'Responsibility', note: 'chapter 14: doing the right thing' },
+]} caption="My grouping of the fourteen chapters." />
+
+## Foundations
+
+### 1. Trade-Offs in Data Systems Architecture
+**Covers:** Operational versus analytical systems, transaction processing versus analytics, data warehousing, systems of record and derived data, cloud versus self-hosting and cloud-native architecture, operations in the cloud era, distributed versus single-node systems, microservices and serverless, cloud computing versus supercomputing, and data systems, law and society.
+
+<Flow steps={['users act in the app', 'operational DB (system of record)', 'ETL or CDC', 'warehouse / derived stores', 'analysts, search, caches']} caption="The basic shape: one system of record, many derived copies built for other reads." />
+
+<Levels label="Chapter 1, Trade-Offs in Data Systems Architecture">
+
+<Level name="Beginner">
+
+Most applications have two kinds of data work. Operational (OLTP): the app reads and writes a few records at a time for a user, quickly. Analytical (OLAP): someone asks questions across millions of records, such as revenue by month. They have different access patterns, so they usually live in different systems: an operational database and a data warehouse fed from it.
+
+The chapter's other key idea is the system of record versus derived data. The system of record holds the authoritative version; caches, search indexes, warehouses and materialised views are derived: if lost, they can be rebuilt from the source.
+
+```sql
+-- operational: one user's recent orders, by key, milliseconds
+SELECT id, total FROM orders WHERE user_id = 42 ORDER BY created_at DESC LIMIT 10;
+-- analytical: scan everything, seconds or minutes
+SELECT date_trunc('month', created_at) AS m, sum(total) FROM orders GROUP BY m ORDER BY m;
+```
+
+Common mistake: treating a cache or search index as the source of truth. Fix: know which store is the system of record and make every other one rebuildable from it.
+
+</Level>
+
+<Level name="Intermediate">
+
+Cloud versus self-hosting is a trade-off, not a default. Managed services remove operational work and scale elastically, but cost more per unit at steady load, limit control and tie you to a provider's guarantees. Cloud-native designs separate storage from compute (object storage plus stateless query engines), so compute can scale independently.
+
+Distributed versus single-node: distribute for fault tolerance, scale beyond one machine, latency near users, or elasticity. Each brings network faults, consistency questions and operational cost. A single modern machine handles a lot more than people expect.
+
+```text
+reason to distribute         first ask
+more reads                   would a cache or a replica do?
+more data than one disk      how fast is it really growing?
+fault tolerance              is a hot standby enough?
+users on several continents  which data must be local?
+```
+
+Common mistake: microservices and a distributed database for a product with a few thousand users. Fix: start with one well-run database and split when a measured limit is near.
+
+</Level>
+
+<Level name="Advanced">
+
+Microservices split an application into independently deployable services, each owning its data. That gives team autonomy and independent scaling, and costs distributed data management: no joins across services, no transactions across services, and data duplicated through events. Serverless functions go further, scaling to zero and billing per invocation, with cold starts, limited state and execution time limits.
+
+The chapter contrasts cloud computing with supercomputing (HPC): HPC jobs often checkpoint and restart the whole job on any failure, while cloud services must keep serving through failures, which is why the rest of the book is about fault tolerance rather than restart.
+
+```text
+HPC job:        1000 nodes, one fails -> stop, restore checkpoint, restart all
+cloud service:  1000 nodes, one fails -> route around it, keep serving, repair later
+```
+
+Common mistake: designing an online service with batch-style restart semantics. Fix: design for continuous operation with partial failure.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: derived data that lags the source. A user updates their name; search still shows the old one for a minute. That is acceptable for search, unacceptable for the account page. Each derived view needs a stated freshness.
+
+```ts
+// derived view with a recorded "as of" position
+type View = { asOfLsn: number; data: Map<string, string> };
+function readForUser(view: View, userLastWriteLsn: number) {
+  return view.asOfLsn >= userLastWriteLsn ? 'serve from view' : 'serve from system of record';
+}
+console.log(readForUser({ asOfLsn: 100, data: new Map() }, 120));
+```
+
+Output: `serve from system of record`.
+
+Common mistake: no way to tell how stale a derived store is. Fix: record the source position it reflects.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: law and society. Data systems are subject to rules about personal data, such as the right to have data erased. Derived data makes erasure hard: the record is deleted from the system of record but survives in backups, logs, warehouse snapshots, search indexes and ML training sets.
+
+```text
+delete user 42:
+  system of record   DELETE ... done
+  search index        needs a delete event
+  warehouse           partitioned history: rewrite or exclude
+  event log           immutable: crypto-shred (delete the per-user key)
+  backups             expire on schedule; document the delay
+```
+
+Common mistake: an "erase" button that only deletes the primary row. Fix: map every derived copy and its erasure path when it is created.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the operational work changes shape in the cloud: fewer disks to replace, more cost management, quota limits, provider incidents and configuration as code. Observability matters more because you cannot log into the machine. The chapter's view is that operations does not disappear; it moves.
+
+```text
+self-hosted                   cloud managed
+replace failed disks          watch provider status, plan for zone outages
+tune the kernel               tune service settings and quotas
+capacity plan months ahead    watch the bill weekly
+```
+
+Common mistake: assuming a managed database means no backups or restore drills are needed. Fix: test restores yourself; the provider's guarantees are in its documentation, not your assumptions.
+
+</Level>
+
+<Level name="Mindset">
+
+Every architectural choice is a trade-off with a cost on the other side. I write both sides down before choosing: what this buys, what it costs, and what would make me change my mind.
+
+<Compare left="choice" right="cost I accept" rows={[
+  ['managed cloud database', 'higher unit cost, less control'],
+  ['microservices', 'no cross-service joins or transactions'],
+  ['separate warehouse', 'pipelines and staleness'],
+  ['single node', 'a ceiling and a single point of failure'],
+]} caption="Every choice in the chapter, with its price." />
+
+Common mistake: "best practice" as a reason. Fix: name the trade-off.
+
+</Level>
+
+<Level name="System design">
+
+In a system design, I start by naming the system of record for each kind of data, then the derived stores and how they are fed (batch ETL or change data capture), then where each read goes. This one diagram answers most later questions about consistency and failure.
+
+```text
+entity       system of record     derived                 fed by
+orders       Postgres             warehouse, search       CDC to a log, consumers
+sessions     Redis (ephemeral)    none                    -
+events       append-only log      aggregates              stream job
+```
+
+Common mistake: dual writes from the application to the database and the search index. Fix: write once to the system of record and derive the rest from its change stream.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: draw the data map of an application I have built: every store, which is the system of record, how derived stores are fed, and their freshness. Then cost two versions of it, self-hosted on one VM and fully managed, for my real load.
+
+Exercise: write the erasure path for one user across every store in that map.
+
+Done when every store in my map has a source, a feed and a freshness, and I can argue for or against distributing it with numbers.
+
+</Level>
+</Levels>
+
+### 2. Defining Nonfunctional Requirements
+**Covers:** The social network home timeline case study (representing users, posts and follows; materialising and updating timelines), describing performance (latency and response time; average, median and percentiles; using response time metrics), reliability and fault tolerance (hardware, software and human faults), scalability (understanding load; shared-memory, shared-disk and shared-nothing; principles), and maintainability (operability, simplicity, evolvability).
+
+<Compare left="timeline on read (pull)" right="timeline on write (fan-out)" rows={[
+  ['post: one insert', 'post: insert into every follower timeline'],
+  ['read: join follows with posts, sort', 'read: one cached list'],
+  ['cheap writes, expensive reads', 'expensive writes, cheap reads'],
+  ['celebrity posts are cheap', 'celebrity posts fan out to millions'],
+]} caption="The case study's two designs. Real systems mix them." />
+
+<Levels label="Chapter 2, Defining Nonfunctional Requirements">
+
+<Level name="Beginner">
+
+Functional requirements say what the system does. Nonfunctional requirements say how well: how fast, how reliably, how much load, how easy to change. The chapter works through a social network home timeline: show each user the recent posts of the people they follow.
+
+The simple design queries at read time: find who I follow, fetch their recent posts, merge and sort.
+
+```sql
+SELECT p.* FROM posts p
+JOIN follows f ON f.followee_id = p.author_id
+WHERE f.follower_id = 42
+ORDER BY p.created_at DESC LIMIT 50;
+```
+
+Common mistake: stating "it should be fast". Fix: a number with a percentile, a load and a time window.
+
+</Level>
+
+<Level name="Intermediate">
+
+Response time is a distribution, not a number. The average hides the slow requests. The median (p50) says what a typical request sees; p95, p99 and p999 say what the slowest requests see, and those are often your most valuable users (they have the most data). One user page load that makes many backend calls is slowed by the slowest of them: tail latency amplification.
+
+```ts
+const times = [12, 14, 15, 15, 16, 18, 20, 22, 25, 30, 32, 35, 40, 60, 900];
+const pct = (xs: number[], p: number) => { const s = [...xs].sort((a, b) => a - b); return s[Math.ceil(p / 100 * s.length) - 1]; };
+const avg = times.reduce((a, b) => a + b) / times.length;
+console.log(avg.toFixed(1), pct(times, 50), pct(times, 95), pct(times, 99));
+```
+
+Output: `83.6 22 900 900`. The average is nearly four times the median and says nothing true about any request.
+
+Common mistake: averaging percentiles across servers. Fix: merge the raw distributions (histograms), then compute the percentile.
+
+</Level>
+
+<Level name="Advanced">
+
+Scalability starts with describing load: requests per second, read/write ratio, fan-out, data size. In the case study, posting is rare and reading timelines is frequent, so materialising timelines (fan-out on write) moves cost to the rare operation. Accounts with huge follower counts break that, so a hybrid fans out for most users and merges celebrity posts at read time.
+
+Architectures for scale: shared-memory (a bigger machine), shared-disk (several machines on shared storage), and shared-nothing (each node has its own CPU, memory and disk; coordination over the network). Shared-nothing scales furthest and is what most of the book assumes.
+
+```ts
+const followers = [10, 200, 50, 3_000_000];               // per author
+const postsPerDay = [5, 2, 10, 3];
+const fanoutWrites = followers.reduce((s, f, i) => s + f * postsPerDay[i], 0);
+console.log(fanoutWrites.toLocaleString('en-US'));
+```
+
+Output: `9,000,950`. One celebrity accounts for almost all of the fan-out writes.
+
+Common mistake: picking an architecture from average load. Fix: model the skewed cases.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: reliability faults come in three kinds. Hardware faults are mostly independent (a disk dies) and are handled with redundancy. Software faults are correlated (a bug triggered by the same input on every node, a leap second, a runaway process) and take down many nodes at once. Human faults (a bad config push) are a leading cause of outages in practice.
+
+```text
+fault           independent?   defence
+disk failure    yes            replication, RAID
+bug on input X  no, all nodes  canaries, gradual rollout, fuzzing
+bad config      no             review, staged rollout, fast rollback
+```
+
+Common mistake: three replicas as the whole reliability plan. Fix: they help with hardware faults only; software and human faults need rollout discipline and rollback.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: blameless postmortems and the human factor. Telling people "be more careful" does not reduce human faults; making the safe thing easy does: good defaults, sandboxes, staged rollouts, quick rollback, and detailed monitoring. The chapter treats humans as part of the system to be designed for.
+
+Corner: percentiles under coordinated omission. A load tester that waits for each response before sending the next under-reports latency during stalls, because it stops sending when the system is slow.
+
+```text
+intended: 1 request every 10 ms
+system stalls for 1 s
+naive tester: sends 1 request, waits 1 s, records 1 slow sample
+reality: 100 requests would have queued; 100 slow samples
+```
+
+Common mistake: closed-loop load tests for an open-loop service. Fix: send at a fixed rate and record from intended send time.
+
+</Level>
+
+<Level name="Production level">
+
+In production, express goals as service level objectives with percentiles: "p99 of timeline reads under 300 ms over 30 days". Measure with histograms in the client as well as the server. Maintainability is a requirement too: operability (good monitoring, automation, documentation), simplicity (removing accidental complexity with good abstractions) and evolvability (easy to change).
+
+```text
+SLO: 99% of GET /timeline under 300 ms, measured at the load balancer, 30-day window
+error budget: 1% of requests may exceed it -> spend it on releases, not on surprises
+```
+
+Common mistake: alerting on the average CPU. Fix: alert on symptoms users feel (percentile latency, error rate).
+
+</Level>
+
+<Level name="Mindset">
+
+Requirements are numbers and trade-offs, written down before the design. "Fast", "reliable" and "scalable" are wishes until they have a percentile, a load and a failure model.
+
+<Flow steps={['describe the load', 'state SLOs with percentiles', 'list fault types', 'pick the design', 'measure against the SLOs']} caption="From wishes to requirements." />
+
+Common mistake: optimising before measuring. Fix: measure the distribution first.
+
+</Level>
+
+<Level name="System design">
+
+In a design review I state: load parameters (with the skewed cases), latency SLOs per operation, which faults the design tolerates and which it does not, and how it is operated. The home timeline example shows the pattern: understand the load, then choose where to spend work, read time or write time.
+
+```text
+operation         load          SLO p99   design
+post              5k/s          500 ms    insert + async fan-out (except large accounts)
+read timeline     300k/s        200 ms    cached materialised list + merge large accounts
+```
+
+Common mistake: one design for every user. Fix: treat outliers as a separate path.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: instrument one service I run with a latency histogram, compute p50, p95 and p99 per endpoint, and write SLOs for the two most important. Build the timeline case study twice (pull and fan-out) on Postgres with a synthetic follower graph including one huge account, and measure both.
+
+Exercise: write a fixed-rate load generator that avoids coordinated omission and compare its numbers with a naive one during an injected stall.
+
+Done when I can state SLOs with percentiles for my service, and my timeline benchmark shows where the hybrid design wins.
+
+</Level>
+</Levels>
+
+### 3. Data Models and Query Languages
+**Covers:** Relational versus document models, the object-relational mismatch, normalization, denormalization and joins, many-to-one and many-to-many relationships, stars and snowflakes for analytics, when to use which model, graph-like models (property graphs, Cypher, graph queries in SQL, triple stores and SPARQL, Datalog), GraphQL, event sourcing and CQRS, and DataFrames, matrices and arrays.
+
+<Figure art={`
+ document (tree)                    relational (tables + keys)          graph (vertices + edges)
+ { user: 'Asha',                    users(id, name)                     (Asha)-[:LIVES_IN]->(Pune)
+   jobs: [ {...}, {...} ],          jobs(id, user_id, ...)              (Pune)-[:WITHIN]->(India)
+   city: 'Pune' }                   cities(id, name)                    (Asha)-[:KNOWS]->(Ravi)
+ good: one-to-many, load whole      good: many-to-one, many-to-many     good: anything-to-anything,
+ weak: joins across documents       weak: deep recursive paths           variable-length paths
+`} caption="Three data models, each natural for a different shape of relationships." />
+
+<Levels label="Chapter 3, Data Models and Query Languages">
+
+<Level name="Beginner">
+
+A data model is how you think about your data and what the database lets you express. The relational model stores tables of rows linked by keys. The document model stores self-contained JSON-like trees. The graph model stores vertices and edges. Each makes some relationships easy and others awkward.
+
+A résumé is a tree: one person, many jobs, many schools. As a document it loads in one read. As tables it needs several tables and joins, or one query per table.
+
+```ts
+const doc = { id: 42, name: 'Asha', jobs: [{ title: 'Engineer', org: 'Acme' }], city: 'Pune' };
+// relational equivalent
+const users = [{ id: 42, name: 'Asha', city_id: 1 }];
+const jobs = [{ user_id: 42, title: 'Engineer', org: 'Acme' }];
+const cities = [{ id: 1, name: 'Pune' }];
+const joined = users.map(u => ({ ...u, jobs: jobs.filter(j => j.user_id === u.id), city: cities.find(c => c.id === u.city_id)!.name }));
+console.log(JSON.stringify(joined[0]));
+```
+
+Output: `{"id":42,"name":"Asha","city_id":1,"jobs":[{"user_id":42,"title":"Engineer","org":"Acme"}],"city":"Pune"}`.
+
+Common mistake: choosing a model by fashion. Fix: choose by the shape of the relationships and the access patterns.
+
+</Level>
+
+<Level name="Intermediate">
+
+Normalisation stores each fact once and refers to it by id (a city id, not the city name in every row). Updates touch one place, and there is no inconsistency. Denormalisation copies data to avoid joins at read time, buying read speed with write cost and the risk of copies disagreeing. Many-to-one and many-to-many relationships push toward the relational model, because documents handle them poorly (references between documents need application-side joins).
+
+```sql
+-- many-to-many: users and the skills they have
+CREATE TABLE user_skill (user_id bigint REFERENCES users, skill_id bigint REFERENCES skills,
+                         PRIMARY KEY (user_id, skill_id));
+SELECT s.name FROM user_skill us JOIN skills s ON s.id = us.skill_id WHERE us.user_id = 42;
+```
+
+Common mistake: embedding many-to-many data in documents and updating every copy when a skill is renamed. Fix: reference by id, or accept a derived copy refreshed from one source.
+
+</Level>
+
+<Level name="Advanced">
+
+Analytics schemas use stars and snowflakes: a central fact table of events (each sale, each click) with foreign keys to dimension tables (product, store, date). A snowflake normalises dimensions further. Facts are huge and append-only; dimensions are small.
+
+Graph models handle data where anything can relate to anything. Property graphs (vertices and edges with properties) are queried with Cypher; triple stores (subject, predicate, object) with SPARQL; Datalog defines recursive rules. SQL can do graph traversal with recursive common table expressions, verbosely.
+
+```sql
+-- everyone living somewhere within India, any depth of 'within'
+WITH RECURSIVE inside(id) AS (
+  SELECT id FROM place WHERE name = 'India'
+  UNION
+  SELECT p.id FROM place p JOIN inside i ON p.within_id = i.id
+)
+SELECT u.name FROM users u WHERE u.place_id IN (SELECT id FROM inside);
+```
+
+Common mistake: a fixed number of self-joins for a hierarchy of unknown depth. Fix: recursive CTEs, or a graph store when traversal dominates.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: schema-on-read versus schema-on-write. Document stores are often called schemaless, but the application still assumes a structure when it reads; the schema is implicit and enforced in code. Changing it means handling old and new shapes at read time, or migrating.
+
+```ts
+type UserV1 = { name: string };                        // old documents
+type UserV2 = { first: string; last: string };          // new documents
+const display = (u: UserV1 | UserV2) => 'name' in u ? u.name : `${u.first} ${u.last}`;
+console.log(display({ name: 'Asha K' }), display({ first: 'Ravi', last: 'S' }));
+```
+
+Output: `Asha K Ravi S`.
+
+Common mistake: assuming "schemaless" means no migration work. Fix: version documents and handle every version you still store.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: GraphQL looks like a graph query language but is a client-facing API query language: clients request exactly the fields they need in a tree shape, with no arbitrary recursion or joins, to keep queries safe to run for untrusted clients. Corner: DataFrames, matrices and arrays are data models too: ML and scientific work treat data as dense numeric arrays, and converting a sparse relational table into a matrix (one-hot encoding, pivoting) is a modelling step.
+
+```ts
+// pivot (user, movie, rating) rows into a user x movie matrix
+const rows = [['u1', 'm1', 5], ['u1', 'm2', 3], ['u2', 'm2', 4]] as const;
+const users = [...new Set(rows.map(r => r[0]))], movies = [...new Set(rows.map(r => r[1]))];
+const m = users.map(u => movies.map(mv => rows.find(r => r[0] === u && r[1] === mv)?.[2] ?? 0));
+console.log(m);
+```
+
+Output: `[ [ 5, 3 ], [ 0, 4 ] ]`.
+
+Common mistake: exposing GraphQL with no query depth or cost limits. Fix: limit depth and complexity per request.
+
+</Level>
+
+<Level name="Production level">
+
+Event sourcing stores every change as an immutable event and derives current state by replaying them. CQRS (command query responsibility segregation) separates the write model (events or commands) from read models (views built for queries). Together they give an audit trail and flexible read views, at the cost of more moving parts, eventual consistency between write and read sides, and event schema evolution.
+
+```ts
+type Ev = { type: 'deposited' | 'withdrew'; amount: number };
+const events: Ev[] = [{ type: 'deposited', amount: 100 }, { type: 'withdrew', amount: 30 }, { type: 'deposited', amount: 5 }];
+const balance = events.reduce((b, e) => b + (e.type === 'deposited' ? e.amount : -e.amount), 0);
+console.log(balance);
+```
+
+Output: `75`.
+
+Common mistake: event sourcing a simple CRUD app. Fix: use it where history and multiple read models are real requirements.
+
+</Level>
+
+<Level name="Mindset">
+
+Pick the model that makes the common relationships simple and the rare ones possible. Most applications are relational at heart, with some tree-shaped parts (a JSON column is fine for those) and occasionally graph-shaped parts.
+
+<Flow steps={['list the entities', 'mark each relationship 1:N, N:1 or N:M', 'note traversal depth', 'pick the model per area']} caption="Choosing a data model from the relationships." />
+
+Common mistake: one model forced on every part of the app. Fix: Postgres covers relational, documents (JSONB) and modest graphs (recursive CTEs); reach for a specialist store when one access pattern dominates.
+
+</Level>
+
+<Level name="System design">
+
+In a design, I sketch the entities and relationships, the main queries, and then pick. A product catalogue with flexible attributes: relational core plus a JSONB attributes column. A social graph with friend-of-friend queries: a graph store or a carefully indexed edges table. An audit-heavy domain: events as the record, with relational read models.
+
+```text
+area                  model                         why
+orders, payments      relational                    N:1, N:M, constraints, transactions
+product attributes    JSONB column                  varies per category, read whole
+recommendations       graph or edges table          multi-hop traversal
+ledger                events + read model           history is the requirement
+```
+
+Common mistake: picking a document database and then building joins in application code. Fix: if most queries join, choose relational.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: model one domain (a small job board) three ways: relational in Postgres, documents in JSONB, and a graph via an edges table with recursive CTEs. Write the five most important queries in each and compare clarity and plans.
+
+Exercise: implement an event-sourced account with a projection into a read table, and rebuild the projection from scratch.
+
+Done when I can justify the model for each part of the domain and my projection rebuild produces identical rows.
+
+</Level>
+</Levels>
+
+### 4. Storage and Retrieval
+**Covers:** Storage and indexing for OLTP (log-structured storage, B-trees, comparing them, multicolumn and secondary indexes, storing values in the index, keeping everything in memory), data storage for analytics (cloud data warehouses, column-oriented storage, query compilation and vectorisation, materialised views and data cubes), and multidimensional and full-text indexes (full-text search, vector embeddings).
+
+<Layers layers={[
+  { name: 'Hash index over a log', note: 'append-only file, in-memory key to offset map' },
+  { name: 'SSTables and LSM trees', note: 'sorted immutable files, merged in the background' },
+  { name: 'B-trees', note: 'fixed-size pages updated in place, with a WAL' },
+  { name: 'Column storage', note: 'one file per column, compressed, for analytics' },
+  { name: 'Special indexes', note: 'multidimensional, full-text, vector' },
+]} caption="The chapter builds from the simplest possible store up to the indexes behind analytics and search." />
+
+<Levels label="Chapter 4, Storage and Retrieval">
+
+<Level name="Beginner">
+
+The chapter starts with the simplest database: append every key-value pair to a file, and to read, scan for the last occurrence of the key. Writes are fast; reads are linear. An index fixes reads: a structure that maps keys to where data lives. Every index speeds up reads and slows down writes, because it must be updated on every write.
+
+```ts
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+writeFileSync('/tmp/db.log', '');
+const set = (k: string, v: string) => appendFileSync('/tmp/db.log', `${k},${v}\n`);
+const get = (k: string) => readFileSync('/tmp/db.log', 'utf8').trim().split('\n')
+  .filter(l => l.startsWith(k + ',')).map(l => l.slice(k.length + 1)).pop();
+set('42', 'Pune'); set('7', 'Delhi'); set('42', 'Mumbai');
+console.log(get('42'), get('7'), get('99'));
+```
+
+Output: `Mumbai Delhi undefined`.
+
+Common mistake: adding indexes to every column "for speed". Fix: each index costs writes and space; index for the queries you run.
+
+</Level>
+
+<Level name="Intermediate">
+
+Log-structured storage keeps the append-only log and adds an index. The simplest: an in-memory hash map from key to byte offset (Bitcask-style). Sorting each segment by key gives SSTables, which allow merging segments efficiently, sparse indexes and range scans; organise them in levels and you have an LSM tree. B-trees instead keep fixed-size pages updated in place, with a write-ahead log for crash safety.
+
+```ts
+// add a hash index to the log: key -> offset of its latest record
+import { appendFileSync, readSync, openSync, statSync, writeFileSync } from 'node:fs';
+writeFileSync('/tmp/db2.log', ''); const idx = new Map<string, number>();
+function set(k: string, v: string) { idx.set(k, statSync('/tmp/db2.log').size); appendFileSync('/tmp/db2.log', `${k},${v}\n`); }
+function get(k: string) {
+  const off = idx.get(k); if (off === undefined) return undefined;
+  const buf = Buffer.alloc(256), n = readSync(openSync('/tmp/db2.log', 'r'), buf, 0, 256, off);
+  return buf.toString('utf8', 0, n).split('\n')[0].split(',')[1];
+}
+set('42', 'Pune'); set('42', 'Mumbai');
+console.log(get('42'), idx.get('42'));
+```
+
+Output: `Mumbai 8`. One seek per read, whatever the file size.
+
+Common mistake: a hash index when range queries are needed. Fix: sorted structures (SSTables, B-trees) for ranges.
+
+</Level>
+
+<Level name="Advanced">
+
+Comparing B-trees and LSM trees: LSM trees usually sustain higher write throughput (sequential writes, lower write amplification in many configurations) and compress better; B-trees give more predictable reads and keep each key in one place, which suits transactions with range locks. Multicolumn (composite) indexes sort by several columns in order; secondary indexes are not unique and point to rows or primary keys. A clustered index stores the row in the index; a covering index includes extra columns so a query never visits the table.
+
+```sql
+CREATE INDEX orders_user_created ON orders (user_id, created_at DESC) INCLUDE (total);
+EXPLAIN SELECT created_at, total FROM orders WHERE user_id = 42 ORDER BY created_at DESC LIMIT 10;
+-- expect: Index Only Scan using orders_user_created on orders  (if the visibility map allows)
+```
+
+Common mistake: a composite index in the wrong column order, `(created_at, user_id)`, for "by user, newest first". Fix: equality column first, then the sort or range column.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: keeping everything in memory. In-memory databases are fast not mainly because they avoid disk reads (the OS cache does that for disk databases too) but because they avoid encoding data structures into a disk format. They still need a log or snapshots for durability, and the data must fit in memory (or be evicted carefully).
+
+```text
+in-memory store, 64 GB RAM, dataset grows to 80 GB:
+  options: evict to disk (anti-caching), shard across machines, or a disk-based engine
+```
+
+Common mistake: choosing an in-memory store for a dataset that grows without bound. Fix: plan the size trajectory first.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: query execution for analytics. Interpreting a query plan row by row has overhead per row. Two answers: compile the query into machine code for this specific query (query compilation), or process columns in batches with tight loops over arrays that CPUs and SIMD instructions handle well (vectorised execution). Materialised views precompute query results and must be maintained on writes; data cubes precompute aggregates across dimensions.
+
+```ts
+// row-at-a-time vs vectorised: same sum, different loop shape
+const n = 5_000_000, price = new Float64Array(n).fill(2), qty = new Float64Array(n).fill(3);
+let t = performance.now(); let s1 = 0;
+for (let i = 0; i < n; i++) { const row = { price: price[i], qty: qty[i] }; s1 += row.price * row.qty; }
+const rowMs = performance.now() - t; t = performance.now(); let s2 = 0;
+for (let i = 0; i < n; i++) s2 += price[i] * qty[i];
+console.log(s1 === s2, rowMs > performance.now() - t);
+```
+
+Output: `true true` on my machine; the tight loop over arrays is faster. The exact ratio depends on the JIT.
+
+Common mistake: assuming a column store is fast only because of less I/O. Fix: CPU efficiency from vectorised execution matters as much.
+
+</Level>
+
+<Level name="Production level">
+
+Column-oriented storage and cloud data warehouses: each column in its own file, compressed (bitmap or run-length encoding works well because a column holds similar values), sorted by a chosen key so ranges are contiguous. Cloud warehouses separate storage (object storage) from compute (scalable query engines), so you pay for scans. In production, partitioning and sort keys are the main levers: a query that filters on the sort key reads far fewer blocks.
+
+```ts
+// run-length encoding of a sorted, low-cardinality column
+const city = ['Delhi', 'Delhi', 'Delhi', 'Pune', 'Pune', 'Mumbai'];
+const rle: [string, number][] = [];
+for (const v of city) rle.length && rle[rle.length - 1][0] === v ? rle[rle.length - 1][1]++ : rle.push([v, 1]);
+console.log(rle);
+```
+
+Output: `[ [ 'Delhi', 3 ], [ 'Pune', 2 ], [ 'Mumbai', 1 ] ]`.
+
+Common mistake: `SELECT *` in a column store, reading every column. Fix: select only the columns you need; the bill follows bytes scanned.
+
+</Level>
+
+<Level name="Mindset">
+
+Every index is a trade: faster reads for slower writes and more space. Before adding one, I name the query it serves and check it is used.
+
+<Compare left="structure" right="best at" rows={[
+  ['hash index', 'point lookups, no ranges'],
+  ['LSM tree', 'heavy writes, compression'],
+  ['B-tree', 'predictable reads, ranges, transactions'],
+  ['column store', 'scans and aggregates over few columns'],
+  ['inverted index', 'full-text search'],
+  ['vector index', 'nearest-neighbour similarity'],
+]} caption="Choosing a storage structure by the query." />
+
+Common mistake: unused indexes left forever. Fix: check index usage statistics and drop the dead ones.
+
+</Level>
+
+<Level name="System design">
+
+Multidimensional, full-text and vector indexes extend the idea. A geospatial query (latitude and longitude ranges) needs an R-tree or a space-filling curve, not two separate B-trees. Full-text search uses an inverted index: term to list of documents, with tokenising, stemming and ranking. Vector embeddings represent text or images as vectors; similarity search uses approximate nearest-neighbour indexes (such as HNSW or IVF) that trade a little recall for speed.
+
+```ts
+const cos = (a: number[], b: number[]) => {
+  const dot = a.reduce((s, x, i) => s + x * b[i], 0), n = (v: number[]) => Math.hypot(...v);
+  return dot / (n(a) * n(b));
+};
+const q = [1, 0, 1], docs = { a: [1, 0, 0.9], b: [0, 1, 0], c: [0.5, 0.5, 0.5] };
+console.log(Object.entries(docs).map(([k, v]) => [k, cos(q, v).toFixed(2)]).sort((x, y) => +y[1] - +x[1]));
+```
+
+Output: `[ [ 'a', '1.00' ], [ 'c', '0.82' ], [ 'b', '0.00' ] ]` (a is 0.998, which rounds to 1.00).
+
+Common mistake: adding a separate vector database before trying a vector index in the database you already run. Fix: try pgvector or equivalent first and measure.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: build the log with a hash index above, then turn segments into SSTables with compaction, and compare with my B-tree from *Database Internals*. In Postgres, create composite, covering and partial indexes for a real query set and confirm each with EXPLAIN. Load a few million rows into DuckDB or another column store and compare an aggregate with Postgres.
+
+Exercise: an inverted index for a few hundred of my own notes with tokenising and simple ranking.
+
+Done when every index I create names its query, my EXPLAIN output confirms its use, and I can explain the column store's speed in terms of I/O and CPU.
+
+</Level>
+</Levels>
+
+### 5. Encoding and Evolution
+**Covers:** Formats for encoding data (language-specific formats; JSON, XML and binary variants; Protocol Buffers; Avro; the merits of schemas) and modes of dataflow (through databases, through services with REST and RPC, durable execution and workflows, event-driven architectures).
+
+<Figure art={`
+ time --->
+ v1 writer  ----writes---->  [ data ]  ----read by---->  v2 reader     backward compatible:
+                                                                       new code reads old data
+ v2 writer  ----writes---->  [ data ]  ----read by---->  v1 reader     forward compatible:
+                                                                       old code reads new data
+ during a rolling deploy, both directions happen at once
+`} caption="Compatibility in both directions, because old and new code run side by side." />
+
+<Levels label="Chapter 5, Encoding and Evolution">
+
+<Level name="Beginner">
+
+Data lives in memory as objects and pointers; to store it or send it, it must be encoded into bytes (serialisation) and decoded on the other side. Formats include language-specific ones (Java serialisation, Python pickle), textual ones (JSON, XML, CSV) and binary schema-based ones (Protocol Buffers, Avro).
+
+```ts
+const obj = { userName: 'Asha', followerCount: 1337, skills: ['sql', 'typescript'] };
+const json = JSON.stringify(obj);
+console.log(json.length, Buffer.byteLength(json));
+```
+
+Output: `70 70`. Every field name travels with every record.
+
+Common mistake: language-specific serialisation for data that crosses services or lives long. Fix: a language-neutral format with a schema; pickle-style formats also allow arbitrary code execution on decode.
+
+</Level>
+
+<Level name="Intermediate">
+
+JSON's gaps: no distinction between integers and floats, numbers above 2^53 lose precision in JavaScript, no binary strings (base64 adds a third), and schemas are optional. Protocol Buffers use field tags (numbers) instead of names, so the encoding is compact and fields can be renamed freely; the tag is the contract.
+
+```ts
+const big = JSON.parse('{"id": 9007199254740993}');
+console.log(big.id, Number.isSafeInteger(big.id));
+```
+
+Output: `9007199254740992 false`. The id silently changed.
+
+```proto
+message Person {
+  string user_name = 1;
+  int64 follower_count = 2;
+  repeated string skills = 3;
+}
+```
+
+Common mistake: 64-bit ids as JSON numbers consumed by JavaScript. Fix: send them as strings.
+
+</Level>
+
+<Level name="Advanced">
+
+Schema evolution rules. In Protocol Buffers, you may add fields with new tag numbers (old code ignores unknown tags: forward compatibility; new code sees a default for missing fields: backward compatibility). You may not reuse a tag number or change a field's meaning; removed fields should have their tags reserved. Avro has no tags: the writer's schema and the reader's schema are resolved side by side by field name, which requires the reader to know the writer's schema (stored in the file header, a schema registry, or negotiated on connection).
+
+```proto
+message Person {
+  reserved 4;                  // was 'nickname', removed: never reuse 4
+  string user_name = 1;
+  int64 follower_count = 2;
+  repeated string skills = 3;
+  string city = 5;             // new optional field: safe in both directions
+}
+```
+
+Common mistake: making a new field required. Fix: new fields must be optional or have defaults, or old data cannot be read.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: dataflow through databases. Data written years ago by old code is read by today's code: "data outlives code". A subtle bug: old code reads a record that has a new field, updates another field, and writes it back without the new field, deleting it.
+
+```ts
+// old code: knows only {name}
+const stored = { name: 'Asha', city: 'Pune' };            // written by new code
+type OldUser = { name: string };
+const loaded: OldUser = { name: stored.name };             // decoded into old type, drops city
+const saved = { ...loaded, name: 'Asha K' };
+console.log(saved);
+```
+
+Output: `{ name: 'Asha K' }`. The city written by new code is gone.
+
+Common mistake: decoding into a fixed model and re-encoding the whole object. Fix: preserve unknown fields, or update only changed columns.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: durable execution and workflows. A multi-step business process (charge card, reserve stock, send email) can crash between steps. Durable execution engines record each step's result in a log; on restart, the workflow code re-runs deterministically and recorded steps return their saved results instead of re-executing. The code must be deterministic: no reading the clock or random numbers directly, and changing workflow code must stay compatible with running instances.
+
+```ts
+const journal = new Map<string, unknown>();               // persisted in a real engine
+async function step<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  if (journal.has(name)) return journal.get(name) as T;   // replay: no side effect
+  const r = await fn(); journal.set(name, r); return r;
+}
+let charges = 0;
+const run = async () => { await step('charge', async () => ++charges); await step('email', async () => 'sent'); };
+await run(); await run();                                  // second run simulates a replay after crash
+console.log(charges);
+```
+
+Output: `1`.
+
+Common mistake: calling `Date.now()` inside workflow code and getting a different branch on replay. Fix: get time through a recorded step.
+
+</Level>
+
+<Level name="Production level">
+
+Dataflow through services: REST over HTTP with JSON, or RPC frameworks (gRPC with Protocol Buffers). RPC tries to make a remote call look local, but a network call can time out with unknown outcome, has variable latency and must encode its arguments. Version APIs explicitly, keep old versions running during migrations, and expect clients you cannot upgrade.
+
+Event-driven architectures pass messages through a broker: the sender does not wait for the receiver, the broker buffers, and many consumers can subscribe. The message schemas need the same compatibility discipline, often enforced with a schema registry.
+
+```text
+rolling deploy of a gRPC service with 10 instances:
+  minute 0:   10 x v1
+  minute 3:   6 x v1, 4 x v2     <- clients hit both; both must accept both message versions
+  minute 6:   10 x v2
+```
+
+Common mistake: deploying a producer that emits a new required field before all consumers understand it. Fix: consumers first, producers second, and only compatible changes.
+
+</Level>
+
+<Level name="Mindset">
+
+Data outlives code. Every format decision assumes old and new versions will meet: during rolling deploys, in stored data, and in messages queued during an upgrade.
+
+<Flow steps={['add field as optional', 'deploy readers', 'deploy writers', 'backfill if needed', 'only then rely on it']} caption="Safe order for introducing a field." />
+
+Common mistake: big-bang deploys that assume all code changes at once. Fix: assume mixed versions always.
+
+</Level>
+
+<Level name="System design">
+
+In a design, I choose formats per boundary: JSON for public APIs (readable, universal), Protocol Buffers or Avro for internal high-volume services and event streams (compact, schema-checked), and the database's own types for storage. I put a schema registry in front of event streams and run compatibility checks in CI.
+
+```text
+boundary              format          compatibility check
+public REST API       JSON + OpenAPI  contract tests, versioned paths
+service to service    gRPC/protobuf   buf breaking-change check in CI
+event stream          Avro            registry: backward + forward
+```
+
+Common mistake: no automated compatibility check, relying on review. Fix: make the build fail on breaking schema changes.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: encode the same record as JSON, Protocol Buffers and Avro and compare sizes and decode behaviour. Then evolve the schema three times (add, rename, remove) and test every old/new reader-writer pair. Build the tiny durable-execution journal above into a real one backed by Postgres.
+
+Exercise: reproduce the "old code drops new field" bug against a JSONB column and fix it.
+
+Done when I have a compatibility matrix for my three schema versions that passes in CI, and my workflow survives a crash between steps without repeating a side effect.
+
+</Level>
+</Levels>
+
+## Distributed data
+
+### 6. Replication
+**Covers:** Single-leader replication (synchronous versus asynchronous, setting up followers, handling outages, replication logs), replication lag and its solutions, multi-leader replication (geographic distribution, sync engines and local-first software, conflicting writes), leaderless replication (writing when a node is down, single-leader versus leaderless performance, multi-region operation, detecting concurrent writes).
+
+<Figure art={`
+ single-leader              multi-leader                 leaderless
+   clients                    clients    clients            client
+      |                         |           |              /  |  \\
+   [leader]                 [leader A]<->[leader B]     [n1] [n2] [n3]
+    /    \\                    |            |            write to W, read from R
+ [f1]    [f2]               [f..]        [f..]          R + W > N for overlap
+`} caption="Three replication topologies. Each moves the conflict problem to a different place." />
+
+<Levels label="Chapter 6, Replication">
+
+<Level name="Beginner">
+
+Replication keeps a copy of the same data on several machines: for availability, for reads near users, and for read capacity. In single-leader replication, all writes go to one node (the leader), which sends a stream of changes to followers. Reads can go to the leader or to followers.
+
+```ts
+type Change = { lsn: number; key: string; val: string };
+const leaderLog: Change[] = []; const follower = new Map<string, string>(); let applied = 0;
+function write(key: string, val: string) { leaderLog.push({ lsn: leaderLog.length + 1, key, val }); }
+function replicate() { for (; applied < leaderLog.length; applied++) follower.set(leaderLog[applied].key, leaderLog[applied].val); }
+write('a', '1'); write('b', '2'); replicate(); write('a', '3');
+console.log(follower.get('a'), applied, leaderLog.length);
+```
+
+Output: `1 2 3`. The follower is one change behind.
+
+Common mistake: assuming followers are always current. Fix: measure lag and design reads around it.
+
+</Level>
+
+<Level name="Intermediate">
+
+Synchronous replication waits for a follower to confirm before acknowledging the write: no data loss if the leader dies, but a slow follower blocks writes. Asynchronous replication acknowledges immediately: fast, but recent writes can be lost on failover. Semi-synchronous setups keep one synchronous follower and the rest asynchronous.
+
+Setting up a new follower: take a consistent snapshot of the leader, copy it, then replay the log from the snapshot's position. Handling outages: a follower catches up from its last position; a leader failure needs failover: detect, choose a new leader (the most up-to-date follower), reconfigure clients.
+
+```sql
+-- Postgres: make commits wait for one named standby
+ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (replica_a)';
+SELECT pg_reload_conf();
+```
+
+Common mistake: synchronous replication to a single follower in another region, then every write pays cross-region latency and stalls when that link blips. Fix: a synchronous follower nearby, or a quorum of several.
+
+</Level>
+
+<Level name="Advanced">
+
+Replication logs come in several kinds: statement-based (send the SQL; breaks on non-deterministic functions like `now()`), write-ahead log shipping (send the storage engine's low-level log; ties replicas to the same version), logical (row-based) logs (send row changes in an engine-independent format; good for change data capture), and trigger-based (flexible, slow).
+
+Problems with replication lag: reading your own writes (a user's update vanishes on refresh), monotonic reads (time goes backwards across refreshes), and consistent prefix reads (an answer appears before the question).
+
+```text
+consistent prefix violation (sharded or multi-leader):
+  comment 1 (question):  "Is the build green?"     shard 1, slow replica
+  comment 2 (reply):     "Yes, just fixed it."     shard 2, fast replica
+  a reader sees the reply before the question
+fix: causally related writes go to the same shard, or track causal dependencies
+```
+
+Common mistake: statement-based replication with `now()`, `random()` or auto-increment in multi-row inserts. Fix: row-based logs.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: failover hazards. The new leader may not have the last writes of the old one; when the old leader returns, its extra writes conflict and are usually discarded, which is dangerous if other systems already saw them: for example, auto-increment ids reused after failover while a cache still holds data under the old ids. Split brain: two nodes both believe they are leader. Choosing the failover timeout is the failure detection trade-off again.
+
+```text
+old leader: wrote id 1001..1005, crashed before replicating 1004..1005
+new leader: next id 1004 -> reuses ids already handed to Redis cache keys
+result: cached data for old 1004 shown to new 1004's owner
+fix: do not reuse ids (fencing, or ids that include the leader epoch)
+```
+
+Common mistake: automatic failover with no fencing of the old leader. Fix: STONITH or fencing tokens, and test failover regularly.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: multi-leader replication. Each region (or each device) has its own leader; writes are accepted locally and exchanged asynchronously. Good for latency and offline work, but concurrent writes to the same data conflict. Sync engines and local-first software take this to the client: each device is a leader with a local database, syncing when online. Conflicts must be resolved: last-write-wins (loses data), merging values, or CRDTs and operational transformation that merge automatically.
+
+```ts
+// last-write-wins silently discards one concurrent edit
+const a = { title: 'B', ts: 1000 }, b = { title: 'C', ts: 1001 };
+const lww = [a, b].reduce((x, y) => (y.ts > x.ts ? y : x));
+console.log(lww.title);
+```
+
+Output: `C`. The edit to "B" is gone without anyone being told.
+
+Common mistake: last-write-wins for data users typed by hand. Fix: CRDTs, or keep both versions and ask the user.
+
+</Level>
+
+<Level name="Production level">
+
+Leaderless replication (Dynamo-style): clients write to several replicas and read from several. With N replicas, W write acknowledgements and R read responses, R + W > N gives overlapping quorums. A node that was down is repaired by read repair or anti-entropy. Detecting concurrent writes needs version vectors: two writes are concurrent if neither knew about the other.
+
+```ts
+type VV = Record<string, number>;
+const leq = (a: VV, b: VV) => Object.keys({ ...a, ...b }).every(k => (a[k] ?? 0) <= (b[k] ?? 0));
+const rel = (a: VV, b: VV) => leq(a, b) && leq(b, a) ? 'equal' : leq(a, b) ? 'a before b' : leq(b, a) ? 'b before a' : 'concurrent';
+console.log(rel({ n1: 2, n2: 1 }, { n1: 2, n2: 3 }), rel({ n1: 3, n2: 1 }, { n1: 2, n2: 3 }));
+```
+
+Output: `a before b concurrent`.
+
+Common mistake: comparing timestamps to decide which concurrent write wins. Fix: detect concurrency with version vectors and merge or keep siblings.
+
+</Level>
+
+<Level name="Mindset">
+
+Every replication design answers "where do conflicts get resolved?" Single-leader resolves them by having one place for writes; multi-leader and leaderless push them to merge logic. I choose the topology by asking where I want to pay.
+
+<Compare left="topology" right="where the pain is" rows={[
+  ['single-leader', 'failover, write latency far from the leader'],
+  ['multi-leader', 'conflict resolution'],
+  ['leaderless', 'quorum tuning, repair, concurrent-write detection'],
+]} caption="No topology avoids the cost; each puts it somewhere." />
+
+Common mistake: multi-leader "for performance" without a conflict strategy. Fix: design conflict resolution first.
+
+</Level>
+
+<Level name="System design">
+
+Most applications should use single-leader replication with asynchronous followers for reads and one synchronous or semi-synchronous standby for failover. Multi-region writes or offline-first clients justify multi-leader or local-first designs. Leaderless suits high-availability key-value workloads that tolerate eventual consistency.
+
+```text
+need                                  topology
+OLTP app, one region                  single leader + sync standby + async read replicas
+collaborative editing, offline        local-first, CRDTs, sync engine
+always-writable cart across regions   leaderless or multi-leader with merge
+```
+
+Common mistake: read replicas for read-your-writes flows. Fix: route those reads to the leader or wait for the replica to pass the write's LSN.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: run a Postgres primary and a streaming replica in containers, measure replication lag under load, then fail over manually and see which writes are lost with asynchronous replication. Implement read-your-writes using `pg_current_wal_lsn()` on write and `pg_last_wal_replay_lsn()` on the replica.
+
+Exercise: build the version-vector store above into a tiny leaderless store with siblings, and a CRDT-based shopping cart that merges them.
+
+Done when my failover drill is written down and repeatable, and my read-your-writes routing never shows a user their own stale data in a test.
+
+</Level>
+</Levels>
+
+### 7. Sharding
+**Covers:** Pros and cons of sharding, sharding for multitenancy, sharding key-value data (by key range, by hash of key), skewed workloads and relieving hot spots, automatic versus manual rebalancing, request routing, and sharding with secondary indexes (local and global).
+
+<Figure art={`
+ by key range                         by hash of key
+ shard 1: a  .. f                     shard 1: hash in [0, 2^30)
+ shard 2: g  .. m                     shard 2: hash in [2^30, 2^31)
+ shard 3: n  .. z                     shard 3: ...
+ + range scans stay on one shard      + even spread of keys
+ - sequential keys pile onto one      - range scans hit every shard
+`} caption="Two ways to assign keys to shards, with their typical failure mode." />
+
+<Levels label="Chapter 7, Sharding">
+
+<Level name="Beginner">
+
+Sharding (also called partitioning) splits a dataset so each piece, a shard, lives on a different node. It is for when data or write load exceeds one machine. Each record belongs to exactly one shard; shards are usually also replicated. Sharding adds complexity everywhere: routing, cross-shard queries, rebalancing, cross-shard transactions. A single well-tuned database goes a long way, and the chapter is clear that sharding has costs to weigh.
+
+```ts
+const shardOf = (userId: number, shards: number) => userId % shards;
+console.log([1, 2, 3, 4, 5, 6].map(id => shardOf(id, 3)));
+```
+
+Output: `[ 1, 2, 0, 1, 2, 0 ]`.
+
+Common mistake: sharding early "for scale". Fix: shard when measured growth says one node will run out, and first exhaust indexing, caching and read replicas.
+
+</Level>
+
+<Level name="Intermediate">
+
+Sharding by key range keeps keys sorted, so range scans touch few shards, but sequential keys (timestamps) send all writes to the last shard. Sharding by hash of key spreads writes evenly but destroys ordering, so range queries go to every shard. A compound approach hashes the first part of a key and keeps the rest sorted: hash on user id, sorted by timestamp within a user.
+
+```ts
+import { createHash } from 'node:crypto';
+const hash = (s: string) => createHash('md5').update(s).digest().readUInt32BE(0);
+const keys = Array.from({ length: 9000 }, (_, i) => `2026-10-23T10:${String(i % 60).padStart(2, '0')}:${i}`);
+const byRange = (k: string) => (k < '2026-10-23T10:20' ? 0 : k < '2026-10-23T10:40' ? 1 : 2);
+const counts = (f: (k: string) => number) => keys.reduce((c, k) => (c[f(k)]++, c), [0, 0, 0]);
+console.log(counts(byRange), counts(k => hash(k) % 3));
+```
+
+Output: `[ 3000, 3000, 3000 ] [ 3000, 2933, 3067 ]`. Both look balanced here; the difference appears over time, when every new timestamp lands in the last range.
+
+Common mistake: range-sharding by creation time for an insert-heavy table. Fix: hash by an entity id, keep time as the sort key inside it.
+
+</Level>
+
+<Level name="Advanced">
+
+Multitenancy: in a SaaS product, sharding by tenant gives isolation (a noisy tenant affects only its shard), simpler compliance (a tenant's data in one region), and easy per-tenant backup and deletion. It fails when one tenant outgrows a shard.
+
+Rebalancing: when nodes are added, shards move. Hash mod N moves almost everything; instead, create many more shards than nodes (fixed number of shards) and move whole shards, or split shards dynamically when they grow (as range-sharded systems do). Automatic rebalancing is convenient but can fire during an overload and make it worse; many operators keep a human in the loop.
+
+```ts
+const moved = (n1: number, n2: number) => Array.from({ length: 10000 }, (_, k) => k).filter(k => k % n1 !== k % n2).length / 10000;
+// fixed 1024 shards: moving from 4 to 5 nodes moves only the shards reassigned to the new node
+console.log(moved(4, 5).toFixed(2), (1024 / 5 / 1024).toFixed(2));
+```
+
+Output: `0.80 0.20`. Modulo hashing moves 80 percent of keys; moving whole shards moves about a fifth.
+
+Common mistake: hash mod number-of-nodes. Fix: many fixed shards, or consistent hashing.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: hot spots. Even with hashing, one key can be hot: a celebrity's post, a viral product. All requests for that key go to one shard. Mitigations: add a random suffix to the hot key to spread writes over several shards (and read all of them), cache hot reads, or treat the hot entity specially.
+
+```ts
+const hotKey = 'post:viral';
+const writeKey = () => `${hotKey}#${Math.floor(Math.random() * 8)}`;   // spread over 8 sub-keys
+const allReadKeys = Array.from({ length: 8 }, (_, i) => `${hotKey}#${i}`);
+console.log(writeKey().startsWith(hotKey), allReadKeys.length);
+```
+
+Output: `true 8`. Writes spread; reads now fan out to eight keys.
+
+Common mistake: splitting every key this way. Fix: only for known hot keys, because reads get more expensive.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: secondary indexes on sharded data. Local (document-partitioned) indexes: each shard indexes only its own records; writes are local, but a query by the secondary key must ask every shard (scatter/gather), and tail latency grows with the number of shards. Global (term-partitioned) indexes: the index itself is sharded by the indexed value; reads go to one index shard, but a write may update index shards on other nodes, usually asynchronously, so the index can lag.
+
+```text
+query: products where color = 'red'
+local index:   ask all 32 shards, merge -> p99 = slowest of 32
+global index:  ask the 'red' index shard -> one call, but may miss a product added 200 ms ago
+```
+
+Common mistake: frequent scatter/gather queries on a large cluster. Fix: a global index (accepting lag) or a separate search system fed by change data capture.
+
+</Level>
+
+<Level name="Production level">
+
+Request routing: how does a client find the shard? Options: any node forwards to the right one, a routing tier that knows the assignment, or clients that know the assignment themselves. The assignment usually lives in a coordination service (ZooKeeper, etcd) or is gossiped. In production I would watch shard sizes, per-shard load and skew, and have a documented procedure for splitting a shard and moving a tenant.
+
+<Flow steps={['client request with key', 'router looks up shard map', 'forward to shard leader', 'shard map changes published by coordinator']} caption="Routing through a tier that watches the shard map." />
+
+```sql
+-- Postgres native partitioning (one node) is often the first step before sharding across nodes
+CREATE TABLE events (tenant_id bigint, at timestamptz, payload jsonb) PARTITION BY HASH (tenant_id);
+CREATE TABLE events_p0 PARTITION OF events FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+```
+
+Common mistake: routing logic copied into every client with a hard-coded shard list. Fix: one source of truth for the shard map.
+
+</Level>
+
+<Level name="Mindset">
+
+"When a single Postgres is still the right answer" is a real question with a real answer: usually, for longer than people think. Sharding is a one-way door that makes every query and migration harder, so I need numbers before walking through it.
+
+```text
+before sharding, check:
+  are the slow queries indexed?          EXPLAIN them
+  can reads move to replicas or a cache?
+  is the data growth real?               bytes per month, projected 2 years
+  is one big machine cheaper than the engineering?
+```
+
+Common mistake: sharding to fix slow queries. Fix: fix the queries.
+
+</Level>
+
+<Level name="System design">
+
+In a design, the shard key is the most important decision: it decides which queries stay on one shard, where hot spots appear, and what a cross-shard transaction is. Choose the key that keeps the main transactions and queries on one shard (tenant, user, account) and accept scatter/gather for rare ones.
+
+```text
+product: multi-tenant project tracker
+shard key: tenant_id
+single-shard: everything a user does inside their workspace
+cross-shard: admin reports across tenants -> run on the warehouse instead
+```
+
+Common mistake: a shard key chosen for even spread that splits every transaction across shards. Fix: choose for locality first, spread second.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: simulate sharding in TypeScript with range, hash and fixed-shard schemes, a skewed workload (Zipf-distributed keys), and node additions; measure balance, moved keys and hot shards. Then use Postgres hash partitioning on one node to feel the query planning side (partition pruning in EXPLAIN).
+
+Exercise: write a scatter/gather query layer over four Postgres databases and measure how p99 grows with shard count.
+
+Done when I can pick and defend a shard key for a given product, and my simulator shows the hot-spot and rebalancing behaviour the chapter describes.
+
+</Level>
+</Levels>
+
+### 8. Transactions
+**Covers:** What a transaction is and the meaning of ACID, single-object and multi-object operations, weak isolation levels (read committed, snapshot isolation and repeatable read, preventing lost updates, write skew and phantoms), serializability (actual serial execution, two-phase locking, serializable snapshot isolation), and distributed transactions (two-phase commit, across different systems, database-internal, exactly-once message processing revisited).
+
+<Compare left="isolation level" right="still allows" rows={[
+  ['read uncommitted', 'dirty reads, and everything below'],
+  ['read committed', 'non-repeatable reads, lost updates, write skew, phantoms'],
+  ['snapshot isolation / repeatable read', 'write skew, phantoms that cause write skew (lost updates depend on the engine)'],
+  ['serializable', 'nothing: equivalent to some serial order'],
+]} caption="Weak isolation levels and the anomalies each still permits." />
+
+<Levels label="Chapter 8, Transactions">
+
+<Level name="Beginner">
+
+A transaction groups several reads and writes into one logical unit: it commits as a whole or aborts as a whole, and the application can safely retry an aborted transaction. ACID is the usual summary, but the chapter shows each letter is vaguer than it sounds: atomicity is really abortability, consistency is mostly the application's invariants, isolation comes in levels, and durability depends on what "written" means.
+
+```sql
+BEGIN;
+INSERT INTO emails (id, recipient) VALUES (1, 'asha@example.com');
+UPDATE mailboxes SET unread = unread + 1 WHERE owner = 'asha@example.com';
+COMMIT;      -- the count and the email agree, or neither change happened
+```
+
+Common mistake: updating a counter in one statement and the item in another, outside a transaction. Fix: multi-object changes that must agree go in one transaction.
+
+</Level>
+
+<Level name="Intermediate">
+
+Single-object operations (an atomic increment, compare-and-set on one row) need no multi-statement transaction. Multi-object operations do: foreign keys, denormalised counts, secondary indexes. Read committed, the default in Postgres, prevents dirty reads and dirty writes: you only see committed data, and you only overwrite committed data. It still allows reading two different committed states in one transaction.
+
+```sql
+-- read skew under READ COMMITTED: transfer between two accounts runs mid-report
+-- report:   SELECT balance FROM account WHERE id = 1;    -- 500 (before transfer)
+-- transfer: moves 100 from 2 to 1, commits
+-- report:   SELECT balance FROM account WHERE id = 2;    -- 400 (after transfer)
+-- report total = 900, but the real total was always 1000
+```
+
+Common mistake: long reports and backups at read committed. Fix: snapshot isolation (`REPEATABLE READ` in Postgres) gives one consistent snapshot.
+
+</Level>
+
+<Level name="Advanced">
+
+Snapshot isolation: each transaction reads from a consistent snapshot as of its start, implemented with multi-version concurrency control (MVCC). Readers never block writers. Lost updates happen when two transactions read-modify-write the same value; fixes are atomic writes, explicit locks (`SELECT ... FOR UPDATE`), automatic lost-update detection (Postgres repeatable read aborts one), or compare-and-set.
+
+```sql
+-- compare-and-set: only succeeds if nobody changed it since I read it
+UPDATE wiki_page SET content = 'new text', version = version + 1
+WHERE id = 7 AND version = 41;
+-- "UPDATE 0" means someone else won: reload and retry
+```
+
+Common mistake: an ORM that reads, modifies in memory, and writes back the whole row. Fix: atomic updates or version checks.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: write skew and phantoms. Two transactions read the same set of rows, each makes a decision based on it, and each writes a different row. Snapshot isolation does not detect this. A phantom is a write in one transaction that changes the result of a search query in another; when the rows that would conflict do not exist yet, there is nothing to lock.
+
+```sql
+-- meeting room booking, both sessions at REPEATABLE READ
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM bookings WHERE room = 1 AND tstzrange(start_at, end_at) && tstzrange('2026-10-23 12:00+05:30', '2026-10-23 13:00+05:30');
+-- both see 0
+INSERT INTO bookings (room, start_at, end_at) VALUES (1, '2026-10-23 12:00+05:30', '2026-10-23 13:00+05:30');
+COMMIT;   -- both commit: double booking
+```
+
+A Postgres exclusion constraint makes the database enforce it whatever the isolation level:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT no_overlap
+  EXCLUDE USING gist (room WITH =, tstzrange(start_at, end_at) WITH &&);
+-- the second insert fails: ERROR:  conflicting key value violates exclusion constraint "no_overlap"
+```
+
+Common mistake: check-then-insert in application code. Fix: a constraint, SERIALIZABLE, or materialising the conflict as lockable rows.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: the three ways to get serializability. Actual serial execution: run every transaction one at a time on a single thread, which works when transactions are short, data fits in memory, and transactions are stored procedures (no network round trips mid-transaction). Two-phase locking: readers and writers block each other, with predicate or index-range locks for phantoms; correct but slow and deadlock-prone. Serializable snapshot isolation (SSI): optimistic; run on snapshots, track read/write dependencies, and abort a transaction whose reads were invalidated by a concurrent commit. Postgres's SERIALIZABLE is SSI.
+
+```ts
+// any SERIALIZABLE code must expect aborts and retry
+async function serializable<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { return await run(); }
+    catch (e: any) { if (e.code !== '40001') throw e; }
+  }
+  throw new Error('gave up after 5 serialization failures');
+}
+```
+
+Common mistake: enabling SERIALIZABLE without retry logic, then surfacing errors to users. Fix: wrap transactions in a retry helper, and keep them short so aborts are cheap.
+
+</Level>
+
+<Level name="Production level">
+
+Distributed transactions: two-phase commit across nodes, with the coordinator-failure blocking problem; across different systems (XA between a database and a message broker), which is fragile and slow; and database-internal distributed transactions in systems built for them, which work better because every participant runs the same software. The chapter revisits exactly-once message processing: you can get its effect by making the processing and the acknowledgement atomic, or by idempotent processing with deduplication.
+
+```sql
+-- exactly-once effect: record the message id in the same transaction as its effect
+BEGIN;
+INSERT INTO processed_messages (msg_id) VALUES ('m-881');    -- PRIMARY KEY: duplicates fail here
+UPDATE account SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+Common mistake: "exactly-once delivery" claims from a broker taken to mean exactly-once effects in my database. Fix: deduplicate at the consumer, inside its own transaction.
+
+</Level>
+
+<Level name="Mindset">
+
+Isolation levels are lists of allowed anomalies. When someone says "it's transactional", I ask which level and which anomalies it allows, then check whether any of my invariants rely on those not happening.
+
+<Flow steps={['write the invariant', 'find the transactions that touch it', 'name the anomaly that would break it', 'pick: constraint, lock, or SERIALIZABLE']} caption="From an invariant to the right protection." />
+
+Common mistake: testing concurrency bugs with one user. Fix: two sessions, step by step, or a concurrent test harness.
+
+</Level>
+
+<Level name="System design">
+
+In a design, I list the invariants (no double booking, balance never negative, unique usernames), and for each choose the cheapest reliable protection: a unique or exclusion constraint, an atomic update, a row lock, or a SERIALIZABLE transaction with retries. Constraints are best because the database enforces them for every code path.
+
+```text
+invariant                    protection
+unique username              UNIQUE index
+no overlapping bookings      EXCLUDE constraint
+balance >= 0                 CHECK + atomic UPDATE ... WHERE balance >= amount
+at least one doctor on call  SERIALIZABLE with retry, or lock the shift row
+```
+
+Common mistake: invariants enforced only in application code that a second service or a script can bypass. Fix: push them into the database where possible.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: with two psql sessions, reproduce dirty-write prevention, read skew, lost update, write skew and a phantom, noting the isolation level and exact error for each; then fix each the cheapest way. Write a concurrent test in TypeScript that hammers the booking table with parallel inserts and asserts no overlaps.
+
+Exercise: implement the exactly-once consumer pattern with a processed-messages table and kill the consumer between steps.
+
+Done when each anomaly is reproducible on demand and its fix is verified by a concurrent test.
+
+</Level>
+</Levels>
+
+### 9. The Trouble with Distributed Systems
+**Covers:** Faults and partial failures, unreliable networks (the limitations of TCP, network faults in practice, fault detection, timeouts and unbounded delays, synchronous versus asynchronous networks), unreliable clocks (monotonic versus time-of-day, synchronisation and accuracy, relying on synchronised clocks, process pauses), knowledge, truth and lies (the majority rules, distributed locks and leases, Byzantine faults, system model and reality), and formal methods and randomised testing.
+
+<Figure art={`
+ node A holds lease (expires 12:00:10)
+ 12:00:05  A starts writing ............ GC pause 15 s ............ 12:00:20 A writes (lease long gone!)
+ 12:00:10  lease expires
+ 12:00:11  node B acquires lease, writes
+ storage receives writes from A and B   -> corruption, unless writes carry fencing tokens
+`} caption="A process pause makes a lease holder act after its lease expired." />
+
+<Levels label="Chapter 9, The Trouble with Distributed Systems">
+
+<Level name="Beginner">
+
+On one computer, things either work or fail cleanly. In a distributed system, some parts fail while others work, and you often cannot tell which: a partial failure. The network can lose, delay, duplicate or reorder messages, clocks drift, and processes pause. The chapter's message is to be pessimistic: assume all of these will happen.
+
+```ts
+// a request with a timeout: three possible truths behind the same error
+async function call(timeoutMs: number, workMs: number) {
+  return Promise.race([
+    new Promise(r => setTimeout(() => r('ok'), workMs)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs)),
+  ]);
+}
+call(100, 150).catch(e => console.log(e.message, '- but the work may still complete'));
+```
+
+Output: `timeout - but the work may still complete`.
+
+Common mistake: treating a timeout as "it did not happen". Fix: treat it as "unknown", and make retries safe.
+
+</Level>
+
+<Level name="Intermediate">
+
+TCP gives reliable, ordered delivery on one connection, but not across reconnects, not against a crashed peer, and not with any bound on delay. Network delays are unbounded in practice because of queueing: in switches, in the OS, in the VM hypervisor, in TCP congestion control. Timeouts must therefore be chosen empirically, from the measured distribution of round-trip times, and ideally adapted over time.
+
+```ts
+// adaptive timeout from observed RTTs, like TCP's estimator
+let srtt = 0, rttvar = 0;
+function observe(rtt: number) {
+  if (srtt === 0) { srtt = rtt; rttvar = rtt / 2; return; }
+  rttvar = 0.75 * rttvar + 0.25 * Math.abs(srtt - rtt); srtt = 0.875 * srtt + 0.125 * rtt;
+}
+[40, 42, 39, 120, 41].forEach(observe);
+console.log(Math.round(srtt + 4 * rttvar));
+```
+
+Output: `145`. The timeout widened after the 120 ms outlier.
+
+Common mistake: a fixed timeout copied from a blog post. Fix: measure, then set or adapt.
+
+</Level>
+
+<Level name="Advanced">
+
+Clocks. Time-of-day clocks return wall-clock time and can jump (NTP corrections, leap seconds, manual changes). Monotonic clocks only move forward and are for measuring durations on one machine. Synchronised clocks have error bars; NTP accuracy is limited by network delay. Relying on timestamps from different machines to order events (last write wins) can silently drop writes when clocks disagree.
+
+```ts
+const t0 = Date.now(), m0 = performance.now();
+// ... work ...
+const elapsedWall = Date.now() - t0;          // wrong if the clock is adjusted meanwhile
+const elapsedMono = performance.now() - m0;   // right for durations
+console.log(typeof elapsedWall, typeof elapsedMono);
+```
+
+Output: `number number`. Same type, different guarantees.
+
+Common mistake: measuring timeouts with `Date.now()`. Fix: a monotonic clock (`performance.now()`, `process.hrtime`).
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: process pauses. A thread can stop for seconds: garbage collection, VM suspension, swapping, a slow disk, SIGSTOP. A node holding a lease checks "my lease is valid", then pauses, then writes after the lease expired. Code cannot detect its own pause.
+
+```ts
+let tokenCounter = 0; let storageMax = 0;
+const acquire = () => ++tokenCounter;                         // lock service issues increasing tokens
+const write = (token: number) => { if (token < storageMax) return 'rejected'; storageMax = token; return 'ok'; };
+const a = acquire();          // A gets 1, then pauses
+const b = acquire();          // lease expired, B gets 2
+console.log(write(b), write(a));
+```
+
+Output: `ok rejected`.
+
+Common mistake: a distributed lock without fencing protecting a resource. Fix: fencing tokens checked by the resource.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: knowledge and truth. A node cannot trust its own judgement: it may believe it is the leader, alive and holding a lock, while the rest of the cluster has declared it dead. Decisions are made by a majority (quorum). Byzantine faults (nodes that lie) need much stronger protocols; most data systems assume nodes are honest but may be slow or crashed, and protect against lightweight lies (corrupted packets) with checksums and input validation.
+
+```text
+3-node cluster, node A partitioned away:
+  A thinks: "I am leader, I hold the lock"
+  B, C (majority) elect B, grant the lock to B
+  truth = what the majority decided; A must step down when it finds out
+```
+
+Common mistake: a node acting on its own view during a partition. Fix: actions that matter require a quorum's agreement.
+
+</Level>
+
+<Level name="Production level">
+
+System models make reasoning precise: timing (synchronous, partially synchronous, asynchronous) and node failures (crash-stop, crash-recovery, Byzantine). Algorithms are proved correct within a model; reality sometimes violates the model (a disk loses data the model said was durable). The chapter closes with formal methods (model checking a specification, such as with TLA+) and randomised testing (fault injection, deterministic simulation testing) as ways to find the bugs reasoning misses.
+
+```text
+deterministic simulation testing:
+  run all nodes in one process with a seeded scheduler and simulated network/clock
+  inject drops, delays, crashes, pauses
+  on failure, the seed reproduces the exact run
+```
+
+Common mistake: trusting a design because it worked in staging. Fix: inject faults deliberately and repeatably.
+
+</Level>
+
+<Level name="Mindset">
+
+Assume the worst about the network, clocks and pauses, and design so that correctness does not depend on timing. Timing may affect performance or availability, never safety.
+
+<Flow steps={['what if this message is lost?', 'what if it is delayed a minute?', 'what if this node pauses here?', 'what if its clock is wrong?']} caption="Questions to ask at every step of a distributed protocol." />
+
+Common mistake: "this can't happen in our data centre". Fix: it will, at scale; design for it.
+
+</Level>
+
+<Level name="System design">
+
+In a design: every remote call has a measured timeout and idempotent retry; every lock or lease has fencing; ordering does not rely on wall clocks across machines; decisions about leadership and ownership go through a quorum or a consensus service; and the system is tested with fault injection.
+
+```text
+component         timing-safe design
+job scheduler     lease + fencing token stored with the job result
+event ordering    sequence numbers from one log, not timestamps
+cache expiry      wall clock is fine: only freshness, not correctness, depends on it
+```
+
+Common mistake: Redis-based locks used for correctness without fencing. Fix: use them for efficiency only, or add fencing at the resource.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write a deterministic simulator (seeded random scheduler, simulated clock and network), then implement a lease-based lock and show the pause bug, then fix it with fencing tokens. Measure RTT distributions on a real network path and set a timeout from them.
+
+Exercise: write a TLA+ or PlusCal model of the lease plus fencing protocol and model-check it for two clients.
+
+Done when the simulator reproduces the pause bug from a seed and the fenced version passes thousands of seeds.
+
+</Level>
+</Levels>
+
+### 10. Consistency and Consensus
+**Covers:** Linearizability (what makes a system linearizable, relying on it, implementing it, its cost), ID generators and logical clocks (logical clocks, linearizable ID generators), and consensus (its many faces, consensus in practice, coordination services).
+
+<Figure art={`
+ client A:  |--- write x=1 ---|
+ client B:          |--- read x -> 1 ---|
+ client C:                                  |--- read x -> 0 ---|   NOT linearizable:
+                                                                    C started after B saw 1
+ once any read has seen the new value, every later read must see it too
+`} caption="Linearizability: after one client sees a write, no later read may see the old value." />
+
+<Levels label="Chapter 10, Consistency and Consensus">
+
+<Level name="Beginner">
+
+Linearizability is the strongest common consistency guarantee: the system behaves as if there were a single copy of the data and every operation took effect atomically at some point between its start and end. If a read returns a new value, every read that starts later also returns it. It is a recency guarantee, and it is what people intuitively expect from "a database".
+
+```text
+linearizable register, two clients:
+  A writes 5 (completes at t=10)
+  B reads at t=12 -> must return 5
+  non-linearizable replica set: B may read 4 from a lagging follower
+```
+
+Common mistake: confusing linearizability with serializability. Fix: serializability is about transactions over many objects appearing in some serial order; linearizability is about single-object reads seeing the latest write in real time.
+
+</Level>
+
+<Level name="Intermediate">
+
+Where linearizability is needed: leader election and locks (everyone must agree who holds it), uniqueness constraints (two users must not get the same username), and cross-channel timing (a file uploaded to storage and a message sent to a queue; the consumer must see the file). Implementations: single-leader replication can be linearizable if reads go to the leader and the leader knows it is still leader; consensus algorithms are; multi-leader and leaderless systems generally are not.
+
+```ts
+// cross-channel race: message arrives before the replica has the file
+const storage = { primary: new Set<string>(), replica: new Set<string>() };
+storage.primary.add('img-7');                 // upload
+setTimeout(() => storage.replica.add('img-7'), 50);
+const consumer = () => storage.replica.has('img-7') ? 'resized' : 'file not found';
+console.log(consumer());                      // message delivered immediately
+```
+
+Output: `file not found`.
+
+Common mistake: a worker reading from a replica right after a message says the data exists. Fix: read from a linearizable source, or include the data (or its version) in the message.
+
+</Level>
+
+<Level name="Advanced">
+
+The cost of linearizability: during a network partition, a linearizable system must stop serving on the side without the leader or quorum (the CAP trade-off), and even without partitions, linearizable reads and writes need coordination, so their latency is bounded below by network delays. Many systems give it up deliberately for performance.
+
+ID generators and logical clocks: auto-increment ids on one node are linearizable; across nodes they need coordination. Logical clocks order events without physical time. A Lamport clock gives a total order consistent with causality: each node keeps a counter, increments it on each event, and on receiving a message sets its counter to the max of its own and the message's plus one; ties are broken by node id.
+
+```ts
+class Lamport {
+  t = 0; constructor(public id: string) {}
+  tick() { return [++this.t, this.id] as const; }
+  recv(remote: number) { this.t = Math.max(this.t, remote) + 1; return [this.t, this.id] as const; }
+}
+const a = new Lamport('A'), b = new Lamport('B');
+const [ta] = a.tick(); a.tick(); const [ta3] = a.tick();
+console.log(ta, ta3, b.recv(ta3), b.tick());
+```
+
+Output: `1 3 [ 4, 'B' ] [ 5, 'B' ]`.
+
+Common mistake: using Lamport timestamps to enforce uniqueness at the moment of a request. Fix: they order events after the fact; deciding "who was first" right now needs consensus or a linearizable store.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: linearizable ID generators. A single sequence generator node is linearizable but a bottleneck and a single point of failure; batching ranges of ids to each node improves throughput but loses the "later id means later in time" property across nodes. Timestamp-based ids (with node ids) are unique but only ordered as well as clocks are synchronised.
+
+```ts
+// time-ordered ids: ms timestamp + node + sequence; ordered across nodes only as well as their clocks agree
+let seq = 0;
+const id = (node: number, ms: number) => (BigInt(ms) << 22n) | (BigInt(node) << 12n) | BigInt(seq++ & 4095);
+const x = id(1, 1_700_000_000_000), y = id(2, 1_699_999_999_990);   // node 2's clock is 10 ms behind
+console.log(y < x);
+```
+
+Output: `true`. Node 2's id sorts earlier even if it was created later in real time.
+
+Common mistake: sorting by such ids as if they were a true global order. Fix: treat them as unique and roughly ordered, not linearizable.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: the many faces of consensus. Total order broadcast, linearizable compare-and-set registers, distributed locks with fencing, atomic commit, and leader election are all equivalent to consensus or reducible to it: if you can solve one in a fault-tolerant way, you can solve the others. That is why so many systems lean on one consensus service rather than inventing each.
+
+<Flow steps={['consensus', 'total order broadcast (shared log)', 'linearizable compare-and-set', 'locks, leases, leader election, unique ids']} caption="Build one fault-tolerant primitive, derive the rest." />
+
+```text
+linearizable compare-and-set from a log:
+  append "claim username asha by U1"; read the log up to my entry;
+  if the first claim for 'asha' is mine -> success, else -> taken
+```
+
+Common mistake: building a lock, an election and a sequence generator separately, each with its own subtle bugs. Fix: build them all on one consensus-backed log or store.
+
+</Level>
+
+<Level name="Production level">
+
+Consensus in practice: Raft, Multi-Paxos, Zab and Viewstamped Replication all elect a leader per epoch (term) and replicate a log with majority quorums. They need a majority alive, are sensitive to network delay (frequent leader elections under jittery networks), and usually have fixed membership changed carefully. Coordination services (ZooKeeper, etcd) package this as a small, linearizable key-value store with leases, watches and ordering, used for leader election, service discovery, shard assignment and configuration.
+
+```text
+etcd use, conceptually:
+  put /services/payments/leader "node-3" with lease 10s, only if absent (transaction)
+  watch /services/payments/leader -> notified when it changes
+  fencing token = the key's revision number
+```
+
+Common mistake: storing large or frequently changing application data in a coordination service. Fix: keep it to small, slowly changing metadata.
+
+</Level>
+
+<Level name="Mindset">
+
+Ask "does this need to be linearizable?" for each operation. Most do not; the few that do (uniqueness, locks, leadership, money) deserve a consensus-backed component, and the rest should not pay its cost.
+
+```text
+operation              linearizable?   reason
+claim a username       yes             two users must never both succeed
+show a like count      no              approximate is fine
+promote a new leader   yes             exactly one leader per term
+render a feed          no              staleness tolerated
+```
+
+Common mistake: everything linearizable (slow) or nothing (bugs). Fix: decide per operation.
+
+</Level>
+
+<Level name="System design">
+
+Design pattern: a small consensus-backed control plane (membership, leadership, configuration, shard map) and a large data plane that uses it. The data plane's own replication can be simpler because the hard decisions are made by the control plane.
+
+```text
+control plane: etcd (3 nodes) stores shard -> leader assignments with fencing revisions
+data plane:    each shard leader replicates to followers; rejects writes with old revisions
+```
+
+Common mistake: running consensus across continents for every write. Fix: keep the consensus group close together; replicate data asynchronously farther away when the product allows.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write a linearizability checker for single-register histories and run it against my quorum store from chapter 6 under partitions. Implement Lamport clocks and version vectors and compare what each can and cannot tell me. Use etcd locally for a leader election with leases and fencing.
+
+Exercise: implement a unique-username service on top of a Raft log (from the phase 10 work) and show two concurrent claims resolved correctly.
+
+Done when my checker flags the non-linearizable configurations and passes the linearizable ones, and my etcd election survives killing the leader.
+
+</Level>
+</Levels>
+
+## Derived data
+
+### 11. Batch Processing
+**Covers:** Batch processing with Unix tools (simple log analysis, chains of commands versus custom programs, sorting versus in-memory aggregation), batch processing in distributed systems (distributed filesystems, object stores, distributed job orchestration), batch processing models (MapReduce, dataflow engines, shuffling data, joins and grouping, query languages, DataFrames), and batch use cases (extract-transform-load, analytics, machine learning, serving derived data).
+
+<Flow steps={['input files (immutable)', 'map: extract key, value', 'shuffle: sort and group by key', 'reduce: aggregate per key', 'output files (new, immutable)']} caption="The batch pattern, from a Unix pipeline to a cluster: read immutable input, write new output." />
+
+<Levels label="Chapter 11, Batch Processing">
+
+<Level name="Beginner">
+
+A batch job reads a bounded set of input, processes it, and writes output, without a user waiting. The chapter starts with Unix tools: a log analysis pipeline that finds the most requested URLs is a batch job in one line, and the ideas (immutable input, composable steps, sorting to group) scale to clusters.
+
+```bash
+# five most requested paths in an nginx access log
+awk '{print $7}' access.log | sort | uniq -c | sort -rn | head -5
+```
+
+```text
+   4189 /
+   1203 /sanjay/
+    880 /sanjay/plans/traditional-software-developer/
+    ...
+```
+
+(The counts are illustrative; the shape is what the pipeline prints.)
+
+Common mistake: writing a custom script that loads the whole log into a hash map when it is larger than memory. Fix: `sort` spills to disk and handles data larger than memory.
+
+</Level>
+
+<Level name="Intermediate">
+
+Sorting versus in-memory aggregation: a hash table of counts is fast when the distinct keys fit in memory; sorting works for any size because it can merge sorted runs from disk. The Unix philosophy (small tools, a uniform interface, separation of logic and wiring, immutable input) maps directly to distributed batch processing.
+
+```ts
+// the same job as the pipeline, in-memory aggregation
+const lines = ['GET / 200', 'GET /a 200', 'GET / 200', 'GET /b 404', 'GET / 200', 'GET /a 200'];
+const counts = new Map<string, number>();
+for (const l of lines) { const path = l.split(' ')[1]; counts.set(path, (counts.get(path) ?? 0) + 1); }
+console.log([...counts].sort((a, b) => b[1] - a[1]));
+```
+
+Output: `[ [ '/', 3 ], [ '/a', 2 ], [ '/b', 1 ] ]`.
+
+Common mistake: a batch job that modifies its input in place. Fix: input is immutable; write new output, so a buggy run can be rerun.
+
+</Level>
+
+<Level name="Advanced">
+
+Distributed batch processing runs on a distributed filesystem (HDFS) or, increasingly, object storage (S3 and similar), with a scheduler that places tasks near data and restarts failed ones. MapReduce: a map function emits key-value pairs, the framework shuffles (partitions and sorts by key), and a reduce function processes all values for each key. Dataflow engines (Spark, Flink in batch mode) generalise this to graphs of operators, keep intermediate data in memory when possible, and avoid writing every stage to disk.
+
+```ts
+const docs = ['to be or not', 'to do or die'];
+const mapped = docs.flatMap(d => d.split(' ').map(w => [w, 1] as [string, number]));
+const shuffled = new Map<string, number[]>();
+for (const [k, v] of mapped) shuffled.set(k, [...(shuffled.get(k) ?? []), v]);
+const reduced = [...shuffled].map(([k, vs]) => [k, vs.reduce((a, b) => a + b, 0)]);
+console.log(reduced);
+```
+
+Output: `[ [ 'to', 2 ], [ 'be', 1 ], [ 'or', 2 ], [ 'not', 1 ], [ 'do', 1 ], [ 'die', 1 ] ]`.
+
+Common mistake: a reduce step with side effects (writing to a database row by row). Fix: write output files and load them atomically; tasks may run twice.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: joins in batch. A sort-merge join partitions both datasets by join key so related records meet in the same reducer. A broadcast hash join sends a small dataset to every task holding a part of the large one. Skew (one key with millions of records, such as a celebrity user) overloads one reducer; mitigations split hot keys across several reducers.
+
+```ts
+const users = new Map([[1, 'Asha'], [2, 'Ravi']]);                        // small: broadcast
+const events = [[1, 'click'], [2, 'view'], [1, 'buy'], [3, 'view']] as const;
+console.log(events.map(([u, e]) => [users.get(u) ?? null, e]));
+```
+
+Output: `[ [ 'Asha', 'click' ], [ 'Ravi', 'view' ], [ 'Asha', 'buy' ], [ null, 'view' ] ]`. User 3 has no match, which is a left join's job to keep visible.
+
+Common mistake: joining against a live production database from inside a batch job, one query per record. Fix: copy a snapshot of the database into the batch system and join locally.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: fault tolerance in batch relies on determinism. If a task fails, the scheduler reruns it on the same input; if the task is nondeterministic (random numbers, current time, iteration order of a hash map), the rerun produces different output, and downstream tasks that already consumed the first output disagree.
+
+```ts
+const nondeterministic = () => [...new Set(['b', 'a', 'c'])].sort(() => Math.random() - 0.5);
+const deterministic = () => [...new Set(['b', 'a', 'c'])].sort();
+console.log(deterministic().join(''), deterministic().join(''));
+```
+
+Output: `abc abc`. The other function may differ from run to run.
+
+Common mistake: `Math.random()` for sampling in a batch job. Fix: a seeded generator derived from the record key.
+
+</Level>
+
+<Level name="Production level">
+
+Query languages and DataFrames sit on top: SQL engines over files (Spark SQL, Trino, DuckDB), and DataFrame APIs (pandas, Polars, Spark DataFrames) that look like local code but are optimised as query plans. Production batch use cases: ETL into the warehouse, analytics, training ML models, and building derived datasets to serve (search indexes, recommendation tables) that are swapped in atomically.
+
+```sql
+-- DuckDB querying a directory of Parquet files directly
+SELECT path, count(*) AS hits FROM read_parquet('logs/2026-10-*.parquet')
+GROUP BY path ORDER BY hits DESC LIMIT 5;
+```
+
+Common mistake: writing serving data by updating rows in the live database from the batch job. Fix: build a new immutable dataset, then switch readers to it in one step; switch back if it is bad.
+
+</Level>
+
+<Level name="Mindset">
+
+Immutable inputs and deterministic jobs make mistakes cheap: rerun with fixed code and get correct output. The chapter calls this human fault tolerance.
+
+<Compare left="mutable, in-place" right="immutable, rebuild" rows={[
+  ['a bug corrupts data permanently', 'a bug produces bad output; rerun'],
+  ['partial failure leaves a mess', 'failed tasks rerun; output is all or nothing'],
+  ['hard to test', 'test against a copy of the input'],
+]} caption="Why batch systems treat input as read-only." />
+
+Common mistake: "we'll be careful" with in-place updates. Fix: design for rerunnable jobs.
+
+</Level>
+
+<Level name="System design">
+
+In a design, I use batch for anything that can be late by minutes or hours: daily reports, model training, rebuilding search indexes, backfills. Inputs come from the system of record's change log or snapshots; outputs are versioned datasets. An orchestrator (Airflow-style) handles dependencies, retries and backfills.
+
+```text
+nightly pipeline:
+  02:00  snapshot orders table -> object storage (date-partitioned Parquet)
+  02:20  job: aggregate revenue by product -> new dataset v2026-10-23
+  02:40  validate row counts and totals against the source
+  02:45  point dashboards at v2026-10-23 (keep v2026-10-22 for rollback)
+```
+
+Common mistake: no validation step before publishing output. Fix: check counts and invariants, and keep the previous version.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: analyse my own web server logs first with a Unix pipeline, then the same in TypeScript with in-memory aggregation, then with DuckDB on Parquet. Write a tiny MapReduce in TypeScript with a sort-based shuffle that spills to disk, and run a word count and a join on files larger than my memory limit.
+
+Exercise: introduce a skewed key into the join and fix it by salting.
+
+Done when the three versions of the log analysis agree, and my MapReduce handles input larger than memory and gives identical output when a task is killed and rerun.
+
+</Level>
+</Levels>
+
+### 12. Stream Processing
+**Covers:** Transmitting event streams (messaging systems, log-based message brokers), databases and streams (keeping systems in sync, change data capture, state, streams and immutability), and processing streams (uses, reasoning about time, stream joins, fault tolerance).
+
+<Figure art={`
+ producers -> [ partition 0: e0 e1 e2 e3 e4 ... ]  <- consumer group G1 offset 3
+              [ partition 1: e0 e1 e2 ...       ]  <- consumer group G1 offset 2
+                                                    <- consumer group G2 offset 0 (replaying)
+ the log is retained; each consumer only remembers its offset
+`} caption="A log-based broker: append-only partitions, consumers track offsets, history can be replayed." />
+
+<Levels label="Chapter 12, Stream Processing">
+
+<Level name="Beginner">
+
+A stream is unbounded data arriving over time, as events: small immutable records of something that happened. Producers write events; consumers process them. Between them, a messaging system: either direct (producer to consumer), or a broker that buffers.
+
+Traditional message brokers (AMQP/JMS style) deliver each message to a consumer and delete it once acknowledged. Log-based brokers (Kafka style) append events to a partitioned log and keep them; consumers track their position (offset) and can re-read.
+
+```ts
+class Log { events: string[] = []; append(e: string) { this.events.push(e); return this.events.length - 1; } read(from: number) { return this.events.slice(from); } }
+const log = new Log(); ['signup', 'login', 'purchase'].forEach(e => log.append(e));
+let offsetA = 0; const batch = log.read(offsetA); offsetA += batch.length;
+console.log(batch, offsetA, log.read(1));
+```
+
+Output: `[ 'signup', 'login', 'purchase' ] 3 [ 'login', 'purchase' ]`. Another consumer can still start from offset 1.
+
+Common mistake: using a deleting queue when consumers will later need to replay history. Fix: a log-based broker with retention.
+
+</Level>
+
+<Level name="Intermediate">
+
+Databases and streams: a database's replication log is a stream of changes. Change data capture (CDC) reads that log and publishes every insert, update and delete as events, so search indexes, caches and warehouses can stay in sync without dual writes. Dual writes (the app writes to the database and then to the search index) go wrong under concurrency and partial failure.
+
+```text
+dual-write race:
+  client 1: DB set x=A ............................ index set x=A
+  client 2:          DB set x=B ... index set x=B
+  final: DB has B, index has A   (orders differed)
+CDC: index applies changes in the database's commit order -> always converges to B
+```
+
+Common mistake: dual writes from application code. Fix: write to the database only and derive everything else from its change stream.
+
+</Level>
+
+<Level name="Advanced">
+
+State, streams and immutability: the current state of a database is the result of applying the log of changes; the log is the source of truth and the tables are a cache of it. Event sourcing applies this at the application level. Log compaction keeps only the latest value per key, so a new consumer can rebuild state without the full history.
+
+```ts
+const changes = [['u1', 'Pune'], ['u2', 'Delhi'], ['u1', 'Mumbai'], ['u2', null]] as const;   // null = delete
+const compacted = new Map<string, string | null>();
+for (const [k, v] of changes) compacted.set(k, v);
+console.log([...compacted].filter(([, v]) => v !== null));
+```
+
+Output: `[ [ 'u1', 'Mumbai' ] ]`.
+
+Common mistake: deleting personal data from the state but leaving it in an immutable event log forever. Fix: compaction with tombstones, or per-user encryption keys that can be destroyed.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: reasoning about time. Event time (when it happened on the device) differs from processing time (when the stream processor sees it). A phone offline for an hour sends old events late. Windowing by processing time gives wrong counts; windowing by event time needs a decision about when a window is complete (watermarks) and what to do with stragglers.
+
+```ts
+type E = { eventMs: number; procMs: number };
+const evs: E[] = [{ eventMs: 1000, procMs: 1100 }, { eventMs: 61000, procMs: 61050 }, { eventMs: 2000, procMs: 3_600_000 }];
+const minute = (ms: number) => Math.floor(ms / 60000);
+const byEvent = evs.reduce((m, e) => (m[minute(e.eventMs)] = (m[minute(e.eventMs)] ?? 0) + 1, m), {} as Record<number, number>);
+const byProc = evs.reduce((m, e) => (m[minute(e.procMs)] = (m[minute(e.procMs)] ?? 0) + 1, m), {} as Record<number, number>);
+console.log(byEvent, byProc);
+```
+
+Output: `{ '0': 2, '1': 1 } { '0': 1, '1': 1, '60': 1 }`. The straggler belongs to minute 0 but arrived an hour later.
+
+Common mistake: dashboards bucketed by processing time that spike after an outage. Fix: event time windows with allowed lateness.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: stream joins. Stream-stream joins (match a search event with a click on its results within an hour) keep state for the window. Stream-table joins (enrich each event with the current user profile) keep a local copy of the table updated from its changelog. Table-table joins maintain a materialised view of a join of two changelogs. In every case, the result depends on timing: if the profile changes, which version did the event see? That is a slowly changing dimension problem.
+
+```text
+order event at 10:00 for user 42 (city then: Pune)
+profile change at 10:05: city -> Delhi
+stream processor lagging, processes the order at 10:10 -> enriches with Delhi (wrong for the order)
+fix: version the profile and join on the version valid at event time
+```
+
+Common mistake: assuming a stream-table join is deterministic. Fix: decide whether the join is as-of event time or as-of processing time, and implement that deliberately.
+
+</Level>
+
+<Level name="Production level">
+
+Fault tolerance in streams: you cannot rerun "the whole input" because it never ends. Approaches: microbatching (small batches, each rerun on failure), checkpointing operator state with input positions, and making output idempotent or transactional so retries do not duplicate effects. "Exactly once" in stream processors means exactly-once effects inside the framework; external side effects still need idempotency.
+
+```ts
+// idempotent sink keyed by (partition, offset)
+const applied = new Set<string>(); let total = 0;
+function sink(partition: number, offset: number, amount: number) {
+  const id = `${partition}:${offset}`; if (applied.has(id)) return; applied.add(id); total += amount;
+}
+sink(0, 7, 100); sink(0, 7, 100); sink(0, 8, 50);   // offset 7 redelivered after a crash
+console.log(total);
+```
+
+Output: `150`.
+
+Common mistake: committing the consumer offset before the side effect completes, losing events on crash; or after, without idempotency, duplicating them. Fix: commit offset and effect atomically, or make the effect idempotent.
+
+</Level>
+
+<Level name="Mindset">
+
+The log is the truth and everything else is derived. Thinking this way turns integration problems (keep the search index in sync) into stream processing problems with clear ordering.
+
+<Flow steps={['database commits', 'CDC publishes changes in order', 'consumers update derived stores', 'replay from offset 0 to rebuild any of them']} caption="Derived data from a change stream." />
+
+Common mistake: treating derived stores as independent sources. Fix: one log, many consumers.
+
+</Level>
+
+<Level name="System design">
+
+In a design: the database stays the system of record; CDC (for Postgres, logical decoding through a tool like Debezium) publishes changes to a log-based broker; consumers maintain search, caches, analytics and notifications. Each consumer is idempotent and can be rebuilt by replaying. Event time is carried in every event.
+
+```text
+orders DB --CDC--> topic orders.changes (partitioned by order_id)
+   -> search indexer (idempotent upserts)
+   -> cache invalidator
+   -> warehouse loader (hourly files)
+   -> notification service (dedupe by order_id + status)
+```
+
+Common mistake: partitioning the topic so changes to one entity spread across partitions, losing per-entity order. Fix: partition by entity key.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: run a local Kafka-compatible broker and Postgres with logical decoding; build a CDC consumer in TypeScript that keeps a search table in sync, kill it mid-stream, and verify convergence after restart. Then build an event-time windowed counter with a watermark and feed it late events.
+
+Exercise: reproduce the dual-write race with two concurrent clients and show CDC fixes it.
+
+Done when my derived store always converges to the database after crashes and replays, and my windowed counter handles late events within the allowed lateness.
+
+</Level>
+</Levels>
+
+### 13. A Philosophy of Streaming Systems
+**Covers:** Data integration (combining specialised tools by deriving data, batch and stream processing), unbundling databases (composing storage technologies, designing applications around dataflow, observing derived state), and aiming for correctness (the end-to-end argument for databases, enforcing constraints, timeliness and integrity, trust but verify).
+
+<Layers layers={[
+  { name: 'Applications', note: 'write events or commands; read derived views' },
+  { name: 'Derivation', note: 'batch and stream jobs: index, aggregate, join, cache' },
+  { name: 'Log', note: 'ordered, durable record of every change (the source of truth)' },
+  { name: 'Storage', note: 'specialised stores holding derived state' },
+]} caption="The unbundled database: the pieces of a database spread across a system, connected by logs." />
+
+<Levels label="Chapter 13, A Philosophy of Streaming Systems">
+
+<Level name="Beginner">
+
+No single tool does everything well: a relational database, a search index, a cache, a warehouse and an ML feature store each serve different reads. The chapter's argument is that combining them should be done by deriving data from one ordered source (a log) through batch and stream processing, rather than by having applications write to several systems.
+
+```text
+one write path:  app -> database (system of record) -> change log
+many read paths: search index, cache, warehouse, recommendations (all derived)
+```
+
+Common mistake: each team syncing its own copy from the application with its own logic. Fix: a shared change log as the integration point.
+
+</Level>
+
+<Level name="Intermediate">
+
+Batch and stream processing are two ways to compute the same derived data. Batch reprocesses historical data, which is how you build a new view or fix a bug; streams keep views current. Reprocessing lets a system evolve: build the new view alongside the old one, compare, switch readers gradually.
+
+```ts
+// the same derivation used by a batch rebuild and by incremental stream updates
+const derive = (state: Map<string, number>, e: { user: string; amount: number }) =>
+  state.set(e.user, (state.get(e.user) ?? 0) + e.amount);
+const history = [{ user: 'a', amount: 5 }, { user: 'b', amount: 3 }, { user: 'a', amount: 2 }];
+const batch = history.reduce(derive, new Map());
+const stream = new Map<string, number>(); for (const e of history) derive(stream, e);
+console.log(JSON.stringify([...batch]) === JSON.stringify([...stream]), batch.get('a'));
+```
+
+Output: `true 7`.
+
+Common mistake: separate code for batch and streaming that drifts apart. Fix: one derivation function, two drivers.
+
+</Level>
+
+<Level name="Advanced">
+
+Unbundling the database: a database internally has a log, indexes, materialised views and replication. The chapter suggests these can be composed across a system: the log in a broker, indexes in a search engine, views in caches, each maintained by stream processors. Designing applications around dataflow means application code becomes derivation functions; observing derived state means pushing changes to clients (subscriptions) rather than having them poll.
+
+```text
+inside one database          unbundled across a system
+WAL                          log-based broker
+secondary index              search index fed by CDC
+materialised view            stream processor writing to a cache
+trigger                      consumer reacting to an event
+```
+
+Common mistake: unbundling for a small app that one Postgres serves well. Fix: unbundle when one database cannot serve the read patterns, not as a default.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: the end-to-end argument for databases. A database transaction does not guarantee that a user's request is processed exactly once: a client can retry after a timeout and submit twice. Only an end-to-end identifier, from the client through every layer, can deduplicate.
+
+```ts
+const seen = new Map<string, string>();
+function submitOrder(requestId: string, item: string) {
+  if (seen.has(requestId)) return seen.get(requestId)!;       // retry: same answer, no second order
+  const orderId = `order-${seen.size + 1}`; seen.set(requestId, orderId); return orderId;
+}
+console.log(submitOrder('req-9f2', 'book'), submitOrder('req-9f2', 'book'));
+```
+
+Output: `order-1 order-1`.
+
+Common mistake: relying on the database's transactions to prevent double submission. Fix: a request id generated by the client and stored with a unique constraint.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: enforcing constraints in a log-based system. A uniqueness constraint (one account per username) can be enforced by routing all claims for a username to the same log partition and processing them sequentially: the first claim wins, later ones are rejected. Multi-partition constraints become multi-stage processes with request ids, reaching the same correctness without distributed transactions.
+
+<Flow steps={['claim event to partition by username', 'single-threaded processor reads in order', 'first claim accepted', 'later claims rejected', 'result events back to clients']} caption="A uniqueness constraint enforced by ordered processing in one partition." />
+
+```text
+partition for 'asha':  [claim by U1 @ offset 10] [claim by U2 @ offset 11]
+processor: offset 10 -> accept U1; offset 11 -> reject U2 (taken)
+```
+
+Common mistake: checking uniqueness in a read replica, then writing. Fix: decide in one ordered place.
+
+</Level>
+
+<Level name="Production level">
+
+Timeliness and integrity: timeliness means users see an up-to-date state; integrity means no corruption, nothing lost or contradictory. Violations of timeliness are often fine if temporary (eventual consistency); violations of integrity are not. Many constraints can be checked loosely and apologised for afterwards (overbooking, then compensating), which avoids coordination. Trust, but verify: run regular end-to-end checks that derived data matches its source, because bugs and hardware do corrupt data.
+
+```sql
+-- audit: does the derived daily total match the source?
+SELECT d.day, d.total AS derived, s.total AS source
+FROM daily_revenue d
+JOIN (SELECT created_at::date AS day, sum(total) AS total FROM orders GROUP BY 1) s USING (day)
+WHERE d.total <> s.total;
+-- expect zero rows
+```
+
+Common mistake: assuming derived data is correct because the pipeline has no errors. Fix: scheduled reconciliation queries with alerts.
+
+</Level>
+
+<Level name="Mindset">
+
+Prefer integrity over timeliness: let views be a little late, but never wrong in a way that cannot be detected and repaired. Keep the log, so any view can be rebuilt.
+
+<Compare left="timeliness" right="integrity" rows={[
+  ['user sees the latest state', 'no data lost or corrupted'],
+  ['violation: stale view', 'violation: permanent inconsistency'],
+  ['often acceptable briefly', 'never acceptable'],
+  ['fix: wait', 'fix: detect, repair, rebuild'],
+]} caption="Two meanings of consistency, separated." />
+
+Common mistake: paying for strong timeliness everywhere while having no integrity checks. Fix: invest in verification first.
+
+</Level>
+
+<Level name="System design">
+
+A design built on this philosophy: commands come in with request ids; a single log records accepted events; processors enforce constraints per partition; derived views serve reads; clients subscribe to changes; nightly reconciliation verifies every view against the log; any view can be rebuilt by replay.
+
+```text
+request (with request_id) -> validator (partition by key) -> events log
+events log -> views: account balance, search, analytics, notifications
+nightly: recompute each view from the log on a sample, compare, alert on mismatch
+```
+
+Common mistake: no replay path, so a corrupted view must be patched by hand. Fix: retain the log long enough to rebuild.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: take the CDC pipeline from chapter 12 and add end-to-end request ids, a uniqueness constraint enforced by ordered processing, a client subscription for live updates, and a reconciliation job that compares each derived view with the source.
+
+Exercise: corrupt a derived view on purpose and show the reconciliation catching it and a replay repairing it.
+
+Done when my system rejects duplicate submissions end to end, enforces a uniqueness constraint without a distributed transaction, and detects and repairs a corrupted view automatically.
+
+</Level>
+</Levels>
+
+## Responsibility
+
+### 14. Doing the Right Thing
+**Covers:** Predictive analytics (bias and discrimination, responsibility and accountability, feedback loops), and privacy and tracking (surveillance, consent and freedom of choice, privacy and use of data, data as assets and power, remembering the industrial revolution, legislation and self-regulation).
+
+<Flow steps={['data collected', 'model or rule decides about a person', 'decision affects their life', 'their response becomes new data', 'model trained on it again']} caption="The feedback loop the chapter warns about: decisions shape the data that justifies them." />
+
+<Levels label="Chapter 14, Doing the Right Thing">
+
+<Level name="Beginner">
+
+The last chapter steps back: data systems make decisions about people (credit, jobs, insurance, what news they see) and collect information about them. Engineers who build these systems carry part of the responsibility for their effects. Technical correctness is not enough.
+
+```text
+questions before shipping a data feature:
+  who is affected by this decision?
+  can they see why, and appeal it?
+  what data does it collect, and would the user expect that?
+```
+
+Common mistake: "I just build the pipeline; what it is used for is not my concern." Fix: ask the questions above as part of design review.
+
+</Level>
+
+<Level name="Intermediate">
+
+Predictive analytics can encode bias: a model trained on historical decisions learns the patterns in those decisions, including discriminatory ones, and proxies (postcode, name) can stand in for protected attributes even if those are removed. Accountability means a person can find out why a decision was made and challenge it.
+
+```ts
+// removing a protected attribute does not remove a correlated proxy
+const applicants = [
+  { area: 'north', group: 'X', approvedBefore: true }, { area: 'north', group: 'X', approvedBefore: true },
+  { area: 'south', group: 'Y', approvedBefore: false }, { area: 'south', group: 'Y', approvedBefore: false },
+];
+const ruleByArea = (a: { area: string }) => a.area === 'north';     // "group" not used
+console.log(applicants.map(a => [a.group, ruleByArea(a)]));
+```
+
+Output: `[ [ 'X', true ], [ 'X', true ], [ 'Y', false ], [ 'Y', false ] ]`. The rule never reads the group and still splits exactly along it.
+
+Common mistake: "the model doesn't use race or gender, so it's fair". Fix: measure outcomes across groups.
+
+</Level>
+
+<Level name="Advanced">
+
+Feedback loops: a system that predicts someone is a bad credit risk denies them credit, which makes it harder for them to build a credit history, which confirms the prediction. Recommendation systems that show more of what people clicked narrow what they see. Systems thinking, looking at the whole loop rather than one decision, is the tool.
+
+```ts
+// a toy loop: exposure follows past clicks, clicks follow exposure
+let shares = [0.5, 0.5];
+for (let round = 0; round < 5; round++) {
+  const clicks = shares.map(s => s * s);              // more exposure, disproportionately more clicks
+  const sum = clicks.reduce((a, b) => a + b);
+  shares = clicks.map(c => c / sum);
+  shares = [shares[0] + 0.0001, shares[1] - 0.0001];  // a tiny initial edge
+}
+console.log(shares.map(s => s.toFixed(3)));
+```
+
+Output: `[ '0.503', '0.497' ]`. The gap roughly doubles each round: after ten rounds it is `[ '0.601', '0.399' ]`, after twelve `[ '0.837', '0.163' ]`. A tiny edge became dominance with no difference in quality.
+
+Common mistake: evaluating a ranking system only on click-through rate. Fix: also track diversity and long-term outcomes.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: data collected for one purpose used for another. Location data collected to show nearby restaurants reveals home and work addresses, religious practice and health visits. Combining datasets re-identifies "anonymous" people.
+
+```text
+dataset A (anonymous): zip code, birth date, gender, diagnosis
+dataset B (public):    name, zip code, birth date, gender
+join on the three columns -> many people uniquely re-identified
+```
+
+Common mistake: calling data anonymous because names were removed. Fix: assume quasi-identifiers can be joined; aggregate, add noise, or do not collect.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: consent and choice. Users "agree" to terms they cannot read and cannot negotiate, and declining often means being excluded from a service everyone else uses. That is not meaningful consent. The chapter's comparison with surveillance (replace "data" with "surveillance" in a product pitch and see how it reads) is a useful test.
+
+```text
+"we collect behavioural data to improve the experience"
+"we run behavioural surveillance to improve the experience"
+if the second sentence would embarrass us, rethink the first
+```
+
+Common mistake: dark patterns that make "accept all" easy and "reject" hard. Fix: equal-effort choices and defaults that collect the minimum.
+
+</Level>
+
+<Level name="Production level">
+
+In production, privacy is engineering work: data minimisation (do not collect what you do not need), retention limits with automated deletion, access controls and audit logs, purpose limitation, and support for data subject requests (export and erasure). Legislation such as the GDPR sets requirements; self-regulation means doing more than the minimum.
+
+```sql
+-- retention enforced by the system, not by memory
+DELETE FROM page_views WHERE viewed_at < now() - interval '90 days';
+-- scheduled daily; the 90-day limit is documented in the privacy notice
+```
+
+Common mistake: "keep everything, storage is cheap". Fix: data is a liability as well as an asset; keep only what has a purpose and a deletion date.
+
+</Level>
+
+<Level name="Mindset">
+
+Data as assets and power: whoever holds data about people holds power over them. The chapter's comparison with the industrial revolution, which brought prosperity and also pollution and exploitation until society regulated it, suggests data has its own pollution problem. I treat my own systems as places where those choices are made.
+
+<Compare left="question" right="what I do" rows={[
+  ['do we need this field?', 'if not, do not collect it'],
+  ['how long do we keep it?', 'set a deletion date at creation'],
+  ['who can see it?', 'least privilege, audited'],
+  ['could this decision harm someone?', 'measure outcomes by group, allow appeal'],
+]} caption="My checklist for any feature that touches personal data." />
+
+Common mistake: treating ethics as a separate review at the end. Fix: questions in the design template.
+
+</Level>
+
+<Level name="System design">
+
+In a design document, I add a section on data about people: what is collected, why, retention, access, how a user exports or erases it, and which automated decisions affect them and how they appeal. The erasure path through every derived store (chapter 1) belongs here.
+
+```text
+feature: personalised recommendations
+data: view history (90 days), no location
+decisions: ranking only; no eligibility decisions
+user controls: clear history, turn off personalisation
+erasure: delete events + rebuild user's features within 24 h
+```
+
+Common mistake: a design doc with no section on people's data. Fix: make it a required heading.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write the data-about-people section for one system I have built, including retention and erasure paths through every derived store, and implement the automated retention job. Measure one decision rule or ranking in my own work across groups where I can.
+
+Exercise: take an "anonymous" dataset I control and try to re-identify records by joining quasi-identifiers; then fix the release.
+
+Done when every personal field in my system has a purpose, a retention period and an erasure path, and my design template has the people's-data section.
+
+</Level>
+</Levels>
+
+The book ends with a glossary and an index.
+
+## Misreadings to avoid
+
+- "Pick the most scalable database." Pick the one whose trade-offs match the workload; most applications are served by one well-run relational database for a long time.
+- "Eventual consistency is fine everywhere." It is fine for some reads and dangerous for others (uniqueness, money, reading your own writes). Decide per operation.
+- "Our database is ACID, so concurrency is handled." The default isolation level allows anomalies; check which.
+- "Exactly-once delivery solves duplicates." Exactly-once effects need idempotency or atomic offset-and-effect commits, end to end.
+- "Timestamps order events." Clocks on different machines disagree; use logical ordering where correctness depends on order.
+- "Streams replace databases." The log and the database are two views of the same data; derived views still need a system of record and verification.
+- "Ethics is someone else's job." The engineers who build data systems make many of the decisions that matter.
+
+## Done with this book when
+
+- For one application I know well, I have a data map: system of record, derived stores, feeds, freshness and erasure paths.
+- I can state SLOs with percentiles and measure them without coordinated omission.
+- I have reproduced every isolation anomaly in Postgres and protected each invariant with the cheapest reliable mechanism.
+- I have run a primary and replica, measured lag, done a failover drill and implemented read-your-writes routing.
+- I can pick and defend a shard key, and explain local versus global secondary indexes with numbers from my simulator.
+- I have a linearizability checker, a lease with fencing tokens, and a CDC pipeline that converges after crashes.
+- Gate: I can pass the phase 8 gate of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core plan</a> using this book for the trade-offs, and come back to chapters 9 to 13 for phase 10.
