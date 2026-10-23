@@ -52,94 +52,192 @@ criteria, and every accepted suggestion is read, run and logged in the delegatio
 
 #### Phase 12: Authentication, authorization and tenant isolation
 
+Three different questions get confused all the time. Authentication asks who is making this request.
+Authorization asks whether that identity can do this action. Tenant isolation asks whether this
+resource even belongs to the world that identity lives in. In a multi-tenant product the third
+question matters most, because a leak doesn't only hurt one user. It breaks the promise the whole
+product makes to every customer.
+
 <Flow
   caption="Every request, in order"
   steps={['session cookie', 'load session: user + tenant + role', 'route policy: is this role allowed?', 'ownership check on the resource', 'database with RLS tenant setting', 'response']}
+/>
+
+<Layers
+  caption="Where tenancy is enforced, outermost first"
+  layers={[
+    { name: 'route policy', note: 'role may call this endpoint' },
+    { name: 'service check', note: 'resource loaded with tenant in the query' },
+    { name: 'row-level security', note: 'database refuses other tenants even if code forgets' },
+    { name: 'derived stores', note: 'vector index, cache keys, queue payloads carry tenant' },
+  ]}
 />
 
 <Levels label="Phase 12, authentication, authorization and tenant isolation">
 
 <Level name="Beginner">
 
-Authentication proves who the user is (sign up, sign in, sign out, password reset, session expiry).
-Authorization decides what they may do (roles, ownership). Tenant isolation makes sure no user ever
-touches another customer's data. In the capstone all three are in place before the first feature.
+Authentication starts with sign-up and sign-in. The server checks a password against a stored slow
+hash, creates a session row, and sends back a cookie that holds only a random session id. On each
+request the server looks the id up. Sign-out deletes the row. Expiry is a column, so a stolen cookie
+stops working.
 
-Mistake: checking the role but not ownership: an editor in tenant A edits a document in tenant B by
-changing an id in the URL. Fix: every resource load includes the tenant and owner check.
+```ts
+export async function signIn(email: string, password: string) {
+  const user = await db.users.findByEmail(email.toLowerCase());
+  const ok = user && (await argon2.verify(user.passwordHash, password));
+  if (!ok) throw httpError(401, 'invalid_credentials');      // same error for both cases
+  const id = randomBytes(32).toString('base64url');
+  await db.sessions.insert({ id: sha256(id), userId: user.id, expiresAt: addDays(new Date(), 14) });
+  return cookie('sid', id, { httpOnly: true, secure: true, sameSite: 'lax', path: '/' });
+}
+```
+
+The session id is hashed at rest, so a database leak doesn't hand out live sessions. The error is the
+same whether the email exists or not, so nobody can use the form to list accounts.
+
+Authorization in its first form is a role check: viewers read, editors write, owners manage billing
+and members. Tenant isolation in its first form is a rule: every table that holds customer data has a
+`tenant_id`, and every query filters on it.
+
+Common mistake: checking the role but not ownership. An editor in tenant A changes the id in
+`/documents/123/edit` and edits tenant B's document, because the code only asked "are you an
+editor?". Fix: every resource load includes the tenant (and owner, where relevant) in the query.
 
 </Level>
 
 <Level name="Intermediate">
 
-Sessions are server-side rows with an expiry, referenced by an HttpOnly, Secure, SameSite cookie.
-Passwords use a slow hash (argon2id or bcrypt). Reset tokens are single-use, hashed at rest and
-short-lived.
+I put the rules in one module, so routes, workers and AI tools all ask the same question.
 
 ```ts
+const policy = {
+  viewer: ['documents:read', 'answers:ask'],
+  editor: ['documents:read', 'documents:write', 'answers:ask'],
+  owner:  ['documents:read', 'documents:write', 'answers:ask', 'members:manage', 'billing:manage'],
+} as const;
+
+export function can(role: Role, perm: Perm) { return (policy[role] as readonly string[]).includes(perm); }
+
 export async function requireDoc(ctx: Ctx, docId: string, need: 'read' | 'write') {
-  const doc = await db.documents.find({ id: docId, tenantId: ctx.tenantId }); // tenant in the query
-  if (!doc) throw httpError(404);                 // 404, not 403: do not reveal existence
-  if (need === 'write' && !can(ctx.role, 'documents:write')) throw httpError(403);
+  const doc = await db.documents.find({ id: docId, tenantId: ctx.tenantId });
+  if (!doc) throw httpError(404);           // 404, not 403: don't reveal it exists elsewhere
+  if (!can(ctx.role, need === 'write' ? 'documents:write' : 'documents:read')) throw httpError(403);
   return doc;
 }
 ```
+
+The test that matters most is the cross-tenant one. I seed two tenants and try everything across them:
+
+```ts
+test.each(routes)('%s refuses tenant B resources for tenant A', async (route) => {
+  const res = await as(userA).request(route.method, route.path(tenantB.docId));
+  expect([403, 404]).toContain(res.status);
+});
+// FAIL  PATCH /api/documents/:id  expected [403, 404] to contain 200
+```
+
+That failure line is the reason the suite exists. It names the exact route that forgot its check.
+
+Password reset: the token is random and single-use, stored as a hash, expires within the hour, and
+using it revokes every other session for that user.
 
 </Level>
 
 <Level name="Advanced">
 
-Defence in depth: the application check and Postgres RLS both enforce tenancy; vector retrieval
-filters by tenant; cache keys include tenant; queue messages carry tenant from the session, never
-from user input. Admin access is a separate role with audit logging of every action.
+Defence in depth means the database enforces tenancy too. With Postgres row-level security, the app
+sets the tenant per transaction and the policy does the rest:
+
+```sql
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON documents
+  USING (tenant_id = current_setting('app.tenant_id')::bigint);
+-- in each request transaction:
+SET LOCAL app.tenant_id = '42';
+SELECT count(*) FROM documents;   -- only tenant 42's rows, even with no WHERE clause
+```
+
+The app connects as a role that doesn't own the tables (owners bypass RLS unless it is forced), and
+migrations run as a separate role. Then I go through every derived store. Vector search filters on
+tenant before ranking. Cache keys start with the tenant id. Queue messages take tenant from the
+session at enqueue time, never from request bodies. AI tool calls run with the caller's context, not a
+service account.
+
+Admin and support access is a separate, audited path: who looked at which tenant, when, and why, with
+a reason field that can't be empty.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Expired session mid-form:** the form keeps its data and asks to sign in again.
-- **Password reset for an unknown email:** the same response as for a known one.
+- **Session expires mid-form:** the client keeps the draft locally, the server returns 401, and after
+  signing in again the draft is restored. Users shouldn't lose work to security.
+- **Reset for an unknown email:** same message and roughly the same response time as a known one.
+- **Email case and Unicode:** I normalise before lookup, otherwise `A@x.com` and `a@x.com` become two
+  accounts.
+- **Invitation accepted by a different signed-in user:** the invite is bound to an email. A mismatch
+  asks them to switch accounts instead of silently joining.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **User removed from a tenant while their session is live:** sessions are revoked on membership
-  change.
-- **A user in two tenants:** the active tenant is explicit in the session; switching re-checks
-  membership.
+- **User removed from a tenant while signed in:** their membership-scoped sessions are revoked
+  straight away, or each request re-checks membership. Otherwise they keep access until expiry.
+- **One person in two tenants:** the active tenant is explicit in the session. Switching re-checks
+  membership and rotates the session id.
+- **Background job running after a role downgrade:** jobs re-check permission when they run, not only
+  when they are queued.
+- **Last owner leaves:** blocked. A tenant must always have an owner, otherwise billing and deletion
+  have no one who can act.
 
 </Level>
 
 <Level name="Production level">
 
-Tests: cross-tenant access for every route, an IDOR test per resource, session expiry, reset token
-reuse. Login is rate-limited.
+I watch failed logins per account and per IP, run rate limits on sign-in and reset, alert on spikes,
+and keep an audit log of role changes and admin access. The cross-tenant suite runs on every PR. To
+prove it can fail, I remove one check on a branch and watch the build go red. Session cookies are
+rotated on privilege change. There is a documented way to revoke every session for a tenant if one
+of their accounts is compromised.
 
 </Level>
 
 <Level name="Mindset">
 
-Auth is the code I do not delegate and do not improvise.
+Auth is the code I don't improvise and don't delegate. Boring, explicit and tested beats clever. When
+I'm unsure, I deny by default and make allowing something a deliberate line of code.
 
 </Level>
 
 <Level name="System design">
 
-One authorization module, used by HTTP routes, AI tools and workers alike.
+One authorization module, one request context, and RLS underneath. Every entry point builds the same
+context: HTTP routes, webhooks, workers and AI tool calls. If a new entry point can't build that
+context, it can't touch data. That is a design property, not a code review habit.
 
 </Level>
 
 <Level name="Strategy">
 
-I write the cross-tenant test suite first, then the auth code until it passes. Done when every route
-is covered and a deliberately removed check fails a test.
+Week 63 starts with the cross-tenant suite, red. Then I write auth and policy code until it goes
+green, then add RLS and watch it catch a check I left out on purpose. Done when every route and job
+is in the suite, RLS is on for every tenant table, and a removed check fails CI.
 
 </Level>
 
 </Levels>
-
 #### Phase 12: A database with migrations, indexes and a backup/restore drill
+
+The database is the one part of the capstone I can't redeploy my way out of. Code that's broken can
+be rolled back in minutes. Data that's gone or corrupted stays that way unless a restore I've
+practised brings it back.
+
+<Flow
+  caption="Expand, migrate, contract: renaming a column without downtime"
+  steps={['expand: add new column, nullable', 'deploy app that writes both', 'backfill in batches', 'deploy app that reads new', 'contract: drop old column']}
+/>
 
 <Figure art={`
   backup drill
@@ -153,75 +251,130 @@ is covered and a deliberately removed check fails a test.
 
 <Level name="Beginner">
 
-The schema has constraints (not null, unique, foreign keys, checks) so bad data cannot get in.
-Migrations change the schema in versioned, reviewed files. Indexes make the important queries fast.
-Backups are taken automatically and restored on purpose to prove they work.
+Constraints are the database's own tests. They run on every write, whatever code did the writing.
 
-Mistake: editing the production schema by hand. Fix: every change is a migration in the repo.
+```sql
+CREATE TABLE documents (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id  bigint NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  title      text   NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+  status     text   NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','indexed','failed')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO documents (tenant_id, title) VALUES (42, '');
+-- ERROR:  new row for relation "documents" violates check constraint "documents_title_check"
+```
+
+Migrations are numbered files in the repo that move the schema forward, applied by a tool in CI and
+on deploy. Never by hand.
+
+Common mistake: editing the production schema in a console "just this once". The next migration then
+fails or drifts. Fix: every change, including a one-off index, is a migration file.
 
 </Level>
 
 <Level name="Intermediate">
 
-Indexes come from the queries: I list the top queries from the slow log and `EXPLAIN ANALYZE` each.
+Indexes come from real queries, not guesses. I take the top queries by total time (for example from
+`pg_stat_statements`) and run each through `EXPLAIN ANALYZE`:
 
 ```sql
 EXPLAIN ANALYZE SELECT id, title FROM documents
 WHERE tenant_id = 42 ORDER BY updated_at DESC LIMIT 20;
--- before: Seq Scan on documents ... then Sort
--- after CREATE INDEX ON documents (tenant_id, updated_at DESC): Index Scan, no sort
+-- before:
+--   Limit -> Sort (Sort Key: updated_at DESC) -> Seq Scan on documents (Filter: tenant_id = 42)
+CREATE INDEX CONCURRENTLY documents_tenant_updated ON documents (tenant_id, updated_at DESC);
+-- after:
+--   Limit -> Index Scan using documents_tenant_updated on documents (Index Cond: tenant_id = 42)
 ```
+
+Column order follows the query: equality first (tenant_id), then the sort column. The sort step goes
+away because the index already returns rows in order. I write the before and after timings into the
+ADR for that index. I don't quote them from memory.
+
+Backups: the managed host takes nightly snapshots plus continuous WAL archiving. That allows
+point-in-time recovery. The drill in the figure proves it works.
 
 </Level>
 
 <Level name="Advanced">
 
-Migrations are backward-compatible with the previous app version (expand, migrate data, contract), so
-deploys and rollbacks never break. Large index builds use `CREATE INDEX CONCURRENTLY` to avoid locking
-writes.
+Zero-downtime migrations follow expand and contract. During a deploy, the old and new versions of the
+app run at the same time, so each migration must work with both. Dangerous operations get rewritten:
+
+```sql
+-- risky on a big table: takes a strong lock while it validates every row
+ALTER TABLE documents ADD CONSTRAINT fk_owner FOREIGN KEY (owner_id) REFERENCES users(id);
+-- safer: add without validating, then validate separately (lighter lock)
+ALTER TABLE documents ADD CONSTRAINT fk_owner FOREIGN KEY (owner_id) REFERENCES users(id) NOT VALID;
+ALTER TABLE documents VALIDATE CONSTRAINT fk_owner;
+```
+
+I set a `lock_timeout` in migrations, so a migration that can't get its lock fails fast instead of
+queueing behind a long query and blocking everything after it. Backfills run in batches of a few
+thousand rows with a pause between them, and they can restart from where they stopped.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **A migration on an empty test database passes, on production data fails** (a not-null column on
-  existing rows): test migrations against a copy of realistic data.
+- **Migration passes on an empty test database, fails on production data:** for example, adding a
+  NOT NULL column when old rows have nothing to put there. Fix: add it nullable, backfill, then add the
+  constraint. Test migrations against a realistic copy.
+- **Long-running transaction during a migration:** the ALTER waits on its lock, and everything queues
+  behind it. `lock_timeout` plus a retry turns an outage into a failed deploy step.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Restore plus vectors:** the vector index is derived; the drill includes rebuilding or verifying it.
+- **Restore and derived data:** the vector index and caches are built from rows. After a
+  point-in-time restore they may hold chunks of documents that the restore removed. The drill
+  includes a rebuild or a consistency check.
+- **Restore across a migration:** restoring to before migration N means the running app must be one
+  that works with that schema. The runbook pairs restore points with app versions.
 
 </Level>
 
 <Level name="Production level">
 
-Restore time and data-loss window are measured numbers in the runbook.
+The runbook holds two measured numbers: restore time and the data-loss window (RTO and RPO). It also
+lists the exact commands and who can run them. Slow-query logging is on. Index bloat and unused
+indexes get reviewed every quarter. Connection pooling limits are written down, so a traffic spike
+can't run Postgres out of connections.
 
 </Level>
 
 <Level name="Mindset">
 
-Data outlives code. I treat schema changes with more care than code changes.
+Data outlives code. A schema change gets more care than a code change, and a deletion gets the most
+care of all.
 
 </Level>
 
 <Level name="System design">
 
-Postgres is the source of truth for rows, full-text, vectors and the job queue; one thing to back up.
+Postgres is the single source of truth for rows, full-text, vectors (pgvector) and the job queue.
+That gives me one thing to back up and one transaction boundary. A specialised store gets added only
+when a measured limit forces it, and that decision goes in an ADR.
 
 </Level>
 
 <Level name="Strategy">
 
-I run the restore drill twice and record both. Done when the runbook has the measured restore time.
+I run the restore drill twice in week 63: once to learn it, once to time it. Done when the runbook has
+the measured RTO and RPO, every schema change is a migration, and the top five queries have an
+EXPLAIN plan on record.
 
 </Level>
 
 </Levels>
 
 #### Phase 12: A frontend with accessible, fast, tested core flows
+
+Core flows are the few paths every user takes. If those are fast, accessible and tested, the rest
+can be rough for a while. If they aren't, nothing else matters.
 
 <Compare
   caption="Core flow budgets"
@@ -235,14 +388,32 @@ I run the restore drill twice and record both. Done when the runbook has the mea
   ]}
 />
 
+<Flow
+  caption="The four states every async view has"
+  steps={['loading: skeleton, not a spinner forever', 'error: what happened + retry', 'empty: what to do first', 'success: the content']}
+/>
+
 <Levels label="Phase 12, frontend core flows">
 
 <Level name="Beginner">
 
-Core flows are the few paths every user takes. Each has loading, error, empty and success states,
-works with the keyboard alone, and has an end-to-end test.
+Every view that waits on the network has four states. I write them as one component so none get
+forgotten:
 
-Mistake: testing components but not the flow. Fix: one Playwright test per core flow.
+```tsx
+function Answers({ q }: { q: Query }) {
+  if (q.status === 'loading') return <AnswerSkeleton />;
+  if (q.status === 'error')   return <ErrorBox message="Couldn't load answers." onRetry={q.retry} />;
+  if (q.data.length === 0)    return <Empty>Upload a document to ask your first question.</Empty>;
+  return <AnswerList items={q.data} />;
+}
+```
+
+Accessibility at its most basic: real buttons and links, a label on every input, visible focus,
+enough colour contrast, and headings in order.
+
+Common mistake: testing components one at a time but never the whole flow, so the flow breaks
+where they connect. Fix: one end-to-end test per core flow.
 
 </Level>
 
@@ -259,56 +430,92 @@ test('ask a question and open a citation', async ({ page }) => {
 });
 ```
 
-Role-based selectors double as accessibility checks.
+Role-based selectors do two jobs: they find elements the way assistive technology does, so an
+unlabeled textbox fails the test. When it does, the error says so plainly:
+
+```text
+Error: locator.fill: Timeout 5000ms exceeded.
+  waiting for getByRole('textbox', { name: 'Ask about your documents' })
+```
+
+I add an axe scan to each flow test and fail on serious or critical violations.
 
 </Level>
 
 <Level name="Advanced">
 
-Performance budgets in CI (Lighthouse CI) for LCP, CLS, bundle size; INP checked on the answer
-interaction in the field with real-user monitoring.
+Performance has two sides. Lab budgets run in CI (Lighthouse CI asserting LCP, CLS and total JS).
+Field numbers come from real-user monitoring (the `web-vitals` library sending LCP, INP and CLS with
+the route and release). For the streamed answer, INP is the number to watch. Typing in the box and
+pressing Enter must stay responsive while tokens stream in, so DOM updates are batched once per
+animation frame, not once per token.
+
+```ts
+let buf = ''; let scheduled = false;
+stream.on('token', (t) => {
+  buf += t;
+  if (!scheduled) { scheduled = true; requestAnimationFrame(() => { el.append(buf); buf = ''; scheduled = false; }); }
+});
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Slow 3G:** the streamed answer still shows progress; the upload shows real progress.
+- **Slow network:** uploads show real progress and can be cancelled. The streamed answer shows
+  something within the first second.
+- **320 px width and 200% zoom:** no horizontal scroll on core flows, and buttons stay reachable.
+- **Answer finishes while focus is elsewhere:** a polite live region announces it without moving focus.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Reduced motion plus a streaming animation:** respect `prefers-reduced-motion`.
+- **Reduced motion:** the streaming cursor and skeleton shimmer respect `prefers-reduced-motion`.
+- **Double submit:** the ask button is disabled while a request is in flight, and the server is
+  idempotent anyway.
+- **Back button mid-stream:** the request is aborted with an `AbortController`, so tokens aren't
+  billed for a page nobody is looking at.
 
 </Level>
 
 <Level name="Production level">
 
-Front-end errors go to error tracking with the release version.
+Front-end errors go to error tracking with release version and route. Source maps are uploaded but
+not served publicly. Field vitals are on the dashboard, split by device class.
 
 </Level>
 
 <Level name="Mindset">
 
-A flow is done when someone using only a keyboard or a screen reader can finish it.
+A flow is done when someone using only a keyboard or a screen reader can finish it, on a slow phone.
 
 </Level>
 
 <Level name="System design">
 
-Flows are the contract between product and code; their tests run on every deploy.
+The core flows are the contract between product and code. Their tests run on every deploy and against
+staging after every deploy, so a broken flow blocks the release.
 
 </Level>
 
 <Level name="Strategy">
 
-I write the four flow tests first. Done when they pass in CI and an axe scan shows no serious issues.
+Week 64: the four flow tests come first, then the UI to make them pass. Done when they pass in CI with
+axe clean, lab budgets are asserted, and field vitals are reporting.
 
 </Level>
 
 </Levels>
-
 #### Phase 12: A backend with validation, rate limits, jobs and useful errors
+
+The backend's job is to be predictable. Bad input gets a clear answer, abuse gets slowed down, slow
+work moves to the background, and every failure leaves a trail I can follow.
+
+<Flow
+  caption="The middleware chain for every route"
+  steps={['request id', 'session + tenant context', 'rate limit', 'schema validation', 'handler', 'error mapper', 'structured log line']}
+/>
 
 <Figure art={`
   HTTP 422
@@ -324,59 +531,111 @@ I write the four flow tests first. Done when they pass in CI and an axe scan sho
 
 <Level name="Beginner">
 
-Every input is validated at the boundary with a schema. Every AI and auth endpoint is rate-limited.
-Slow work (ingest, emails) runs in background jobs. Errors have one consistent shape with a request id.
+Validation happens at the boundary, before any handler logic runs. A schema library turns
+"unknown JSON" into a typed value or a list of problems:
 
-Mistake: returning stack traces to users. Fix: log the stack, return the shape.
+```ts
+const CreateDoc = z.object({ title: z.string().trim().min(1).max(200), sourceUrl: z.string().url().optional() });
+
+app.post('/api/documents', async (req, res) => {
+  const parsed = CreateDoc.safeParse(req.body);
+  if (!parsed.success) return sendError(res, 422, 'validation_failed', parsed.error.flatten().fieldErrors);
+  const doc = await createDocument(req.ctx, parsed.data);
+  res.status(201).json(doc);
+});
+```
+
+Common mistake: returning the raw exception to the user, stack trace and SQL included. Fix: log the
+full error with the request id, and return the standard shape with that id.
 
 </Level>
 
 <Level name="Intermediate">
 
-Jobs are idempotent, retried with backoff, and dead-lettered after N attempts; their status is
-visible to the user ("indexing 3 of 10").
+Rate limits protect two things: availability and money. AI endpoints get a per-user limit and a
+per-tenant limit. Sign-in gets per-account and per-IP limits. The response tells the client when to
+retry:
+
+```text
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+{"error":"rate_limited","message":"Too many questions. Try again in 12 seconds.","requestId":"req_91ab"}
+```
+
+Jobs: document ingest runs in a queue backed by Postgres (`SELECT ... FOR UPDATE SKIP LOCKED`). Each
+job is idempotent, retried with exponential backoff and jitter, and dead-lettered after five
+attempts. The user sees progress in the UI, for example "indexing 3 of 10".
+
+```sql
+UPDATE jobs SET locked_at = now(), attempts = attempts + 1
+WHERE id = (SELECT id FROM jobs WHERE run_at <= now() AND locked_at IS NULL
+            ORDER BY run_at FOR UPDATE SKIP LOCKED LIMIT 1)
+RETURNING *;
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Idempotency keys on mutating endpoints that clients may retry (uploads, payments) prevent duplicates.
+Idempotency keys make retries from clients safe. The client sends a key, the server stores the first
+response under that key, and any repeat gets the stored response back:
+
+```ts
+const prior = await db.idem.find(ctx.tenantId, key);
+if (prior) return res.status(prior.status).json(prior.body);   // replay, no second side effect
+const result = await doUpload(ctx, body);
+await db.idem.insert({ tenantId: ctx.tenantId, key, status: 201, body: result });
+```
+
+The insert and the side effect share a transaction where they can. Timeouts are set on every outbound
+call, so one slow dependency can't hold every worker.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Payload too large:** a 413 with the limit stated.
+- **Payload too large:** 413 with the limit in the message. Uploads go straight to object storage
+  with a signed URL, so big files never pass through the app server.
+- **Unknown fields in the body:** the schema strips or rejects them. It never passes them through to
+  the database (mass assignment).
+- **Client disconnects mid-request:** handlers check the abort signal before expensive steps.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Job retried after the document was deleted:** the job checks existence first and exits cleanly.
+- **Job retried after its document was deleted:** the job loads the row first and exits cleanly if
+  it's gone. That's a success, not a dead letter.
+- **Poison message:** one malformed file fails every time. The dead-letter queue holds it with the
+  error, and an alert fires on dead-letter count, not on each failure.
 
 </Level>
 
 <Level name="Production level">
 
-Error rates per route and job failure rates are alerting metrics.
+Error rate per route, p95 per route, queue depth, oldest job age and dead-letter count are metrics
+with alerts. Every 5xx has a request id that leads to the trace.
 
 </Level>
 
 <Level name="Mindset">
 
-A useful error saves a support request.
+A useful error saves a support request, and a useful log saves an hour of an incident.
 
 </Level>
 
 <Level name="System design">
 
-Validation, limits and errors are middleware; handlers stay small.
+Validation, limits, context and error mapping live in middleware, so handlers stay small and look the
+same. Workers use the same context and error types as HTTP.
 
 </Level>
 
 <Level name="Strategy">
 
-I fuzz every endpoint with invalid input. Done when all return the error shape and none returns 500.
+Week 64: I fuzz every endpoint with invalid and oversized input. Done when all of them return the
+standard shape, none returns a 500, and the job queue survives a killed worker with no lost or
+duplicated work.
 
 </Level>
 
@@ -384,76 +643,129 @@ I fuzz every endpoint with invalid input. Done when all return the error shape a
 
 #### Phase 12: An AI feature with retrieval, citations, evals, guardrails and a cost budget
 
+This is the phase 7 and 8 work living inside a real product. The difference is that now there are
+real users, real tenants, and real money.
+
 <Flow
-  caption="The phase 7 and 8 work, inside the product"
-  steps={['retrieve (tenant-filtered, hybrid, reranked)', 'answer with citations or refuse', 'guardrails', 'cost check against the budget', 'trace + feedback', 'eval suite in CI']}
+  caption="The answer path"
+  steps={['question + tenant context', 'hybrid retrieve (tenant-filtered)', 'rerank, trim to budget', 'generate with cited sources', 'verify citations exist', 'guardrails', 'stream + log trace + cost']}
+/>
+
+<Compare
+  caption="Failure taxonomy I report against"
+  left="Failure class"
+  right="Typical fix"
+  rows={[
+    ['Retrieval miss: right chunk not retrieved', 'Chunking, hybrid weights, query rewriting'],
+    ['Context loss: retrieved but trimmed', 'Reranking, smaller chunks, budget split'],
+    ['Generation: had it, said it wrong', 'Prompt, model choice, citation enforcement'],
+    ['Should have refused', 'Refusal threshold, eval cases for missing info'],
+  ]}
 />
 
 <Levels label="Phase 12, the AI feature">
 
 <Level name="Beginner">
 
-The capstone's AI feature is the phase 8 Q&A, now inside a product with real users. It answers with
-citations, refuses when sources are missing, and stays within a cost budget.
+The feature answers questions about a tenant's own documents. It cites the passages it used, and it
+says "I can't find that in your documents" when nothing relevant comes back. Refusal is a feature,
+not a failure. A confident wrong answer is worse than an honest "not found".
 
-Mistake: re-tuning by feel in the last week. Fix: every change goes through the eval suite.
+Common mistake: tuning by feel in the last week ("this answer looks better now"). Fix: every change
+goes through the eval suite, and the PR shows the before and after table.
 
 </Level>
 
 <Level name="Intermediate">
 
-The eval suite grows from user feedback: every thumbs-down is triaged and many become cases. The suite
-runs in CI with a results table on the PR.
+The eval suite grows from use. Every thumbs-down is triaged into the taxonomy, and many become cases:
+
+```ts
+{ id: 'c-041', tenant: 'sample-legal', q: 'What is the termination notice period?',
+  mustCite: ['contract.pdf#p3'], expect: 'states 30 days', kind: 'faithful' },
+{ id: 'c-042', tenant: 'sample-legal', q: 'What is the CEO salary?',
+  expect: 'refuses: not in documents', kind: 'refusal' },
+```
+
+CI output on a PR:
+
+```text
+evals (52 cases)  base -> PR
+  faithful   44 -> 46
+  cited      50 -> 50
+  refusal     6 -> 5   REGRESSION c-042 answered with an invented figure
+  p95 ms      recorded per run
+  cost/case   recorded per run
+FAIL: refusal regression
+```
 
 </Level>
 
 <Level name="Advanced">
 
-I report quality with the failure taxonomy: what share of bad answers were retrieval, context or
-generation failures, and what I did about the biggest class.
+Citation enforcement is code, not trust in the prompt. After generation, every cited id is checked
+against the retrieved set. An answer citing a chunk that wasn't retrieved is rejected and retried
+once, or shown with that citation removed and a warning. Guardrails run on input (length,
+prompt-injection markers in retrieved text kept as data, never as instructions) and on output (PII
+patterns, no URLs that aren't in the sources).
+
+I report quality through the taxonomy: what share of bad answers were retrieval, context or
+generation failures this week, and which fix I made for the biggest class, with eval evidence.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **A tenant with one document:** retrieval works, but the refusal path is common; check the UX.
+- **A tenant with one short document:** most questions should refuse. I check that the refusal UX
+  suggests uploading more, instead of reading as an error.
+- **A question in a different language from the documents:** retrieval quality drops. That's an eval
+  case and a known limit in the user guide.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Budget exhausted mid-month for one tenant:** non-AI mode, clear message, and an alert to me.
+- **Budget used up mid-month for one tenant:** the feature switches to search-only mode with a clear
+  message. The tenant owner and I both get alerted. Other tenants aren't affected.
+- **A document edited after an answer cited it:** the citation link points to the version it cited,
+  or shows a "source has changed" note.
 
 </Level>
 
 <Level name="Production level">
 
-Prompt and model versions in the registry; rollback rehearsed; provider outage degrades to search.
+Prompt and model versions live in a registry and get logged with every trace. Rollback to the previous
+pair has been rehearsed. A provider outage drops the feature to search results after a timeout.
+Cost per successful answer is a tracked metric, not a guess.
 
 </Level>
 
 <Level name="Mindset">
 
-The AI feature is one component with numbers, like the database.
+The AI feature is one component with numbers, like the database. It earns trust through evals and
+traces, not through demos.
 
 </Level>
 
 <Level name="System design">
 
-It uses the same auth, tenancy, jobs and observability as every other feature.
+It uses the same auth context, tenancy, job queue, rate limits and observability as everything else.
+There's no side door for AI.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the eval dashboard shows the trend over the capstone weeks and one improvement made with
-evidence.
+Week 65. Done when the eval dashboard shows the trend across the capstone weeks, one improvement
+backed by eval evidence, citation enforcement tested, and the budget cutover rehearsed.
 
 </Level>
 
 </Levels>
-
 #### Phase 12: Observability: logs, metrics, traces, error tracking, an eval dashboard
+
+Operating without guessing means any question about the running system can be answered from what it
+already records. If I have to add logging to understand an incident, I'm already late.
 
 <Layers
   caption="What I look at, from the top"
@@ -466,63 +778,104 @@ evidence.
   ]}
 />
 
+<Figure art={`
+  trace req_7f3c  POST /api/ask                         total 4.2 s
+  |- auth.session               ##                          12 ms
+  |- retrieve.hybrid            #####                      180 ms
+  |- rerank                     ####                       150 ms
+  |- llm.generate               ##############################  3.7 s   tokens in/out logged
+  |- citations.verify           #                            8 ms
+  '- log + cost                 #                            5 ms
+`} caption="One trace shows where four seconds went. Here the model call dominates, so caching retrieval won't help much." />
+
 <Levels label="Phase 12, observability">
 
 <Level name="Beginner">
 
-Logs say what happened, metrics say how much and how fast, traces say where time went in one request,
-error tracking groups exceptions, the eval dashboard says how good the AI is. Together they let me
-operate without guessing.
+Each tool answers a different question. Logs answer "what happened?". Metrics answer "how much, how
+often, how fast?". Traces answer "where did the time go in this one request?". Error tracking answers
+"which exceptions, how often, since which release?". The eval dashboard answers "how good are the
+answers?".
+
+Logs are structured, one JSON object per line, with the request id, tenant id and route:
+
+```json
+{"level":"info","msg":"answer.done","requestId":"req_7f3c","tenantId":42,"route":"/api/ask","ms":4210,"tokensIn":3100,"tokensOut":280,"cited":3}
+```
+
+Common mistake: logging prompts and documents in full. That leaks tenant data into the logging
+vendor. Fix: log ids, sizes and hashes. Full content goes to a short-retention, access-controlled
+store only when needed.
 
 </Level>
 
 <Level name="Intermediate">
 
-I define two or three SLOs (for example, 99.5% of page loads succeed; 95% of answers within 5 s) and
-alert on burning the error budget, not on every blip.
+SLOs turn metrics into decisions. Two or three are enough for the capstone:
+
+```text
+SLO 1  99.5% of page requests succeed (non-5xx) over 28 days
+SLO 2  95% of answers complete within 6 s over 28 days
+SLO 3  answer success (cited or valid refusal) >= target on the weekly eval run
+```
+
+Alerts fire when the error budget is burning fast (a large share of the month's budget used in an
+hour), not on every spike. A spike that fixes itself isn't worth waking anyone.
 
 </Level>
 
 <Level name="Advanced">
 
-Every alert links to a runbook step and a dashboard. An alert with no action is deleted.
+OpenTelemetry carries the trace context from browser to server to worker to the provider call, so
+one id follows a question through ingest and answer. Each AI stage is a span with attributes:
+model, prompt version, tokens, cache hit, number of chunks. That's how the figure above gets made.
+Every alert links to a dashboard and a runbook step. An alert that has no action gets deleted.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Zero traffic at night looks like an outage:** use synthetic checks.
+- **No traffic at night looks like perfect health:** synthetic checks run the core flows every few
+  minutes and count toward availability.
+- **High-cardinality labels:** putting user ids on metrics blows up cost. User and tenant go on
+  traces and logs. Metrics get only bounded labels like route or plan.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Observability vendor down during an incident:** keep minimal local logs.
+- **Observability vendor down during an incident:** stdout logs are kept for a short window on the
+  host, so I'm never fully blind.
+- **Sampling drops the one trace I need:** errors and slow requests are always kept (tail sampling).
+  Only fast successes get sampled.
 
 </Level>
 
 <Level name="Production level">
 
-A weekly look at dashboards, written in the log.
+Once a week I review the dashboards and note anything odd in the study log. Error tracking groups are
+triaged: assigned, fixed, or marked expected with a reason. Release markers on graphs show which
+deploy changed what.
 
 </Level>
 
 <Level name="Mindset">
 
-If I have to add logging to understand an incident, observability failed before the incident did.
+Observability is how I learn what the system actually does, as opposed to what I designed it to do.
 
 </Level>
 
 <Level name="System design">
 
-One request id ties browser, server, worker and provider call together.
+One request id and one trace context tie browser, server, worker and provider call together. The
+logging, metrics and tracing setup is shared code, not something each feature does its own way.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when I can answer "why was this slow?" and "why was this wrong?" for any request from tools
-alone.
+Week 66. Done when, for any request, I can answer "why was this slow?" and "why was this wrong?" from
+the tools alone, and each alert has a runbook link.
 
 </Level>
 
@@ -540,73 +893,101 @@ alone.
   Elevation       injected tool use    -> no write tools, approvals
 `} caption="A threat model as a table: one threat per row, one control per threat." />
 
+<Flow
+  caption="Trust boundaries the threat model walks"
+  steps={['browser (untrusted)', 'app server', 'database', 'object storage', 'model provider', 'payment provider webhooks (verify signature)']}
+/>
+
 <Levels label="Phase 12, security">
 
 <Level name="Beginner">
 
-A threat model lists what an attacker could do and what stops them. A secrets scan finds keys committed
-by mistake. A dependency audit finds known vulnerabilities in packages.
+A threat model starts with the architecture diagram and asks, at each boundary: what could go wrong
+here, and what stops it? STRIDE is a handy prompt list: spoofing, tampering, repudiation, information
+disclosure, denial of service, elevation of privilege. Each threat gets one row with a control and a
+test.
 
-Mistake: a threat model written once and never revisited. Fix: update it with each new feature.
+Common mistake: writing it once and never coming back. Fix: any PR that adds a boundary (a new
+provider, a new upload type) updates the threat model.
 
 </Level>
 
 <Level name="Intermediate">
 
+The automated parts run in CI:
+
 ```bash
-gitleaks detect --source . --redact      # secrets in history
-npm audit --omit=dev                     # known vulnerable packages
+gitleaks detect --source . --redact        # secrets in the working tree and history
+npm audit --omit=dev --audit-level=high    # known vulnerabilities in runtime deps
 ```
 
-Both run in CI and block on findings above a severity I set.
+```text
+Finding:     STRIPE_SECRET_KEY=sk_test_****
+File:        scripts/seed.ts   Line: 4
+Commit:      3e1a...           1 leak found
+```
+
+Even a test key gets rotated, because the habit matters more than the key. Response headers are set
+once: a Content-Security-Policy that blocks inline scripts, HSTS, frame-ancestors none, and
+`X-Content-Type-Options: nosniff`.
 
 </Level>
 
 <Level name="Advanced">
 
-The AI section covers prompt injection via documents, data sent to providers, and tool permissions,
-with tests for each.
+The AI section of the threat model has its own rows. Retrieved documents can contain instructions
+(indirect prompt injection), so retrieved text is treated as data, the model has no write tools, and
+anything with side effects needs my approval. Data sent to the provider is listed, along with the
+provider's retention terms. Uploads get type-checked by content, not just extension, size-limited, and
+parsed in a worker with no network access to internal services (to block SSRF through document URLs).
 
 </Level>
 
 <Level name="Edge cases">
 
-- **A vulnerable package with no fix:** document the exposure and mitigation; do not ignore silently.
+- **A vulnerable package with no fix yet:** check whether the vulnerable path is actually reachable,
+  write down the exposure and the mitigation, and set a date to check again. Never ignore it quietly.
+- **A dev-only dependency flagged:** lower priority, but still tracked.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **A secret found in an old commit:** rotate it first, then clean history; rotation is the fix.
+- **A secret found in an old commit:** rotate it first, then clean history if needed. Cleaning
+  history doesn't revoke a key that's already been cloned.
+- **SVG upload:** it can carry scripts. I serve uploads from a separate origin with a
+  `Content-Disposition` header, or convert them.
 
 </Level>
 
 <Level name="Production level">
 
-Security findings are tracked like bugs with owners and dates.
+Security findings are tracked like bugs, with severity, owner and date. Dependencies are updated on
+a schedule, in small batches, with tests. Access to production is limited, logged, and needs 2FA.
 
 </Level>
 
 <Level name="Mindset">
 
-Security is a property of the system I keep, not a review I pass.
+Security is a property of the system I keep up, not a review I pass once.
 
 </Level>
 
 <Level name="System design">
 
-The threat model follows the architecture diagram's trust boundaries.
+The threat model follows the trust boundaries on the architecture diagram. New boundaries need a row
+before the code can merge.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the threat model has a tested control per row and CI blocks secrets and serious vulnerabilities.
+Week 66. Done when each row in the threat model has a tested control and CI blocks secrets and
+high-severity vulnerabilities.
 
 </Level>
 
 </Levels>
-
 #### Phase 12: DevOps: CI/CD, a rollback, a runbook, an incident game day
 
 <Flow
@@ -614,62 +995,111 @@ Done when the threat model has a tested control per row and CI blocks secrets an
   steps={['push', 'CI: lint, types, unit, evals, e2e, scans', 'build image', 'deploy to staging', 'smoke tests', 'deploy to production', 'watch; rollback if needed']}
 />
 
+<Timeline
+  caption="A game day, as it would be written up"
+  items={[
+    { when: 'T+0', what: 'Inject: model provider returns errors; a deploy is mid-rollout.' },
+    { when: 'T+2 min', what: 'Alert: answer error budget burning. I declare an incident, open the log.' },
+    { when: 'T+5 min', what: 'Pause the deploy. Confirm fallback to search mode is serving.' },
+    { when: 'T+12 min', what: 'Status note to users. Provider still failing; fallback holding.' },
+    { when: 'T+30 min', what: 'Injection removed. Resume deploy after smoke tests. Close incident.' },
+    { when: 'after', what: 'Write-up: what worked, what was slow, two actions with dates.' },
+  ]}
+/>
+
 <Levels label="Phase 12, DevOps">
 
 <Level name="Beginner">
 
-Every change goes through CI (checks) and CD (deploy). A rollback returns to the previous release
-quickly. A runbook says what to do in known situations. A game day practises an incident on purpose.
+CI runs the checks on every push. CD deploys what passes. The pipeline is a file in the repo:
+
+```yaml
+jobs:
+  ci:
+    steps:
+      - run: npm ci
+      - run: npm run lint && npm run typecheck
+      - run: npm test
+      - run: npm run evals -- --ci
+      - run: npx playwright test
+      - run: gitleaks detect --redact && npm audit --omit=dev --audit-level=high
+```
+
+Rollback means putting the previous release back. The rollback command is in the runbook and I've
+run it.
+
+Common mistake: a rollback I've never tried, which then fails because of a migration. Fix:
+migrations work with both versions (expand and contract), and I rehearse rollback on staging.
 
 </Level>
 
 <Level name="Intermediate">
 
-Rollback is tested: deploy a broken release to staging and roll back, timing it. Migrations are
-compatible with rollback.
+The runbook is a list of situations with steps, not a set of essays:
+
+```md
+## Answers failing (alert: answer-error-budget)
+1. Check provider status + traces filtered by span llm.generate, status=error.
+2. If provider errors: confirm fallback mode is serving (dashboard: fallback rate).
+3. If our bug: roll back -> `deploy rollback --to previous`; verify smoke tests.
+4. Post a status note if user-facing for over 10 minutes.
+```
+
+Every alert names its runbook section.
 
 </Level>
 
 <Level name="Advanced">
 
-The game day scenario for the capstone: the model provider fails during peak use while a deploy is in
-progress. I play incident commander, follow the runbook, and write the timeline.
+A game day is a planned failure, injected on purpose. For the capstone, the scenario is a provider
+outage during a deploy, as in the timeline above. I act as incident commander even though I'm the only
+one there: I declare the incident, keep a timestamped log, and make one change at a time. The write-up
+is blameless and ends with dated actions.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **CI flaky test:** quarantine with an owner and a date, never retry until green silently.
+- **Flaky test in CI:** quarantine it with an owner and a date. A silent retry-until-green teaches
+  everyone to ignore red.
+- **Staging differs from production:** same image, same migrations. Config differs only through env
+  vars that are listed in the README.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Rollback while a long job runs on the new code:** jobs are versioned or drained before rollback.
+- **Rollback while a long job runs on the new code:** job payloads are versioned, or workers drain
+  before the rollback.
+- **Feature flag left on after rollback:** flags are part of the release record, so rolling back
+  rolls them back too.
 
 </Level>
 
 <Level name="Production level">
 
-Deploy frequency, change failure rate and time to restore are recorded.
+I track deploy frequency, change failure rate, and time to restore. Deploys are small and frequent,
+and each one is easy to roll back.
 
 </Level>
 
 <Level name="Mindset">
 
-Deploys should be boring; incidents should be rehearsed.
+Deploys should be boring and incidents should be rehearsed. Calm comes from practice.
 
 </Level>
 
 <Level name="System design">
 
-The pipeline is code in the repo, reviewed like any other change.
+The pipeline is code, reviewed like any other change. Environments are rebuilt from config, never
+hand-tuned.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when one game day has a written timeline and an action item that was completed.
+Week 67. Done when rollback is timed on staging, the runbook covers every alert, and one game day has
+a written timeline with an action that's been completed.
 
 </Level>
 
@@ -688,43 +1118,72 @@ Done when one game day has a written timeline and an action item that was comple
   ]}
 />
 
+<Flow
+  caption="Subscription states"
+  steps={['trialing', 'active', 'past_due (grace)', 'canceled or downgraded to free', 'reactivated']}
+/>
+
 <Levels label="Phase 12, billing or metering">
 
 <Level name="Beginner">
 
-The capstone meters AI usage per tenant and integrates a payment provider in test mode with a pricing
-page, checkout and webhooks.
+Metering counts what each tenant uses, like questions answered and tokens spent, in an append-only
+usage table. Billing turns plans and usage into charges through a payment provider. In test mode, no
+real money moves, but the code paths are real.
+
+Common mistake: trusting the redirect after checkout ("success page reached, so they paid"). Fix:
+entitlements change only when a verified webhook arrives.
 
 </Level>
 
 <Level name="Intermediate">
 
-Entitlements come from the billing module: plan, allowance, status. Features ask it, never the
-provider directly.
+```ts
+export async function handleWebhook(rawBody: Buffer, signature: string) {
+  const event = provider.verify(rawBody, signature, env.WEBHOOK_SECRET); // throws if forged
+  if (await db.webhookEvents.exists(event.id)) return;                   // idempotent
+  await db.tx(async (t) => {
+    await t.webhookEvents.insert({ id: event.id, type: event.type });
+    if (event.type === 'subscription.updated') await t.entitlements.sync(event.data);
+  });
+}
+```
+
+Features ask the billing module ("may tenant 42 ask another question?"). They never ask the provider
+directly.
 
 </Level>
 
 <Level name="Advanced">
 
-Usage allowances are derived from the phase 10 cost model so a plan cannot lose money at its limit.
+Allowances come from the phase 10 cost model. If a plan's allowance is used in full at the worst
+realistic cost per answer, it still covers its price. I keep that calculation in an ADR and check it
+against real cost per answer every month.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Webhook arrives before the user record exists:** retry later; idempotent handler.
+- **Webhook arrives before my user record exists:** return an error so the provider retries later.
+  The handler is idempotent, so retries are safe.
+- **Webhooks out of order:** use the event's own timestamp or version. Never let an older event
+  overwrite a newer state.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Plan change mid-cycle with usage already consumed:** define proration or a simple rule, and test it.
+- **Plan change mid-cycle after usage is consumed:** pick one rule (for example, new allowance from
+  now on, no refund of usage), write it in the user guide, and test it.
+- **Failed payment during heavy use:** grace period with a banner, then downgrade. Data is never
+  deleted for non-payment without notice.
 
 </Level>
 
 <Level name="Production level">
 
-Daily reconciliation of usage and subscriptions.
+A daily reconciliation job compares usage totals and subscription states with the provider and alerts
+on any mismatch.
 
 </Level>
 
@@ -736,18 +1195,19 @@ Money paths get the most tests per line in the codebase.
 
 <Level name="System design">
 
-Billing is a module with its own tables and events.
+Billing is a module with its own tables, events and webhook endpoint, and one interface for
+entitlements.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when trial, payment, failure, grace and downgrade all pass in tests with test-mode webhooks.
+Week 67. Done when trial, payment, failure, grace, downgrade and reactivation all pass with test-mode
+webhooks, including replayed and out-of-order events.
 
 </Level>
 
 </Levels>
-
 #### Phase 12: Documentation: README, architecture, ADRs, user guide
 
 <Layers
@@ -761,70 +1221,91 @@ Done when trial, payment, failure, grace and downgrade all pass in tests with te
   ]}
 />
 
+<Figure art={`
+  ADR-004  Postgres + pgvector instead of a separate vector database
+  Status:   accepted (week 63)
+  Context:  one tenant-filtered search over rows and vectors; small team (me)
+  Decision: pgvector in the main database, HNSW index, tenant filter first
+  Consequences:
+    + one backup, one transaction boundary, RLS applies to vectors
+    - index build cost on large tenants; revisit if p95 retrieval exceeds budget
+  Revisit when: measured retrieval p95 or index size crosses the written limit
+`} caption="An ADR is short: context, decision, consequences both ways, and when to revisit." />
+
 <Levels label="Phase 12, documentation">
 
 <Level name="Beginner">
 
-Documentation is written for a reader with a goal. The README gets a stranger running the app; the
-architecture doc explains the shape; ADRs record decisions; the user guide helps users.
+Each document is written for one reader with one goal. The README gets a stranger from a fresh clone
+to a running app. The architecture doc explains the shape and the reasons. ADRs record the expensive
+decisions. The user guide helps users do their jobs.
 
-Mistake: a README that assumes my laptop.
+Common mistake: a README that only works on my laptop (a global tool, a local database, an env var
+from my shell profile). Fix: test it in a clean container.
 
 </Level>
 
 <Level name="Intermediate">
 
-The README is tested: a fresh container or a friend follows it exactly, and every stumble is fixed in
-the README.
-
 ```md
 ## Run locally
-1. Node 22, Docker. 2. cp .env.example .env  3. docker compose up -d db
-4. npm ci && npm run db:migrate && npm run seed  5. npm run dev -> http://localhost:4321
+1. Install Node 22 and Docker.
+2. cp .env.example .env        # placeholders; MODEL_PROVIDER=mock works offline
+3. docker compose up -d db
+4. npm ci && npm run db:migrate && npm run seed
+5. npm run dev                 # open http://localhost:4321, sign in as demo@example.test
 ```
+
+Then a test: someone else follows it exactly while I stay quiet and note every place they get stuck.
+Each one becomes a fix to the README, not a spoken explanation.
 
 </Level>
 
 <Level name="Advanced">
 
-Docs live next to code and change in the same PRs; a PR that changes behaviour without docs is
-incomplete.
+Docs live next to the code and change in the same PR. A PR that changes behaviour without updating
+the docs isn't finished. The architecture doc has one diagram per level of detail: the system, then
+the containers, then the main components of the answer path. Each box links to the ADR that shaped it.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Windows users:** note differences or provide a container path.
+- **Windows users:** a dev container or a WSL note. The commands are tested there once.
+- **Paid provider keys:** a mock provider mode, so the app runs and tests pass with no secrets.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Secrets needed to run:** `.env.example` with safe placeholders and a mock provider mode.
+- **An ADR that turned out wrong:** I don't edit it. A new ADR supersedes it and links back, so the
+  history of the reasoning stays.
 
 </Level>
 
 <Level name="Production level">
 
-A changelog per release, user-facing.
+A user-facing changelog per release, and known limits listed in the user guide (languages, file types,
+size caps).
 
 </Level>
 
 <Level name="Mindset">
 
-If a stranger cannot run it, I do not fully understand my own setup.
+If a stranger can't run it, I don't fully understand my own setup.
 
 </Level>
 
 <Level name="System design">
 
-Docs mirror the architecture: one page per module boundary.
+Docs follow the architecture: one page per module boundary, matching the code layout.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when someone else ran it from the README without asking me anything.
+Week 68. Done when someone else ran it from the README without asking me anything, and every
+expensive decision has an ADR.
 
 </Level>
 
@@ -839,64 +1320,73 @@ Done when someone else ran it from the README without asking me anything.
   cause:     ingest deleted rows but not vector entries
   fix:       delete-by-doc in one transaction; citation check at render
   actions:   alert on 404 source clicks; eval case added
-`} caption="A blameless postmortem: impact, detection, cause, fix, and actions that make it less likely or faster to see." />
+`} caption="An example of the shape, not a real incident: impact, detection, cause, fix, and actions that make it less likely or faster to see." />
+
+<Flow
+  caption="From trigger to cause: asking why until it is about the system"
+  steps={['dead links in answers', 'chunks outlived their document', 'delete path skipped the vector table', 'two stores, no shared transaction', 'no test for delete consistency']}
+/>
 
 <Levels label="Phase 12, postmortem">
 
 <Level name="Beginner">
 
-A postmortem is a written account of something that went wrong: what happened, the impact, how it was
-detected, the cause, the fix and the follow-up actions. It is blameless: it looks at the system, not
-at who to blame.
+A postmortem is a written account of something that went wrong. It covers what happened, the impact,
+how it was found, the cause, the fix, and the follow-up actions. It's blameless: it asks what about
+the system allowed the mistake, not who made it.
 
 </Level>
 
 <Level name="Intermediate">
 
-The timeline comes from logs and traces, not memory. The causes go deeper than the trigger: why could
-the trigger cause harm, and why was it not caught earlier?
+The timeline comes from logs, traces and the incident log, not memory. Analysis goes deeper than the
+trigger, as in the flow above. Each "why" moves from the event toward the system property that
+allowed it.
 
 </Level>
 
 <Level name="Advanced">
 
-Actions are few, owned and dated, and at least one improves detection.
+Actions are few, owned and dated. At least one improves detection (find it faster next time) and at
+least one improves prevention (make it less likely). Each action gets a test or an eval case, so the
+same failure can't come back quietly.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **No real incident happened:** use the game day.
+- **No real incident during the capstone:** the game day write-up is the postmortem.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Two causes interacting:** describe both and the interaction; do not pick one for neatness.
+- **Two causes interacting:** describe both and how they combined. Don't pick one just to make the
+  story neat.
 
 </Level>
 
 <Level name="Production level">
 
-Postmortems are published internally and their actions tracked to done.
+Postmortems are published (internally, or in the case study) and their actions are tracked until done.
 
 </Level>
 
 <Level name="Mindset">
 
-What would I do differently is the most valuable section.
+"What would I do differently?" is the most valuable section, and the hardest one to write honestly.
 
 </Level>
 
 <Level name="System design">
 
-Each postmortem updates the failure matrix and adds an eval case or test.
+Every postmortem updates the failure matrix from phase 10 and adds a test or eval case.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when the postmortem is written and its actions are completed.
+Week 68. Done when the postmortem is written and all its actions are complete.
 
 </Level>
 
@@ -909,43 +1399,57 @@ Done when the postmortem is written and its actions are completed.
   steps={['the problem and who has it', 'the design and the three decisions that mattered', 'the numbers: quality, latency, cost, reliability, usage', 'what broke and what I changed', 'what I would do next and what I would not']}
 />
 
+<Compare
+  caption="Claim versus evidence"
+  left="Weak claim"
+  right="What I write instead"
+  rows={[
+    ['Fast answers', 'p95 answer latency from the dashboard, with the date range'],
+    ['Accurate', 'Eval pass rate on the named suite, with failure classes'],
+    ['Cheap to run', 'Cost per successful answer, measured over a month'],
+    ['Reliable', 'SLO attainment and the one incident, linked to the postmortem'],
+  ]}
+/>
+
 <Levels label="Phase 12, public case study">
 
 <Level name="Beginner">
 
 The case study explains the capstone to someone who has never seen it: the problem, the design, the
-numbers and the lessons. It is the artefact that shows what I can be trusted with.
+numbers and the lessons. It's the artefact that shows what I can be trusted with.
 
 </Level>
 
 <Level name="Intermediate">
 
-Numbers are real and dated: eval scores, p95, cost per successful answer, uptime, users. Each comes
-from a dashboard or log I can show.
+Every number is real, dated, and traceable to a dashboard or log I could show. Where I don't have a
+number, I say so instead of rounding a guess into a claim.
 
 </Level>
 
 <Level name="Advanced">
 
-The strongest section is the honest one: what failed and what it taught me.
+The strongest section is the honest one: what failed, what it taught me, and what I'd still not ship.
 
 </Level>
 
 <Level name="Edge cases">
 
-- **Users' data in screenshots:** use the sample tenant.
+- **User data in screenshots:** everything comes from the sample tenant.
 
 </Level>
 
 <Level name="Corner cases">
 
-- **Numbers that look bad:** publish them with context; they show judgment.
+- **Numbers that look bad:** publish them with context. They show judgment, and they're the start of
+  the next plan.
 
 </Level>
 
 <Level name="Production level">
 
-The case study is published on this site as a note, once the capstone is real.
+It gets published on this site as a note once the capstone is real, linked to the README,
+architecture doc and ADRs.
 
 </Level>
 
@@ -957,13 +1461,13 @@ Show the work, the numbers and the mistakes.
 
 <Level name="System design">
 
-It links to the README, architecture doc and ADRs.
+Its structure mirrors the architecture: one section per layer, each with that layer's numbers.
 
 </Level>
 
 <Level name="Strategy">
 
-Done when a stranger can explain from it what I built and why.
+Done when a stranger can explain from it what I built, why, and how well it works.
 
 </Level>
 
@@ -977,4 +1481,4 @@ Done when a stranger can explain from it what I built and why.
 - I can explain every layer and every dependency.
 - The code is mine: every line I accepted from a model was read, run, tested and logged.
 
-Done when all five are shown to someone else, and they agree.
+Done when all five have been shown to someone else, and they agree.
