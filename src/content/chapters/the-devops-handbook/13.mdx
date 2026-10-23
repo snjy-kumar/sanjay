@@ -1,0 +1,1440 @@
+---
+book: the-devops-handbook
+number: 13
+title: "Architect for Low-Risk Releases"
+description: "Architecture for low-risk releases: loose coupling, testable and independently deployable services, monoliths versus microservices, and the strangler fig pattern."
+part: "Part III, The First Way: The Technical Practices of Flow"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+The practices in the last four chapters, environments on demand, fast
+tests, continuous integration and low-risk releases, all get harder when
+the architecture fights them. If every change touches everything, tests
+must cover everything, every merge risks breaking someone else, and every
+deployment must move the whole system at once. This chapter, the last of
+Part III, looks at architecture as a tool for flow. It explains how tight
+coupling slows teams down, what a loosely coupled architecture gives them,
+how to think about monoliths and microservices without dogma, and how to
+evolve an existing architecture safely with the strangler fig pattern
+instead of a risky rewrite.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- explain how tight coupling makes testing, integration and deployment slower and riskier;
+- measure the blast radius of a change in a dependency graph;
+- describe what a loosely coupled architecture is and the properties it gives teams;
+- compare monolithic and microservice architectures by their trade-offs, and say when each fits;
+- explain why architectures must evolve as organisations grow;
+- use the strangler fig pattern and versioned APIs to replace parts of a system incrementally.
+
+What I should already know: Conway's Law and team design from
+<a href={withBase('/books/the-devops-handbook/07-how-to-design-our-organization-and-architecture-with-conways-law-in-mind/')}>chapter 7</a>,
+continuous integration from
+<a href={withBase('/books/the-devops-handbook/11-enable-and-practice-continuous-integration/')}>chapter 11</a>,
+the release patterns from
+<a href={withBase('/books/the-devops-handbook/12-automate-and-enable-low-risk-releases/')}>chapter 12</a>,
+and what an API and a database are. All code examples on this page are
+JavaScript run with node.
+
+Reading time: about 75 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Flow caption="The chapter as a path. Read left to right: see how coupling hurts flow, learn what loose coupling gives, weigh monoliths and microservices, then evolve a real system safely." steps={[
+  "How architecture slows or speeds flow",
+  "Loosely coupled architecture",
+  "Monoliths versus microservices",
+  "Architecture must evolve",
+  "The strangler fig pattern",
+  "From beginner to strategy",
+]} />
+
+## How architecture slows or speeds the flow of work
+
+### In one sentence
+
+In a tightly coupled system, a small change ripples into many parts, so
+every change needs wide testing, careful coordination and a big deployment,
+and flow slows to the pace of the whole.
+
+### The idea
+
+The book describes a pattern many organisations recognise. A system
+starts small and simple. Over years, features are added, parts start
+calling each other directly, sharing database tables and libraries, and
+depending on each other's internals. Eventually the system becomes what is
+often called a **big ball of mud**: no clear boundaries, and every part
+connected to many others.
+
+In such a system, **coupling**, the degree to which one part depends on
+another's details, is high. The consequences hit every practice from Part
+III.
+
+- **Testing** becomes slow, because a change anywhere may break something
+  anywhere, so the whole system must be tested together.
+- **Integration** becomes risky, because developers working in different
+  areas constantly collide.
+- **Deployment** becomes a big event, because parts cannot be deployed
+  separately; the whole system must move at once.
+- **Understanding** becomes hard, because to change one thing safely, a
+  developer must understand many others.
+
+The book links this to chapter 7's argument: tight coupling in the
+architecture forces tight coupling between teams, who must coordinate
+every change. Small, independent teams are only possible when the
+architecture lets them work independently.
+
+#### Measuring the blast radius of a change
+
+A useful way to see coupling is to ask: if I change this component, what
+else must be retested and redeployed? Call it the change's **blast
+radius**. Here is a script, run with node, that follows dependencies
+through two small systems. In the tightly coupled one, components share
+libraries and read the shared database schema directly. In the loosely
+coupled one, each service owns its data and others depend only on its
+published API.
+
+```js
+// Blast radius: which components must be retested and redeployed
+// when one changes? Tightly coupled (shared code, shared DB) vs loosely coupled (APIs).
+function affected(graph, changed) {
+  const seen = new Set([changed]), queue = [changed];
+  while (queue.length) {
+    const c = queue.shift();
+    for (const [comp, deps] of Object.entries(graph))
+      if (deps.includes(c) && !seen.has(comp)) { seen.add(comp); queue.push(comp); }
+  }
+  return [...seen];
+}
+const tight = { // everyone links shared libs and reads the shared DB schema
+  db: [], common: ["db"], orders: ["common", "db"], billing: ["common", "db", "orders"],
+  search: ["common", "db"], reports: ["common", "db", "billing", "orders"], web: ["orders", "billing", "search"],
+};
+const loose = { // each service owns its data; others depend only on its published API
+  ordersApi: [], billingApi: [], searchApi: [],
+  orders: [], billing: ["ordersApi"], search: [],
+  reports: ["ordersApi", "billingApi"], web: ["ordersApi", "billingApi", "searchApi"],
+};
+for (const [name, g, changed] of [
+  ["tightly coupled", tight, "orders"],
+  ["tightly coupled", tight, "db"],
+  ["loosely coupled", loose, "orders"],
+  ["loosely coupled", loose, "ordersApi"],
+]) {
+  const a = affected(g, changed);
+  console.log(`${name.padEnd(16)} change ${changed.padEnd(10)} -> ${a.length} to retest/redeploy: ${a.join(", ")}`);
+}
+```
+
+It prints:
+
+```text
+tightly coupled  change orders     -> 4 to retest/redeploy: orders, billing, reports, web
+tightly coupled  change db         -> 7 to retest/redeploy: db, common, orders, billing, search, reports, web
+loosely coupled  change orders     -> 1 to retest/redeploy: orders
+loosely coupled  change ordersApi  -> 4 to retest/redeploy: ordersApi, billing, reports, web
+```
+
+The four lines teach four things. In the tightly coupled system, changing
+orders drags in billing, reports and the web front end, because they reach
+into its internals. Changing the shared database touches everything. In the
+loosely coupled system, changing the internals of orders affects only
+orders: it can be tested and deployed alone. But changing the orders
+**API** affects all its consumers. Loose coupling does not make
+dependencies disappear; it concentrates them at stable, explicit
+interfaces, which is why those interfaces must change carefully, as the
+last section shows.
+
+<Trace columns={["System", "Change", "Blast radius", "What it means for the team"]} rows={[
+  ["Tight", "orders internals", "4 of 7", "coordinate with three other teams"],
+  ["Tight", "shared database", "7 of 7", "everyone tests and deploys together"],
+  ["Loose", "orders internals", "1 of 8", "test and deploy alone, any time"],
+  ["Loose", "orders API", "4 of 8", "change rarely, compatibly, with versions"],
+]} caption="The script's output as team experience. Read top to bottom: loose coupling shrinks the blast radius of everyday changes and concentrates risk at interfaces that can be managed deliberately." />
+
+#### One small change in a tightly coupled system
+
+Blast radius becomes concrete when we follow a single small change. Here
+is a composite of a one-line change to how an order's total is rounded,
+in a system where four parts read the orders table directly.
+
+<Timeline caption="A one-line change in a tightly coupled system. Read top to bottom: the code change takes minutes; the coordination it triggers takes days." items={[
+  { when: "Day 1, 10:00", what: "Change the rounding rule in orders. Unit tests pass." },
+  { when: "Day 1, 11:00", what: "Notice billing and reports compute totals from the same columns. Ask their teams." },
+  { when: "Day 2", what: "Billing agrees to change in step; reports team is busy until next week." },
+  { when: "Day 3", what: "Full system test suite run, two hours; a web page shows the old total. Fix it." },
+  { when: "Day 8", what: "Reports ready. All four parts deployed together in the next release window." },
+]} />
+
+In a loosely coupled system, the same change would sit inside the orders
+service, behind an interface that already returns the total. Billing,
+reports and the web would receive the new rounding through the interface
+without changing, and the change could be deployed the same morning.
+Coupling turned minutes of work into a week of waiting.
+
+### Worked example
+
+**Simple.** My site once had one big stylesheet used by every page. Changing
+the spacing for blog posts shifted the layout of book pages too, so every
+style change meant checking every kind of page. Splitting the styles by
+component, each with its own file, meant a change to posts could only
+affect posts.
+
+**Realistic.** A team's application has one database used directly by five
+modules. A developer adds a column and renames another for a new feature.
+Two unrelated modules break because they query the table directly. The
+team gives one module ownership of the table and makes others go through
+its interface. The next schema change breaks nothing outside that module.
+
+**In production: the coordinated release train.** An organisation with a
+tightly coupled system ships every few months in a coordinated release,
+because no part can be deployed without the others. Each release needs
+weeks of integration testing across teams. As parts are separated behind
+stable interfaces, teams start deploying their parts independently, and
+the release train shrinks until it is no longer needed for most changes.
+
+### Step by step
+
+1. **Draw the dependency graph** of the system, including shared databases
+   and libraries.
+2. **Compute blast radius** for common changes.
+3. **Find the worst couplings**: shared tables, reaching into internals,
+   shared mutable libraries.
+4. **Put interfaces in front of them**, one at a time.
+5. **Track blast radius** as the architecture changes.
+
+### Common mistake
+
+The common mistake is to treat coupling as a code-quality detail rather
+than a delivery problem. Its real cost is in slower tests, riskier merges
+and bigger deployments. Measuring blast radius makes that cost visible.
+
+### In real systems
+
+Dependency analysis tools, build systems that compute affected modules,
+and service maps from tracing all help teams see coupling.
+
+### Check yourself
+
+<details>
+<summary>1. What is the blast radius of a change?</summary>
+
+The set of components that must be retested and redeployed because of it.
+
+</details>
+
+<details>
+<summary>2. In the script, why did changing the orders API in the loose system still affect four components?</summary>
+
+Because consumers depend on the API. Loose coupling concentrates
+dependencies at interfaces; it does not remove them.
+
+</details>
+
+<details>
+<summary>3. How does tight coupling affect deployment?</summary>
+
+Parts cannot be deployed separately, so the whole system must move at
+once, making each deployment large and risky.
+
+</details>
+
+## Create a loosely coupled architecture for productivity, testability and safety
+
+### In one sentence
+
+A loosely coupled architecture divides the system into parts with clear,
+enforced interfaces, so each part can be changed, tested and deployed
+independently, which makes teams more productive and changes safer.
+
+### The idea
+
+The book's prescription is a **loosely coupled architecture with
+well-defined interfaces**. Each part of the system, whether a module in
+one codebase or a separate service, has a boundary. Inside the boundary,
+its team can change anything. Across the boundary, other parts interact
+only through an explicit interface, such as an API, a message format or a
+published library version, and never reach into internals or shared data.
+
+The book highlights three things this gives.
+
+**Productivity.** Developers can work on their part without understanding
+or coordinating with every other part. Small teams, as chapter 7
+described, can own a part end to end and move at their own pace.
+
+**Testability.** Because each part has a defined interface, it can be
+tested on its own, with other parts replaced by test doubles or checked
+with contract tests. The test suite for a change is the suite for the part
+that changed, plus contract checks at its interfaces, not the whole
+system's suite. Chapter 10's fast feedback becomes possible.
+
+**Safety.** A failure inside one part is contained by its boundary.
+Deployment of one part does not require deployment of others, so releases
+are smaller and rollbacks are local.
+
+The book relates this to industry research, reported qualitatively here,
+that the ability of teams to test and deploy their parts independently,
+without fine-grained coordination with other teams, is one of the strongest
+predictors of delivery performance. The point is that architecture is not
+only a technical concern; it decides how teams can work.
+
+<Layers caption="The properties of a loosely coupled part. Read top to bottom: each property removes a reason for teams to coordinate on every change." layers={[
+  { name: "Owns its data", note: "no other part reads or writes its tables directly" },
+  { name: "Explicit interface", note: "an API or message contract others depend on" },
+  { name: "Hidden internals", note: "anything behind the interface can change freely" },
+  { name: "Tested alone", note: "own suite plus contract tests at its interfaces" },
+  { name: "Deployed alone", note: "no lockstep releases with other parts" },
+  { name: "Fails alone", note: "timeouts and fallbacks contain its failures" },
+]} />
+
+#### Bounded contexts: where to draw the lines
+
+Where should the boundaries go? A helpful idea, widely used and in the
+spirit of the book, is the **bounded context**: a part of the business
+domain with its own language and rules, such as ordering, billing,
+shipping or search. Inside a bounded context, words have precise
+meanings; across contexts, the same word may mean different things. A
+"customer" in billing has payment details and invoices; in shipping, an
+address and delivery preferences. Drawing service or module boundaries
+around bounded contexts tends to produce parts that change for their own
+reasons and rarely need to change together.
+
+<Compare left="Boundary by technical layer" right="Boundary by business capability" caption="Two ways to split a system. Read across each row: splitting by layer makes most features cross every boundary; splitting by capability keeps most features inside one." rows={[
+  ["Front end, back end, database teams", "Ordering, billing, search teams"],
+  ["A feature touches every layer team", "A feature usually lives in one team"],
+  ["Every change needs coordination", "Most changes are local"],
+  ["Interfaces change with every feature", "Interfaces change rarely"],
+]} />
+
+#### Interfaces that tolerate change
+
+Even well-drawn interfaces must change sometimes. Loose coupling holds up
+when interfaces change in ways that do not break existing consumers. A
+few rules help, and they echo chapter 12's expand and contract.
+
+- **Add, do not alter.** Add new fields or operations; do not change the
+  meaning of existing ones.
+- **Make new fields optional**, so old consumers ignore them.
+- **Be tolerant when reading**: consumers should ignore fields they do not
+  understand rather than fail.
+- **Version when a breaking change is unavoidable**, and run old and new
+  versions side by side for a period.
+- **Use contract tests**, from chapter 10, so a provider learns at once if
+  it would break a consumer.
+
+#### Contain failure at the boundary
+
+A boundary contains change; it should also contain failure. When one part
+calls another over a network, the call can be slow or fail. A loosely
+coupled design handles this explicitly: each call has a **timeout**, so a
+slow dependency cannot hang the caller; a **fallback**, such as cached or
+default data, keeps the caller useful; and a **circuit breaker** stops
+calling a dependency that keeps failing, giving it time to recover.
+
+<Trace columns={["Moment", "Recommendations service", "Product page without protection", "Product page with timeout and fallback"]} rows={[
+  ["Normal", "responds in 50 ms", "shows recommendations", "shows recommendations"],
+  ["Slowdown", "responds in 8 s", "page takes 8 s or times out", "gives up at 200 ms; shows popular items"],
+  ["Outage", "not responding", "page fails", "circuit opens; shows popular items"],
+  ["Recovery", "responds in 50 ms", "page works again", "circuit closes after a test call"],
+]} caption="A dependency failing, with and without protection. Read down each column: the boundary keeps the product page working when a non-essential part fails." />
+
+#### Consistency across boundaries
+
+When each part owns its data, a business event often has to update more
+than one owner. Without a shared database, there is no single transaction
+across them. A common approach is to publish an **event** when something
+happens, "order placed", and let other parts react in their own time.
+The data becomes consistent shortly afterwards rather than instantly,
+which is called **eventual consistency**.
+
+<Trace columns={["Moment", "Orders service", "Stock service", "Email service"]} rows={[
+  ["t = 0", "order 81 saved; publishes 'order placed'", "still shows old stock", "no email yet"],
+  ["t + 50 ms", "-", "receives event; reduces stock", "-"],
+  ["t + 2 s", "-", "-", "receives event; sends confirmation"],
+  ["Stock service down", "keeps taking orders; events wait in the queue", "catches up when back", "unaffected"],
+]} caption="An event flowing between owners. Read top to bottom: each service updates its own data when it receives the event, and a failure in one delays it without stopping the others." />
+
+The design trades instant consistency for independence. That is usually
+the right trade between capabilities such as ordering and email, and
+usually the wrong one inside a capability where a user expects to see
+their own change immediately. Drawing boundaries well means putting data
+that must be consistent together inside the same owner.
+
+#### A contract test catching a breaking change
+
+Contract tests are what make it safe for a provider team to change its
+service without asking every consumer first. Each consumer records what it
+relies on; the provider's pipeline checks every recorded contract on every
+change.
+
+<Trace columns={["Step", "What happens"]} rows={[
+  ["Consumer side", "billing records: 'GET /orders/7 returns id and a numeric total'"],
+  ["Provider change", "orders team renames total to amount in a refactor"],
+  ["Provider pipeline", "billing's contract fails: total missing"],
+  ["Decision", "keep total as well as amount, or publish a new version"],
+  ["Outcome", "billing never sees a broken response in any environment"],
+]} caption="A breaking change stopped at the provider. Read top to bottom: the provider learns about the consumer's needs from a test, not from an incident." />
+
+This is how loosely coupled teams avoid both extremes: they neither
+coordinate on every change nor break each other silently. The contract is
+the coordination, written down and checked automatically.
+
+### Worked example
+
+**Simple.** My site's search was built into every page's script, so a bug
+in search could break the whole page. I moved it into its own component
+loaded only on the search page, with a plain fallback list if it fails.
+Search can now change, or break, without touching other pages.
+
+**Realistic.** A team splits a large application's billing logic into a
+module with its own tables and a defined interface. Before, any change to
+billing meant running the whole application's two-hour test suite. After,
+billing changes run billing's ten-minute suite plus contract tests
+against its three consumers. The billing team starts deploying its module
+several times a week.
+
+**In production: a contained failure.** A product page calls a
+recommendations service. One evening, recommendations becomes slow under
+load. Because the page calls it with a short timeout and falls back to a
+list of popular items, customers see a slightly less personal page instead
+of an error, and checkout is unaffected. The recommendations team fixes the
+problem the next morning without an incident for the rest of the system.
+
+### Step by step
+
+1. **Identify bounded contexts** in the business domain.
+2. **Give each one an owner** and its own data.
+3. **Define explicit interfaces** and stop direct access to internals.
+4. **Add contract tests** at every interface.
+5. **Make calls resilient**: timeouts, fallbacks, circuit breakers.
+6. **Deploy each part independently**, and measure how often that happens.
+
+### Common mistake
+
+The common mistake is to split a system into services that still share a
+database, so they remain coupled through the tables and must change and
+deploy together. The fix is data ownership: one owner per piece of data,
+others go through its interface. Moving to that state is itself a
+small strangle: one table at a time, with the owner's interface added
+first and direct queries removed afterwards.
+
+A second mistake is to draw boundaries by technical layer, front end,
+back end, database, so every feature crosses every boundary. Boundaries by
+business capability keep most changes local.
+
+### In real systems
+
+Service ownership, per-service databases, API gateways, schema registries
+for messages and resilience libraries with timeouts and circuit breakers
+are common building blocks of loosely coupled systems.
+
+### Check yourself
+
+<details>
+<summary>1. What three things does loose coupling give, according to the book?</summary>
+
+Productivity, testability and safety.
+
+</details>
+
+<details>
+<summary>2. Why is a shared database a form of tight coupling?</summary>
+
+Every part that reads the tables depends on their structure, so a schema
+change affects them all, and they must change and deploy together.
+
+</details>
+
+<details>
+<summary>3. What do a timeout and a fallback protect against?</summary>
+
+A slow or failing dependency hanging or breaking the caller; the caller
+gives up quickly and serves something useful instead.
+
+</details>
+
+## Architectural archetypes: monoliths versus microservices
+
+### In one sentence
+
+Monoliths and microservices are both reasonable architectures with
+different trade-offs, and the right choice depends on the size and stage of
+the organisation, not on fashion.
+
+### The idea
+
+The book describes a range of architectural archetypes and their
+trade-offs, rather than declaring one right.
+
+**A monolith** is one codebase deployed as one unit. A **simple monolith**
+has everything together with few internal boundaries. A **modular** or
+layered monolith has clear internal modules with interfaces, still
+deployed together. A **microservices** architecture splits the system into
+many small services, each deployed independently, usually owning its own
+data and communicating over the network.
+
+The book's position is that monoliths are often the right choice early.
+They are simple to build, test and deploy when the team and product are
+small; there is one thing to run and one place to look. Their problems
+appear as the organisation grows: many teams in one codebase collide, the
+build and tests get slow, and one deployment carries everyone's changes.
+
+Microservices address those problems: teams can work and deploy
+independently, parts can scale separately, and failures can be contained.
+But they bring costs of their own: network calls that can fail, data
+spread across services, harder end-to-end testing and debugging, and the
+need for strong automation, monitoring and operational skill. Adopting
+them before those capabilities exist can make things worse.
+
+The modular monolith sits between: one deployment, but internal
+boundaries that keep coupling low and make later separation easier.
+
+<Compare left="Monolith" right="Microservices" caption="Two archetypes. Read across each row: each strength on one side is a cost on the other, so the choice depends on context." rows={[
+  ["One codebase, one deployment", "Many services, independent deployments"],
+  ["Simple to build, test and run when small", "Needs mature automation and monitoring"],
+  ["In-process calls: fast, reliable", "Network calls: slower, can fail"],
+  ["One database: easy consistency", "Data per service: consistency is designed"],
+  ["Teams collide as it grows", "Teams work independently"],
+  ["Scale everything together", "Scale parts separately"],
+  ["Debug in one place", "Debug across services with tracing"],
+]} />
+
+#### Choosing by stage
+
+<Layers caption="A rough fit between stage and architecture. Read top to bottom: as teams and traffic grow, the costs of a monolith rise and the costs of services become worth paying." layers={[
+  { name: "One small team, new product", note: "simple monolith: fastest to change" },
+  { name: "A few teams, growing product", note: "modular monolith: boundaries without network costs" },
+  { name: "Many teams, independent capabilities", note: "services for parts that need independence" },
+  { name: "Large scale, mature platform", note: "microservices with strong automation, telemetry and ownership" },
+]} />
+
+#### A cost model for splitting
+
+It helps to think of splitting a component into its own service as a
+trade. What do we gain, and what do we pay?
+
+<Trace columns={["Factor", "Keep in the monolith", "Split into a service"]} rows={[
+  ["Deploy independently", "no", "yes"],
+  ["Team can own end to end", "partly, if modular", "yes"],
+  ["Scale separately", "no", "yes"],
+  ["Network failure handling", "not needed", "timeouts, retries, fallbacks"],
+  ["Data consistency", "one transaction", "designed across services"],
+  ["Testing", "in-process", "contract tests plus some end to end"],
+  ["Operations", "one thing to run", "one more thing to deploy, monitor and page for"],
+]} caption="The trade behind one split. Read across each row: the gains are in independence; the costs are in distribution, so a split is worth it when independence matters more." />
+
+#### Keeping a modular monolith modular
+
+A modular monolith only works if its boundaries hold. In one codebase, it
+is very easy for one module to import another's internals "just this
+once". Teams keep the boundaries by making them checkable.
+
+<Trace columns={["Rule", "How it is checked", "What happens on violation"]} rows={[
+  ["Modules import only each other's public interface", "a dependency rule in the build", "build fails with the offending import"],
+  ["Each module owns its tables", "schema names per module; access checks", "query from another module is rejected in review or tests"],
+  ["No cycles between modules", "dependency graph check in the pipeline", "pipeline fails and shows the cycle"],
+  ["Module tests run alone", "each module has its own test target", "a test that needs another module's internals is flagged"],
+]} caption="Making internal boundaries enforceable. Read across each row: a boundary that is checked by the pipeline survives deadlines; one kept only by good intentions does not." />
+
+Enforced boundaries have a second benefit. When a module later needs to
+become a separate service, its interface already exists and its data is
+already separate, so extraction is mostly moving code and adding a network
+call, not untangling years of hidden dependencies.
+
+### Worked example
+
+**Simple.** My site is a monolith, one static build, and that is right
+for one person. Splitting it into services would add work without solving
+any problem I have. What I do keep is internal structure: components,
+content collections and utilities with clear roles, so the monolith stays
+modular.
+
+**Realistic.** A start-up builds its product as a monolith and grows to
+five teams. Builds slow down, and teams collide in shared code. Rather than
+rewriting into dozens of services, the team first makes the monolith
+modular with enforced boundaries, then extracts two parts that most need
+independence, payments, with its own compliance needs, and search, with
+different scaling needs, as services. The rest stays a modular monolith.
+
+**In production: services too early.** A small team starts a new product
+with many microservices because it is the modern way. They spend much of
+their time on service plumbing, network failures, and debugging requests
+across services, with little time for features. They merge most services
+back into a modular monolith and keep only one or two separate, which lets
+them focus on the product again.
+
+### Step by step
+
+1. **Name the current archetype** honestly.
+2. **List the problems** it is causing today, if any.
+3. **Prefer modular boundaries first**: they help in any archetype.
+4. **Split a part out** only when independence clearly pays for the
+   distribution cost.
+5. **Build automation and telemetry** before multiplying services.
+6. **Revisit the choice** as the organisation grows.
+
+### Common mistake
+
+The common mistake is to treat microservices as a goal rather than a tool,
+splitting systems before the organisation needs independence or has the
+automation and monitoring to run many services. The fix is to choose by the
+problems being solved.
+
+The opposite mistake is to keep a monolith long after many teams are
+colliding in it, because splitting feels risky. The strangler fig pattern
+in the last section makes splitting safe.
+
+### In real systems
+
+Many successful products began as monoliths and moved to services as they
+grew; many others run well as modular monoliths. The archetype matters
+less than whether teams can test and deploy independently.
+
+A useful way to see this in practice is to ask a team two questions. Can
+you deploy your part today without telling any other team? And when you
+change your part, which test suite do you run? Teams in a well-structured
+monolith and teams with services can both give good answers; teams in a
+tangled monolith or a distributed monolith cannot. The answers say more
+about delivery than the archetype's name does.
+
+### Check yourself
+
+<details>
+<summary>1. Why is a monolith often right for a small, new product?</summary>
+
+It is simple to build, test, deploy and debug, and its problems, team
+collisions and slow builds, only appear as the organisation grows.
+
+</details>
+
+<details>
+<summary>2. Name two costs microservices add.</summary>
+
+Any two of: network failures, distributed data consistency, harder
+testing and debugging, and more operational work.
+
+</details>
+
+<details>
+<summary>3. What is a modular monolith?</summary>
+
+One deployment with enforced internal boundaries between modules, giving
+low coupling without network costs.
+
+</details>
+
+## Every architecture will be outgrown
+
+### In one sentence
+
+The architecture that suits an organisation today will not suit it as it
+grows, so architecture must be expected to change, and changed
+continuously rather than in rare, risky rewrites.
+
+### The idea
+
+The book makes a point that relieves a lot of guilt. Organisations often
+look at their old architecture and think it was a mistake. Usually it was
+not: it was the right choice for the size, product and knowledge of the
+time. What has changed is the organisation. The book describes well-known
+internet companies that rearchitected their systems several times as they
+grew, each time moving to a design that fitted their new scale. The lesson
+is that outgrowing an architecture is normal; the problem is failing to
+evolve it.
+
+The book contrasts two ways of responding when an architecture no longer
+fits.
+
+**The big rewrite.** Stop, build a new system from scratch, and switch over
+when it is done. This is tempting, because the new design can be clean.
+But it is very risky. The old system keeps changing while the new one is
+built, so the target moves. The new system delivers no value until the
+switch, which may be months or years away. The switch itself is a huge
+batch, with all the risks of large batches. And the new system must
+reproduce years of behaviour, much of it undocumented, so it often arrives
+late and missing features.
+
+**Incremental evolution.** Keep the system running and delivering, and
+change its architecture step by step: put interfaces in front of tangled
+parts, extract pieces one at a time, and retire old parts as they are
+replaced. Each step is small, delivers value and can be reversed. The
+strangler fig pattern in the next section is the book's main technique
+for this.
+
+The book also connects architecture to **technical debt**, the accumulated
+cost of shortcuts and outdated designs. Chapter 6 argued for reserving
+capacity to pay down debt. Architectural debt is the hardest kind,
+because it affects everything, and paying it continuously, in small
+steps, is much safer than letting it grow until only a rewrite seems
+possible.
+
+<Compare left="Big rewrite" right="Incremental evolution" caption="Two responses to an outgrown architecture. Read across each row: evolution keeps delivering and keeps each step small and reversible." rows={[
+  ["Build the new system beside the old", "Change the running system step by step"],
+  ["No value until the switch", "Value with every step"],
+  ["Target moves while building", "Each step targets today's system"],
+  ["One huge, risky switch", "Many small, reversible switches"],
+  ["Must reproduce all old behaviour at once", "Reproduce one piece of behaviour at a time"],
+]} />
+
+#### Signs an architecture is being outgrown
+
+How does a team know its architecture no longer fits? The signs are
+usually in flow, not in the code itself.
+
+<Trace columns={["Sign", "What it looks like", "What it suggests"]} rows={[
+  ["Coordinated releases", "teams wait for a shared release date", "parts cannot deploy independently"],
+  ["Slow builds and tests", "feedback takes an hour or more", "too much is built and tested together"],
+  ["Frequent merge collisions", "teams break each other's work", "boundaries do not match team ownership"],
+  ["Fear of certain areas", "nobody wants to touch a module", "tangled, untested, undocumented code"],
+  ["Scaling everything for one part", "the whole system scaled for one hot path", "a part has different needs"],
+  ["Long onboarding", "weeks before a new person can change things safely", "too much must be understood at once"],
+]} caption="Symptoms of an outgrown architecture. Read across each row: each sign is a flow problem pointing to a specific architectural cause." />
+
+#### Evolving in the right order
+
+When the signs appear, the order of steps matters. A common, safe order
+is: first, make the existing system observable and tested enough to change
+safely; second, create internal boundaries, a modular monolith; third,
+extract the parts that most need independence; fourth, retire what is left
+of the old structure. Each stage is useful on its own, so if priorities
+change halfway, the work already done still pays off.
+
+<Flow caption="A safe order for architectural evolution. Read left to right: each stage makes the next safer, and each is valuable even if the next never happens." steps={[
+  "Add tests and telemetry around the old system",
+  "Create internal module boundaries",
+  "Extract parts that need independence",
+  "Retire the remains of the old structure",
+]} />
+
+#### Paying architectural debt a little at a time
+
+Chapter 6 suggested reserving a share of capacity for improvement work.
+Architectural debt is where that reservation pays most, because small,
+regular steps keep the architecture close to what the organisation needs.
+A practical way is to keep a short, ordered list of architectural
+improvements, each sized to fit in a few days, and to take the top item
+in every iteration.
+
+<Compare left="Debt paid in rare big pushes" right="Debt paid in small regular steps" caption="Two ways to fund architectural work. Read across each row: small regular steps keep risk low and never need a rewrite to be justified." rows={[
+  ["A 'refactoring quarter' every few years", "A few days of architecture work every iteration"],
+  ["Large, risky changes", "Small, reversible changes"],
+  ["Features stop during the push", "Features continue throughout"],
+  ["Debt grows between pushes", "Debt stays roughly level or falls"],
+]} />
+
+#### Recording why a choice was made
+
+When an architecture is outgrown, teams often cannot remember why it was
+built that way, and so cannot tell whether the original reasons still
+hold. A light habit helps: an **architecture decision record**, a short
+note kept in version control beside the code, written whenever a
+significant choice is made.
+
+<Trace columns={["Field", "Example entry"]} rows={[
+  ["Decision", "keep search inside the monolith for now"],
+  ["Context", "one team; search traffic similar to the rest; no separate scaling need"],
+  ["Options considered", "separate search service; search module in the monolith"],
+  ["Consequences", "simpler operations; search deploys with everything else"],
+  ["Revisit when", "a second team owns search, or search load needs separate scaling"],
+]} caption="An architecture decision record. Read top to bottom: the last field turns a past choice into a clear trigger for the next one." />
+
+The "revisit when" field is the useful part. It records the conditions
+under which the choice stops fitting, so when the organisation grows,
+someone can see that the trigger has been reached and plan the next
+step, without blaming the original decision.
+
+### Worked example
+
+**Simple.** My first site was a single template file. When I added a blog,
+then books, then a log, the file became unmanageable. I did not rewrite
+the site; I split one section into its own layout each week, checking that
+pages still rendered the same. After a month, the structure fitted what the
+site had become.
+
+**Realistic.** A team considers rewriting an old order system that
+everyone fears. They estimate a year. Instead, they spend a few weeks
+adding characterisation tests, from chapter 5, around the most-used
+behaviour, then extract the pricing rules into a module with an interface,
+then the stock checks. Six months later, the old system is much smaller,
+the team has delivered features throughout, and the remaining old code is
+replaced piece by piece.
+
+**In production: a rewrite that never landed.** A team commits to a full
+rewrite of a core system. After many months, the new system still lacks
+features the old one gained in the meantime. The business keeps asking for
+changes to the old system, which must be made twice. Eventually the
+rewrite is paused, and the team switches to extracting pieces from the old
+system one at a time, reusing parts of the new code where they fit. Most of
+the value arrives only after the switch to incremental work.
+
+### Step by step
+
+1. **Accept that outgrowing is normal**; do not blame past choices.
+2. **Watch for the signs** in flow measures.
+3. **Prefer evolution** over rewrite by default.
+4. **Make the old system safe to change**: tests and telemetry first.
+5. **Create boundaries**, then extract, then retire.
+6. **Reserve capacity** for architectural work every iteration.
+
+### Common mistake
+
+The common mistake is to let architectural debt build until the only
+option seems to be a rewrite. The fix is continuous, small improvements
+paid for from reserved capacity, so the architecture evolves as the
+organisation does.
+
+A second mistake is to treat the old system as worthless. It encodes years
+of business knowledge; evolution preserves that knowledge, while a rewrite
+risks losing it.
+
+### In real systems
+
+Many long-lived products have been rearchitected more than once,
+typically through incremental extraction rather than full rewrites.
+Architecture decision records help teams remember why each choice was made
+when it is later revisited.
+
+### Check yourself
+
+<details>
+<summary>1. Why does the book say outgrowing an architecture is normal?</summary>
+
+Because the architecture fitted the organisation's size and needs at the
+time; growth changes the needs, so the architecture must change too.
+
+</details>
+
+<details>
+<summary>2. Give two reasons big rewrites are risky.</summary>
+
+Any two of: no value until the switch, a moving target, a huge risky
+switch, and the need to reproduce undocumented behaviour all at once.
+
+</details>
+
+## Use the strangler fig pattern to evolve the architecture safely
+
+### In one sentence
+
+Put a routing layer in front of the old system, build new functionality
+as new services behind it, move behaviour across one piece at a time, and
+retire the old system when nothing depends on it.
+
+### The idea
+
+The **strangler fig** pattern is named after a kind of fig that grows
+around a host tree, gradually replacing it until the tree is gone and the
+fig stands in its place. The book recommends it as the safest way to
+replace a legacy system.
+
+The pattern has a few steps. First, put a **facade** or router in front of
+the old system, so every request goes through it. At first, it sends
+everything to the old system, and users notice nothing. Then, build a new
+piece of functionality, or a replacement for one existing piece, as a new
+service. Change the router so requests for that piece go to the new
+service. Repeat, piece by piece. Each move is small and can be reversed by
+routing back. Over time, the old system receives less and less traffic,
+until it receives none and can be switched off.
+
+The book stresses two supporting practices. New services should be built
+with the architecture the organisation wants, loosely coupled, tested,
+deployable on their own, so the strangler grows into the target design.
+And interfaces should be **versioned**, so consumers can move from old to
+new at their own pace instead of all at once.
+
+Here is the pattern as a short script, run with node, with a router moving
+paths one at a time and one move reversed after a problem:
+
+```js
+// Strangler fig: a router sends each path to the legacy system or the new service.
+// Paths move one at a time; the legacy system shrinks until it can be retired.
+const paths = ["/login", "/search", "/product", "/cart", "/checkout", "/account"];
+const migrated = new Set();
+const route = (p) => (migrated.has(p) ? "new" : "legacy");
+const show = (label) =>
+  console.log(label.padEnd(29), paths.map((p) => `${p}:${route(p)}`).join(" "),
+    `| ${Math.round((migrated.size / paths.length) * 100)}% new`);
+show("start");
+for (const p of ["/search", "/product", "/account"]) { migrated.add(p); show(`move ${p}`); }
+migrated.delete("/account"); show("problem: route /account back");
+for (const p of ["/account", "/login", "/cart", "/checkout"]) { migrated.add(p); show(`move ${p}`); }
+console.log("legacy receives no traffic: retire it");
+```
+
+It prints:
+
+```text
+start                         /login:legacy /search:legacy /product:legacy /cart:legacy /checkout:legacy /account:legacy | 0% new
+move /search                  /login:legacy /search:new /product:legacy /cart:legacy /checkout:legacy /account:legacy | 17% new
+move /product                 /login:legacy /search:new /product:new /cart:legacy /checkout:legacy /account:legacy | 33% new
+move /account                 /login:legacy /search:new /product:new /cart:legacy /checkout:legacy /account:new | 50% new
+problem: route /account back  /login:legacy /search:new /product:new /cart:legacy /checkout:legacy /account:legacy | 33% new
+move /account                 /login:legacy /search:new /product:new /cart:legacy /checkout:legacy /account:new | 50% new
+move /login                   /login:new /search:new /product:new /cart:legacy /checkout:legacy /account:new | 67% new
+move /cart                    /login:new /search:new /product:new /cart:new /checkout:legacy /account:new | 83% new
+move /checkout                /login:new /search:new /product:new /cart:new /checkout:new /account:new | 100% new
+legacy receives no traffic: retire it
+```
+
+Two details in the output matter. The order starts with low-risk,
+read-mostly paths, search and product pages, and leaves checkout, the
+riskiest, for last, when the team has the most experience. And when the
+new account service had a problem, the fix was one routing change back to
+the old system, the same move as chapter 12's blue-green rollback.
+
+<Figure caption="The strangler fig over time. Read top to bottom: the router stays in place while the new services grow around the old system, until the old system can be removed." art={`
+  stage 1           stage 2               stage 3               stage 4
+  users             users                 users                 users
+    |                 |                     |                     |
+ [router]          [router]              [router]              [router]
+    |               /     \\              /    |   \\             /  |  \\
+ [legacy]       [legacy] [new A]   [legacy] [new A] [new B]  [new A][new B][new C]
+  (all)         (most)    (some)    (little)                   (legacy retired)
+`} />
+
+#### Versioned APIs let consumers move at their own pace
+
+When a service's interface must change in a way that would break
+consumers, the book recommends versioning: keep the old version working,
+publish the new one beside it, and let consumers move when they are ready.
+Here is a sketch, run with node, of a provider adding a version 2 that
+reports money in paise instead of rupees:
+
+```js
+// Versioned API: a provider adds v2 without breaking v1 consumers.
+const provider = {
+  v1: (o) => ({ id: o.id, total: o.totalRupees }),                 // original contract
+  v2: (o) => ({ id: o.id, total: { amount: o.totalRupees * 100, unit: "paise" } }),
+};
+const order = { id: 7, totalRupees: 499 };
+const consumerContracts = {
+  "billing (v1)": { version: "v1", check: (r) => typeof r.total === "number" },
+  "mobile app (v1)": { version: "v1", check: (r) => r.id === 7 && r.total === 499 },
+  "new reports (v2)": { version: "v2", check: (r) => r.total.unit === "paise" },
+};
+for (const [name, c] of Object.entries(consumerContracts))
+  console.log(`${name.padEnd(17)} against ${c.version}: ${c.check(provider[c.version](order)) ? "pass" : "FAIL"}`);
+// What if the provider had changed v1 in place instead?
+const broken = provider.v2;
+console.log(`billing (v1)      if v1 were changed in place: ${consumerContracts["billing (v1)"].check(broken(order)) ? "pass" : "FAIL"}`);
+```
+
+It prints:
+
+```text
+billing (v1)      against v1: pass
+mobile app (v1)   against v1: pass
+new reports (v2)  against v2: pass
+billing (v1)      if v1 were changed in place: FAIL
+```
+
+Each consumer's expectations are written down as a contract and checked.
+With two versions side by side, every consumer passes. Had the provider
+changed version 1 in place, billing would have broken, the semantic
+conflict from chapter 11 at the scale of services. The mobile app is the
+reason versioning matters most: installed apps cannot all be updated at
+once, so the old version must keep working until they are.
+
+<Timeline caption="The life of a versioned API change. Read top to bottom: the new version arrives beside the old, consumers move at their own pace, and the old version is retired only when nobody uses it." items={[
+  { when: "Step 1", what: "Publish v2 beside v1; contract tests for both." },
+  { when: "Step 2", what: "New consumers use v2; announce a retirement plan for v1." },
+  { when: "Step 3", what: "Existing consumers move to v2 when convenient; track v1 traffic." },
+  { when: "Step 4", what: "v1 traffic reaches zero, apart from old installed clients if any." },
+  { when: "Step 5", what: "Retire v1, contract style, once nothing depends on it." },
+]} />
+
+#### Choosing the first piece
+
+The first piece of a strangle sets the tone. A good first piece has a
+clear boundary, so it is easy to route; low risk, so a mistake is cheap;
+real value, so the work is visible; and enough traffic, so the team learns
+how the new service behaves in production.
+
+<Trace columns={["Candidate", "Clear boundary?", "Risk", "Value", "Verdict"]} rows={[
+  ["Product pages", "yes: read-only, one path", "low", "faster pages", "good first piece"],
+  ["Search", "yes: one path, own index", "low", "better results", "good second piece"],
+  ["Login", "yes, but everything depends on it", "high", "security fixes", "later, with experience"],
+  ["Checkout", "tangled with stock and payment", "highest", "high", "last"],
+]} caption="Ranking candidates for the first move. Read across each row: low risk and a clear boundary come first, so the riskiest pieces move when the team is most practised." />
+
+#### Measuring progress to the finish
+
+A strangle that is not measured tends to stall at "mostly done", with the
+old system still running for a few awkward pieces. A few simple measures
+keep it moving and make the finish line visible.
+
+<Layers caption="Measures for a strangler fig migration. Read top to bottom: from how much traffic has moved to whether the old system can actually be switched off." layers={[
+  { name: "Share of requests to the old system", note: "should fall step by step toward zero" },
+  { name: "Pieces still owned by the old system", note: "a short, named list with owners and dates" },
+  { name: "Data still mastered in the old system", note: "each kind of record has one owner at any moment" },
+  { name: "Callers of the old system found in logs", note: "including batch jobs and forgotten integrations" },
+  { name: "Cost of running both", note: "a reminder that finishing is part of the value" },
+]} />
+
+The fourth measure is the one teams most often skip. Logging every caller
+of the old system for a period before switching it off reveals the
+integrations nobody remembered, which would otherwise break on the day it
+goes dark.
+
+### Worked example
+
+**Simple.** When I moved my site to new page addresses, I did not change
+them all at once. I added redirects, a tiny router, from old addresses to
+new ones, moved one section at a time, and checked each. The old addresses
+still work for anyone with an old link.
+
+**Realistic.** A team replaces an old customer-account system. They put a
+proxy in front of it, then build a new profile service and route the
+profile pages to it, keeping everything else on the old system. Next they
+move address management, then preferences, then login. Each move is
+reversible by changing the route. After several months, the old system
+handles nothing and is switched off. Features were delivered throughout.
+
+**In production: data during the strangle.** The hardest part of a real
+strangle is data, because the old system and the new services may both
+need the same records during the transition. The team chooses, piece by
+piece, which system owns each kind of data, and synchronises in one
+direction, from owner to the other, until the old copy is no longer
+needed. Clear ownership at each moment prevents the two systems from
+overwriting each other.
+
+### Step by step
+
+1. **Put a router or facade** in front of the old system.
+2. **Choose the first piece**: low risk, clear boundary, real value.
+3. **Build it as a new service** with the target architecture.
+4. **Route its traffic** to the new service; keep the route reversible.
+5. **Decide data ownership** for each piece and sync one way.
+6. **Repeat**, moving riskier pieces as experience grows.
+7. **Retire the old system** when its traffic reaches zero.
+
+### Common mistake
+
+The common mistake is to start a strangler fig and never finish it,
+leaving two systems running indefinitely and doubling the operational
+cost. The fix is to treat retirement of the old system as part of the
+goal, and to track the share of traffic still going to it.
+
+A second mistake is to rebuild the old system's tangle in the new
+services, by copying its data model and coupling. New pieces should be
+built the way the organisation wants its architecture to be.
+
+### In real systems
+
+Reverse proxies, API gateways and load balancers serve as strangler
+routers. Many large migrations, from old platforms to new ones, have been
+done this way, path by path or capability by capability.
+
+Teams that do this well usually keep the router's configuration in
+version control and change it through the same pipeline as code, so
+every move of a path is reviewed, recorded and reversible by reverting a
+commit. The routing table becomes a readable history of the migration.
+
+### Check yourself
+
+<details>
+<summary>1. What role does the router play in the strangler fig pattern?</summary>
+
+It sits in front of the old system and decides, piece by piece, whether
+requests go to old or new, making each move small and reversible.
+
+</details>
+
+<details>
+<summary>2. Why move low-risk pieces first?</summary>
+
+To learn the process and build confidence before moving the riskiest
+pieces, such as checkout.
+
+</details>
+
+<details>
+<summary>3. Why do versioned APIs matter most for installed clients such as mobile apps?</summary>
+
+They cannot all be updated at once, so the old interface must keep
+working until they move.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 13, Architect for Low-Risk Releases">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that architecture affects how fast
+and safely a team can change things. I learn what coupling is, why a
+change that ripples through many parts is slow to test and risky to
+deploy, and what an interface is. I learn the words monolith,
+microservice and strangler fig, and that neither monoliths nor
+microservices are always right.
+
+An example: I look at one of my projects and ask, for a recent change,
+which files I had to touch and which pages I had to check. If the answer
+is "almost all of them", that is tight coupling I can see.
+
+The habit to start here is asking "what else will this change affect?"
+before making it, and noticing when the honest answer is "I am not sure".
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can draw a dependency graph and compute the
+blast radius of a change. I give data a single owner and make others go
+through its interface. I draw boundaries by business capability rather
+than technical layer. I add timeouts and fallbacks to calls between parts,
+so one failure does not spread.
+
+An example: I move direct database queries from three modules into one
+module that owns the table, and the next schema change touches only that
+module.
+
+I also start writing contract tests for the interfaces I own, so I find
+out at once when a change would break a consumer.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I choose between monolith, modular monolith and
+services by weighing independence against distribution costs, and I can
+explain the choice. I design interfaces that tolerate change: additive,
+optional fields, tolerant readers, versions when needed, and contract
+tests. I lead incremental evolution of an outgrown system, in a safe
+order, with tests and telemetry first.
+
+An example: I extract a payment module from a monolith into a service
+behind the existing interface, with contract tests on both sides, and
+route a small share of traffic to it before moving all of it.
+
+I track architectural health with flow measures: how often parts deploy
+independently, build and test times, and how many changes need
+coordination across teams.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: transactions that span what are now separate
+services, which need designs such as compensating actions instead of one
+database transaction; reporting that needs data from many services, which
+needs a read-only copy or event stream rather than direct queries into
+each; shared reference data, such as country lists, that everyone needs
+and nobody owns; and performance-critical paths where a network call
+between services adds too much latency.
+
+An example: an order that must reserve stock and take payment cannot use
+one transaction across two services. The design reserves stock, takes
+payment, and releases the reservation if payment fails.
+
+Another edge case is a legacy system with no tests and no documentation,
+where even characterising its behaviour is hard. There, recording real
+production requests and responses, and replaying them against new code,
+gives a practical baseline for what "the same behaviour" means.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: a strangler fig where the old and new systems both
+write the same data during transition, risking conflicts; consumers that
+nobody knew about, discovered only when an old API version is retired;
+cyclic dependencies between services, where neither can deploy first;
+and a "distributed monolith", services that must still be deployed
+together because they share data or call each other's internals.
+
+An example: before retiring API version 1, a team logs every caller for a
+month and finds an old batch job nobody remembered. They move it first,
+then retire the version.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, each part of the system has an owning team, its own
+data and an explicit, versioned interface with contract tests. Parts are
+tested and deployed independently, and the share of deployments needing
+cross-team coordination is tracked and kept small. Calls between parts
+have timeouts, fallbacks and circuit breakers. Architectural evolution
+is continuous, funded from reserved capacity, with outgrown parts replaced
+by strangler fig migrations that track remaining legacy traffic to zero.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that architecture serves flow, and that every architecture
+is temporary. I do not judge past designs harshly; I judge whether today's
+design lets teams change things safely and independently. I prefer many
+small, reversible architectural steps over one bold rewrite, and I treat
+interfaces as promises to other teams that I change carefully.
+
+An example of the mindset: when I feel the urge to rewrite something from
+scratch, I ask what the smallest first step of evolving it would be, and I
+take that step instead.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, this chapter ties together Part III. Loose
+coupling makes tests fast, because each part is tested alone; makes
+continuous integration easy, because teams rarely collide; and makes
+releases low risk, because parts deploy alone and fail alone. Conway's Law,
+from chapter 7, closes the loop: team boundaries and system boundaries
+must match, or one will pull the other out of shape.
+
+An example: a design review asks three questions of any proposed
+component: who owns it, what is its interface, and can it be tested and
+deployed without anyone else.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to make independence the architectural goal. Measure
+blast radius and coordination. Give every piece of data one owner. Draw
+boundaries by business capability, matching teams. Choose the simplest
+archetype that gives the independence needed, usually a modular monolith
+first. Evolve continuously, tests and telemetry first, then boundaries,
+then extraction. Replace outgrown parts with strangler fig migrations and
+versioned interfaces, and finish them by retiring the old.
+
+Done when most changes are tested and deployed by one team without
+coordinating with others, every interface has an owner and contract tests,
+and the organisation evolves its architecture in small steps instead of
+planning rewrites.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Should we move to microservices?</summary>
+
+Only if the problems they solve, teams colliding, slow builds, parts
+needing separate scaling or release, are real for us, and we have the
+automation and telemetry to run many services. A modular monolith is
+often a better first step.
+
+</details>
+
+<details>
+<summary>Is a monolith technical debt?</summary>
+
+Not by itself. A well-structured monolith can be the right architecture
+for years. It becomes a problem when it no longer lets teams work and
+deploy independently.
+
+</details>
+
+<details>
+<summary>How small should a service be?</summary>
+
+Small enough for one team to own, understand and deploy alone; large
+enough that most changes stay inside it. Size in lines of code matters
+less than whether its boundary matches a business capability.
+
+</details>
+
+<details>
+<summary>How long does a strangler fig migration take?</summary>
+
+It depends on the system, often months or longer. The point is that value
+arrives throughout and each step is reversible, so the length is less
+risky than a rewrite of the same length.
+
+</details>
+
+<details>
+<summary>What if we cannot put a router in front of the old system?</summary>
+
+Look for another seam: a message queue it reads from, a database it writes
+to, a batch job that calls it. The strangler needs a point where traffic
+or work can be diverted; it does not have to be an HTTP proxy.
+
+</details>
+
+<details>
+<summary>Do shared libraries count as coupling?</summary>
+
+They can. A shared library used at a pinned version is a stable
+interface. A shared library that every part must update in lockstep, or
+that carries business logic, couples them tightly.
+
+</details>
+
+<details>
+<summary>Who owns cross-cutting concerns such as login or logging?</summary>
+
+Often a platform team, as in chapter 7, providing them as services or
+libraries with stable interfaces that product teams consume.
+
+</details>
+
+<details>
+<summary>How does this chapter connect to Part IV?</summary>
+
+Part IV is about feedback: telemetry and learning from production. Loosely
+coupled systems need good telemetry, because a request may pass through
+many parts, and chapter 14 begins there.
+
+</details>
+
+<details>
+<summary>How do we test a system made of many services end to end?</summary>
+
+Mostly, we do not test everything together on every change. Each service
+has its own tests and contract tests at its interfaces; a small number of
+end-to-end journeys run against a production-like environment; and
+production telemetry, from Part IV, watches real behaviour. The pyramid
+from chapter 10 applies across services as well as inside them.
+
+</details>
+
+<details>
+<summary>Can a team own more than one service?</summary>
+
+Yes, and it is common. What matters is that every service has exactly one
+owning team, and that the team can change, test and deploy each of its
+services without waiting for other teams.
+
+</details>
+
+<details>
+<summary>What is the first architectural change worth making in a tangled system?</summary>
+
+Usually, giving one heavily shared piece of data a single owner and
+putting an interface in front of it. It reduces the blast radius of many
+everyday changes at once, and it is small enough to finish quickly. Adding
+tests and telemetry around that area first makes the change safe.
+
+</details>
+
+## Key takeaways
+
+- Tight coupling makes every change slow to test, risky to integrate and large to deploy.
+- Blast radius, the set of parts a change forces to retest and redeploy, makes coupling visible.
+- Loose coupling with explicit interfaces gives productivity, testability and safety.
+- Give each piece of data one owner; shared databases are tight coupling.
+- Draw boundaries by business capability, matching teams.
+- Monoliths and microservices are trade-offs; a modular monolith is often the right first step.
+- Every architecture will be outgrown; evolve continuously instead of rewriting.
+- The strangler fig pattern replaces a system piece by piece behind a router, each step reversible.
+- Versioned interfaces let consumers move at their own pace.
+
+## Glossary
+
+- **Coupling**: how much one part of a system depends on another's details.
+- **Big ball of mud**: a system with no clear internal boundaries.
+- **Blast radius**: the parts that must be retested and redeployed because of a change.
+- **Loosely coupled architecture**: parts with explicit interfaces that can change, test and deploy independently.
+- **Interface**: the explicit contract, such as an API or message format, through which parts interact.
+- **Bounded context**: a part of the business domain with its own language and rules.
+- **Data ownership**: the rule that one part owns each piece of data and others access it through that part.
+- **Tolerant reader**: a consumer that ignores fields it does not understand.
+- **Timeout**: a limit on how long a caller waits for a response.
+- **Fallback**: a useful default served when a dependency fails.
+- **Circuit breaker**: a mechanism that stops calling a failing dependency for a while.
+- **Monolith**: one codebase deployed as one unit.
+- **Modular monolith**: a monolith with enforced internal module boundaries.
+- **Microservices**: many small, independently deployed services, each usually owning its data.
+- **Distributed monolith**: services that still must deploy together because they remain coupled.
+- **Technical debt**: the accumulated cost of shortcuts and outdated designs.
+- **Strangler fig pattern**: replacing a system incrementally behind a router until it can be retired.
+- **Facade**: a layer in front of a system that hides whether requests go to old or new parts.
+- **API versioning**: running old and new interface versions side by side.
+
+## Exercises and self-check
+
+**Warm-up.** Draw the dependency graph of a project I know, including
+shared databases and libraries. Add it to the blast-radius script and run
+it for three common changes.
+
+**Build.** Take one place where several parts read the same data directly,
+give that data one owner, and route the others through an interface. Add a
+contract test for the interface and a timeout with a fallback for one call.
+
+**Stretch.** Plan a strangler fig migration for an old part of a system:
+the router, the order of pieces, data ownership at each step, and the
+measure that shows when the old part can be retired. Run the strangler
+script with my own list of paths.
+
+### Self-check
+
+<details>
+<summary>1. In the blast-radius script, why did changing the shared database affect all seven components?</summary>
+
+Every component depended on it directly or through others, so a change
+reached all of them.
+
+</details>
+
+<details>
+<summary>2. What are the three benefits of loose coupling?</summary>
+
+Productivity, testability and safety.
+
+</details>
+
+<details>
+<summary>3. When is splitting a part into its own service worth it?</summary>
+
+When the independence gained, separate deployment, ownership or scaling,
+is worth more than the costs of distribution.
+
+</details>
+
+<details>
+<summary>4. Why is a big rewrite riskier than incremental evolution?</summary>
+
+No value until the switch, a moving target, one huge switch and the need
+to reproduce all old behaviour at once.
+
+</details>
+
+<details>
+<summary>5. What made rollback easy in the strangler script?</summary>
+
+Routing: moving a path back to the old system was a single change at the
+router.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter with a real codebase and a pencil. Drawing the
+dependencies of a system I know teaches more than any diagram of a system
+I do not.
+
+<Timeline caption="Three sessions and a habit for chapter 13." items={[
+  { when: "Session 1", what: "Read the chapter. Run the three scripts. Draw my project's dependency graph." },
+  { when: "Session 2", what: "Fix one shared-data coupling with an owner and an interface; add a contract test." },
+  { when: "Session 3", what: "Plan a strangler fig migration for one old part, with order, data ownership and a retirement measure." },
+  { when: "Every design", what: "Ask who owns it, what its interface is, and whether it can deploy alone." },
+]} />
+
+This chapter is part of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+It closes Part III; Part IV turns from flow to feedback, starting with
+telemetry.
+
+Done when I can draw the blast radius of changes in a system I work on,
+have removed one shared-data coupling, and can plan a strangler fig
+migration step by step.
