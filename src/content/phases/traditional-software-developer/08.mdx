@@ -1,0 +1,2071 @@
+---
+plan: traditional-software-developer
+phase: 8
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+
+This is how I would work through every bullet of the databases phase. The
+primary book is [Database Internals](/sanjay/books/database-internals/); the
+free guide for indexing is [Use the Index, Luke](/sanjay/books/use-the-index-luke/);
+the depth for replication, partitioning and the trade-offs is
+[Designing Data-Intensive Applications](/sanjay/books/designing-data-intensive-applications/).
+Every topic below climbs nine levels, each with a worked example, what I would see, and the common mistake with
+its fix. SQL is PostgreSQL; plan costs and timings will differ on my machine.
+
+<Layers
+  caption="What sits between my SQL and the disk."
+  layers={[
+    { name: 'Query', note: 'SQL text from my application' },
+    { name: 'Parser and planner', note: 'syntax tree, statistics, the cheapest plan it can find' },
+    { name: 'Executor', note: 'scans, joins, sorts, aggregates, row by row or in batches' },
+    { name: 'Access methods', note: 'heap pages, B-tree and other indexes' },
+    { name: 'Buffer pool and WAL', note: 'pages cached in memory, every change logged first' },
+    { name: 'Files on disk', note: 'fsync makes it durable' },
+  ]}
+/>
+
+#### The relational model, keys, constraints, and relational algebra
+
+<Figure art={`
+ customer                         orders
+ +----+--------+-------+          +-----+-------------+--------+
+ | id | email  | city  |          | id  | customer_id | total  |
+ +----+--------+-------+          +-----+-------------+--------+
+ |  1 | a@x.in | Pune  | <------- | 101 |      1      | 450.00 |
+ |  2 | b@x.in | Delhi | <------- | 102 |      2      |  80.00 |
+ +----+--------+-------+   FK     | 103 |      1      | 120.00 |
+   PK, UNIQUE(email)              +-----+-------------+--------+
+`} caption="Two relations, a primary key, a unique key and a foreign key between them." />
+
+<Levels label="Phase 8, the relational model">
+
+<Level name="Beginner" depth={5}>
+
+A relation is a table: a set of rows with the same named, typed columns. A primary key identifies each row; a foreign key in one table refers to a primary key in another; constraints (`NOT NULL`, `UNIQUE`, `CHECK`) are rules the database enforces on every write, no matter which application writes.
+
+```sql
+CREATE TABLE customer (
+  id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL UNIQUE,
+  city  text
+);
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customer (id),
+  total       numeric(10,2) NOT NULL CHECK (total >= 0)
+);
+INSERT INTO orders (customer_id, total) VALUES (99, 10);
+```
+
+```text
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(99) is not present in table "customer".
+```
+
+Common mistake: enforcing "an order must belong to a customer" only in application code. Fix: a foreign key, so every writer (scripts, other services, manual fixes) obeys it.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Relations are sets: rows have no inherent order, and a query result has no order unless `ORDER BY` says so. Keys come in kinds: natural keys (email, ISBN) come from the domain; surrogate keys (identity, UUID) are generated. A candidate key is any minimal set of columns that is unique; you pick one as primary and enforce the others with `UNIQUE`.
+
+```sql
+SELECT id FROM customer;          -- order is whatever the plan produces
+SELECT id FROM customer ORDER BY id;
+```
+
+Common mistake: relying on rows coming back in insertion order, which works in a test and breaks after an update or a parallel scan. Fix: always `ORDER BY` when order matters.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Relational algebra is the small set of operations every query reduces to: selection (filter rows), projection (pick columns), join, union, difference and rename, plus aggregation in practice. SQL is a declarative way to express them; the planner rewrites the algebra into an efficient order.
+
+```ts
+// relational algebra on arrays: selection, projection, join
+type C = { id: number; city: string }; type O = { id: number; customerId: number; total: number };
+const customers: C[] = [{ id: 1, city: 'Pune' }, { id: 2, city: 'Delhi' }];
+const orders: O[] = [{ id: 101, customerId: 1, total: 450 }, { id: 102, customerId: 2, total: 80 }, { id: 103, customerId: 1, total: 120 }];
+const select = <T>(r: T[], p: (t: T) => boolean) => r.filter(p);
+const join = customers.flatMap(c => orders.filter(o => o.customerId === c.id).map(o => ({ ...c, ...o, id: o.id })));
+const project = select(join, t => t.city === 'Pune').map(t => [t.id, t.total]);
+console.log(project);
+```
+
+Output: `[ [ 101, 450 ], [ 103, 120 ] ]`.
+
+Common mistake: thinking of SQL as a sequence of steps executed in the written order. Fix: it is an expression; the planner chooses the order.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: NULL means unknown, and comparisons with it are unknown, not false. `NULL = NULL` is not true; a `UNIQUE` column allows many NULLs by default; `NOT IN` with a NULL in the list returns no rows.
+
+```sql
+SELECT NULL = NULL AS eq, NULL IS NULL AS is_null;
+SELECT 1 WHERE 1 NOT IN (2, NULL);
+```
+
+```text
+ eq | is_null
+----+---------
+    | t
+(0 rows)
+```
+
+The first column is NULL (shown empty); the second query returns nothing.
+
+Common mistake: `WHERE customer_id NOT IN (SELECT customer_id FROM blocked)` when `blocked.customer_id` can be NULL. Fix: `NOT EXISTS`, or make the column `NOT NULL`.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: deferred constraints. Two rows that reference each other (a team with a captain who is a member of the team) cannot be inserted one at a time if both foreign keys are checked immediately. Declaring the constraint `DEFERRABLE INITIALLY DEFERRED` checks it at commit.
+
+```sql
+CREATE TABLE team (id int PRIMARY KEY, captain_id int);
+CREATE TABLE member (id int PRIMARY KEY, team_id int NOT NULL REFERENCES team (id) DEFERRABLE INITIALLY DEFERRED);
+ALTER TABLE team ADD FOREIGN KEY (captain_id) REFERENCES member (id) DEFERRABLE INITIALLY DEFERRED;
+BEGIN;
+INSERT INTO team VALUES (1, 10);
+INSERT INTO member VALUES (10, 1);
+COMMIT;   -- both constraints checked here, and pass
+```
+
+Common mistake: dropping a foreign key because of a circular insert. Fix: defer it.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, constraints are added to existing large tables without long locks: add the constraint as `NOT VALID` (enforced for new writes only), then `VALIDATE CONSTRAINT`, which checks old rows with a weaker lock.
+
+```sql
+ALTER TABLE orders ADD CONSTRAINT orders_total_nonneg CHECK (total >= 0) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_total_nonneg;
+```
+
+Common mistake: `ALTER TABLE ... ADD CONSTRAINT` on a hot table, blocking writes while every row is checked. Fix: `NOT VALID` then `VALIDATE`.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+The database is the last line of defence for data integrity. Application bugs come and go; constraints stay. I put every invariant I can express into the schema.
+
+<Compare left="rule only in code" right="rule as a constraint" rows={[
+  ['bypassed by scripts and other services', 'enforced for every writer'],
+  ['bad rows discovered months later', 'bad write rejected immediately'],
+  ['documented in comments, maybe', 'documented in the schema'],
+]} caption="Where an invariant lives decides whether it holds." />
+
+Common mistake: "constraints slow down writes". Fix: the check is cheap compared with cleaning corrupt data.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+When designing a schema I write the invariants in plain words first ("every order has a customer", "an email belongs to one account", "a total is never negative"), then map each to a key or constraint. Invariants that cross rows in ways constraints cannot express (an account's balance never below zero across concurrent transfers) go to transactions with the right isolation (the transactions topic below).
+
+```text
+invariant                                   mechanism
+order has a customer                         FOREIGN KEY
+one account per email (case-insensitive)     UNIQUE index on lower(email)
+total >= 0                                   CHECK
+no overlapping bookings for a room           EXCLUDE USING gist (room WITH =, during WITH &&)
+balance never negative under concurrency     SERIALIZABLE or SELECT ... FOR UPDATE
+```
+
+Common mistake: listing tables before invariants. Fix: invariants first; the tables follow.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: write the invariants for an application I know, build the schema with constraints, and then try to break each invariant with a direct `INSERT`. Every attempt should fail with a clear error.
+
+Exercise: reproduce the `NOT IN` with NULL trap and fix it with `NOT EXISTS`.
+
+Done when I can express any single-table or two-table invariant as a constraint, and add one to a large table without blocking writes.
+
+</Level>
+</Levels>
+
+#### SQL: joins, aggregates, subqueries, CTEs, window functions, and transactions
+
+<Flow steps={['FROM and JOIN', 'WHERE', 'GROUP BY', 'HAVING', 'SELECT (and window functions)', 'DISTINCT', 'ORDER BY', 'LIMIT']} caption="The logical order a SELECT is evaluated in, which is not the order it is written in." />
+
+<Levels label="Phase 8, SQL">
+
+<Level name="Beginner" depth={5}>
+
+SQL describes the result, not the steps. A `SELECT` reads from tables (`FROM`, `JOIN`), filters rows (`WHERE`), groups and aggregates (`GROUP BY`, `count`, `sum`), filters groups (`HAVING`) and orders the output.
+
+```sql
+SELECT c.city, count(*) AS orders, sum(o.total) AS revenue
+FROM orders o JOIN customer c ON c.id = o.customer_id
+GROUP BY c.city
+HAVING count(*) > 1
+ORDER BY revenue DESC;
+```
+
+```text
+ city | orders | revenue
+------+--------+---------
+ Pune |      2 |  570.00
+```
+
+(With the three sample orders above: Delhi has one order and is filtered out by `HAVING`.)
+
+Common mistake: using a column alias from `SELECT` in `WHERE`. Fix: `WHERE` runs before `SELECT`; repeat the expression or use a subquery.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Joins: an inner join keeps matching pairs; a left join keeps every row of the left table, with NULLs where there is no match. Subqueries and CTEs (`WITH`) name intermediate results. `EXISTS` asks whether a related row exists without multiplying rows.
+
+```sql
+-- customers with no orders
+SELECT c.email FROM customer c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+
+-- the same with a left join
+SELECT c.email FROM customer c LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL;
+```
+
+Common mistake: a filter on the right table in `WHERE` after a left join (`WHERE o.status = 'paid'`), which silently turns it into an inner join. Fix: put that condition in the `ON` clause.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Window functions compute over a set of rows related to the current one, without collapsing them like `GROUP BY`: running totals, ranks, the previous row's value.
+
+```sql
+SELECT customer_id, id, total,
+       sum(total) OVER (PARTITION BY customer_id ORDER BY id) AS running,
+       row_number() OVER (PARTITION BY customer_id ORDER BY total DESC) AS rank_in_customer
+FROM orders ORDER BY customer_id, id;
+```
+
+```text
+ customer_id | id  | total  | running | rank_in_customer
+-------------+-----+--------+---------+------------------
+           1 | 101 | 450.00 |  450.00 |                1
+           1 | 103 | 120.00 |  570.00 |                2
+           2 | 102 |  80.00 |   80.00 |                1
+```
+
+Common mistake: a correlated subquery per row for "latest order per customer". Fix: `row_number()` partitioned by customer, then filter rank 1, or `DISTINCT ON`.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: aggregates over empty sets and NULLs. `count(*)` counts rows; `count(col)` skips NULLs; `sum` of no rows is NULL, not zero; `avg` ignores NULLs.
+
+```sql
+SELECT count(*), count(x), sum(x), avg(x) FROM (VALUES (1), (NULL), (3)) t(x);
+SELECT sum(total) FROM orders WHERE false;
+```
+
+```text
+ count | count | sum |        avg
+-------+-------+-----+--------------------
+     3 |     2 |   4 | 2.0000000000000000
+ sum
+-----
+
+```
+
+Common mistake: displaying "revenue: null" for a day with no orders. Fix: `coalesce(sum(total), 0)`.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: a join that multiplies rows. Joining orders and payments, both on customer, produces every order paired with every payment, so sums double-count.
+
+```sql
+-- customer 1 has 2 orders and 2 payments: 4 joined rows
+SELECT c.id, sum(o.total) AS order_total
+FROM customer c JOIN orders o ON o.customer_id = c.id JOIN payment p ON p.customer_id = c.id
+GROUP BY c.id;      -- order_total is doubled
+
+-- fix: aggregate each side first, then join
+WITH o AS (SELECT customer_id, sum(total) t FROM orders GROUP BY 1),
+     p AS (SELECT customer_id, sum(amount) a FROM payment GROUP BY 1)
+SELECT o.customer_id, o.t, p.a FROM o JOIN p USING (customer_id);
+```
+
+Common mistake: patching a fan-out with `DISTINCT` inside `sum`, which also merges genuinely equal amounts. Fix: pre-aggregate.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In application code, SQL is sent with parameters, never by string building, and multi-statement changes run in a transaction. Connection pooling keeps the number of connections bounded.
+
+```ts
+// with the 'pg' driver; the shape of a safe, transactional write
+async function transfer(client: { query: (s: string, v?: unknown[]) => Promise<unknown> }, from: number, to: number, amt: number) {
+  await client.query('BEGIN');
+  try {
+    await client.query('UPDATE account SET balance = balance - $1 WHERE id = $2', [amt, from]);
+    await client.query('UPDATE account SET balance = balance + $1 WHERE id = $2', [amt, to]);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; }
+}
+const log: string[] = [];
+await transfer({ query: async s => { log.push(s.split(' ')[0]); } }, 1, 2, 50);
+console.log(log);
+```
+
+Output: `[ 'BEGIN', 'UPDATE', 'UPDATE', 'COMMIT' ]`.
+
+Common mistake: issuing `BEGIN` on a pool rather than on one checked-out client, so the statements go to different connections. Fix: check out one client for the whole transaction.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+I read SQL as set operations and always ask: how many rows does each step produce? Most SQL bugs are cardinality bugs: a join that multiplies, a filter that removes NULLs, an aggregate over nothing.
+
+<Compare left="row-by-row thinking" right="set thinking" rows={[
+  ['loop over customers, query orders', 'one join'],
+  ['fetch all, filter in code', 'WHERE in SQL'],
+  ['compute rank in code', 'window function'],
+]} caption="Moving work into the database where it belongs." />
+
+Common mistake: pulling a whole table into the application to compute a report. Fix: let the database aggregate.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+In a service I keep SQL in one data-access layer, each query named and tested against a real Postgres (not mocks), with the plan of the hot queries checked. Reports run on a replica or warehouse.
+
+```text
+src/db/queries/
+  orders_for_customer.sql      -- tested, plan checked
+  revenue_by_city.sql          -- runs on the replica
+tests/ spin up Postgres in a container, load fixtures, assert results
+```
+
+Common mistake: testing data access with an in-memory fake that does not implement NULL or collation rules. Fix: test against the real database.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: write 30 queries against a schema I designed: each kind of join, aggregates with HAVING, three window functions, a recursive CTE for a tree. Predict each result's row count before running it.
+
+Exercise: produce the join fan-out bug on purpose and fix it two ways.
+
+Done when I can write the query for any reporting question in one statement and predict its row count.
+
+</Level>
+</Levels>
+
+#### Schema design: normalization, denormalization, and the cost of each
+
+<Compare left="normalised" right="denormalised" rows={[
+  ['each fact stored once', 'facts copied where they are read'],
+  ['updates touch one row', 'updates touch every copy'],
+  ['reads need joins', 'reads are one lookup'],
+  ['no update anomalies', 'copies can disagree'],
+]} caption="The trade at the centre of schema design." />
+
+<Levels label="Phase 8, schema design">
+
+<Level name="Beginner" depth={5}>
+
+Normalisation means storing each fact in exactly one place. If a customer's city is stored on every order, changing it means updating every order, and missing one leaves the data contradicting itself. Normal forms are rules for spotting such duplication.
+
+```sql
+-- denormalised: city copied into every order
+CREATE TABLE order_flat (id int, customer_email text, customer_city text, total numeric);
+INSERT INTO order_flat VALUES (1, 'a@x.in', 'Pune', 10), (2, 'a@x.in', 'Pune', 20);
+UPDATE order_flat SET customer_city = 'Mumbai' WHERE id = 1;    -- forgot id 2
+SELECT DISTINCT customer_email, customer_city FROM order_flat;
+```
+
+```text
+ customer_email | customer_city
+----------------+---------------
+ a@x.in         | Mumbai
+ a@x.in         | Pune
+```
+
+Common mistake: one wide table "because joins are slow". Fix: normalise first; measure before denormalising.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+The normal forms in practice: first normal form (no repeating groups or lists in a column), second and third (every non-key column depends on the key, the whole key, and nothing but the key). Many-to-many relationships need a join table.
+
+```sql
+-- a post has many tags; a tag has many posts
+CREATE TABLE post (id bigint PRIMARY KEY, title text NOT NULL);
+CREATE TABLE tag  (id bigint PRIMARY KEY, name text NOT NULL UNIQUE);
+CREATE TABLE post_tag (post_id bigint REFERENCES post, tag_id bigint REFERENCES tag, PRIMARY KEY (post_id, tag_id));
+```
+
+Common mistake: a comma-separated `tags` text column. Fix: a join table, or a Postgres array or JSONB with a GIN index if the tags are never queried as entities.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Denormalisation is a deliberate copy for read speed: a counter of comments on a post, a materialised view of revenue per day, a snapshot of the price on an order line. The last one is not denormalisation at all: the price at purchase time is a different fact from the current price.
+
+```sql
+CREATE TABLE order_line (
+  order_id bigint, product_id bigint, quantity int NOT NULL,
+  unit_price numeric(10,2) NOT NULL,      -- price at purchase, deliberately stored
+  PRIMARY KEY (order_id, product_id)
+);
+CREATE MATERIALIZED VIEW daily_revenue AS
+  SELECT created_at::date AS day, sum(total) AS revenue FROM orders GROUP BY 1;
+REFRESH MATERIALIZED VIEW daily_revenue;
+```
+
+Common mistake: joining order lines to the current product price for an invoice. Fix: store the price at the time of sale.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: JSONB columns. They are right for data whose shape varies and is not queried relationally (third-party webhook payloads, user preferences). They are wrong for data with relationships or constraints.
+
+```sql
+CREATE TABLE webhook_event (id bigserial PRIMARY KEY, source text NOT NULL, payload jsonb NOT NULL);
+CREATE INDEX ON webhook_event USING gin (payload jsonb_path_ops);
+SELECT id FROM webhook_event WHERE payload @> '{"type": "payment.succeeded"}';
+```
+
+Common mistake: storing customer_id inside JSONB, losing the foreign key. Fix: promote fields that relate to other tables into real columns.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: soft deletes (`deleted_at` column) break uniqueness: a deleted user's email blocks a new sign-up with the same email. A partial unique index fixes it.
+
+```sql
+CREATE TABLE account (id bigserial PRIMARY KEY, email text NOT NULL, deleted_at timestamptz);
+CREATE UNIQUE INDEX account_email_live ON account (lower(email)) WHERE deleted_at IS NULL;
+INSERT INTO account (email, deleted_at) VALUES ('a@x.in', now());
+INSERT INTO account (email) VALUES ('A@x.in');   -- allowed: the first row is deleted
+INSERT INTO account (email) VALUES ('a@x.in');   -- rejected
+```
+
+```text
+ERROR:  duplicate key value violates unique constraint "account_email_live"
+```
+
+Common mistake: every query forgetting `WHERE deleted_at IS NULL`. Fix: a view of live rows, or move deleted rows to an archive table.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, schema changes are migrations: versioned, reviewed, reversible, and safe under load. Adding a nullable column is instant; adding a column with a volatile default, changing a type, or adding an index without `CONCURRENTLY` can lock or rewrite the table. Big changes follow expand and contract: add the new shape, backfill in batches, switch reads, remove the old shape.
+
+```sql
+-- expand
+ALTER TABLE customer ADD COLUMN email_normalised text;
+-- backfill in batches (repeat until 0 rows)
+UPDATE customer SET email_normalised = lower(email)
+WHERE id IN (SELECT id FROM customer WHERE email_normalised IS NULL LIMIT 5000);
+-- constrain and index without long locks
+CREATE UNIQUE INDEX CONCURRENTLY customer_email_norm ON customer (email_normalised);
+-- contract later, after the code no longer reads email for lookups
+```
+
+Common mistake: a single migration that renames a column used by running code. Fix: expand and contract across several deployments.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Normalise by default; denormalise with a reason, a measurement, and a mechanism that keeps the copy correct (trigger, materialised view refresh, or a derived pipeline).
+
+<Flow steps={['write invariants', 'normalise to remove duplication', 'measure the hot reads', 'denormalise one path with a sync mechanism', 'verify copies match']} caption="The order I make schema decisions in." />
+
+Common mistake: denormalising without a way to detect drift. Fix: a periodic query comparing the copy with its source.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+For a new application I sketch entities, relationships, invariants and access paths on one page. Then tables, keys and constraints; then the indexes for the main queries; then any read models. The migration plan is part of the design.
+
+```text
+entities: customer, order, order_line, product
+relationships: customer 1-n order; order 1-n order_line; product 1-n order_line
+access paths: order history by customer (latest first); product page; daily revenue
+read models: daily_revenue materialised view, refreshed every 10 minutes
+```
+
+Common mistake: designing tables from the UI screens. Fix: from entities and invariants; screens become queries.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: design the schema for an application I would actually build, normalise it, then write the five most frequent queries and decide which, if any, need a denormalised read model. Write every change as a migration with a rollback.
+
+Exercise: a migration that splits `name` into `first_name` and `last_name` on a million-row table without downtime, with a tested rollback.
+
+Done when my schema has every invariant as a constraint, and I can change it under load without blocking writes.
+
+</Level>
+</Levels>
+
+#### Indexes: B-trees, hash indexes, composite indexes, covering indexes, partial indexes, and selectivity
+
+<Compare left="index type" right="good for" rows={[
+  ['B-tree (default)', 'equality, ranges, ORDER BY, prefix LIKE'],
+  ['hash', 'equality only'],
+  ['GIN', 'JSONB containment, arrays, full-text, trigrams'],
+  ['GiST', 'ranges, geometry, exclusion constraints'],
+  ['BRIN', 'huge tables physically ordered by the column (time)'],
+]} caption="PostgreSQL index types and what each serves." />
+
+<Levels label="Phase 8, indexes">
+
+<Level name="Beginner" depth={5}>
+
+An index is a sorted structure over some columns, with pointers to rows. It turns "read every row" into "walk a small tree". Postgres creates one automatically for every primary key and unique constraint; everything else I create for my queries.
+
+```sql
+EXPLAIN SELECT * FROM customer WHERE email = 'user42@example.com';
+-- Index Scan using customer_email_key on customer   (from the UNIQUE constraint)
+EXPLAIN SELECT * FROM customer WHERE city = 'Pune';
+-- Seq Scan on customer   (no index on city, and many rows match anyway)
+```
+
+Common mistake: no index on foreign key columns, so deleting a customer scans the whole orders table to check references. Fix: index foreign keys that are used in joins or cascades.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Composite indexes are sorted by the first column, then the second, and serve queries on a leading prefix. Put equality columns first, then the range or order by column.
+
+```sql
+CREATE INDEX orders_cust_created ON orders (customer_id, created_at);
+EXPLAIN SELECT * FROM orders WHERE customer_id = 7 AND created_at > now() - interval '30 days';
+-- Index Cond: ((customer_id = 7) AND (created_at > ...))
+EXPLAIN SELECT * FROM orders WHERE created_at > now() - interval '30 days';
+-- cannot seek on created_at with this index: Seq Scan or another index
+```
+
+Common mistake: separate single-column indexes on customer_id and created_at. Fix: one composite index matching the query.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Covering indexes contain every column the query needs, so the table is not read (Index Only Scan). Partial indexes include only rows matching a condition, so they are small and cheap to maintain. Expression indexes index a computed value such as `lower(email)`.
+
+```sql
+CREATE INDEX orders_history ON orders (customer_id, created_at DESC) INCLUDE (total);
+CREATE INDEX orders_unpaid ON orders (created_at) WHERE status = 'new';
+CREATE UNIQUE INDEX customer_email_ci ON customer (lower(email));
+EXPLAIN SELECT created_at, total FROM orders WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 20;
+-- Limit -> Index Only Scan using orders_history
+```
+
+Common mistake: a partial index the query cannot use because its where clause does not imply the index condition. Fix: repeat the exact condition in the query.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: selectivity. An index helps when a query matches a small fraction of rows. For a condition matching a quarter of the table, a sequential scan is cheaper than hundreds of thousands of random table reads, and the planner is right to ignore the index.
+
+```ts
+// a rough cost model: random page reads versus sequential pages
+const rows = 2_000_000, rowsPerPage = 80, pages = rows / rowsPerPage;
+const seqCost = pages * 1.0;                       // seq_page_cost = 1
+const indexCost = (fraction: number) => rows * fraction * 4.0;   // random_page_cost = 4, one page per row worst case
+for (const f of [0.0001, 0.01, 0.25]) console.log(f, indexCost(f) < seqCost ? 'index' : 'seq scan');
+```
+
+Output: `0.0001 index`, `0.01 seq scan`, `0.25 seq scan` on three lines. With scattered rows, even 1 percent can favour the scan; clustering changes that.
+
+Common mistake: forcing the index with `enable_seqscan = off` in production. Fix: accept the scan, or make the query more selective, or cover it.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: an index on a low-cardinality boolean or status column is useless for the common value and great for the rare one. A partial index on the rare value is smaller and better than a full index.
+
+```sql
+-- 1% of jobs are pending
+CREATE INDEX jobs_pending ON job (id) WHERE status = 'pending';
+SELECT id FROM job WHERE status = 'pending' ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED;
+```
+
+The second line is the classic queue pattern: workers take pending jobs without blocking each other.
+
+Common mistake: `CREATE INDEX ON job (status)` and expecting it to help `status = 'done'`. Fix: partial index for the rare value only.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+Indexes on live tables are built with `CREATE INDEX CONCURRENTLY` (no write lock, slower, cannot run inside a transaction). A failed concurrent build leaves an invalid index that must be dropped. Unused indexes are found with `pg_stat_user_indexes` and dropped, because each slows every write.
+
+```sql
+CREATE INDEX CONCURRENTLY orders_status_created ON orders (status, created_at);
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;   -- leftovers from failed builds
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE relname = 'orders' ORDER BY idx_scan;
+```
+
+Common mistake: plain `CREATE INDEX` on a busy table, blocking writes for minutes. Fix: `CONCURRENTLY`, and check for invalid leftovers.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+An index is designed for a query, not for a column. I start from the query's where, order by and select list, and build the one index that serves all three.
+
+<Flow steps={['equality columns', 'then one range or ORDER BY column', 'then INCLUDE columns for covering', 'add WHERE for a partial index if the query always filters', 'check the plan']} caption="From a query to its index." />
+
+Common mistake: indexing every column "just in case". Fix: each index justified by a query and by plan evidence.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+For each table I keep a short index rationale: index, the queries it serves, and when it was last confirmed used. Write-heavy tables get the fewest indexes.
+
+```text
+orders indexes
+  orders_pkey                          lookups by id
+  orders_history (customer_id, created_at DESC) INCLUDE (total)   order history page
+  orders_unpaid (created_at) WHERE status = 'new'                 payment reminder job
+  (no index on total: no query filters on it)
+```
+
+Common mistake: nobody knowing why an index exists, so nobody dares drop it. Fix: a rationale next to each index in the migration.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: Use the Index, Luke chapters 1, 2, 5 and 6 with a five-million-row table, building the same query's index three ways and comparing buffers. Then the queue pattern with `SKIP LOCKED` and two workers.
+
+Exercise: find the selectivity at which my planner switches from index to scan, and explain it with the cost settings.
+
+Done when I can design the index for any single-table query and show it in the plan, and I know what each index costs writes.
+
+</Level>
+</Levels>
+
+#### Query planning: EXPLAIN, statistics, join strategies, sequential versus index scans
+
+<Flow steps={['parse SQL', 'rewrite (views, rules)', 'enumerate plans: scan types, join orders, join methods', 'estimate cost of each from statistics', 'pick the cheapest', 'execute']} caption="How the planner turns SQL into a plan." />
+
+<Levels label="Phase 8, query planning">
+
+<Level name="Beginner" depth={5}>
+
+`EXPLAIN` shows the plan the database will use; `EXPLAIN ANALYZE` runs the query and shows what actually happened. A plan is a tree: the leaves read tables (scans), the inner nodes join, sort and aggregate. Read it from the most indented node outwards.
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 7;
+```
+
+```text
+Index Scan using orders_cust_created on orders  (cost=0.43..85.10 rows=50 width=40) (actual time=0.03..0.09 rows=50 loops=1)
+  Index Cond: (customer_id = 7)
+Planning Time: 0.1 ms
+Execution Time: 0.1 ms
+```
+
+Common mistake: running `EXPLAIN ANALYZE` on an `UPDATE` or `DELETE` in production, which actually executes it. Fix: wrap it in `BEGIN; ... ROLLBACK;`.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+The cost numbers are in arbitrary units: startup cost and total cost. `rows` is the estimate; `actual ... rows` is the truth. The planner's estimates come from statistics collected by `ANALYZE`: row counts, most common values, histograms and correlation per column.
+
+```sql
+SELECT attname, n_distinct, most_common_vals, correlation
+FROM pg_stats WHERE tablename = 'orders' AND attname IN ('status', 'customer_id');
+```
+
+Common mistake: ignoring the gap between estimated and actual rows. Fix: a gap of 10x or more means bad statistics; it is usually the root cause of a bad plan.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Join strategies: nested loop (good when the outer side is small and the inner side has an index), hash join (good for large unsorted inputs with equality), merge join (good when both sides are sorted). The planner also picks the join order, which matters more than anything else in a multi-table query.
+
+```sql
+EXPLAIN SELECT c.city, sum(o.total) FROM orders o JOIN customer c ON c.id = o.customer_id
+WHERE o.created_at > now() - interval '1 day' GROUP BY c.city;
+```
+
+```text
+HashAggregate
+  ->  Hash Join  (Hash Cond: (o.customer_id = c.id))
+        ->  Index Scan using orders_created on orders o  (Index Cond: (created_at > ...))
+        ->  Hash  ->  Seq Scan on customer c
+```
+
+Common mistake: assuming the join order is the order of tables in the `FROM` clause. Fix: the planner reorders (up to `join_collapse_limit` tables).
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: correlated columns. The planner assumes columns are independent, so for `city = 'Pune' AND pincode = '411001'` it multiplies the two selectivities and underestimates. Extended statistics teach it the correlation.
+
+```sql
+EXPLAIN SELECT * FROM address WHERE city = 'Pune' AND pincode = '411001';   -- rows estimate far too low
+CREATE STATISTICS address_city_pin (dependencies) ON city, pincode FROM address;
+ANALYZE address;
+EXPLAIN SELECT * FROM address WHERE city = 'Pune' AND pincode = '411001';   -- estimate close to actual
+```
+
+Common mistake: a nested loop chosen because of a tiny row estimate, then running for minutes over thousands of rows. Fix: extended statistics or a higher statistics target.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: generic versus custom plans for prepared statements. After several executions, Postgres may switch a prepared statement to a generic plan that ignores the parameter value. With skewed data (one huge customer), the generic plan can be wrong for some values.
+
+```sql
+PREPARE q(bigint) AS SELECT * FROM orders WHERE customer_id = $1;
+EXPLAIN EXECUTE q(7);
+SET plan_cache_mode = force_custom_plan;   -- per session, when skew makes generic plans bad
+```
+
+Common mistake: a query fast in psql and slow from the application, because the application uses prepared statements. Fix: compare with `EXPLAIN EXECUTE`, and consider `plan_cache_mode`.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, `auto_explain` logs plans of slow queries automatically, and `pg_stat_statements` ranks queries by total time. Together they show which query to fix and why it is slow.
+
+```sql
+-- postgresql.conf
+-- shared_preload_libraries = 'pg_stat_statements,auto_explain'
+-- auto_explain.log_min_duration = '500ms'
+-- auto_explain.log_analyze = on
+SELECT left(query, 60), calls, round(total_exec_time) AS total_ms FROM pg_stat_statements ORDER BY 3 DESC LIMIT 5;
+```
+
+Common mistake: tuning by guessing. Fix: plans from the slow log, then one change at a time with before and after numbers.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+The planner is usually right given its information. When a plan is bad, I find the wrong information (a bad estimate) rather than forcing a plan.
+
+<Compare left="forcing" right="informing" rows={[
+  ['enable_* settings off', 'ANALYZE, higher statistics target'],
+  ['query hints (extension)', 'extended statistics for correlated columns'],
+  ['rewriting until it looks fast', 'an index that matches the query'],
+]} caption="Two ways to fix a bad plan; prefer the right column." />
+
+Common mistake: a fix that works today and breaks when data shifts. Fix: fix estimates, not plans.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+For a system, I keep a list of critical queries with expected plans and latency budgets, and a CI check on a realistic dataset. Plan changes after a Postgres upgrade or data growth are caught before users see them.
+
+```text
+critical query            budget p99   expected plan node
+order history             20 ms         Index Only Scan orders_history
+checkout insert           30 ms         (insert; 4 indexes)
+daily revenue report      2 s           replica; HashAggregate
+```
+
+Common mistake: no baseline, so nobody knows a plan changed. Fix: record plans for critical queries and diff them.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: take ten queries from an application, run `EXPLAIN (ANALYZE, BUFFERS)`, and for each write the estimate gap, the most expensive node and one improvement. Then break statistics on purpose (correlated columns) and fix them.
+
+Exercise: tune one slow query with before-and-after plans and numbers.
+
+Done when I can read any plan, find the expensive node and the bad estimate, and fix the cause.
+
+</Level>
+</Levels>
+
+#### Transactions: ACID, isolation levels, anomalies, MVCC, and locking
+
+<Figure art={`
+ READ COMMITTED (default)            two sessions, balance = 100
+ T1: BEGIN                           T2: BEGIN
+ T1: SELECT balance -> 100           T2: SELECT balance -> 100
+ T1: UPDATE balance = 100 - 30       T2: UPDATE balance = 100 - 50   (waits for T1's row lock)
+ T1: COMMIT                          T2: ... then writes 50
+                                     T2: COMMIT
+ final balance 50, but 80 was withdrawn: a lost update
+`} caption="A lost update: read-modify-write in application code under the default isolation level." />
+
+<Levels label="Phase 8, transactions">
+
+<Level name="Beginner" depth={5}>
+
+A transaction groups statements so they succeed or fail together (atomicity), keep constraints valid (consistency), do not interfere with concurrent transactions in defined ways (isolation), and survive a crash once committed (durability).
+
+```sql
+BEGIN;
+UPDATE account SET balance = balance - 50 WHERE id = 1;
+UPDATE account SET balance = balance + 50 WHERE id = 2;
+COMMIT;      -- both, or (on error, ROLLBACK) neither
+```
+
+Common mistake: autocommit for multi-step changes, leaving half-done transfers after an error. Fix: wrap related writes in one transaction.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Isolation levels decide which anomalies are possible. In Postgres: Read Committed (default; each statement sees data committed before it started), Repeatable Read (snapshot isolation: the whole transaction sees one snapshot), Serializable (behaves as if transactions ran one at a time, aborting some with serialization errors).
+
+```text
+anomaly            read committed   repeatable read   serializable
+dirty read         no               no                no
+non-repeatable     possible         no                no
+lost update        possible*        detected (error)  detected (error)
+write skew         possible         possible          no
+* for read-modify-write in application code
+```
+
+Common mistake: assuming "transaction" means "serializable". Fix: check the level; Postgres defaults to Read Committed.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+MVCC (multi-version concurrency control): an update writes a new row version instead of overwriting; each transaction sees the versions visible to its snapshot. Readers do not block writers. Old versions are removed later by vacuum.
+
+```ts
+// a toy MVCC store: versions tagged with the creating transaction id
+type V = { value: number; xmin: number };
+const versions: V[] = [{ value: 100, xmin: 1 }];
+const visible = (snapshotXid: number) => versions.filter(v => v.xmin <= snapshotXid).at(-1)!.value;
+const t2Snapshot = 2;                 // T2 started after txn 1 committed
+versions.push({ value: 70, xmin: 3 }); // T3 commits an update later
+console.log(visible(t2Snapshot), visible(3));
+```
+
+Output: `100 70`. T2 still sees its snapshot; a later transaction sees the new version.
+
+Common mistake: a transaction left open for hours, which prevents vacuum from removing old versions and bloats tables. Fix: `idle_in_transaction_session_timeout` and short transactions.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: the lost update. Two sessions read a value, compute in application code, and write back. Fixes: an atomic update (`SET balance = balance - 30`), a row lock (`SELECT ... FOR UPDATE`), or optimistic concurrency with a version column.
+
+```sql
+-- optimistic: the update only succeeds if nobody changed the row since we read it
+UPDATE account SET balance = 70, version = version + 1 WHERE id = 1 AND version = 5;
+-- UPDATE 0 means someone else won: reread and retry
+```
+
+Common mistake: read-modify-write in an ORM (`acct.balance -= 30; save()`) without a lock or version. Fix: one of the three patterns above.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: write skew. Two doctors on call; the rule is at least one must remain. Each transaction checks "two on call", then removes itself. Under Repeatable Read both succeed and nobody is on call. Only Serializable (or explicit locks on the rows read) prevents it.
+
+```sql
+-- both sessions, concurrently, at REPEATABLE READ
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM on_call WHERE shift = 1;         -- 2
+DELETE FROM on_call WHERE shift = 1 AND doctor = 'A'; -- the other session deletes 'B'
+COMMIT;
+-- result: 0 on call.  At SERIALIZABLE, one commit fails:
+-- ERROR:  could not serialize access due to read/write dependencies among transactions
+```
+
+Common mistake: using Serializable without retry logic. Fix: retry the whole transaction on SQLSTATE 40001.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, locking problems show as waiting queries. `pg_locks` and `pg_stat_activity` show who blocks whom. A `lock_timeout` on migrations prevents one DDL statement from queueing behind a long query and blocking everything behind it.
+
+```sql
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event_type, left(query, 50)
+FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0;
+SET lock_timeout = '3s';
+ALTER TABLE orders ADD COLUMN note text;   -- fails fast instead of blocking the table
+```
+
+Common mistake: a migration waiting for an exclusive lock while every new query queues behind it. Fix: `lock_timeout` and retries.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+For each invariant, I name the anomaly that would break it and choose the cheapest mechanism that prevents it: a constraint, an atomic statement, a row lock, or Serializable.
+
+<Flow steps={['state the invariant', 'which anomaly breaks it?', 'constraint possible? use it', 'single row? atomic update or FOR UPDATE', 'across rows? SERIALIZABLE with retry']} caption="Choosing a concurrency mechanism." />
+
+Common mistake: raising everything to Serializable and ignoring the retries. Fix: targeted mechanisms, Serializable where needed, always with retry.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+In a service, transactions are short, never span a network call to another service, and are retried on serialization failures and deadlocks with backoff. Cross-service consistency uses an outbox table written in the same transaction.
+
+```sql
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES (7, 450) RETURNING id;
+INSERT INTO outbox (topic, payload) VALUES ('order.created', '{"order_id": 104}');
+COMMIT;
+-- a relay publishes outbox rows to the message broker, then marks them sent
+```
+
+Common mistake: calling a payment API inside an open transaction, holding locks for seconds. Fix: commit, call, then record the result in a new transaction (with an idempotency key).
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: two psql sessions side by side, reproducing each anomaly at each isolation level, writing down what each session sees before running it. Then DDIA chapter 8 and Database Internals chapter 5 to explain what I saw.
+
+Exercise: lost update and write skew reproduced, then prevented in three different ways each.
+
+Done when I can explain any isolation anomaly from memory, show it in two sessions, and prevent it with the cheapest mechanism.
+
+</Level>
+</Levels>
+
+#### Replication: leader–follower, read replicas, lag, failover, and split brain
+
+<Flow steps={['client writes to primary', 'primary appends to WAL', 'WAL streamed to replicas', 'replicas replay it', 'reads may go to replicas (possibly behind)']} caption="Streaming replication in PostgreSQL: one primary, followers replaying its log." />
+
+<Levels label="Phase 8, replication">
+
+<Level name="Beginner" depth={5}>
+
+Replication keeps copies of the database on several machines: for availability (another copy takes over if one dies), for read scaling (reads spread across replicas), and for latency (a copy near the users). In Postgres the primary streams its write-ahead log to replicas, which replay it.
+
+```sql
+-- on the primary
+SELECT client_addr, state, sent_lsn, replay_lsn,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS bytes_behind
+FROM pg_stat_replication;
+```
+
+Common mistake: calling a replica a backup. Fix: a replica copies mistakes instantly (a dropped table is dropped everywhere); backups are separate (the backup topic below).
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Synchronous replication waits for a replica to confirm before reporting commit, so a committed write survives losing the primary; asynchronous replication does not wait, so it is faster but recent commits can be lost on failover. Replica lag is how far behind a replica is.
+
+```sql
+-- on a replica
+SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;
+-- on the primary: synchronous commit to at least one named standby
+-- synchronous_standby_names = 'FIRST 1 (replica_a, replica_b)'
+```
+
+Common mistake: synchronous replication to a single replica, so when that replica is down every commit hangs. Fix: `ANY 1 (a, b)` or `FIRST 1` with two candidates.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Read-your-writes: a user writes on the primary, then reads from a lagging replica and does not see their change. Fixes: read from the primary for a short time after the user's write, or wait until the replica has replayed the write's log position.
+
+```ts
+// route reads: primary for 5 s after this user's last write, else a replica
+const lastWrite = new Map<string, number>();
+const route = (user: string, now: number) => (now - (lastWrite.get(user) ?? -Infinity) < 5000 ? 'primary' : 'replica');
+lastWrite.set('asha', 1_000);
+console.log(route('asha', 3_000), route('asha', 7_000), route('ravi', 3_000));
+```
+
+Output: `primary replica replica`.
+
+Common mistake: sending all reads to replicas behind a load balancer with no awareness of lag. Fix: routing by recency of the user's writes, or by LSN.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: failover. When the primary dies, a replica is promoted. With asynchronous replication, commits not yet streamed are lost. Clients must reconnect to the new primary; the old primary, if it comes back, must not accept writes.
+
+```text
+t0  primary P commits txn 1001; replica R has replayed up to 998
+t1  P crashes
+t2  R promoted to primary (txns 999-1001 lost)
+t3  clients reconnect to R (DNS or proxy change)
+t4  P restarts: must be rebuilt as a replica of R (pg_rewind), never as a primary
+```
+
+Common mistake: automatic failover without fencing the old primary. Fix: an orchestrator (Patroni-style) with a consensus store that ensures only one primary.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: split brain. A network partition separates the primary from the orchestrator; a replica is promoted; the old primary is still alive and still accepts writes from clients that can reach it. Two primaries diverge. Prevention: the primary must hold a lease and stop accepting writes when it cannot renew it, and clients must connect only through something that knows the current leader.
+
+```ts
+// a primary that only accepts writes while its lease is valid
+const leaseUntil = { ms: 10_000 };
+const canWrite = (now: number) => now < leaseUntil.ms;
+console.log(canWrite(9_000), canWrite(11_000));   // after a partition it cannot renew
+```
+
+Output: `true false`.
+
+Common mistake: two-node clusters with automatic failover and no witness. Fix: at least three voters (two databases and a witness, or a three-node consensus store).
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production I monitor lag in bytes and seconds, alert well before it matters, and run failover drills. Long queries on replicas can conflict with replay; `hot_standby_feedback` and `max_standby_streaming_delay` trade replica query cancellations against primary bloat.
+
+```text
+alerts
+  replication lag > 30 s for 5 min        warn
+  replica not streaming                   page
+  replication slot retaining > 20 GB WAL  page (disk will fill on the primary)
+```
+
+Common mistake: an abandoned replication slot keeping WAL forever until the primary's disk fills. Fix: monitor slots and drop unused ones.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Replication is about failure: decide what happens to writes when a machine dies, and test it. The happy path is easy.
+
+<Compare left="asynchronous" right="synchronous" rows={[
+  ['commit is fast', 'commit waits for a replica'],
+  ['recent commits can be lost on failover', 'committed means on two machines'],
+  ['replica outage does not affect writes', 'needs two candidates or writes stall'],
+]} caption="The durability trade in replication." />
+
+Common mistake: not knowing which mode a production cluster uses. Fix: write it down, with the expected data loss on failover.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+A typical design: one primary, two replicas in different zones, quorum-synchronous commit to one of them, an orchestrator with a consensus store for failover, a proxy or DNS for the current primary, and read routing with read-your-writes for user-facing reads.
+
+```text
+app -> proxy (knows leader) -> primary (zone a)
+                            -> replica (zone b)  sync candidate
+                            -> replica (zone c)  sync candidate, serves reports
+failover target: < 30 s, data loss: 0 committed transactions (quorum sync)
+```
+
+Common mistake: a design with replicas but no tested failover. Fix: quarterly drills with measured downtime.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: run a primary and a replica with Docker, measure lag under a write load, promote the replica, and see what happened to in-flight commits. DDIA chapter 6 explains what I observe.
+
+Exercise: implement read-your-writes routing in a small API and prove it with a test that writes and immediately reads.
+
+Done when I have done a failover drill, measured the data loss for async replication, and can explain split brain and its prevention.
+
+</Level>
+</Levels>
+
+#### Partitioning and sharding: when a single Postgres is still the right answer
+
+<Figure art={`
+ partitioning (one server)              sharding (many servers)
+ orders                                  router: hash(customer_id) mod 4
+  |- orders_2026_08                        |- shard 0: customers ..0
+  |- orders_2026_09                        |- shard 1: customers ..1
+  |- orders_2026_10  <- current            |- shard 2: customers ..2
+  (drop old months instantly)              |- shard 3: customers ..3
+`} caption="Partitioning splits a table on one server; sharding splits data across servers." />
+
+<Levels label="Phase 8, partitioning and sharding">
+
+<Level name="Beginner" depth={5}>
+
+Partitioning splits one big table into smaller ones (by time range, list of values, or hash) inside one database. Queries that filter on the partition key read only the relevant partitions, and old partitions can be dropped instantly. Sharding splits data across several database servers, each holding a subset.
+
+```sql
+CREATE TABLE event (id bigint, created_at timestamptz NOT NULL, payload jsonb) PARTITION BY RANGE (created_at);
+CREATE TABLE event_2026_10 PARTITION OF event FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE event_2026_11 PARTITION OF event FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+EXPLAIN SELECT count(*) FROM event WHERE created_at >= '2026-10-20' AND created_at < '2026-10-21';
+-- scans only event_2026_10 (partition pruning)
+```
+
+Common mistake: inserting a row with no matching partition. Fix: create future partitions ahead of time (a scheduled job) or a default partition.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+A single well-tuned Postgres on modern hardware handles a very large workload: terabytes of data and many thousands of transactions per second. Sharding adds cross-shard queries, distributed transactions, rebalancing and operational cost. The first steps are almost always indexes, query fixes, caching, read replicas and partitioning.
+
+```text
+before sharding, I would check:
+  slowest queries fixed (pg_stat_statements)?
+  connection pooling in place?
+  read replicas taking reads?
+  big tables partitioned by time with retention?
+  vertical scaling headroom left?
+```
+
+Common mistake: sharding a 50 GB database "for scale". Fix: measure the actual bottleneck first.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Shard keys: hash partitioning spreads load evenly but makes range queries scatter; range partitioning keeps ranges together but can create hot spots (all new writes on the latest range). The key should match the main access path, so most queries hit one shard.
+
+```ts
+const shards = 4;
+const hashShard = (id: number) => ((id * 2654435761) >>> 0) % shards;
+const counts = [0, 0, 0, 0];
+for (let id = 1; id <= 10_000; id++) counts[hashShard(id)]++;
+console.log(counts);
+```
+
+Output: `[ 2500, 2500, 2500, 2500 ]`. Sequential ids spread evenly under this multiplicative hash; a range split by id would put all new customers on the last shard.
+
+Common mistake: sharding by created date, so every insert hits one shard. Fix: shard by the entity most queries are scoped to (customer, tenant).
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: changing the number of shards. With `hash mod N`, going from 4 to 5 shards moves most keys. Consistent hashing or a fixed large number of logical partitions mapped to servers moves only a fraction.
+
+```ts
+let moved = 0;
+for (let id = 1; id <= 10_000; id++) {
+  const h = (id * 2654435761) >>> 0;
+  if (h % 4 !== h % 5) moved++;
+}
+console.log((moved / 10_000).toFixed(2));
+```
+
+Output: `0.80`: four fifths of keys move. With 256 logical partitions assigned to servers, adding a server moves only the partitions reassigned to it.
+
+Common mistake: `mod N` sharding with plans to grow. Fix: many logical partitions from day one.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: cross-shard operations. A unique constraint on email across shards cannot be enforced by any one shard; a query "top 10 customers by revenue" must gather from all shards; a transfer between customers on different shards needs a distributed transaction or a saga.
+
+```text
+global uniqueness options:
+  a separate small "email -> customer_id" table on one database (or its own shard by email)
+  insert there first (unique), then create the customer on its shard
+  if the second step fails, delete the claim (compensating action)
+```
+
+Common mistake: assuming foreign keys and unique constraints still work across shards. Fix: design these explicitly.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, partition maintenance is automated (create next month's partitions, detach and drop or archive old ones), and indexes are created on the parent so new partitions get them. For sharding, Citus-style extensions or application-level routing with a directory are the usual approaches.
+
+```sql
+-- retention: detach without blocking, then drop or archive
+ALTER TABLE event DETACH PARTITION event_2025_10 CONCURRENTLY;
+DROP TABLE event_2025_10;
+```
+
+Common mistake: deleting old rows from a giant table with `DELETE`, bloating it and the WAL. Fix: drop partitions.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Partition for manageability (retention, vacuum, pruning); shard only when one machine cannot do the job and simpler steps are exhausted.
+
+<Compare left="partition (one database)" right="shard (many databases)" rows={[
+  ['transactions and constraints still work', 'cross-shard needs extra design'],
+  ['cheap retention by dropping partitions', 'rebalancing and routing to operate'],
+  ['limited by one machine', 'scales writes horizontally'],
+]} caption="Partitioning versus sharding." />
+
+Common mistake: treating sharding as the default scalability answer. Fix: it is the last one.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+For a multi-tenant SaaS, the tenant id is the natural shard key: every query is scoped to a tenant. Start with one database and `tenant_id` on every table (in every primary key and index), so moving to sharding later is a data move, not a redesign.
+
+```sql
+CREATE TABLE project (tenant_id bigint NOT NULL, id bigint NOT NULL, name text, PRIMARY KEY (tenant_id, id));
+CREATE INDEX ON project (tenant_id, name);
+```
+
+Common mistake: a single huge tenant overwhelming its shard. Fix: allow a big tenant to have a dedicated shard.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: partition an event table by month with five years of generated data, measure pruning and the cost of retention by drop versus delete. Then simulate sharding in TypeScript with logical partitions and rebalancing. DDIA chapter 7 for the theory.
+
+Exercise: write the decision memo for "should we shard?" for a system with given numbers, and argue for the cheaper alternative if it suffices.
+
+Done when I can partition a table with automated maintenance, and I can name the costs of sharding and when they are worth paying.
+
+</Level>
+</Levels>
+
+#### Backup and restore: full, incremental, point-in-time recovery, and drills
+
+<Timeline items={[
+  { when: 'Sunday 01:00', what: 'full base backup' },
+  { when: 'every minute', what: 'WAL segments archived to object storage' },
+  { when: 'Wednesday 14:32', what: 'someone runs DELETE without WHERE' },
+  { when: 'Wednesday 15:10', what: 'restore base backup, replay WAL to 14:31:59' },
+  { when: 'Wednesday 15:40', what: 'verified data, application back' },
+]} caption="Point-in-time recovery: a base backup plus archived WAL replays to just before the mistake." />
+
+<Levels label="Phase 8, backup and restore">
+
+<Level name="Beginner" depth={5}>
+
+A backup is a copy of the data from which you can restore after loss: disk failure, a bad deploy, a mistaken `DELETE`, ransomware. A logical backup (`pg_dump`) exports SQL or a custom archive; a physical backup copies the data files.
+
+```bash
+pg_dump -Fc -d shop -f shop.dump            # logical, compressed custom format
+createdb shop_restore
+pg_restore -d shop_restore --jobs 4 shop.dump
+psql -d shop_restore -c "SELECT count(*) FROM orders;"
+```
+
+Common mistake: backups that have never been restored. Fix: a backup counts only after a successful restore test.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Physical backups plus WAL archiving give point-in-time recovery (PITR): restore the base backup, then replay archived WAL up to a chosen moment. Tools (pgBackRest-style, or a managed service) handle full, differential and incremental backups and retention.
+
+```text
+# postgresql.conf for WAL archiving (sketch)
+archive_mode = on
+archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+# restore: put base backup in place, then
+restore_command = 'cp /archive/%f %p'
+recovery_target_time = '2026-10-21 14:31:59+05:30'
+```
+
+Common mistake: an archive command that silently fails, leaving gaps. Fix: monitor `pg_stat_archiver` for failures.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+RPO (recovery point objective) is how much data you can afford to lose; RTO (recovery time objective) is how long recovery may take. Continuous WAL archiving gives an RPO of seconds to minutes; restore time depends on data size and WAL to replay, which is why base backups must be frequent enough.
+
+```ts
+// estimate restore time: copy base backup, then replay WAL since it
+const baseGB = 500, copyGBperMin = 5, walGBsinceBase = 120, replayGBperMin = 2;
+const minutes = baseGB / copyGBperMin + walGBsinceBase / replayGBperMin;
+console.log(`${minutes} minutes`);
+```
+
+Output: `160 minutes`. If the RTO is one hour, this setup cannot meet it: take base backups more often or keep a delayed replica.
+
+Common mistake: stating an RPO and RTO nobody has measured. Fix: measure them in a drill.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: logical mistakes replicate. A dropped table on the primary is dropped on every replica within a second. A delayed replica (`recovery_min_apply_delay = '1h'`) gives an hour to stop replay before the mistake is applied.
+
+```sql
+-- on a delayed replica, after noticing the mistake
+SELECT pg_wal_replay_pause();
+-- copy the lost table out, or promote to the moment before the mistake
+```
+
+Common mistake: relying on replicas for protection against mistakes. Fix: PITR backups, optionally a delayed replica for fast recovery.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: a backup that restores but is inconsistent with other systems. If files are in object storage and the database is restored to 14:31, files uploaded after 14:31 are orphans, and files deleted after it are missing. Restores must consider every store the data spans.
+
+```text
+restore database to 14:31:59
+object storage: keep versioning on; list objects created or deleted after 14:31:59
+reconcile: orphans to quarantine, missing objects restored from versions
+```
+
+Common mistake: restoring only the database and declaring success. Fix: a restore runbook that covers every data store.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, backups are encrypted, stored in another region and account, retained according to policy, and tested automatically: a scheduled job restores the latest backup to a scratch server and runs checks.
+
+```bash
+# nightly restore test (sketch)
+pgbackrest --stanza=shop --type=time --target="$(date -d '-1 hour' '+%F %T%z')" restore --pg1-path=/scratch/pg
+pg_ctl -D /scratch/pg start
+psql -h /scratch -d shop -c "SELECT max(created_at) FROM orders;"   # must be within the last hour
+```
+
+Common mistake: backups in the same account as production, deleted along with it by a compromised credential. Fix: a separate account with write-only, immutable storage.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+The only number that matters is the time it takes to restore, measured. Everything else is a hope.
+
+<Flow steps={['back up', 'restore to scratch', 'verify row counts and recent data', 'record time taken', 'compare with RTO and RPO', 'fix and repeat']} caption="The backup loop that actually protects data." />
+
+Common mistake: celebrating a green backup job. Fix: celebrate a green restore job.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+A backup design states: RPO and RTO; full backup frequency; WAL archiving; retention; off-site copy; encryption; automated restore tests; who can delete backups (nobody, for the retention period).
+
+```text
+RPO 1 min (continuous WAL), RTO 1 h
+full weekly, differential daily, WAL continuous
+retention 35 days; monthly fulls for 1 year
+copy to a second region, object lock enabled
+restore test nightly to scratch; quarterly human drill with the runbook
+```
+
+Common mistake: a single person who knows how to restore. Fix: a runbook, and drills by different people.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: set up WAL archiving on a local Postgres, take a base backup, run a workload, make a deliberate mistake, and recover to one second before it. Time each step.
+
+Exercise: a backup, a point-in-time restore and a timed drill, written up with RPO and RTO achieved.
+
+Done when I have restored a database to a precise moment, measured RPO and RTO, and automated a nightly restore test.
+
+</Level>
+</Levels>
+
+#### Caching: Redis, invalidation, and the two hard problems
+
+<Flow steps={['read: check cache', 'hit: return', 'miss: query database', 'store in cache with TTL', 'write: update database, then delete cache key']} caption="Cache-aside, the most common caching pattern." />
+
+<Levels label="Phase 8, caching">
+
+<Level name="Beginner" depth={5}>
+
+A cache stores the result of an expensive operation so the next request is fast. Redis is an in-memory key-value store often used for this. Cache-aside: the application checks the cache, and on a miss reads the database and stores the result with a time to live (TTL).
+
+```ts
+const cache = new Map<string, { v: string; exp: number }>();
+let dbReads = 0;
+const db = (id: string) => { dbReads++; return `user ${id}`; };
+function get(id: string, now: number) {
+  const e = cache.get(id);
+  if (e && e.exp > now) return e.v;
+  const v = db(id); cache.set(id, { v, exp: now + 60_000 }); return v;
+}
+get('7', 0); get('7', 1_000); get('7', 61_000);
+console.log(dbReads);
+```
+
+Output: `2`. One miss, one hit, one miss after expiry.
+
+Common mistake: caching without a TTL, so stale data lives forever after a missed invalidation. Fix: always a TTL, even with explicit invalidation.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Invalidation: when data changes, the cached copy is wrong. On write, update the database and then delete the cache key (not update it), so the next read repopulates from the source of truth.
+
+```ts
+const store = new Map<string, string>([['7', 'Pune']]);
+const c = new Map<string, string>();
+const read = (k: string) => c.get(k) ?? (c.set(k, store.get(k)!), store.get(k)!);
+const write = (k: string, v: string) => { store.set(k, v); c.delete(k); };
+read('7'); write('7', 'Mumbai');
+console.log(read('7'));
+```
+
+Output: `Mumbai`.
+
+Common mistake: updating the cache on write; two concurrent writers can leave the cache with the older value. Fix: delete on write; let reads fill it.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+The race that remains: a reader misses, reads the old value from the database, a writer updates the database and deletes the key, then the reader stores the old value. Mitigations: short TTLs, versioned values, or deleting again after a short delay.
+
+```text
+reader: miss -> reads v1 from DB ...................... SET key v1   (stale!)
+writer:              UPDATE DB to v2 -> DEL key
+fix options: TTL bounds staleness; store (value, version) and refuse to overwrite a newer version;
+             delayed second DEL after ~1 s
+```
+
+Common mistake: assuming delete-on-write makes the cache always correct. Fix: accept bounded staleness, or use versions.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: cache stampede. A popular key expires; thousands of requests miss at once and all query the database. Fixes: a lock so one request recomputes while others wait or serve stale, and jittered TTLs so keys do not expire together.
+
+```ts
+const inflight = new Map<string, Promise<string>>();
+let computes = 0;
+async function getOnce(k: string) {
+  if (!inflight.has(k)) inflight.set(k, (async () => { computes++; await new Promise(r => setTimeout(r, 10)); return 'v'; })().finally(() => inflight.delete(k)));
+  return inflight.get(k)!;
+}
+await Promise.all(Array.from({ length: 1000 }, () => getOnce('hot')));
+console.log(computes);
+```
+
+Output: `1`. A thousand concurrent misses, one computation (request coalescing).
+
+Common mistake: identical TTLs set by a batch job, so everything expires at the same second. Fix: add random jitter.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: caching negative results and per-user data. If a lookup for a missing id is not cached, an attacker can hammer the database with random ids. If a response varies by user but is cached by URL alone, one user sees another's data.
+
+```text
+negative caching: GET user 999999 -> not found -> cache "none" for 30 s
+key design: cache key = route + user id + locale + permissions version
+never cache responses with Set-Cookie or Authorization-dependent content under a shared key
+```
+
+Common mistake: a CDN or shared cache keyed by URL serving a logged-in page to everyone. Fix: mark private responses `Cache-Control: private` and include the user in server-side keys.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production I track hit rate, memory, evictions and latency of the cache; set an eviction policy (`allkeys-lru` for a pure cache); and make the application survive the cache being down (fall back to the database with a circuit breaker so it is not overwhelmed).
+
+```bash
+redis-cli INFO stats | grep -E "keyspace_hits|keyspace_misses|evicted_keys"
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+```
+
+Common mistake: an application that fails entirely when Redis restarts. Fix: treat the cache as optional; test with it turned off.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+A cache is a copy, and every copy can be wrong. I add one only after measuring a slow read I cannot fix in the database, and I decide up front how stale it may be.
+
+<Compare left="fix in the database" right="add a cache" rows={[
+  ['one source of truth', 'two copies to keep consistent'],
+  ['index or query rewrite', 'invalidation logic, TTLs, stampedes'],
+  ['try first', 'when the database fix is not enough'],
+]} caption="The order I consider them in." />
+
+Common mistake: caching to hide an unindexed query. Fix: index it first.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+In a design I list each cached item: key format, value, TTL, invalidation trigger, allowed staleness, and behaviour if the cache is down. Invalidation driven from the database's change stream (CDC) avoids missed deletes from code paths that forgot.
+
+```text
+key                      ttl     invalidated by            staleness ok
+product:{id}             10 min  product update event      < 10 min
+user:{id}:profile        5 min   delete on profile write   seconds
+home:popular             1 min   none (recomputed)         1 min
+```
+
+Common mistake: invalidation code scattered across every write path. Fix: invalidate from one place, ideally from the change stream.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: put a cache in front of a slow query in a small API, measure hit rate and latency, then reproduce the stale-set race and the stampede with a load test, and fix each.
+
+Exercise: a cache with delete-on-write, TTL with jitter and request coalescing, and a test that turns the cache off.
+
+Done when I can show my cache's hit rate and staleness bound, and the application still works with the cache down.
+
+</Level>
+</Levels>
+
+#### NoSQL: document, key-value, wide-column, graph, and vector stores
+
+<Compare left="model" right="fits when" rows={[
+  ['key-value (Redis, DynamoDB)', 'access is always by key; huge scale, simple lookups'],
+  ['document (MongoDB, JSONB)', 'self-contained records read and written whole'],
+  ['wide-column (Cassandra)', 'very high write volume, queries known in advance'],
+  ['graph (Neo4j)', 'many-to-many relationships traversed many hops deep'],
+  ['vector', 'nearest-neighbour search over embeddings'],
+]} caption="Non-relational models and the access patterns they suit." />
+
+<Levels label="Phase 8, NoSQL">
+
+<Level name="Beginner" depth={5}>
+
+"NoSQL" is a loose name for databases that are not relational tables queried with SQL. Each model trades general-purpose querying for something specific: simpler scaling, flexible records, fast writes or graph traversal. Most applications are well served by a relational database; NoSQL stores earn their place for particular access patterns.
+
+```ts
+// a document: everything about an order in one record
+const order = { _id: 'o-104', customer: { id: 7, name: 'Asha' }, lines: [{ sku: 'BK-1', qty: 2, price: 450 }], status: 'paid' };
+console.log(order.lines.reduce((s, l) => s + l.qty * l.price, 0));
+```
+
+Output: `900`.
+
+Common mistake: choosing a document store because "schemas are annoying". Fix: the schema still exists, in every reader's code; choose by access pattern.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Document databases store nested records, good for one-to-many data read together (an order with its lines). They are weaker at many-to-many relationships and joins. Postgres's JSONB gives document storage inside a relational database, which often covers the need.
+
+```sql
+CREATE TABLE doc_order (id text PRIMARY KEY, body jsonb NOT NULL);
+INSERT INTO doc_order VALUES ('o-104', '{"customer": {"id": 7}, "lines": [{"sku": "BK-1", "qty": 2}], "status": "paid"}');
+SELECT body->'customer'->>'id' AS customer_id, jsonb_array_length(body->'lines') AS lines FROM doc_order;
+```
+
+```text
+ customer_id | lines
+-------------+-------
+ 7           |     1
+```
+
+Common mistake: duplicating customer names into every order document, then needing to update them all. Fix: reference by id for data that changes; embed data that belongs to the document.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Wide-column stores (Cassandra-style) are designed around queries: one table per query, partitioned by a key, sorted within the partition. Writes are very fast (log-structured); reads are fast only for the designed queries. Key-value stores with partition and sort keys (DynamoDB-style) are similar: single-table design with access patterns listed first.
+
+```text
+query: messages in a chat, newest first
+table: messages_by_chat   partition key: chat_id   clustering key: sent_at DESC
+query: messages by a user
+table: messages_by_user   partition key: user_id   clustering key: sent_at DESC
+the same message is written to both tables
+```
+
+Common mistake: designing a wide-column schema like a relational one and then needing ad-hoc queries. Fix: list every query first; if the queries are not known, choose a relational database.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: consistency settings. Many NoSQL stores are leaderless or eventually consistent by default; reads may return stale data unless you ask for quorum reads and writes (with N replicas, W + R greater than N).
+
+```ts
+const N = 3;
+const strong = (W: number, R: number) => W + R > N;
+console.log(strong(1, 1), strong(2, 2), strong(3, 1));
+```
+
+Output: `false true true`.
+
+Common mistake: default consistency (one replica) for data that must be read back immediately. Fix: quorum for those reads and writes, and understand the cost.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: graph queries in SQL. A recursive CTE handles hierarchies and short traversals; deep, highly connected traversals (friends of friends of friends with filters) are where graph databases shine.
+
+```sql
+WITH RECURSIVE reports(id, manager_id, depth) AS (
+  SELECT id, manager_id, 0 FROM employee WHERE id = 1
+  UNION ALL
+  SELECT e.id, e.manager_id, r.depth + 1 FROM employee e JOIN reports r ON e.manager_id = r.id
+)
+SELECT depth, count(*) FROM reports GROUP BY depth ORDER BY depth;
+```
+
+Common mistake: a recursive query on a graph with cycles that never terminates. Fix: track visited ids (an array path) and stop on repeats, or use `CYCLE` in Postgres 14+.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+Production NoSQL needs the same discipline: backups, schema versioning (in code), capacity planning, and monitoring. Managed key-value stores bill by throughput and storage; hot partitions throttle even if total capacity is fine.
+
+```text
+hot partition example
+  partition key = date  -> all of today's writes on one partition -> throttled
+  partition key = (date, user_id % 16) -> 16 partitions per day -> spread
+```
+
+Common mistake: a partition key with low cardinality. Fix: high-cardinality keys, or synthetic sharding suffixes.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Choose the data model by access patterns and consistency needs, not by fashion. Polyglot persistence (several stores) is fine when each store has a clear job and a single source of truth feeds them.
+
+<Flow steps={['list access patterns', 'list consistency needs', 'can Postgres (with JSONB, indexes) serve them?', 'if not, which model fits the failing pattern?', 'feed it from the system of record']} caption="How I decide whether to add a non-relational store." />
+
+Common mistake: two stores both treated as sources of truth. Fix: one system of record, others derived.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+A design that uses several stores: Postgres for orders and customers (system of record), Redis for sessions and caches, a search engine for product search, and a wide-column store for a very high-volume activity feed, each fed from Postgres's change stream where it derives from it.
+
+```text
+postgres (truth) --CDC--> search index
+                 --CDC--> analytics warehouse
+redis: sessions (TTL), cache
+activity feed: wide-column, written by the app, rebuilt from events if lost
+```
+
+Common mistake: adding a store per team preference. Fix: each store justified by an access pattern Postgres cannot serve.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: model the same small domain in Postgres, in JSONB, and in a key-value single-table design, write the five main queries in each, and note which were easy and which painful. DDIA chapter 3 for the models.
+
+Exercise: a schema review: for my application, argue whether any NoSQL store is justified.
+
+Done when I can choose a data model from access patterns and defend the choice, including "Postgres is enough".
+
+</Level>
+</Levels>
+
+#### Search and vector databases as specialized indexes, not magic
+
+<Figure art={`
+ documents                inverted index                     vector index
+ d1 "fast b-tree index"   b-tree -> d1                        d1 -> [0.12, -0.40, ...]
+ d2 "lsm tree writes"     fast   -> d1                        d2 -> [0.08,  0.31, ...]
+ d3 "b-tree page split"   index  -> d1                        query -> nearest by cosine
+                          lsm    -> d2                        (approximate, e.g. HNSW graph)
+                          page   -> d3
+                          split  -> d3
+`} caption="Two specialised indexes: words to documents, and embeddings to their nearest neighbours." />
+
+<Levels label="Phase 8, search and vector databases">
+
+<Level name="Beginner" depth={5}>
+
+Full-text search answers "which documents contain these words, ranked by relevance". It uses an inverted index: for each word, the list of documents containing it. Vector search answers "which items are most similar in meaning to this one", using embeddings (lists of numbers) and nearest-neighbour search.
+
+```ts
+const docs = { d1: 'fast b-tree index', d2: 'lsm tree writes', d3: 'b-tree page split' };
+const inverted = new Map<string, string[]>();
+for (const [id, text] of Object.entries(docs)) for (const w of text.split(' ')) inverted.set(w, [...(inverted.get(w) ?? []), id]);
+console.log(inverted.get('b-tree'), inverted.get('tree'));
+```
+
+Output: `[ 'd1', 'd3' ] [ 'd2' ]`.
+
+Common mistake: `LIKE '%term%'` as search. Fix: a full-text index, which handles words, stemming and ranking.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+Postgres has full-text search built in: `tsvector` (normalised words), `tsquery`, a GIN index and ranking functions. It is often enough before adding a search engine.
+
+```sql
+ALTER TABLE post ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))) STORED;
+CREATE INDEX post_search ON post USING gin (search);
+SELECT id, ts_rank(search, q) AS rank FROM post, websearch_to_tsquery('english', 'index pages') q
+WHERE search @@ q ORDER BY rank DESC LIMIT 10;
+```
+
+Common mistake: building the tsvector in the query (`to_tsvector(body) @@ ...`) so the index cannot be used. Fix: a stored generated column, or an expression index with the identical expression.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+Vector search: embeddings from a model place similar items near each other. Exact nearest-neighbour search compares the query with every vector; approximate indexes (HNSW, IVF) trade a little recall for much speed. In Postgres, the pgvector extension provides a vector type and these indexes.
+
+```ts
+const cos = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0) / (Math.hypot(...a) * Math.hypot(...b));
+const items = { btree: [0.9, 0.1, 0.0], lsm: [0.7, 0.6, 0.1], pasta: [0.0, 0.1, 0.9] };
+const q = [0.85, 0.2, 0.05];
+console.log(Object.entries(items).map(([k, v]) => [k, cos(q, v).toFixed(2)]).sort((a, b) => +b[1] - +a[1]));
+```
+
+Output: `[ [ 'btree', '0.99' ], [ 'lsm', '0.89' ], [ 'pasta', '0.08' ] ]`.
+
+Common mistake: comparing embeddings from different models or model versions. Fix: store the model name with each vector and re-embed everything when it changes.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: approximate search misses results. An HNSW index with low search breadth can return a nearest neighbour list that excludes the true best match; combined with a filter (`WHERE tenant_id = 7`), it can return fewer results than asked, because the filter applies after the approximate search.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE chunk (id bigserial PRIMARY KEY, tenant_id bigint, embedding vector(3));
+CREATE INDEX ON chunk USING hnsw (embedding vector_cosine_ops);
+SET hnsw.ef_search = 100;      -- wider search: better recall, slower
+SELECT id FROM chunk WHERE tenant_id = 7 ORDER BY embedding <=> '[0.85,0.2,0.05]' LIMIT 5;
+```
+
+Common mistake: never measuring recall. Fix: compare approximate results with exact search on a sample and tune.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: keyword and vector search fail differently. Vector search misses exact identifiers (error codes, product SKUs); keyword search misses paraphrases. Hybrid search runs both and merges the rankings, for example with reciprocal rank fusion.
+
+```ts
+const rrf = (lists: string[][], k = 60) => {
+  const score = new Map<string, number>();
+  for (const l of lists) l.forEach((id, r) => score.set(id, (score.get(id) ?? 0) + 1 / (k + r + 1)));
+  return [...score].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+};
+console.log(rrf([['d3', 'd1', 'd7'], ['d1', 'd9', 'd3']]));
+```
+
+Output: `[ 'd1', 'd3', 'd9', 'd7' ]`. Documents ranked well by both lists rise to the top.
+
+Common mistake: pure vector search for a support bot that must match error codes exactly. Fix: hybrid search.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+In production, search and vector indexes are derived data: built from the system of record, updated from its change stream, and rebuildable. Monitoring covers index lag, query latency and relevance (click-through or a labelled test set).
+
+```text
+pipeline: postgres -> CDC -> chunker -> embedding model -> vector index
+re-embed job: on model change, build a new index alongside, switch, drop the old
+relevance check: 50 labelled queries, recall@10 tracked per release
+```
+
+Common mistake: a search index nobody can rebuild. Fix: a documented rebuild from the source.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Search engines and vector databases are indexes with special query types. They answer specific questions fast; they are not sources of truth and they are not magic.
+
+<Flow steps={['source of truth (Postgres)', 'derive: tokens or embeddings', 'specialised index', 'query: keyword, vector or hybrid', 'evaluate relevance with labelled queries']} caption="Search as derived data." />
+
+Common mistake: storing data only in the search engine. Fix: the database holds the truth.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+For a documentation search, I start with Postgres full-text search, add pgvector for semantic search on the same table, combine with reciprocal rank fusion, and measure on labelled queries. A separate search engine comes only if scale or features (faceting, typo tolerance at scale) require it.
+
+```text
+table doc_chunk(id, doc_id, text, search tsvector, embedding vector(768), model text)
+query: keyword top 50 + vector top 50 -> RRF -> top 10
+eval: 100 labelled queries; target recall@10 >= 0.9
+```
+
+Common mistake: adding a vector database before trying pgvector beside the data. Fix: start inside Postgres; move out with a measured reason.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: build an inverted index and a cosine search in TypeScript first, then the same in Postgres with tsvector and pgvector, then hybrid ranking, with a small labelled set to measure.
+
+Exercise: measure recall of an HNSW index against exact search at two `ef_search` values.
+
+Done when I can build keyword, vector and hybrid search over my own data and show relevance numbers.
+
+</Level>
+</Levels>
+
+#### Inside the storage engine: a small B-tree or key-value store
+
+<Layers layers={[
+  { name: 'API', note: 'get, put, delete, scan' },
+  { name: 'Memtable', note: 'sorted in-memory map of recent writes' },
+  { name: 'Write-ahead log', note: 'every write appended and fsynced before acknowledging' },
+  { name: 'Segment files', note: 'sorted, immutable, merged by compaction' },
+  { name: 'Index and filters', note: 'sparse index and Bloom filter per segment' },
+]} caption="The pieces of the log-structured key-value store I build for this phase." />
+
+<Levels label="Phase 8, inside the storage engine">
+
+<Level name="Beginner" depth={5}>
+
+A database's storage engine keeps data on disk so it survives restarts and can be found quickly. The simplest durable store appends every write to a log file and keeps an in-memory map from key to the file offset of its latest value.
+
+```ts
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+const file = '/tmp/kv.log'; writeFileSync(file, '');
+const index = new Map<string, number>();
+function put(k: string, v: string) { const off = readFileSync(file).length; appendFileSync(file, `${k},${v}\n`); index.set(k, off); }
+function get(k: string) { const off = index.get(k); if (off === undefined) return undefined; return readFileSync(file).subarray(off).toString().split('\n')[0].split(',')[1]; }
+put('city', 'Pune'); put('city', 'Mumbai');
+console.log(get('city'), readFileSync(file, 'utf8').trim().split('\n').length);
+```
+
+Output: `Mumbai 2`. The log keeps both writes; the index points at the latest.
+
+Common mistake: overwriting values in place in a file, which corrupts data if the process dies mid-write. Fix: append, and treat the log as the truth.
+
+</Level>
+
+<Level name="Intermediate" depth={5}>
+
+The log grows forever, so compaction rewrites it keeping only the latest value per key. Splitting into segments lets compaction work on old segments while new writes go to the current one. Deletes are written as tombstones so compaction knows to drop the key.
+
+```ts
+const log = [['a', '1'], ['b', '2'], ['a', '3'], ['b', null], ['c', '4']] as const;
+const latest = new Map<string, string | null>();
+for (const [k, v] of log) latest.set(k, v);
+console.log([...latest].filter(([, v]) => v !== null));
+```
+
+Output: `[ [ 'a', '3' ], [ 'c', '4' ] ]`.
+
+Common mistake: dropping a tombstone during compaction while an older segment still holds the key, which resurrects the deleted value. Fix: drop tombstones only when compacting the oldest segment.
+
+</Level>
+
+<Level name="Advanced" depth={5}>
+
+An LSM tree keeps recent writes in a sorted memtable, flushes it to an immutable sorted file (SSTable), and merges files in the background. Reads check the memtable, then files from newest to oldest, using a sparse index and a Bloom filter to skip files. A B-tree instead updates fixed-size pages in place, with a write-ahead log for crash safety.
+
+```ts
+// Bloom filter: "definitely not here" or "maybe here"
+const m = 64; const bits = new Uint8Array(m);
+const h = (s: string, seed: number) => { let x = seed; for (const c of s) x = (x * 31 + c.charCodeAt(0)) >>> 0; return x % m; };
+const add = (s: string) => [7, 13, 29].forEach(sd => bits[h(s, sd)] = 1);
+const mayHave = (s: string) => [7, 13, 29].every(sd => bits[h(s, sd)] === 1);
+['apple', 'mango', 'guava'].forEach(add);
+console.log(mayHave('mango'), mayHave('kiwi'));
+```
+
+Output: `true false` (a false positive is possible for other keys, a false negative never).
+
+Common mistake: a read path that checks every segment for missing keys. Fix: Bloom filters per segment.
+
+</Level>
+
+<Level name="Edge cases" depth={5}>
+
+Edge: crash during a write. If the process dies after appending half a record, the log ends with a torn record. On restart, the store must detect it (a length prefix and checksum per record) and truncate, rather than misread garbage.
+
+```ts
+import { createHash } from 'node:crypto';
+const rec = (k: string, v: string) => { const body = `${k}=${v}`; const sum = createHash('sha256').update(body).digest('hex').slice(0, 8); return `${body.length}:${sum}:${body}`; };
+const valid = (line: string) => { const [len, sum, body] = line.split(':'); return body !== undefined && body.length === +len && createHash('sha256').update(body).digest('hex').slice(0, 8) === sum; };
+const good = rec('city', 'Pune'), torn = good.slice(0, good.length - 3);
+console.log(valid(good), valid(torn));
+```
+
+Output: `true false`.
+
+Common mistake: trusting the last record of the log after a crash. Fix: checksums and truncation on recovery.
+
+</Level>
+
+<Level name="Corner cases" depth={5}>
+
+Corner: fsync. A write returns when data is in the operating system's page cache, not on disk. Without `fsync`, a power loss can lose acknowledged writes; with an fsync per write, throughput drops. Group commit batches several writes into one fsync.
+
+```ts
+import { openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+const fd = openSync('/tmp/wal.log', 'w');
+let t = performance.now();
+for (let i = 0; i < 200; i++) { writeSync(fd, `rec ${i}\n`); fsyncSync(fd); }
+const perWrite = performance.now() - t;
+t = performance.now();
+for (let i = 0; i < 200; i++) writeSync(fd, `rec ${i}\n`);
+fsyncSync(fd);
+const grouped = performance.now() - t; closeSync(fd);
+console.log(perWrite > grouped);
+```
+
+Output: `true`. The exact times depend on the disk; the ratio is the lesson.
+
+Common mistake: benchmarking a store without fsync and comparing it with a database that fsyncs. Fix: state durability when quoting throughput.
+
+</Level>
+
+<Level name="Production level" depth={5}>
+
+Production engines add what a toy lacks: concurrency control, buffer management, checksums on pages, compression, background compaction throttling, and recovery tests. Knowing the pieces explains production settings: Postgres's `shared_buffers`, `checkpoint_timeout`, `wal_compression`, `fillfactor`, and an LSM store's compaction strategy.
+
+```text
+symptom                                  storage-engine reason
+write latency spikes every few minutes   checkpoints flushing many dirty pages
+table grows though row count is flat     dead tuples not yet vacuumed (MVCC)
+LSM read latency rises after bulk load   many un-compacted files to check
+```
+
+Common mistake: tuning settings without knowing what they control. Fix: map each setting to the engine component it affects.
+
+</Level>
+
+<Level name="Mindset" depth={5}>
+
+Building a small engine turns database settings and behaviours from magic into consequences. I do not need to build a production engine; I need to have built a toy one.
+
+<Compare left="B-tree" right="LSM tree" rows={[
+  ['updates pages in place (with WAL)', 'appends, merges later'],
+  ['reads: one tree descent', 'reads: memtable plus several files'],
+  ['writes: random page writes', 'writes: sequential, batched'],
+  ['space: fragmentation', 'space: temporary duplicates until compaction'],
+]} caption="The two storage engine families, by what they optimise." />
+
+Common mistake: "LSM is faster" or "B-trees are faster" without a workload. Fix: compare on the workload.
+
+</Level>
+
+<Level name="System design" depth={5}>
+
+The build for this phase: a log-structured key-value store in TypeScript with a write-ahead log, memtable, segment files, compaction, tombstones, Bloom filters and crash recovery, plus a crash test that kills the process at random and checks no acknowledged write is lost. Then a small in-memory B-tree with splits.
+
+```text
+kv/
+  wal.ts        append + fsync, checksummed records, recovery
+  memtable.ts   sorted map, flush at 4 MB
+  segment.ts    sorted file + sparse index + bloom filter
+  compact.ts    merge segments, drop overwritten values and safe tombstones
+  crash.test.ts spawn writer, kill -9 at random, verify all acked keys
+```
+
+Common mistake: testing only clean shutdowns. Fix: kill -9 tests in a loop.
+
+</Level>
+
+<Level name="Strategy" depth={5}>
+
+How I would learn it: Database Internals chapters 1 to 4 and 7 alongside DDIA chapter 4, building each piece after reading about it. The crash test comes first, so every later piece is tested against it.
+
+Exercise: a log-structured key-value store with compaction and a crash test, then a small B-tree with node splits.
+
+Done when my store survives a thousand random kills without losing an acknowledged write, and I can explain each Postgres storage setting I tune.
+
+</Level>
+</Levels>
+
+#### The learning strategy for this phase
+
+<Timeline
+  caption="Four weeks: the model, the planner, the guarantees, then the storage."
+  items={[
+    { when: 'Week 38', what: 'Model, SQL and schema: design the real schema, write the SQL drills.' },
+    { when: 'Week 39', what: 'Indexes and plans: Use the Index, Luke 1–7; tune one slow query with numbers.' },
+    { when: 'Week 40', what: 'Transactions and replication: Database Internals 5, DDIA 6–8; reproduce anomalies; the migration with a rollback plan.' },
+    { when: 'Week 41', what: 'Storage, backups, caches, NoSQL and search: Database Internals 1–4 and 7; the key-value store; the restore drill; the gate.' },
+  ]}
+/>
+
+I would start with the database I already use and go down, not with the B-tree
+and go up. Each concept is learned against my own schema, with real row counts,
+so every claim has a number beside it. The order matters: indexes only make
+sense once I can read a plan, transactions only once I have a schema with
+invariants, and the storage engine last, because by then every setting I have
+met has a reason to exist.
+
+#### How I would learn it
+
+I would load a realistic dataset (a million rows is enough) into Postgres on
+day one, because indexes and plans mean nothing on a hundred rows. Every
+session starts with a question I can run: "will this use the index?", "what does
+the other session see?". I write the answer down before running it. Then I read
+the chapter that explains the result. Migrations are written by hand, with a
+rollback and a test that runs both directions. AI reviews my schema and my
+`EXPLAIN` reading after I have written my own.
+
+#### Exercises
+
+- A schema for a real application with constraints, written requirements and a
+  review.
+- A slow query tuned with before-and-after `EXPLAIN ANALYZE`.
+- A migration that adds a column, backfills it in batches and adds a constraint,
+  with a tested rollback.
+- Lost update and write skew reproduced in two sessions, then prevented.
+- A failover drill on a primary and replica, with the data loss measured.
+- A backup, a point-in-time restore and a timed drill.
+- A cache with delete-on-write, jittered TTLs and request coalescing, tested with the cache turned off.
+- Keyword, vector and hybrid search over my own data, with recall measured.
+- A log-structured key-value store with compaction and a crash test, then a
+  small B-tree.
+
+#### The gate
+
+Closed book, no AI: I design a schema from requirements and defend it; I read a
+query plan and say why an index is or is not used; I explain an isolation
+anomaly and how I would prevent it; I restore a database from a backup.

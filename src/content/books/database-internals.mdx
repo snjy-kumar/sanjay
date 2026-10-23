@@ -1,0 +1,2373 @@
+---
+title: "Database Internals, chapter by chapter"
+description: "Petrov on how databases work inside, all 14 chapters from beginner to strategy: B-trees, file formats, recovery, LSM trees, replication, consensus."
+edition: "first edition (O'Reilly, 2019)"
+tocVerified: true
+tocSources:
+  - "https://www.oreilly.com/library/view/database-internals/9781492040330/"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import Compare from '../../components/book/Compare.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the primary book for phase 8 of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core</a>,
+databases, and it comes back in phase 4 of the <a href={withBase('/plans/software-ai-developer/')}>software and AI developer plan</a>.
+Most applications are a database with a UI, and most of my database surprises came from not knowing what
+the engine does underneath: why an index helps one query and not another, why a write is slow, why a replica
+returns old data.
+
+Alex Petrov's book opens the engine. The first part is storage: B-trees, page layouts, buffer management,
+recovery and log-structured storage. The second part is distribution: failure detection, leader election,
+replication, consistency models, distributed transactions and consensus. It sits between a SQL book and a
+research paper, and it cites the papers so I can go further.
+
+## How I would learn it
+
+I learn this book by building. Part I ends with a small key-value store of my own that has pages, a B-tree,
+a write-ahead log and crash recovery, which is exactly the phase 8 build. Part II I read beside Postgres
+and a small Raft implementation, and I save the deep version for phase 10, distributed systems.
+
+<Timeline items={[
+  { when: 'week 38', what: 'Chapters 1 to 3: architecture, B-tree basics, file formats. Start the key-value store with a page file.' },
+  { when: 'week 39', what: 'Chapters 4 and 5: implementing B-trees, buffer management, recovery and concurrency control. Add the B-tree and the log.' },
+  { when: 'week 40', what: 'Chapters 6 and 7: B-tree variants and LSM trees. Write a tiny LSM store to compare.' },
+  { when: 'week 41', what: 'Chapters 8 to 14 at survey depth: replication, consistency, transactions, consensus. Then the gate.' },
+]} caption="When I read each group of chapters, matched to the phase 8 weeks." />
+
+Every chapter below climbs the same nine levels: what it is, how it combines, what happens underneath,
+the edges, the corners where two edges meet, what changes in production, the habit of thought, where it
+sits in a larger system, and how I would learn it and know I have.
+
+## The book's layers
+
+The book has two parts, each with a short conclusion and a list of the sources it drew on.
+
+<Layers layers={[
+  { name: 'Part I: Storage Engines', note: 'chapters 1 to 7: architecture, B-trees, file formats, recovery, LSM trees' },
+  { name: 'Part II: Distributed Systems', note: 'chapters 8 to 14: failures, leaders, replication, transactions, consensus' },
+]} caption="Storage on one machine first, then many machines agreeing about data." />
+
+## Part I: Storage Engines
+
+### 1. Introduction and Overview
+**Covers:** DBMS architecture, memory-based versus disk-based stores and durability, row-oriented versus column-oriented layouts, wide column stores, data files and index files, primary index as an indirection, and buffering, immutability and ordering.
+
+<Layers layers={[
+  { name: 'Transport', note: 'client connections, the wire protocol, talking to other nodes' },
+  { name: 'Query processor', note: 'parser, then optimizer: SQL becomes a plan' },
+  { name: 'Execution engine', note: 'runs the plan, local or remote' },
+  { name: 'Storage engine', note: 'transaction manager, lock manager, access methods, buffer manager, recovery manager' },
+]} caption="The layers of a database, as the chapter draws them. The rest of Part I lives in the bottom box." />
+
+<Levels label="Chapter 1, Introduction and Overview">
+
+<Level name="Beginner">
+
+A database is not one program doing one thing. It is a stack. A client opens a connection and sends text. The query processor parses that text, checks it, and asks an optimizer to turn it into a plan. The execution engine runs the plan. At the bottom, the storage engine is the part that actually keeps bytes in memory and on disk, and it is the subject of the whole first part of the book.
+
+The first distinction the chapter draws is where the primary copy of the data lives. In a disk-based store, the data lives on disk and memory is a cache. In a memory-based store, the data lives in memory and disk is used only to survive restarts. The second distinction is layout: keep each row together, or keep each column together.
+
+Worked example. The same three rows, laid out both ways:
+
+```text
+rows:     (1, 'Asha', 'Pune')  (2, 'Ravi', 'Delhi')  (3, 'Meera', 'Pune')
+
+row-oriented page:     [1|Asha|Pune][2|Ravi|Delhi][3|Meera|Pune]
+column-oriented files: id:   [1][2][3]
+                       name: [Asha][Ravi][Meera]
+                       city: [Pune][Delhi][Pune]
+```
+
+Common mistake: thinking "database" means "SQL". Fix: SQL is the top of the stack; the storage engine underneath can be swapped (MySQL has had several), and key-value stores often expose only the bottom box.
+
+</Level>
+
+<Level name="Intermediate">
+
+Row stores suit transactional work: fetch one user, update one order, insert one payment. All the fields of a record are in one place, so one page read gets them. Column stores suit analytical work: sum one column over a hundred million rows. They read only the columns the query mentions, and because values in one column look alike, they compress very well.
+
+A small model in TypeScript makes the difference measurable. Count how many "cells" each layout touches to answer "average age":
+
+```ts
+type Row = { id: number; name: string; age: number; city: string };
+const rows: Row[] = Array.from({ length: 1_000_000 }, (_, i) =>
+  ({ id: i, name: 'n' + i, age: 20 + (i % 50), city: i % 2 ? 'Pune' : 'Delhi' }));
+
+// row store: every row is read whole
+let touchedRow = 0, sumR = 0;
+for (const r of rows) { touchedRow += 4; sumR += r.age; }
+
+// column store: only the age column is read
+const ages = rows.map(r => r.age);
+let touchedCol = 0, sumC = 0;
+for (const a of ages) { touchedCol += 1; sumC += a; }
+
+console.log(touchedRow, touchedCol, sumR === sumC);
+```
+
+Output: `4000000 1000000 true`. Four times fewer cells for a four-column table, and the gap grows with wider tables.
+
+Common mistake: running a dashboard of large aggregates straight on the transactional Postgres primary and blaming Postgres when it is slow. Fix: an analytical copy (a column store, or at least a replica with suitable indexes) for analytical queries.
+
+</Level>
+
+<Level name="Advanced">
+
+The chapter separates data files from index files. A data file stores records, either in insertion order (a heap file), sorted by key (an index-organised table), or placed by a hash. An index file maps keys to locations. The primary index is on the primary key; secondary indexes are on anything else.
+
+The subtle choice is what a secondary index points to. It can point straight at the record's physical location, which makes reads one hop but means every index must be updated when a record moves. Or it can point to the primary key, which costs a second lookup through the primary index but survives records moving. The book calls this using the primary index as an indirection.
+
+```text
+direct:      email index  'a@x.com' -> page 812, slot 4      (1 lookup, breaks if row moves)
+indirect:    email index  'a@x.com' -> id 42 -> primary index -> page 812, slot 4
+```
+
+Common mistake: assuming a secondary index lookup costs the same everywhere. Fix: know your engine. In MySQL's InnoDB, secondary indexes store the primary key, so a long primary key makes every secondary index larger and every lookup two tree descents.
+
+</Level>
+
+<Level name="Edge cases">
+
+An in-memory store still has to survive a crash. It does so with a log of operations written to disk before acknowledging, plus periodic snapshots (checkpoints). Recovery loads the newest snapshot and replays the log after it. If the snapshot is corrupt, it must fall back to an older one and replay more log, so old snapshots and the log since then must be kept.
+
+A specific edge: if the process is killed after writing to memory but before the log write reaches disk, the client must not have been told "OK". The order is: log, flush, acknowledge, then apply.
+
+```text
+client  ->  SET k=1
+server      append "SET k=1" to log
+            fsync(log)                <- crash before here: client never got OK, safe
+            reply OK
+            apply to memory
+```
+
+Common mistake: acknowledging before the flush to get better latency, then losing acknowledged writes on power loss. Fix: group commit, which flushes many writes together, gets most of the speed back without lying.
+
+</Level>
+
+<Level name="Corner cases">
+
+A "wide column store" sounds like a column store and is not. It organises data by row key, then by column family, then by column, and keeps it sorted by key. It is a sorted map of maps, and the data of a column family for one row is stored together. Reading one column across all rows is not what it is built for.
+
+Corner case: a column-oriented layout for a query that needs every column of one row has to visit every column file and reassemble the row by position. That is the worst case for a column store, and it is the common case for an application loading a user profile.
+
+```text
+wide column (row key -> family -> column):
+  'user:42' -> profile: { name: 'Asha', city: 'Pune' }
+               visits:  { '2026-10-01': 3, '2026-10-02': 5 }
+```
+
+Common mistake: picking a store by the word "column" in its name. Fix: ask how bytes are laid out on disk and which access path is one sequential read.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the question is which workload each store sees. A transactional store should serve short queries by key and small ranges. An analytical store should serve wide scans. When one store is asked to do both, the long scans evict the hot pages from the cache and the short queries slow down.
+
+The fix is often architecture, not tuning: send analytical reads to a replica or a column store fed by change data capture, and keep the primary for transactions. I would measure first: the slow-query log and the cache hit ratio tell me whether scans are pushing out the working set.
+
+```sql
+-- Postgres: how often reads were served from the buffer cache, per table
+SELECT relname, heap_blks_hit, heap_blks_read,
+       round(heap_blks_hit::numeric / nullif(heap_blks_hit + heap_blks_read, 0), 3) AS hit_ratio
+FROM pg_statio_user_tables ORDER BY heap_blks_read DESC LIMIT 5;
+```
+
+Common mistake: adding RAM when the cache hit ratio drops during a nightly report. Fix: move the report.
+
+</Level>
+
+<Level name="Mindset">
+
+The chapter ends on three axes that classify every storage structure in the book: buffering (do I collect changes in memory before writing?), immutability (do I overwrite in place or append?), and ordering (is data stored sorted by key?). B-trees are mutable, ordered and lightly buffered. LSM trees are immutable, ordered and heavily buffered. Bitcask is immutable and unordered.
+
+The habit I take from this: when I meet a new database, I do not read its marketing. I ask those three questions, and I can predict most of its behaviour: write cost, range scan cost, space overhead, how it recovers.
+
+```text
+             buffered?   immutable?   ordered?
+B-tree       little      no           yes
+LSM tree     yes         yes          yes
+Bitcask      yes         yes          no
+```
+
+Common mistake: comparing databases by feature lists. Fix: compare them on the three axes, then on the features.
+
+</Level>
+
+<Level name="System design">
+
+In a system design, the first storage decision is usually transactional or analytical, and the answer is often both, with a pipeline in between. The second is how data is indexed for the queries the product needs. The third is where durability comes from: one disk, a replica, a log in another system.
+
+For example, an app that records page views and shows a dashboard: views are appended to a log-structured store or a queue, a job aggregates them into a column store, and the dashboard queries the aggregates. The user table lives in a row store with a unique index on email.
+
+<Flow steps={['app writes event', 'append-only log', 'batch or stream job', 'column store', 'dashboard query']} caption="Separating the write path from the analytical read path." />
+
+Common mistake: one database for every access pattern until it falls over. Fix: draw the access patterns first, then pick stores for them.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn this chapter: draw the DBMS stack from memory, then open the documentation for Postgres, SQLite and one column store and place each on the three axes with one sentence of evidence each. Then run the TypeScript row-versus-column model above with ten columns instead of four and predict the ratio before I run it.
+
+Exercise: for a store I use daily, write down where data files and index files live, what a secondary index points to, and how it recovers after a crash.
+
+Done when I can explain from memory why a column store compresses better, what a secondary index points to in Postgres versus InnoDB, and classify three stores on the three axes.
+
+</Level>
+</Levels>
+
+### 2. B-Tree Basics
+**Covers:** Binary search trees and balancing, why disk-based structures differ (hard disks, SSDs), on-disk structures, B-tree hierarchy and separator keys, lookup complexity and algorithm, counting keys, and node splits and merges.
+
+<Figure art={`
+                    [ 40 | 80 ]                 root: separator keys
+                  /      |      \\
+       [ 10 | 25 ]   [ 50 | 65 ]   [ 90 | 99 ]  leaves: keys (and values)
+        /  |  \\       /  |  \\       /  |  \\
+      ...  ...  ...  ...  ...  ...  ...  ...  ...   one node = one page
+`} caption="A small B-tree. Each node is a page; a lookup reads one page per level." />
+
+<Levels label="Chapter 2, B-Tree Basics">
+
+<Level name="Beginner">
+
+A binary search tree keeps keys so that everything left of a node is smaller and everything right is larger. Looking up a key means walking down from the root, one comparison per level. If the tree is balanced, that is about log2(n) levels. If keys arrive in sorted order and nothing rebalances, the tree becomes a linked list and lookups become linear.
+
+A B-tree fixes two problems at once. It stays balanced by construction, and it puts many keys in each node so the tree is short. Each node is sized to one disk page, because the disk reads whole pages anyway.
+
+```ts
+// height of a tree with n keys and fan-out f is about log_f(n)
+const height = (n: number, f: number) => Math.ceil(Math.log(n) / Math.log(f));
+console.log(height(1e9, 2), height(1e9, 100), height(1e9, 500));
+```
+
+Output: `30 5 4`. A billion keys in four or five page reads instead of thirty.
+
+Common mistake: thinking a B-tree is a binary tree. Fix: the B does not mean binary; a node holds hundreds of keys.
+
+</Level>
+
+<Level name="Intermediate">
+
+Internal nodes hold separator keys and pointers to children. Between two separators sits a child that holds every key in that range. Leaves hold the actual keys and either values or pointers to records. In the B+-tree variant most databases use, values live only in leaves, and internal nodes are pure routing.
+
+Lookup is: binary search the separators in the root, follow the right pointer, repeat until a leaf, binary search the leaf.
+
+```ts
+type Node = { keys: number[]; children?: Node[]; values?: string[] };
+function lookup(node: Node, k: number): string | undefined {
+  while (node.children) {
+    let i = 0;
+    while (i < node.keys.length && k >= node.keys[i]) i++;   // linear for clarity
+    node = node.children[i];
+  }
+  const j = node.keys.indexOf(k);
+  return j < 0 ? undefined : node.values![j];
+}
+const leaf = (ks: number[]) => ({ keys: ks, values: ks.map(k => 'v' + k) });
+const root: Node = { keys: [40, 80], children: [leaf([10, 25]), leaf([40, 50, 65]), leaf([80, 90, 99])] };
+console.log(lookup(root, 65), lookup(root, 66));
+```
+
+Output: `v65 undefined`.
+
+Common mistake: an off-by-one at the separator, sending key 40 to the left child. Fix: decide the rule (keys equal to a separator go right here) and test exactly the separator values.
+
+</Level>
+
+<Level name="Advanced">
+
+Why pages? A hard disk pays a seek and a rotation before reading anything, then reads a sequence cheaply. An SSD has no seek, but it still reads and programs in pages and erases in much larger blocks, and it is far slower than memory. In both cases, fetching a whole page and using all of it is the efficient pattern. A node with a fan-out of a few hundred uses the whole page.
+
+Lookup complexity is counted in two units: page transfers, about log base fan-out of n; and comparisons, about log2(n) in total because each node is binary searched. The first is what costs time on disk.
+
+```text
+n = 100 million keys, fan-out 200
+levels      = ceil(log_200(1e8)) = 4
+page reads  = 4 (fewer if the top levels are cached)
+comparisons ~ log2(1e8) ~ 27
+```
+
+Common mistake: optimising comparisons inside a node while the tree does needless page reads. Fix: measure I/O first.
+
+</Level>
+
+<Level name="Edge cases">
+
+Splits: inserting into a full leaf splits it into two half-full leaves and inserts a new separator into the parent. If the parent is full, it splits too. When the root splits, a new root is created above it, and the tree grows one level. That is the only way a B-tree gets taller, which is why all leaves are always at the same depth.
+
+```text
+insert 70 into full leaf [50 | 60 | 65]   (max 3 keys)
+  split   ->  [50 | 60]   [65 | 70]
+  promote 65 into parent  [40 | 65 | 80]
+```
+
+Merges are the reverse: when a delete leaves a node underfull, it borrows from a sibling or merges with it, removing a separator from the parent. If the root ends up with one child, the tree gets shorter.
+
+Common mistake: forgetting to update the parent's separator when keys move between siblings. Fix: every split, merge or borrow changes exactly one separator in the parent; assert it in tests.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner case: a split and a delete on the same path at the same time in a concurrent tree. One thread is splitting a leaf while another is reading it; the reader may land on the old half and miss a key that moved right. Chapter 4 handles this with sibling links and high keys. For now, it is enough to see that the textbook algorithm assumes a single writer.
+
+Another corner: variable-size keys. Counting "keys per node" stops being a fixed number; a node is full when its bytes run out, not when it reaches a count. A long key can force a split with only a few keys in the node.
+
+```text
+page 4096 bytes, keys 16 bytes  -> ~200 keys per node
+page 4096 bytes, keys 500 bytes -> ~7 keys per node   (tree much taller)
+```
+
+Common mistake: indexing a long text column and wondering why the index is deep and slow. Fix: index a shorter key (a hash or a prefix) or use a different access path.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the top levels of a busy B-tree are almost always in memory, so a point lookup usually costs one or two real reads. A range scan costs one descent plus walking leaves. Insert-heavy tables with random keys touch random leaves, so the working set is the whole index; with increasing keys, inserts touch only the rightmost leaf.
+
+```sql
+-- Postgres: see the height and size of an index (needs the pageinspect extension)
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT * FROM bt_metap('note_pkey');      -- includes the root page and the level
+```
+
+The `level` column in the output is the height of the tree above the leaves.
+
+Common mistake: random UUIDv4 primary keys on a huge, insert-heavy table, then surprise at cache misses. Fix: time-ordered identifiers (for example UUIDv7) keep inserts on the right edge.
+
+</Level>
+
+<Level name="Mindset">
+
+Think in pages. Every question about B-tree performance becomes: how many pages does this touch, and are they in memory? That one habit explains index-only scans, why wide indexes are slower, and why sequential keys insert faster.
+
+```text
+question                      -> pages touched
+point lookup, cached top      -> 1-2
+range of 1,000 rows, clustered -> descent + ~10 leaf pages
+range of 1,000 rows, scattered -> descent + up to 1,000 heap pages
+```
+
+Common mistake: reasoning about databases in rows. Fix: reason in pages, then in rows.
+
+</Level>
+
+<Level name="System design">
+
+B-trees appear wherever there is sorted data on a block device: database indexes, filesystems (directories and extent maps), and embedded key-value stores. Recognising one tells me the costs: logarithmic point reads, cheap range scans, in-place updates with write amplification of a page per change.
+
+When I design a key for a B-tree, I design for the scans I need. A composite key `(tenant_id, created_at)` makes "latest notes for one tenant" one descent and a short walk.
+
+<Flow steps={['choose key order', 'one descent to the start', 'walk leaves in order', 'stop at the end of the range']} caption="A range scan on a B-tree." />
+
+Common mistake: a key that does not match the scan, forcing a sort or a full scan. Fix: put the equality columns first and the range column last.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: implement an in-memory B+-tree in TypeScript with insert (with splits), delete (with borrow and merge) and range scan, with a configurable maximum keys per node so I can test with tiny nodes. Then a property test: a million random inserts and deletes compared against a sorted array after each step.
+
+Exercise: by hand, insert 1 to 20 into a tree with at most three keys per node and draw it after each split.
+
+Done when the property test passes with a fan-out of 3 and of 128, and I can draw a split and a merge on paper without looking.
+
+</Level>
+</Levels>
+
+### 3. File Formats
+**Covers:** Why binary formats, encoding primitive types, strings and variable-size data, bit-packed booleans, enums and flags, page structure, slotted pages, cell layout, managing variable-size data, versioning and checksumming.
+
+<Figure art={`
+ +--------+--------------------------------------------------------+
+ | header | slot 0 | slot 1 | slot 2 |  ->  free space  <-  | c2 | c1 | c0 |
+ +--------+--------------------------------------------------------+
+   page     offsets grow to the right       cells grow to the left
+   type,    (2 bytes each, sorted by key)   (key + value bytes)
+   counts
+`} caption="A slotted page: a small array of offsets at the front, variable-size cells packed from the back." />
+
+<Levels label="Chapter 3, File Formats">
+
+<Level name="Beginner">
+
+A database file is a sequence of fixed-size pages, commonly a few kilobytes each. Everything the engine stores, tree nodes, records, free-space maps, goes into pages. Inside a page, values are encoded as raw bytes in a precise layout, not as text, because binary is smaller and faster to read than parsing.
+
+Encoding a number means choosing a size and a byte order. Encoding a string means writing its length, then its bytes.
+
+```ts
+const buf = Buffer.alloc(16);
+let off = 0;
+off = buf.writeUInt32LE(42, off);          // a 4-byte integer, little-endian
+const s = Buffer.from('Pune', 'utf8');
+off = buf.writeUInt16LE(s.length, off);     // length prefix
+s.copy(buf, off); off += s.length;
+console.log(buf.subarray(0, off).toString('hex'));
+```
+
+Output: `2a000000040050756e65`. Four bytes of 42, two bytes of length 4, then the UTF-8 bytes of "Pune".
+
+Common mistake: writing strings without a length and relying on a terminator. Fix: length-prefix variable data; a zero byte can appear in valid data.
+
+</Level>
+
+<Level name="Intermediate">
+
+A slotted page solves variable-size records. The page starts with a header, then an array of slots. Each slot is the offset of a cell. Cells are written from the end of the page backwards. Free space is in the middle. The slot array can be kept in key order even though cells are written in arrival order, so binary search works over slots.
+
+```ts
+class SlottedPage {
+  buf = Buffer.alloc(4096); slots: number[] = []; freeEnd = 4096;
+  insert(key: string, val: string): number {
+    const cell = Buffer.from(key + '\u0000' + val);
+    if (this.freeEnd - cell.length < 8 + 2 * (this.slots.length + 1)) throw new Error('page full');
+    this.freeEnd -= cell.length; cell.copy(this.buf, this.freeEnd);
+    this.slots.push(this.freeEnd);
+    this.slots.sort((a, b) => this.key(a).localeCompare(this.key(b)));
+    return this.freeEnd;
+  }
+  key(off: number) { return this.buf.toString('utf8', off, this.buf.indexOf(0, off)); }
+}
+const p = new SlottedPage(); p.insert('b', '2'); p.insert('a', '1'); p.insert('c', '3');
+console.log(p.slots.map(o => p.key(o)), p.freeEnd);
+```
+
+Output: `[ 'a', 'b', 'c' ] 4087`. Cells arrived as b, a, c; the slots are in key order.
+
+Common mistake: storing records back to back with no slots, so one record growing means rewriting every record after it. Fix: indirection through slots.
+
+</Level>
+
+<Level name="Advanced">
+
+Bit packing stores booleans, small enums and flags in single bits of one byte. A node header might say "leaf or internal", "has overflow", "is root" in three bits. Versioning puts a format version (or a magic number) in the file header so a new release can read files written by an old one, or refuse clearly.
+
+Checksums detect corruption. Each page stores a checksum of its contents, computed on write and verified on read. Disks, controllers and memory do occasionally return wrong bytes, and a database that reads garbage silently is far worse than one that stops.
+
+```ts
+import { createHash } from 'node:crypto';
+const page = Buffer.alloc(4096, 7);
+const sum = createHash('sha256').update(page).digest().readUInt32LE(0);
+page[100] ^= 1;                                   // flip one bit
+const sum2 = createHash('sha256').update(page).digest().readUInt32LE(0);
+console.log(sum === sum2);
+```
+
+Output: `false`. Real engines use cheaper checksums such as CRC32C; the idea is the same.
+
+Common mistake: checksumming the page including the checksum field itself. Fix: zero the field, compute, then write the checksum into it.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: a record larger than a page. It cannot fit in a slot; it goes into overflow pages linked from the cell, and the cell keeps a prefix and a pointer. Reading it costs several page reads, and a page that is mostly overflow pointers is a sign of a schema problem.
+
+Edge: a page that is "full" by bytes but has deleted cells. The free space is fragmented between live cells. Before declaring it full, the engine compacts it: moves live cells together and rewrites their slot offsets, keeping slot numbers stable.
+
+```text
+before: [hdr][s0 s1 s2] free [c2][dead 300B][c0]   -> insert of 250B fails
+compact:[hdr][s0 s1 s2] free.............[c2][c0]  -> insert fits
+```
+
+Common mistake: renumbering slots during compaction, breaking references from other pages. Fix: only offsets change; slot ids never do.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: a torn page. A page write is not atomic at the hardware level; power loss can leave half new bytes and half old. The checksum will catch it on read, but then the page is unreadable. Engines handle this with full-page images in the log (Postgres writes the whole page into the WAL the first time it changes after a checkpoint) or with a double-write buffer (InnoDB).
+
+Corner: byte order and portability. A file written little-endian and read big-endian gives nonsense numbers that look plausible.
+
+```ts
+const b = Buffer.alloc(4); b.writeUInt32LE(1, 0);
+console.log(b.readUInt32LE(0), b.readUInt32BE(0));
+```
+
+Output: `1 16777216`.
+
+Common mistake: using the platform's native byte order in a file format. Fix: fix the byte order in the spec and always read and write explicitly.
+
+</Level>
+
+<Level name="Production level">
+
+In production these details show up as settings and errors. Postgres has data checksums, enabled when the cluster is created (and switchable offline with a tool); full-page writes are on by default for torn-page protection. When a checksum fails, Postgres reports an error naming the page instead of returning wrong data.
+
+```text
+WARNING:  page verification failed, calculated checksum 1234 but expected 5678
+ERROR:  invalid page in block 42 of relation base/16384/16397
+```
+
+(The numbers are made up; the shape of the message is what to recognise.)
+
+Common mistake: turning off full-page writes to save WAL volume on storage that does not guarantee atomic page writes. Fix: leave it on unless the storage really guarantees it.
+
+</Level>
+
+<Level name="Mindset">
+
+A file format is an API with no version negotiation. Whatever I write today, future code must read, maybe years later. So I version it from the first byte, I write a spec before code, and I keep a hex dump of a sample file in the repository as a test fixture.
+
+```text
+offset  size  field
+0       4     magic 'KVS1'
+4       2     format version
+6       2     page size / 1024
+8       4     root page number
+12      4     header checksum
+```
+
+Common mistake: "we'll add a version field later". Fix: there is no later; files already written have no version.
+
+</Level>
+
+<Level name="System design">
+
+The same ideas show up far from databases: network protocols (length prefixes, versions), log formats, and serialisation libraries. When I design a message format between services, I make the same decisions: explicit byte order or a schema language, a version, room for new fields, a checksum if the transport does not have one.
+
+<Flow steps={['magic + version', 'length-prefixed fields', 'reserved space for growth', 'checksum last']} caption="The checklist for any binary format I design." />
+
+Common mistake: a JSON blob with no version inside a binary record. Fix: version the envelope and the payload.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write the slotted page above properly, with delete, compaction, overflow handling and a CRC32 checksum, then a hex dump tool that prints the header, slots and cells. Read a SQLite file header with `xxd` against SQLite's published file format document and identify each field.
+
+Exercise: corrupt one byte in a page file and make my reader refuse it with a clear error.
+
+Done when I can read a record out of my own hex dump by hand, and my compaction test keeps slot ids stable.
+
+</Level>
+</Levels>
+
+### 4. Implementing B-Trees
+**Covers:** Page headers, magic numbers, sibling links, rightmost pointers, high keys, overflow pages, binary search with indirection pointers, propagating splits and merges with breadcrumbs, rebalancing, right-only appends, bulk loading, compression, and vacuum and maintenance.
+
+<Figure art={`
+  descent for key 67:   root ---> internal ---> leaf
+  breadcrumbs stack:    [root, slot 1] [internal, slot 2]
+
+  leaf splits  ->  pop internal from stack, insert separator
+  internal full -> split it too, pop root, insert separator
+  root full    -> new root above, tree grows by one level
+
+  leaves:  [10..25] <-> [40..65] <-> [67..79] <-> [80..99]   sibling links
+`} caption="Breadcrumbs remember the path down so a split can travel back up; sibling links let scans move sideways." />
+
+<Levels label="Chapter 4, Implementing B-Trees">
+
+<Level name="Beginner">
+
+The textbook B-tree is an idea; a real one is a set of pages with headers. Each page header says what kind of node it is, how many cells it holds, where free space starts, and often a magic number that identifies the file type so a stray file is not misread as an index.
+
+Lookups inside a page are binary searches over the slot array. Because slots point at cells, the search compares keys by following each slot to its cell: binary search with indirection.
+
+```ts
+function search(slots: number[], keyAt: (off: number) => string, k: string): number {
+  let lo = 0, hi = slots.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1, c = keyAt(slots[mid]).localeCompare(k);
+    if (c === 0) return mid;
+    c < 0 ? (lo = mid + 1) : (hi = mid - 1);
+  }
+  return -(lo + 1);          // not found: encode the insertion point
+}
+```
+
+Returning `-(insertion point + 1)` tells the caller where to insert, which is exactly what a B-tree insert needs.
+
+Common mistake: returning -1 for "not found" and then searching again to find where to insert. Fix: return the insertion point.
+
+</Level>
+
+<Level name="Intermediate">
+
+Sibling links connect each node to its neighbours on the same level. A range scan descends once and then follows right links through the leaves without climbing back up. Some trees keep a rightmost pointer in the header, because a node with N separators has N+1 children and one pointer has no separator beside it.
+
+Breadcrumbs: on the way down, the insert remembers which node and which slot it came through. When a leaf splits, the separator goes into the remembered parent; if that splits too, the next breadcrumb says where to go.
+
+```ts
+const path: { page: number; slot: number }[] = [];
+// during descent: path.push({ page: node.id, slot: i });
+// after a leaf split producing separator sep and new page right:
+// while (path.length) { const p = path.pop()!; if (insertInto(p.page, sep, right)) break;
+//   ({ sep, right } = split(p.page)); }
+// if path is empty and we still have a separator: make a new root.
+```
+
+Common mistake: keeping parent pointers in each node. Fix: they must be updated on every split of the parent, touching many pages; breadcrumbs cost nothing on disk.
+
+</Level>
+
+<Level name="Advanced">
+
+High keys: each node can store the upper bound of keys it may contain. A concurrent reader that arrives at a node after a split, looking for a key greater than the high key, knows the key moved right and follows the sibling link. This is the core of the Lehman and Yao B-link tree that Postgres's B-tree is based on.
+
+Rebalancing moves keys to a less full sibling to postpone a split, which improves space use. Right-only appends handle ever-increasing keys: instead of splitting the rightmost leaf in half (leaving the left half half-empty forever), the tree starts a new empty right leaf.
+
+```text
+50/50 split on sequential inserts:   [1..50][51..100][101..150] ... each page half full
+right-only append:                   [1..100][101..200] ...         each page full
+```
+
+Common mistake: assuming half-full pages are normal for every workload. Fix: check fill factor and key pattern; sequential keys can pack pages full.
+
+</Level>
+
+<Level name="Edge cases">
+
+Bulk loading: building an index from sorted data bottom up. Fill leaf pages completely, one after another, then build the level above from their first keys, and repeat. It writes each page once and never splits. Creating an index on a big existing table works this way, which is why it is much faster than inserting rows one at a time into a table that already has the index.
+
+```ts
+function bulkLoad(sorted: number[], fanout: number): number[][][] {
+  const levels: number[][][] = [];
+  let level: number[][] = [];
+  for (let i = 0; i < sorted.length; i += fanout) level.push(sorted.slice(i, i + fanout));
+  levels.push(level);
+  while (level.length > 1) {
+    const up: number[][] = [];
+    for (let i = 0; i < level.length; i += fanout) up.push(level.slice(i, i + fanout).map(n => n[0]));
+    levels.push(up); level = up;
+  }
+  return levels.reverse();
+}
+console.log(bulkLoad(Array.from({ length: 27 }, (_, i) => i), 3).map(l => l.length));
+```
+
+Output: `[ 1, 3, 9 ]`: nine leaves, three internal nodes, one root.
+
+Common mistake: loading a large table with indexes in place. Fix: load, then create indexes (or disable and rebuild them), when the database allows it.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: overflow pages and compression together. A compressed page has a variable size on disk while the in-memory page has a fixed size, so the engine must map logical pages to variable-size extents and handle a page that no longer compresses to fit. Deduplicating repeated keys in a leaf (Postgres does this for B-tree indexes since version 13) changes what "full" means.
+
+Corner: fragmentation after many updates and deletes. Pages end up with dead cells; a long range scan reads many nearly empty pages.
+
+```sql
+-- Postgres: index bloat, roughly, with pgstattuple
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('note_pkey');
+```
+
+Common mistake: rebuilding indexes on a schedule "just in case". Fix: measure density and fragmentation, and rebuild (`REINDEX CONCURRENTLY`) when the numbers say so.
+
+</Level>
+
+<Level name="Production level">
+
+Vacuum and maintenance are the production face of this chapter. In Postgres, updates create new row versions and leave old ones; VACUUM marks dead space reusable and removes dead index entries. Autovacuum runs this in the background. When it falls behind, tables and indexes bloat, scans read more pages, and in the worst case transaction id wraparound forces an emergency vacuum.
+
+```sql
+SELECT relname, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 5;
+```
+
+Common mistake: disabling autovacuum because it "uses I/O". Fix: tune it to run more often on hot tables; it is the cheapest it will ever be.
+
+</Level>
+
+<Level name="Mindset">
+
+The algorithm is ten percent of the work. The rest is edge cases, concurrency, maintenance and on-disk compatibility. When I estimate a storage feature, I estimate that ninety percent too.
+
+```text
+textbook B-tree:        insert, split, lookup
+real B-tree also needs: page format, free space, overflow, sibling links,
+                        high keys, latching, WAL records per change, vacuum,
+                        bulk load, compression, crash tests
+```
+
+Common mistake: "I'll write a quick B-tree". Fix: write the quick one to learn, use a proven one to ship.
+
+</Level>
+
+<Level name="System design">
+
+Primary key choice is a storage decision. An increasing key appends to the right edge: inserts touch one hot page (good for cache, but a contention point under heavy concurrency). A random key spreads inserts across the whole tree: no single hot page, but the entire index is the working set.
+
+<Compare left="sequential key (identity, UUIDv7)" right="random key (UUIDv4)" rows={[
+  ['inserts touch the rightmost leaf', 'inserts touch any leaf'],
+  ['pages fill completely', 'pages split and sit half full'],
+  ['small working set', 'whole index must be cached'],
+  ['one hot page under very high concurrency', 'no hot page'],
+]} caption="Two key choices, same table." />
+
+Common mistake: choosing a key format for aesthetics or tradition. Fix: choose by the insert pattern and the reads.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: turn my in-memory B+-tree into a paged one on top of my slotted page, with a page header, magic number, sibling links, breadcrumb-based split propagation and a bulk loader. Benchmark one million inserts with sequential and random keys and count page writes and final page count.
+
+Exercise: read the Postgres `nbtree` README in the source tree for the high-key and right-link rules, and explain them in my own words.
+
+Done when the paged tree survives the same property test as the in-memory one, and I can explain the difference in the sequential and random numbers.
+
+</Level>
+</Levels>
+
+### 5. Transaction Processing and Recovery
+**Covers:** Buffer management (caching, eviction, pinning pages, page replacement), recovery (the log, operation versus data logs, steal and force policies, ARIES), and concurrency control (serializability, isolation, anomalies, isolation levels, optimistic, multiversion, pessimistic and lock-based).
+
+<Flow steps={['BEGIN', 'change page in buffer pool', 'append WAL record (LSN)', 'COMMIT: flush WAL up to commit LSN', 'reply OK', 'checkpoint later writes dirty pages']} caption="The write-ahead rule: the log reaches disk before the data page, and before the client hears OK." />
+
+<Levels label="Chapter 5, Transaction Processing and Recovery">
+
+<Level name="Beginner">
+
+A transaction groups operations so they all take effect or none do (atomicity), the database moves between valid states (consistency), concurrent transactions do not see each other's half-done work (isolation), and committed work survives crashes (durability).
+
+Two components make this possible on one machine. The buffer pool caches pages in memory and decides which to evict. The write-ahead log (WAL) records every change before the changed page may be written to disk, so after a crash the log can redo committed work and undo uncommitted work.
+
+```sql
+BEGIN;
+UPDATE account SET balance = balance - 100 WHERE id = 1;
+UPDATE account SET balance = balance + 100 WHERE id = 2;
+COMMIT;      -- both happen, or after a crash neither does
+```
+
+Common mistake: running the two updates without a transaction in autocommit mode. Fix: anything that must happen together goes in one transaction.
+
+</Level>
+
+<Level name="Intermediate">
+
+Buffer management: pages are read into frames in memory. A page in use is pinned so it cannot be evicted. When the pool is full, a replacement policy picks a victim: LRU, CLOCK (an approximation of LRU with a reference bit), or variants that resist one-off scans. A dirty victim must be written out first, and by the WAL rule, only after its log records are on disk.
+
+```ts
+// CLOCK: a hand sweeps frames; a set reference bit buys one more lap.
+function clockEvict(ref: boolean[], pinned: boolean[], hand: { i: number }): number {
+  for (;;) {
+    const i = hand.i; hand.i = (hand.i + 1) % ref.length;
+    if (pinned[i]) continue;
+    if (ref[i]) { ref[i] = false; continue; }
+    return i;
+  }
+}
+const ref = [true, false, true, true], pinned = [false, false, false, true];
+console.log(clockEvict(ref, pinned, { i: 0 }));
+```
+
+Output: `1`. Frame 0 had its bit set, so it was cleared and skipped; frame 1 was not recently used.
+
+Common mistake: forgetting to unpin a page after use, which slowly leaks the pool until nothing can be evicted. Fix: pin and unpin in one scope (try/finally).
+
+</Level>
+
+<Level name="Advanced">
+
+Steal and force decide how much recovery has to do. Steal: the pool may write a dirty page of an uncommitted transaction to disk; then recovery needs undo. No-force: committed pages need not be written at commit; then recovery needs redo. Steal plus no-force gives the best runtime performance and needs both, which is what ARIES provides.
+
+ARIES recovers in three passes. Analysis scans the log from the last checkpoint to find dirty pages and in-flight transactions. Redo repeats history: reapplies every logged change from the oldest needed point, even for losers, so the pages match the moment of the crash. Undo rolls back the transactions that never committed, writing compensation log records as it goes.
+
+```text
+log:  LSN10 T1 update A   LSN11 T2 update B   LSN12 T1 commit   LSN13 T2 update C   *crash*
+analysis: winners {T1}, losers {T2}
+redo:     apply 10, 11, 13 (repeat history)
+undo:     undo 13, undo 11 (write CLRs), T2 aborted
+```
+
+Common mistake: thinking redo only replays committed transactions. Fix: ARIES redoes everything, then undoes losers; that is what makes it simple and correct with fine-grained locking.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: a crash during recovery. If undo has rolled back some of T2's changes and the machine dies again, the second recovery must not undo them twice. Compensation log records (CLRs) record each undo and point to the next record still to undo, so recovery resumes where it stopped.
+
+Edge: the anomalies. A dirty read sees uncommitted data. A non-repeatable read sees a row change between two reads in one transaction. A phantom sees new rows appear in a range. A lost update overwrites a concurrent update. Write skew happens when two transactions read the same condition and each write something different that together break it.
+
+```sql
+-- lost update under READ COMMITTED, two sessions
+-- S1: SELECT stock FROM item WHERE id=1;   -- 10
+-- S2: SELECT stock FROM item WHERE id=1;   -- 10
+-- S1: UPDATE item SET stock = 9 WHERE id=1; COMMIT;
+-- S2: UPDATE item SET stock = 9 WHERE id=1; COMMIT;   -- one sale lost
+-- fix: UPDATE item SET stock = stock - 1 WHERE id=1;  (or SELECT ... FOR UPDATE)
+```
+
+Common mistake: read-modify-write in application code. Fix: do the arithmetic in the UPDATE, or lock the row first.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: write skew under snapshot isolation. Two doctors are on call; each checks that at least two are on call and then removes themself. Both see two, both commit, nobody is on call. Neither wrote a row the other wrote, so snapshot isolation sees no conflict.
+
+```sql
+-- Postgres, both sessions at REPEATABLE READ (snapshot isolation):
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM on_call WHERE shift = 1;           -- 2 in both sessions
+UPDATE on_call SET active = false WHERE doctor = 'me' AND shift = 1;
+COMMIT;                                                 -- both succeed
+-- at SERIALIZABLE, one of them fails with:
+-- ERROR:  could not serialize access due to read/write dependencies among transactions
+```
+
+Common mistake: believing REPEATABLE READ in Postgres prevents all anomalies. Fix: use SERIALIZABLE and retry on serialization failure, or lock the rows the decision depends on.
+
+</Level>
+
+<Level name="Production level">
+
+Concurrency control comes in three families. Pessimistic, lock-based: take locks, typically with two-phase locking (grow locks, then release at the end), and deal with deadlocks. Optimistic: run without locks and validate at commit, aborting on conflict. Multiversion (MVCC): keep several versions so readers see a snapshot and never block writers. Postgres uses MVCC plus row locks for writes; SERIALIZABLE adds predicate tracking on top.
+
+In production, the operational facts are: know the default isolation level (READ COMMITTED in Postgres), keep transactions short, and make retries part of the code when using SERIALIZABLE.
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries = 5): Promise<T> {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e: any) {
+      if (e.code !== '40001' || i >= tries - 1) throw e;   // serialization_failure
+      await new Promise(r => setTimeout(r, 2 ** i * 10 + Math.random() * 10));
+    }
+  }
+}
+```
+
+Common mistake: a long transaction left open by an idle connection, holding back vacuum and locks. Fix: `idle_in_transaction_session_timeout` and short transactions.
+
+</Level>
+
+<Level name="Mindset">
+
+Durability is a promise about the log, not about data files. If the commit record is on disk, the transaction survived, whatever state the data pages are in. Isolation is a promise about which anomalies are allowed; the name of the level matters less than the list.
+
+```text
+when someone says "it's ACID", ask:
+  A  - what is the unit? statement, transaction, batch?
+  C  - which constraints does the database enforce, and which does the app?
+  I  - which isolation level by default, and which anomalies does it allow?
+  D  - flushed to what: OS cache, local disk, a replica?
+```
+
+Common mistake: treating ACID as a yes or no property. Fix: ask the four questions.
+
+</Level>
+
+<Level name="System design">
+
+MVCC in a system: old versions let long analytical reads run without blocking writes, but they cost space and cleanup. In Postgres, a long transaction prevents vacuum from removing versions newer than its snapshot, across all tables. A reporting query that runs for hours on the primary can cause bloat everywhere.
+
+<Flow steps={['long transaction holds old snapshot', 'vacuum cannot remove newer dead rows', 'tables and indexes bloat', 'scans slow down']} caption="How one long reader hurts every writer in an MVCC database." />
+
+Common mistake: running hours-long reports on the primary. Fix: a replica for reports, with its own settings for conflicts.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: add a WAL and recovery to my key-value store. Every change gets a log record with an LSN; pages record the LSN of their last change; commit flushes the log; recovery replays from the last checkpoint. Then a kill test: a script that runs random transactions, kills the process with SIGKILL at random moments, restarts, and checks invariants (for example, the sum of balances never changes).
+
+Then reproduce in Postgres, with two psql sessions: a lost update at READ COMMITTED, write skew at REPEATABLE READ, and the serialization failure at SERIALIZABLE.
+
+Done when the kill test passes a thousand runs and I can produce each anomaly on demand and say which level prevents it.
+
+</Level>
+</Levels>
+
+### 6. B-Tree Variants
+**Covers:** Copy-on-write B-trees (LMDB), abstracting node updates, lazy B-trees (WiredTiger, the Lazy-Adaptive Tree), FD-trees with fractional cascading, Bw-trees with update chains and compare-and-swap, and cache-oblivious B-trees with the van Emde Boas layout.
+
+<Figure art={`
+   old root R1                  new root R2   (after updating key in leaf L3)
+     /    \\                      /    \\
+   I1      I2        --->      I1      I2'        I2' and L3' are new copies;
+  /  \\    /  \\                /  \\    /  \\       I1, L1, L2, L4 are shared
+ L1  L2  L3  L4              L1  L2  L3'  L4
+   readers holding R1 still see the old tree, untouched
+`} caption="Copy-on-write: change a leaf by copying the path to a new root, never overwriting a page in place." />
+
+<Levels label="Chapter 6, B-Tree Variants">
+
+<Level name="Beginner">
+
+The classic B-tree updates pages in place. Every variant in this chapter changes that one decision, either never overwriting (copy-on-write), delaying the writes (lazy and buffered trees), or recording changes as small deltas (Bw-trees). The tree shape stays; the write path changes.
+
+```text
+in place:        read page, modify, write same page
+copy-on-write:   read page, modify copy, write new page, update parent (also copied)
+lazy/buffered:   record change in memory, apply to page later in a batch
+delta:           prepend a small delta record, consolidate later
+```
+
+Common mistake: thinking these are different data structures to learn from scratch. Fix: learn them as answers to "where and when do bytes get written?"
+
+</Level>
+
+<Level name="Intermediate">
+
+Copy-on-write: to change a leaf, write a modified copy of the leaf, then a copy of its parent pointing to the new leaf, up to a new root. Switching the root pointer atomically publishes the new version. Readers that started earlier still hold the old root and see a consistent snapshot. LMDB works this way, with a single writer and lock-free readers, and it needs no separate WAL because the old tree is intact until the root switch.
+
+```ts
+type N = { keys: number[]; kids?: N[]; vals?: string[] };
+function cowSet(n: N, k: number, v: string): N {
+  if (!n.kids) {                                        // leaf: copy and modify
+    const i = n.keys.indexOf(k), keys = [...n.keys], vals = [...n.vals!];
+    i >= 0 ? (vals[i] = v) : (keys.push(k), vals.push(v));
+    return { keys, vals };
+  }
+  let i = 0; while (i < n.keys.length && k >= n.keys[i]) i++;
+  const kids = [...n.kids]; kids[i] = cowSet(n.kids[i], k, v);
+  return { keys: n.keys, kids };
+}
+const r1: N = { keys: [10], kids: [{ keys: [1], vals: ['a'] }, { keys: [10], vals: ['b'] }] };
+const r2 = cowSet(r1, 10, 'B');
+console.log(r1.kids![1].vals, r2.kids![1].vals, r1.kids![0] === r2.kids![0]);
+```
+
+Output: `[ 'b' ] [ 'B' ] true`. The old version is unchanged and the untouched leaf is shared.
+
+Common mistake: assuming copy-on-write is free. Fix: every update writes a whole path, height pages, so writes are amplified.
+
+</Level>
+
+<Level name="Advanced">
+
+Lazy B-trees buffer updates. WiredTiger keeps in-memory pages in a different format from on-disk pages, with updates attached as lists, and reconciles them into on-disk pages when evicting. The Lazy-Adaptive Tree attaches buffers to subtrees and pushes changes down in batches. FD-trees keep a small mutable head tree and a series of sorted immutable runs, linked with fractional cascading so a search in one run narrows the search in the next.
+
+Bw-trees go further: a mapping table translates logical page ids to physical addresses. An update creates a delta record pointing at the current page and installs it with one compare-and-swap on the mapping entry. No latch is held. When a delta chain is long, it is consolidated into a new base page.
+
+```text
+mapping[P7] -> [delta: insert 42] -> [delta: delete 17] -> [base page P7]
+consolidate: build new base with 42 and without 17, CAS mapping[P7] to it
+```
+
+Common mistake: reading "latch-free" as "no contention". Fix: CAS retries are contention; they are just cheaper than blocking.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: in a copy-on-write tree, freed pages cannot be reused while any reader still holds an old root that references them. LMDB tracks the oldest active reader; a reader that never finishes pins old pages forever and the file grows.
+
+Edge: a Bw-tree delta chain under heavy updates to one page grows faster than consolidation runs, and reads must walk the whole chain.
+
+```text
+reader opened at version 100, never closed
+writers at version 5,000,000
+pages freed since version 100: cannot be reused -> file grows without bound
+```
+
+Common mistake: leaving a read transaction open in LMDB or any MVCC store. Fix: short read transactions, and monitor the oldest reader.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: cache-oblivious B-trees. Instead of tuning node size to one page size, the van Emde Boas layout recursively splits the tree into a top half and bottom subtrees and stores each recursively, so the layout is efficient for every level of the memory hierarchy (cache line, page, disk block) without knowing their sizes. It is elegant and rarely used directly, because real systems know their page size and need concurrency, which this layout makes harder.
+
+```text
+tree of height h:  store top subtree of height h/2 contiguously,
+                   then each bottom subtree of height h/2 contiguously,
+                   recursively inside each.
+```
+
+Common mistake: assuming the asymptotically best layout is the practical choice. Fix: check what it costs in concurrency, updates and code complexity.
+
+</Level>
+
+<Level name="Production level">
+
+In production, the variant explains the behaviour. LMDB: very fast reads, one writer at a time, file grows if readers linger, and a crash leaves a consistent tree with no recovery. WiredTiger (MongoDB's engine): in-memory pages differ from disk pages, so memory use and eviction pressure matter; checkpoints write consistent snapshots.
+
+```text
+symptom                          likely variant-specific cause
+LMDB file keeps growing          a long-lived read transaction
+MongoDB stalls under write load  WiredTiger eviction falling behind (cache full of dirty pages)
+```
+
+Common mistake: tuning one engine with advice written for another. Fix: learn the write path of the engine you run.
+
+</Level>
+
+<Level name="Mindset">
+
+Ask "in place or not, now or later" of every storage structure. The answers predict write amplification, read cost, recovery story and space overhead.
+
+<Compare left="question" right="what the answer implies" rows={[
+  ['overwrite in place?', 'needs a WAL for crash safety; no extra space'],
+  ['copy on write?', 'free snapshots and simple recovery; more writes'],
+  ['buffer changes?', 'cheap writes; reads must merge buffer and pages'],
+  ['deltas with CAS?', 'no latches; chains to consolidate'],
+]} caption="Four write strategies and their consequences." />
+
+Common mistake: picking an engine on benchmark headlines. Fix: map the benchmark to the write strategy and ask if it matches my workload.
+
+</Level>
+
+<Level name="System design">
+
+Copy-on-write appears outside databases: ZFS and Btrfs snapshots, immutable data structures in application code, persistent data structures in functional languages, and Git's object store. The trade-off is the same everywhere: cheap snapshots and simple consistency, paid for with more writes and garbage collection.
+
+```ts
+// immutable update in application code is copy-on-write of a path
+const state = { user: { profile: { city: 'Pune' } }, cart: { items: [] as string[] } };
+const next = { ...state, user: { ...state.user, profile: { ...state.user.profile, city: 'Delhi' } } };
+console.log(next.cart === state.cart, next.user === state.user);
+```
+
+Output: `true false`. The untouched branch is shared; the changed path is new.
+
+Common mistake: deep-cloning the whole state on each update. Fix: copy only the path, as the tree does.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: add copy-on-write to my in-memory B-tree, keep a list of roots as versions, and give readers a snapshot while a writer runs. Then measure pages written per update against the in-place version. Read the LMDB design notes and the Bw-tree paper's overview to see the two extremes.
+
+Exercise: implement a tiny delta-chain page in TypeScript (insert and delete deltas, consolidate after N deltas) and measure read cost as chains grow.
+
+Done when a long-running reader sees a consistent tree during a million writes, and I can state the write amplification of my copy-on-write tree in pages per update.
+
+</Level>
+</Levels>
+
+### 7. Log-Structured Storage
+**Covers:** LSM trees (structure, updates and deletes, lookups, merge-iteration, reconciliation, maintenance), read, write and space amplification and the RUM conjecture, implementation details (SSTables, Bloom filters, skiplists, disk access, compression), unordered stores (Bitcask, WiscKey), concurrency, and log stacking (flash translation layers, filesystem logging, open-channel SSDs).
+
+<Figure art={`
+ write ->  [ memtable (sorted, in memory) ]  + WAL for durability
+                    | flush when full
+                    v
+ level 0:  [SST] [SST] [SST]            newest, may overlap
+                    | compaction (merge, drop shadowed values and old tombstones)
+                    v
+ level 1:  [SST][SST][SST][SST]         sorted, non-overlapping
+ level 2:  [SST][SST][SST][SST][SST][SST][SST][SST] ...
+
+ read:  memtable -> L0 (newest first) -> L1 -> L2 ...  Bloom filter skips files
+`} caption="An LSM tree: writes go to memory and are flushed as immutable sorted files, merged in the background." />
+
+<Levels label="Chapter 7, Log-Structured Storage">
+
+<Level name="Beginner">
+
+A log-structured merge tree never updates data in place. Writes go to an in-memory sorted structure (the memtable) and to a log for durability. When the memtable is full, it is written out as an immutable sorted file (an SSTable). Background compaction merges files so reads do not have to look at too many.
+
+Writes are fast because they are sequential: append to the log, insert into memory. Reads may have to check several places, newest first, because the newest value wins.
+
+```ts
+class TinyLSM {
+  mem = new Map<string, string | null>(); runs: Map<string, string | null>[] = [];
+  put(k: string, v: string) { this.mem.set(k, v); if (this.mem.size >= 3) this.flush(); }
+  del(k: string) { this.mem.set(k, null); }                    // tombstone
+  flush() { this.runs.unshift(new Map([...this.mem].sort())); this.mem = new Map(); }
+  get(k: string) {
+    for (const t of [this.mem, ...this.runs]) if (t.has(k)) return t.get(k) ?? undefined;
+    return undefined;
+  }
+}
+const db = new TinyLSM();
+db.put('a', '1'); db.put('b', '2'); db.put('c', '3');   // flushed
+db.put('a', '9'); db.del('b');
+console.log(db.get('a'), db.get('b'), db.get('c'), db.runs.length);
+```
+
+Output: `9 undefined 3 1`. The newer `a` shadows the flushed one; the tombstone hides `b`.
+
+Common mistake: deleting by removing the key from the memtable. Fix: an older file may still hold it; write a tombstone.
+
+</Level>
+
+<Level name="Intermediate">
+
+Lookups and merges. A read checks the memtable, then each file from newest to oldest. A range scan opens an iterator on each source and merges them with a heap, keeping the newest version of each key: merge-iteration. Reconciliation is the rule for combining versions: newest wins, tombstones hide older values.
+
+```ts
+function* mergeRuns(runs: [string, string | null][][]) {          // runs[0] newest
+  const idx = runs.map(() => 0);
+  for (;;) {
+    let best: string | undefined;
+    runs.forEach((r, i) => { const e = r[idx[i]]; if (e && (best === undefined || e[0] < best)) best = e[0]; });
+    if (best === undefined) return;
+    let val: string | null | undefined;
+    runs.forEach((r, i) => { const e = r[idx[i]]; if (e && e[0] === best) { if (val === undefined) val = e[1]; idx[i]++; } });
+    if (val !== null) yield [best, val];
+  }
+}
+console.log([...mergeRuns([[['a', '9'], ['b', null]], [['a', '1'], ['b', '2'], ['c', '3']]])]);
+```
+
+Output: `[ [ 'a', '9' ], [ 'c', '3' ] ]`.
+
+Common mistake: dropping tombstones during every merge. Fix: only drop a tombstone when merging into the oldest level, where nothing older can exist.
+
+</Level>
+
+<Level name="Advanced">
+
+Read, write and space amplification. Write amplification: bytes written to disk per byte the user wrote; compaction rewrites data several times. Read amplification: files or pages read per lookup. Space amplification: disk used per byte of live data, raised by obsolete versions waiting for compaction. The RUM conjecture says a structure can minimise at most two of read overhead, update overhead and memory (space) overhead.
+
+Compaction strategies choose where the cost lands. Leveled compaction keeps each level non-overlapping: low read and space amplification, high write amplification. Size-tiered compaction merges similar-sized files: lower write amplification, higher read and space amplification.
+
+```text
+leveled, size ratio 10, 4 levels:  each byte rewritten ~10x per level it passes -> high write amp
+size-tiered:                        each byte rewritten ~once per tier -> lower write amp,
+                                    but several overlapping files per tier -> more reads, 2x space at peak
+```
+
+Common mistake: picking a compaction strategy by default. Fix: measure the workload's read/write mix and disk budget, then choose.
+
+</Level>
+
+<Level name="Edge cases">
+
+Bloom filters make negative lookups cheap. Each file has a bit array; a key is hashed several times and those bits set. If any bit is zero, the key is definitely not in the file; if all are set, it might be. Point reads skip most files; range scans cannot use them.
+
+```ts
+import { createHash } from 'node:crypto';
+class Bloom {
+  bits: Uint8Array; constructor(public m: number, public k: number) { this.bits = new Uint8Array(m); }
+  h(s: string, i: number) { return createHash('sha1').update(i + ':' + s).digest().readUInt32LE(0) % this.m; }
+  add(s: string) { for (let i = 0; i < this.k; i++) this.bits[this.h(s, i)] = 1; }
+  has(s: string) { for (let i = 0; i < this.k; i++) if (!this.bits[this.h(s, i)]) return false; return true; }
+}
+const b = new Bloom(10_000, 7); for (let i = 0; i < 1000; i++) b.add('k' + i);
+let fp = 0; for (let i = 1000; i < 11000; i++) if (b.has('k' + i)) fp++;
+console.log(b.has('k5'), (fp / 10000).toFixed(3));
+```
+
+Output: `true 0.006`. The theory for ten bits per key and seven hashes predicts a little under one percent; the exact figure depends on the hash functions and the sample.
+
+Common mistake: expecting Bloom filters to help range scans. Fix: they answer "is this exact key here?"; prefix Bloom filters help some prefix scans.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: a tombstone dropped too early. Suppose a tombstone for `b` is merged into level 1 and dropped there because level 1 had no `b`, but level 2 still holds an old `b`. The deleted value comes back. A tombstone may only be dropped when no older data can contain the key.
+
+Corner: log stacking. An LSM tree is a log. It runs on a filesystem that may journal, on an SSD whose flash translation layer is itself log-structured with its own garbage collection. Three layers of logs can amplify each other's writes and fragment each other's sequential patterns. Open-channel SSDs and careful alignment are attempts to let one layer manage it.
+
+```text
+app writes 1 GB
+LSM compaction:  x10  -> 10 GB to filesystem
+filesystem:      x1.1 -> 11 GB to device
+FTL GC:          x2   -> 22 GB of flash writes   (illustrative multipliers)
+```
+
+Common mistake: computing SSD lifetime from application write volume. Fix: measure device-level writes (SMART counters).
+
+</Level>
+
+<Level name="Production level">
+
+In production, LSM engines (RocksDB, the storage in Cassandra and ScyllaDB, and many others) expose this chapter as configuration: memtable size, level sizes, compaction style, Bloom filter bits, block cache size, compression per level. The signs of trouble are compaction falling behind (pending compaction bytes growing), write stalls when level 0 has too many files, and read latency growing with the number of files.
+
+Unordered stores make a different trade. Bitcask keeps an in-memory hash of every key pointing at its latest position in an append-only log: one seek per read, fast writes, but all keys must fit in memory and range scans are impossible. WiscKey separates keys from values: the LSM tree holds keys and pointers, values sit in a log, so compaction moves far fewer bytes.
+
+```text
+RocksDB log line to look for (shape):  "Stalling writes because we have N level-0 files"
+```
+
+Common mistake: raising the write rate until stalls appear, then raising limits. Fix: give compaction enough I/O and threads first.
+
+</Level>
+
+<Level name="Mindset">
+
+Immutability moves cost from the write path into background work. Somebody always pays; my job is to find out who pays and when, and whether that matches the workload: bursty writes with quiet nights suit LSM trees; constant heavy writes need compaction headroom all the time.
+
+<Compare left="B-tree" right="LSM tree" rows={[
+  ['update in place', 'append, merge later'],
+  ['reads: one path', 'reads: several files, Bloom filters'],
+  ['writes: random page writes', 'writes: sequential, plus compaction'],
+  ['space: fragmentation, fill factor', 'space: obsolete versions until compaction'],
+]} caption="Two answers to the same problem. Neither wins everywhere." />
+
+Common mistake: "LSM is for writes, B-tree for reads" as a rule. Fix: measure amplification on the real workload.
+
+</Level>
+
+<Level name="System design">
+
+In a design, choose B-trees for read-heavy workloads with updates in place and range scans (most OLTP). Choose LSM trees for write-heavy ingestion, time series and large key-value stores where space efficiency and sequential writes matter. When a system has both, it may run both: an LSM store for events and a B-tree store for entities.
+
+```text
+workload: 50k writes/s of sensor readings, reads mostly latest per sensor
+choice:   LSM (sequential ingest), key = (sensor_id, time), TTL-based compaction
+workload: user accounts, orders, frequent updates, joins
+choice:   B-tree based relational database
+```
+
+Common mistake: one storage engine for both ingest and transactions. Fix: split by access pattern.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: grow TinyLSM into a real one in TypeScript: a WAL, a sorted memtable, flushing to SSTable files with a sparse index and a Bloom filter, merge-iteration for scans, and leveled compaction with tombstone rules. Then the same benchmark as my B-tree: write-heavy and read-heavy workloads, measuring bytes written and files read per lookup.
+
+Exercise: write a test that deletes a key, forces compactions in every order, and asserts the key never comes back.
+
+Done when my numbers show the RUM trade-off, the resurrection test passes, and I can explain one place where my measurements disagree with the theory and why.
+
+The part closes with a short conclusion that ties the storage chapters together and lists the sources behind them.
+
+</Level>
+</Levels>
+
+## Part II: Distributed Systems
+
+### 8. Introduction and Overview
+**Covers:** Concurrent execution and shared state, the fallacies of distributed computing (processing, clocks and time, state consistency, local and remote execution, failure handling, partitions, cascading failures), abstractions such as links, the Two Generals' problem, FLP impossibility, system synchrony and failure models (crash, omission, arbitrary).
+
+<Figure art={`
+  client                    server
+    | ---- request ---->      |
+    |                         X  crashed before processing?
+    |      (lost?)            |  or processed, reply lost?
+    |  <--- reply ---- (?)    |  or just slow?
+    |                         |
+  timeout: all three cases look identical from here
+`} caption="The basic uncertainty of distributed systems: a missing reply has many causes." />
+
+<Levels label="Chapter 8, Introduction and Overview">
+
+<Level name="Beginner">
+
+A distributed system is several processes on several machines that cooperate by sending messages. Messages can be delayed, lost, duplicated or reordered; machines can crash and restart; clocks disagree. The chapter starts from concurrency on one machine (shared state needs coordination) and shows that across machines every problem gets harder, because there is no shared memory and no global clock.
+
+```ts
+// two "nodes" increment a shared counter without coordination
+let counter = 0;
+async function node() { const v = counter; await new Promise(r => setTimeout(r, 1)); counter = v + 1; }
+await Promise.all([node(), node()]);
+console.log(counter);
+```
+
+Output: `1`, not 2. Both read 0 before either wrote. Across machines, the same race happens with every replicated value.
+
+Common mistake: treating a remote call like a local function call. Fix: every remote call can fail, time out, or succeed without telling you.
+
+</Level>
+
+<Level name="Intermediate">
+
+The fallacies of distributed computing are the assumptions that break first: the network is reliable, latency is zero, bandwidth is infinite, the network is secure, topology does not change, there is one administrator, transport cost is zero, the network is homogeneous. The chapter adds processing (the remote side is slow or overloaded), clocks (time on different machines drifts) and state (replicas see updates at different times).
+
+Clocks matter because ordering events by wall-clock timestamps across machines is unreliable. Two machines can disagree by milliseconds or more, and a clock can jump backwards after a sync.
+
+```text
+node A clock: 10:00:00.120   writes x=1
+node B clock: 10:00:00.100   writes x=2  (actually 50 ms later in real time)
+"last write wins" by timestamp keeps x=1  -> the later write is lost
+```
+
+Common mistake: last-write-wins by wall-clock time for data that matters. Fix: logical clocks, version vectors, or a single writer per key.
+
+</Level>
+
+<Level name="Advanced">
+
+Abstractions make reasoning possible. Links are modelled from fair-loss (messages may be lost, but retrying enough eventually gets through) to stubborn (keep resending) to perfect (each message delivered exactly once, built from retries plus deduplication). The Two Generals' problem shows that two parties cannot be certain they agree over a link that may lose messages, however many acknowledgements they send. FLP impossibility shows that in a fully asynchronous system, no deterministic consensus algorithm can guarantee termination if even one process may crash.
+
+```ts
+// "perfect link" from a lossy one: sequence numbers + resend + dedupe
+const seen = new Set<number>();
+function deliver(seq: number, msg: string, handle: (m: string) => void) {
+  if (seen.has(seq)) return;          // duplicate from a resend: ignore
+  seen.add(seq); handle(msg);
+}
+deliver(1, 'pay 100', console.log); deliver(1, 'pay 100', console.log);
+```
+
+Output: `pay 100` once.
+
+Common mistake: reading FLP as "consensus is impossible". Fix: it rules out guaranteed termination in a fully asynchronous model; real systems use timeouts (partial synchrony) and randomness, and work in practice.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: partial failure. A request to two services: one succeeds, one times out. Was the second applied? Unknown. The client must be able to retry safely, which means the operation must be idempotent or carry an idempotency key.
+
+```ts
+const applied = new Map<string, string>();
+function charge(idemKey: string, amount: number) {
+  if (applied.has(idemKey)) return applied.get(idemKey)!;     // retry returns same result
+  const receipt = `charged ${amount}`; applied.set(idemKey, receipt); return receipt;
+}
+console.log(charge('order-77', 100), charge('order-77', 100), applied.size);
+```
+
+Output: `charged 100 charged 100 1`.
+
+Common mistake: retrying a non-idempotent POST on timeout and charging twice. Fix: idempotency keys stored with the result.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: cascading failure. One service slows down. Its clients time out and retry, multiplying its load. It slows further, its own dependencies back up, and the failure spreads. The cure is on the client side: retry budgets, exponential backoff with jitter, circuit breakers, and load shedding on the server.
+
+```ts
+const backoff = (attempt: number, base = 100, cap = 10_000) =>
+  Math.random() * Math.min(cap, base * 2 ** attempt);           // "full jitter"
+console.log([0, 1, 2, 3, 4].map(a => Math.round(backoff(a))));
+```
+
+Output: five random delays growing roughly as up to 100, 200, 400, 800, 1600 ms.
+
+Common mistake: fixed-interval retries from thousands of clients, which arrive in synchronised waves. Fix: jitter.
+
+</Level>
+
+<Level name="Production level">
+
+Failure models decide which protocol fits. Crash faults: a process stops and stays stopped (or recovers with its disk). Omission faults: messages are dropped. Arbitrary (Byzantine) faults: a process may do anything, including lie. Most databases assume crash-recovery and non-Byzantine behaviour; blockchains assume Byzantine.
+
+```text
+model             assumes                          typical protocol
+crash-stop        dead nodes stay dead             simple failover
+crash-recovery    nodes restart with their disk    Raft, Paxos, 2PC with logs
+omission          messages lost                    retries, acks, dedupe
+Byzantine         nodes may lie                    PBFT, signatures, 3f+1 nodes
+```
+
+Common mistake: assuming disks never lose acknowledged data in a crash-recovery model. Fix: fsync, and know what your storage really guarantees.
+
+</Level>
+
+<Level name="Mindset">
+
+Impossibility results tell me what to give up, not that the problem is hopeless. When a design seems to need certainty that the network cannot give, I change the design: make operations idempotent, accept eventual convergence, or add a coordinator that can make the decision.
+
+<Flow steps={['what can fail?', 'what does the caller see?', 'is a retry safe?', 'what is the fallback?']} caption="Four questions I ask of every remote call." />
+
+Common mistake: designing for the happy path and adding error handling later. Fix: design the failure path first.
+
+</Level>
+
+<Level name="System design">
+
+In a system design, I state the failure model and the timing assumptions at the start. Then every interaction between components gets a timeout, a retry policy, an idempotency story and a fallback. That turns "the network is unreliable" from a slogan into a design checklist.
+
+```text
+service A -> service B
+  timeout:      300 ms (p99 of B is 80 ms)
+  retries:      2, full jitter, only on timeout or 503
+  idempotency:  key = order id
+  fallback:     queue the request, reply "pending"
+```
+
+Common mistake: default client timeouts of minutes or none. Fix: set every timeout explicitly from measured latency.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: write a small message-passing simulator in TypeScript with a seeded random generator: nodes, a network that drops, delays, duplicates and reorders messages, and crash and restart events. Every later chapter's algorithm runs on it. Start by building a perfect link (resend plus dedupe) on top of a lossy one and test it under 30 percent loss.
+
+Exercise: list the fallacies and, for one service I have built, the concrete failure each would cause there.
+
+Done when my perfect link delivers every message exactly once under loss and duplication in the simulator, and every external call in my own service has a timeout, retry policy and idempotency key.
+
+</Level>
+</Levels>
+
+### 9. Failure Detection
+**Covers:** Heartbeats and pings, a timeout-free failure detector, outsourced heartbeats, the phi-accrual failure detector, gossip-based failure detection, and reversing failure detection.
+
+<Figure art={`
+ heartbeat arrivals from node B (ms apart):  98 101 99 103 100 ... then silence
+
+ time since last heartbeat:   100      200      400      800
+ fixed timeout 300 ms:        alive    alive    DEAD     DEAD
+ phi (suspicion):             0.3      2.1      8.0      high   <- caller picks threshold
+`} caption="A fixed timeout gives yes or no; an accrual detector gives a level of suspicion that grows with silence." />
+
+<Levels label="Chapter 9, Failure Detection">
+
+<Level name="Beginner">
+
+A failure detector answers "is that process alive?" The simplest one sends heartbeats: B sends A a message every interval, and if A hears nothing for longer than a timeout, A suspects B. The opposite style is pinging: A asks, B answers.
+
+Two properties describe detectors. Completeness: every crashed process is eventually suspected. Accuracy: correct processes are not suspected. With unpredictable delays you cannot have both perfectly, so every detector trades one against the other.
+
+```ts
+class TimeoutDetector {
+  last = new Map<string, number>();
+  constructor(private timeoutMs: number) {}
+  heartbeat(node: string, now: number) { this.last.set(node, now); }
+  suspected(node: string, now: number) { return now - (this.last.get(node) ?? -Infinity) > this.timeoutMs; }
+}
+const d = new TimeoutDetector(300); d.heartbeat('B', 0);
+console.log(d.suspected('B', 250), d.suspected('B', 350));
+```
+
+Output: `false true`.
+
+Common mistake: calling a suspected node "dead" in logs and code. Fix: call it suspected; the protocol must cope with being wrong.
+
+</Level>
+
+<Level name="Intermediate">
+
+Timeout choice is the core trade-off. Too short, and a GC pause or a congested link gets a healthy node evicted, which triggers failover, which adds load, which causes more timeouts. Too long, and a real failure takes a long time to notice, and requests pile up on a dead node.
+
+Outsourced heartbeats reduce false positives: when A suspects B, it asks a few other nodes to ping B. If any of them reaches B, the problem was the link from A, not B. The SWIM membership protocol uses this idea.
+
+```text
+A -> ping B           (no reply)
+A -> ask C, D: ping B
+C -> ping B -> ack -> C tells A "B is alive"
+A keeps B in the cluster; the A-B link is the problem
+```
+
+Common mistake: one node's view deciding the fate of another. Fix: confirm suspicion through other nodes.
+
+</Level>
+
+<Level name="Advanced">
+
+The phi-accrual failure detector, used in Cassandra and Akka, keeps a window of recent heartbeat inter-arrival times, models them as a distribution, and computes phi: roughly the negative log10 of the probability that a heartbeat would be this late if the node were alive. Phi of 1 means about a 10 percent chance of a mistake; phi of 8 means about 1 in 100 million. Each consumer chooses its own threshold.
+
+```ts
+function phi(sinceLast: number, mean: number, std: number): number {
+  // probability a normal(mean, std) arrival is later than sinceLast
+  const z = (sinceLast - mean) / std;
+  const pLater = 0.5 * erfc(z / Math.SQRT2);
+  return -Math.log10(Math.max(pLater, 1e-300));
+}
+function erfc(x: number) { // Abramowitz-Stegun approximation
+  const t = 1 / (1 + 0.5 * Math.abs(x)), y = t * Math.exp(-x * x - 1.26551223 + t * (1.00002368 +
+    t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 +
+    t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+  return x >= 0 ? y : 2 - y;
+}
+console.log([100, 110, 120, 130].map(s => phi(s, 100, 5).toFixed(1)));
+```
+
+Output: `[ '0.3', '1.6', '4.5', '9.0' ]`. Suspicion rises sharply as the gap moves past the usual spread.
+
+Common mistake: setting the phi threshold without looking at the real heartbeat distribution. Fix: graph inter-arrival times first.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: a network partition. Each side suspects the other. Both are right from their own view and wrong globally. A failure detector cannot tell a partition from a crash; that decision has to be made by a quorum, so that only one side can act.
+
+Edge: asymmetric links. A can reach B but B cannot reach A. B's heartbeats never arrive; A's pings get through but replies do not.
+
+```text
+A: "B is down"      B: "A is down"      C (reaches both): "both fine"
+majority rule: A+C or B+C forms a quorum; the minority side steps down
+```
+
+Common mistake: letting both sides of a partition keep accepting writes. Fix: only the side with a quorum acts.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: the zombie. A node pauses for 30 seconds (garbage collection, VM migration, a stuck disk). It is declared dead, a new leader is elected, and then the old one wakes up and carries on as if nothing happened, writing with authority it no longer has. No failure detector can prevent this, because the paused node does not know it was paused.
+
+The fix is in the resource being protected: fencing tokens. Each leadership term gets an increasing number; storage rejects writes with an older number.
+
+```ts
+let highestSeen = 0;
+function write(token: number, data: string) {
+  if (token < highestSeen) throw new Error(`stale token ${token} < ${highestSeen}`);
+  highestSeen = token; return `ok ${data}`;
+}
+console.log(write(34, 'new leader'));
+try { write(33, 'zombie'); } catch (e: any) { console.log(e.message); }
+```
+
+Output: `ok new leader` then `stale token 33 < 34`.
+
+Common mistake: trusting a lease's expiry time on the holder's clock. Fix: fencing tokens checked by the resource.
+
+</Level>
+
+<Level name="Production level">
+
+In production, failure detection lives in load balancers (health checks), cluster managers (Kubernetes liveness and readiness probes), databases (replica monitoring) and membership protocols. The tuning question is always the same: how long to wait, and how many checks must fail, before acting.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 3     # about 30 s of failures before a restart
+```
+
+Common mistake: a liveness probe that checks a dependency (the database). When the database blips, every pod restarts at once. Fix: liveness checks only the process itself; readiness can check dependencies.
+
+</Level>
+
+<Level name="Mindset">
+
+"Dead" means "suspected". I design what happens when the suspicion is wrong, because sometimes it will be: the "dead" node must be fenced, and the system must tolerate it coming back.
+
+<Flow steps={['suspect', 'confirm via others or quorum', 'fence the old owner', 'hand over', 'tolerate the zombie returning']} caption="Acting on suspicion safely." />
+
+Common mistake: failover logic that assumes the old primary is gone. Fix: assume it might come back at the worst moment.
+
+</Level>
+
+<Level name="System design">
+
+Gossip-based failure detection scales to large clusters: each node periodically exchanges its heartbeat counters with a few random peers, and a node is suspected when its counter stops increasing in everyone's view. No node pings every other node, and information spreads in a logarithmic number of rounds. The chapter also shows the reverse framing: instead of detecting failure, processes propagate knowledge of who they can reach and agree on who is unreachable.
+
+```text
+node   heartbeat counter as seen by C
+A      1042 (increasing)
+B      877  (unchanged for 6 gossip rounds) -> suspect B
+D      903  (increasing)
+```
+
+Common mistake: all-to-all heartbeats in a cluster of hundreds. Fix: gossip or a hierarchical scheme.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: in my simulator, implement a fixed-timeout detector, a SWIM-style detector with indirect pings, and a phi-accrual detector. Inject jitter, a partition and a 20-second pause. Count false positives and detection time for each.
+
+Exercise: add fencing tokens to a toy lock service and show the zombie's write being rejected.
+
+Done when I can pick a timeout or phi threshold from measured heartbeat data and defend it, and the zombie test passes.
+
+</Level>
+</Levels>
+
+### 10. Leader Election
+**Covers:** The bully algorithm, next-in-line failover, the candidate/ordinary optimization, the invitation algorithm and the ring algorithm.
+
+<Flow steps={['leader suspected', 'node sends ELECTION to higher ranks', 'no higher rank answers', 'node announces itself leader', 'others accept and follow']} caption="The bully algorithm: the highest-ranked live process wins." />
+
+<Levels label="Chapter 10, Leader Election">
+
+<Level name="Beginner">
+
+Leader election picks one process to coordinate a group. With a leader, ordering writes, assigning work or holding a lock happens in one place, which is far simpler than everyone negotiating every decision. The cost is that the leader is a bottleneck and a single point of failure, so the group must be able to elect a new one.
+
+An election must be safe (at most one leader at a time, at least as far as the protocol can ensure) and live (eventually some leader is elected).
+
+```ts
+// bully: the highest id among the live nodes wins
+const live = new Set([1, 2, 4, 5]);           // node 3 is down
+const elect = (from: number) => {
+  const higher = [...live].filter(n => n > from);
+  return higher.length === 0 ? from : Math.max(...higher);   // simplified: highest replies and takes over
+};
+console.log(elect(1));
+```
+
+Output: `5`.
+
+Common mistake: assuming an election result is final. Fix: leaders change; every message must carry which leader or term sent it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The bully algorithm: a process that notices the leader is gone sends election messages to every process with a higher rank. If none answers, it declares itself leader. If one answers, that one takes over the election. The highest-ranked live process always wins, which can cause repeated elections if a high-ranked process keeps crashing and recovering.
+
+Next-in-line failover keeps a list of alternatives so when the leader fails, the next one takes over with fewer messages. The candidate/ordinary optimization splits nodes into candidates (who can lead) and ordinary nodes, so only candidates take part in elections.
+
+```text
+bully, nodes 1..5, leader 5 crashes, node 2 notices:
+2 -> 3,4,5: ELECTION       3 -> 2: OK   4 -> 2: OK   (5 silent)
+3 -> 4,5: ELECTION         4 -> 3: OK
+4 -> 5: ELECTION           (silent)
+4 -> all: COORDINATOR 4
+```
+
+Common mistake: a flapping highest-rank node that wins and crashes repeatedly. Fix: require stability (or priority decay) before a recovered node can lead again.
+
+</Level>
+
+<Level name="Advanced">
+
+The ring algorithm arranges nodes in a logical ring. An election message travels around, collecting the ids of live nodes; when it returns to the starter, the highest id collected becomes leader and a second message announces it. Dead nodes are skipped. The invitation algorithm allows several groups to have their own leaders and merge, rather than forcing a single winner immediately, which suits networks that split and heal.
+
+```ts
+function ringElect(ring: number[], alive: Set<number>, start: number) {
+  const seen: number[] = []; let i = ring.indexOf(start);
+  do { if (alive.has(ring[i])) seen.push(ring[i]); i = (i + 1) % ring.length; } while (ring[i] !== start);
+  return { leader: Math.max(...seen), seen };
+}
+console.log(ringElect([3, 7, 1, 9, 4], new Set([3, 7, 1, 4]), 1));
+```
+
+Output: `{ leader: 7, seen: [ 1, 4, 3, 7 ] }`. Node 9 is down and skipped.
+
+Common mistake: assuming the ring is intact during an election. Fix: each node must know how to skip unreachable successors.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: split brain. During a partition, each side runs an election and gets a leader. Both accept writes. When the partition heals, the data has diverged.
+
+```text
+before:  {A, B, C, D, E}  leader E
+partition: {A, B} | {C, D, E}
+bully in {A, B} elects B; {C, D, E} keeps E    -> two leaders
+quorum rule (3 of 5): only {C, D, E} may elect -> one leader
+```
+
+Common mistake: electing within whatever nodes are reachable. Fix: an election needs a majority of the full membership.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: a stale leader that does not know it was replaced. It was partitioned or paused, a new leader was elected, and it still sends commands. Election algorithms alone do not stop this. Consensus protocols add terms (epochs): every message carries the term, and nodes reject messages from older terms. Storage adds fencing tokens.
+
+```text
+term 4 leader: B (paused)
+term 5 leader: E (elected while B paused)
+B resumes, sends "append x" with term 4
+followers: "term 4 < 5, rejected"; B learns it is no longer leader and steps down
+```
+
+Common mistake: identifying the leader only by node id. Fix: leader = (term, node id).
+
+</Level>
+
+<Level name="Production level">
+
+In production, I rarely write election code. I use the election built into a consensus system (Raft in etcd, ZAB in ZooKeeper) or a lease in a coordination service. A lease is leadership with an expiry: the holder must renew before it expires, and others may take over after it does, with fencing tokens to stop a late holder.
+
+```text
+etcd election (concept): campaign on a key with a lease
+  - holder renews the lease every few seconds
+  - if it dies, the lease expires and the next campaigner wins
+  - the key's revision number serves as a fencing token
+```
+
+Common mistake: a "leader" chosen by "whoever started first" or a database row without expiry. Fix: leases with expiry and fencing.
+
+</Level>
+
+<Level name="Mindset">
+
+A leader is a performance choice, not a correctness guarantee. Correctness comes from what the rest of the system refuses to accept: stale terms, old tokens, minority decisions.
+
+<Compare left="what the leader gives" right="what still protects correctness" rows={[
+  ['one place to order writes', 'terms rejected if stale'],
+  ['fast decisions', 'majority quorums'],
+  ['simple clients', 'fencing tokens at the resource'],
+]} caption="Leadership is the fast path; safety comes from the checks." />
+
+Common mistake: "only the leader writes, so we are safe". Fix: prove that a former leader cannot write.
+
+</Level>
+
+<Level name="System design">
+
+Use leadership for exactly-one jobs: a scheduler that must run a task once, a primary database, a partition owner. Design each with a lease, a term and a fencing token, and decide what happens during the gap between the old leader's death and the new one's election (writes fail, or queue).
+
+```text
+job: send the daily digest exactly once
+design: lease "digest-leader" with 15 s TTL; holder writes "sent for 2026-10-23"
+        with its fencing token in the same transaction; a duplicate run sees the row and stops
+```
+
+Common mistake: a cron job on every instance of a service, "but only one is supposed to run it". Fix: a lease, plus an idempotent record of completion.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: implement the bully and ring algorithms in my simulator, then partition the network and watch split brain happen. Then add terms and a majority requirement and show that only one leader can act per term.
+
+Exercise: write a toy lease service with TTL renewal and fencing tokens, and a client that is paused past its lease.
+
+Done when the simulation never commits from two leaders in one term across a thousand randomised runs with partitions and pauses.
+
+</Level>
+</Levels>
+
+### 11. Replication and Consistency
+**Covers:** Achieving availability, CAP and how to use it carefully, harvest and yield, shared memory, ordering, consistency models (strict, linearizable, sequential, causal), session models, eventual consistency, tunable consistency, witness replicas, and strong eventual consistency with CRDTs.
+
+<Layers layers={[
+  { name: 'Strict', note: 'every read sees the latest write instantly (not achievable in practice)' },
+  { name: 'Linearizable', note: 'behaves like one copy; real-time order respected' },
+  { name: 'Sequential', note: 'one total order all agree on; real time may be ignored' },
+  { name: 'Causal', note: 'cause before effect for everyone; concurrent writes may differ' },
+  { name: 'Session guarantees', note: 'read your writes, monotonic reads, for one client' },
+  { name: 'Eventual', note: 'replicas converge if writes stop' },
+]} caption="Consistency models from strongest to weakest. Stronger costs more latency and availability." />
+
+<Levels label="Chapter 11, Replication and Consistency">
+
+<Level name="Beginner">
+
+Replication keeps copies of the same data on several nodes. It buys availability (one node can fail), lower latency (a copy near the user) and read capacity. The price is that copies can disagree for a while. A consistency model is a contract that says what a client may observe while they disagree.
+
+```ts
+// two replicas, asynchronous replication with a delay
+const leader = new Map<string, number>(), follower = new Map<string, number>();
+function write(k: string, v: number) { leader.set(k, v); setTimeout(() => follower.set(k, v), 50); }
+write('likes', 10);
+console.log(leader.get('likes'), follower.get('likes'));          // immediately
+setTimeout(() => console.log(follower.get('likes')), 100);         // later
+```
+
+Output: `10 undefined`, then `10`. The follower was briefly behind.
+
+Common mistake: reading from any replica straight after a write and treating the result as current. Fix: know the model; route reads that need freshness to the leader.
+
+</Level>
+
+<Level name="Intermediate">
+
+Linearizability: the system behaves as if there were one copy and every operation took effect at one instant between its start and end. If a write finished before a read started, the read sees it. Sequential consistency: all clients see operations in one agreed order consistent with each client's own order, but not necessarily real time. Causal consistency: if one operation could have influenced another (I read a post, then reply), everyone sees them in that order; unrelated operations may appear in different orders to different clients.
+
+```text
+real time:  W(x=1) done  ............  R(x) starts
+linearizable:       R must return 1
+sequential:         R may return the old value if all clients agree on that order
+causal:             R must return 1 only if R depends on W (same client, or it read W's effect)
+```
+
+Common mistake: "strongly consistent" used loosely. Fix: name the model, and test it with a history checker.
+
+</Level>
+
+<Level name="Advanced">
+
+CAP: when a network partition happens, a system must choose between staying available (answering on both sides, possibly inconsistently) and staying consistent in the linearizable sense (refusing on the minority side). The chapter warns to use CAP carefully: its consistency is linearizability, its availability means every non-failed node answers, and it says nothing about the normal case. Harvest and yield is a gentler framing: under failure, answer with less complete data (lower harvest) or fail fewer requests (higher yield).
+
+Tunable consistency: with N replicas, a write waits for W acknowledgements and a read asks R replicas. If R + W > N, every read quorum overlaps every write quorum, so a read reaches at least one replica with the latest acknowledged write.
+
+```ts
+const overlaps = (n: number, r: number, w: number) => r + w > n;
+console.log(overlaps(3, 1, 1), overlaps(3, 2, 2), overlaps(5, 2, 3));
+```
+
+Output: `false true false`. With N=5, R=2 and W=3 sum to exactly 5, so they can miss each other.
+
+Common mistake: assuming R + W > N gives linearizability. Fix: it gives overlap; with concurrent writes, sloppy quorums and repair timing, anomalies remain.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: session guarantees. A user posts a comment, the page reloads from a lagging replica, and the comment is gone. Read-your-writes would prevent that. Monotonic reads: a user refreshes twice and sees newer data, then older data, because the second read hit a more lagging replica.
+
+```text
+fix for read-your-writes:  remember the LSN of my last write in the session;
+                           read from a replica only if it has replayed past that LSN
+fix for monotonic reads:   pin a session to one replica, or carry the highest LSN seen
+```
+
+Common mistake: global strong consistency to fix a per-user problem. Fix: session guarantees are cheaper and often all users need.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: witness replicas. To tolerate failures with a majority quorum you need 2f+1 copies, which triples storage for f=1. A witness participates in quorums but stores little or no data, cutting cost while keeping quorum overlap. It works only while enough full copies stay alive.
+
+Corner: CRDTs (conflict-free replicated data types) give strong eventual consistency: replicas that have received the same set of updates are in the same state, whatever the order. A grow-only counter keeps one count per replica and merges with max.
+
+```ts
+type GCounter = Record<string, number>;
+const inc = (c: GCounter, id: string) => ({ ...c, [id]: (c[id] ?? 0) + 1 });
+const merge = (a: GCounter, b: GCounter) => {
+  const out: GCounter = { ...a }; for (const k in b) out[k] = Math.max(out[k] ?? 0, b[k]); return out;
+};
+const value = (c: GCounter) => Object.values(c).reduce((s, x) => s + x, 0);
+let a: GCounter = {}, b: GCounter = {};
+a = inc(inc(a, 'A'), 'A'); b = inc(b, 'B');
+console.log(value(merge(a, b)), value(merge(b, a)), value(merge(merge(a, b), b)));
+```
+
+Output: `3 3 3`. Order and duplicates do not matter.
+
+Common mistake: a CRDT counter that sums on merge. Fix: merge must be idempotent, commutative and associative; max per replica is, sum is not.
+
+</Level>
+
+<Level name="Production level">
+
+In production: know which model each store gives for each operation. Postgres with async replicas: linearizable on the primary, stale reads on replicas. A Dynamo-style store: tunable per request. Then design flows around it: read-after-write from the primary for the user who wrote; tolerate staleness for feeds and counts.
+
+```sql
+-- Postgres: how far behind each replica is, from the primary
+SELECT application_name, replay_lag FROM pg_stat_replication;
+```
+
+Common mistake: load-balancing all reads across replicas, including the read that confirms a payment. Fix: classify reads by freshness need.
+
+</Level>
+
+<Level name="Mindset">
+
+"Consistent" means nothing until I say which model. I ask "what can a client observe?" and write the answer as a concrete history: who wrote what, who read what, in what order, and which outcomes are allowed.
+
+<Flow steps={['write the history', 'list allowed outcomes per model', 'pick the weakest model the product accepts', 'test with a checker']} caption="Choosing a consistency model from what users may see." />
+
+Common mistake: choosing a database first and discovering its consistency model in production. Fix: decide the model per operation first.
+
+</Level>
+
+<Level name="System design">
+
+Choose the weakest model the product can tolerate for each operation. Money movement and uniqueness need linearizable operations (or a single leader). Social feeds, view counts and recommendations can be eventual. Collaboration features often want causal consistency or CRDTs so offline edits merge.
+
+```text
+operation                 model                    mechanism
+username uniqueness       linearizable             unique index on the primary
+account balance           linearizable             single leader, transactions
+like counter              eventual                 CRDT counter or async aggregation
+comment thread            causal (+ read-your-writes)  session LSN tracking
+```
+
+Common mistake: one consistency setting for the whole system. Fix: per-operation choices.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: in my simulator, build a three-replica register with configurable R and W and asynchronous repair, record every operation's start, end and result, and write a small linearizability checker for single-register histories (brute force is fine for short histories). Find R and W settings that produce stale reads.
+
+Exercise: implement G-Counter, PN-Counter and an observed-remove set, and fuzz their merges in random orders.
+
+Done when I can predict which quorum settings allow stale reads and my checker confirms it, and my CRDTs converge under every fuzzed order.
+
+</Level>
+</Levels>
+
+### 12. Anti-Entropy and Dissemination
+**Covers:** Read repair, digest reads, hinted handoff, Merkle trees, bitmap version vectors, gossip dissemination (mechanics, overlay networks, hybrid gossip, partial views).
+
+<Figure art={`
+ replica A root H(ab..)          replica B root H(ab..)'     roots differ
+        /        \\                      /        \\
+   H(a..m)     H(n..z)            H(a..m)     H(n..z)'      left equal, right differs
+                /    \\                          /    \\
+           H(n..s) H(t..z)                 H(n..s) H(t..z)'  only t..z must be synced
+`} caption="Merkle trees: compare hashes top-down and exchange only the ranges that differ." />
+
+<Levels label="Chapter 12, Anti-Entropy and Dissemination">
+
+<Level name="Beginner">
+
+Replicas drift apart: a write misses a node that was down, a message is dropped, a disk loses a file. Anti-entropy is the family of mechanisms that find and fix the differences. Dissemination is how updates (and cluster facts such as membership) spread to every node efficiently.
+
+Three places to repair: on the read path (when a read sees disagreement), on the write path (when a write cannot reach a node), and in the background (comparing whole datasets).
+
+<Flow steps={['read path: read repair', 'write path: hinted handoff', 'background: Merkle tree comparison']} caption="Where replicas get repaired." />
+
+```text
+read from 3 replicas:  A: v5   B: v5   C: v3
+return v5 to the client, then send v5 to C   <- read repair
+```
+
+Common mistake: assuming replication alone keeps replicas identical. Fix: replication sends updates; something must also repair missed ones.
+
+</Level>
+
+<Level name="Intermediate">
+
+Read repair: the coordinator of a read compares responses and updates stale replicas. Digest reads make this cheap: ask one replica for the full value and the others only for a hash of it; fetch full values only if hashes differ. Hinted handoff: when a target replica is down during a write, another node stores the write with a hint naming the intended owner, and delivers it when the owner returns.
+
+```ts
+import { createHash } from 'node:crypto';
+const digest = (v: string) => createHash('sha256').update(v).digest('hex').slice(0, 8);
+const replicas = { A: 'v5:hello', B: 'v5:hello', C: 'v3:hi' };
+const full = replicas.A, d = digest(full);
+const stale = Object.entries(replicas).filter(([, v]) => digest(v) !== d).map(([k]) => k);
+console.log(stale);
+```
+
+Output: `[ 'C' ]`. Only C needs repair, and only hashes crossed the network for B and C.
+
+Common mistake: read repair on every read at full fetch cost. Fix: digest reads, and probabilistic read repair on a fraction of reads.
+
+</Level>
+
+<Level name="Advanced">
+
+Merkle trees compare large datasets cheaply. Each leaf is the hash of a key range; each parent is the hash of its children. Two replicas compare roots; if equal, they are in sync. If not, they descend only into differing children. The data exchanged is proportional to the number of differences times the tree height, not the dataset size.
+
+```ts
+import { createHash } from 'node:crypto';
+const H = (s: string) => createHash('sha1').update(s).digest('hex').slice(0, 6);
+function tree(leaves: string[]): string[][] {
+  const levels = [leaves.map(H)];
+  while (levels[0].length > 1) {
+    const prev = levels[0], up: string[] = [];
+    for (let i = 0; i < prev.length; i += 2) up.push(H(prev[i] + (prev[i + 1] ?? '')));
+    levels.unshift(up);
+  }
+  return levels;
+}
+function diff(a: string[][], b: string[][], lvl = 0, i = 0, out: number[] = []): number[] {
+  if (a[lvl][i] === b[lvl][i]) return out;
+  if (lvl === a.length - 1) { out.push(i); return out; }
+  diff(a, b, lvl + 1, 2 * i, out); if (2 * i + 1 < a[lvl + 1].length) diff(a, b, lvl + 1, 2 * i + 1, out);
+  return out;
+}
+const ra = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7'], rb = [...ra]; rb[5] = 'r5-changed';
+console.log(diff(tree(ra), tree(rb)));
+```
+
+Output: `[ 5 ]`. Only range 5 differs, found by visiting one path.
+
+Common mistake: Merkle leaves that cover too many keys, so one difference transfers a huge range. Fix: size leaves for the expected difference rate.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: hints expire. If a node is down for longer than the hint window, the hints are dropped and the node returns missing writes. Only a full anti-entropy repair fixes it. Edge: a node that returns after a long absence may bring back data that others deleted, if their tombstones have been purged.
+
+```text
+t0   delete k  (tombstone on A, B; C is down)
+t0+  tombstone grace period passes; A, B purge the tombstone
+t1   C returns with the old value of k, repair copies it to A and B  -> k is back
+rule: repair every node more often than the tombstone grace period
+```
+
+Common mistake: treating repair as optional maintenance. Fix: schedule it within the grace period, and alert when it fails.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: bitmap version vectors. Tracking which writes each replica has seen with plain version vectors can grow large. The chapter's bitmap variant records per-node sequences of seen writes as a compact bitmap so replicas can find exactly which writes the other is missing, not only whose counter is behind.
+
+```text
+node A knows writes from B: 1..120, 122, 125   -> bitmap after 120: 0101 (121 missing, 122 seen, ...)
+A asks B only for 121, 123, 124
+```
+
+Corner: gossip with partial views. In a huge cluster, a node cannot know every member. Each keeps a small random partial view and gossips within it; hybrid schemes combine a reliable tree overlay for fast delivery with gossip for repair when tree links break.
+
+Common mistake: assuming gossip delivers within a fixed time. Fix: it delivers with high probability in about log(n) rounds; design for stragglers.
+
+</Level>
+
+<Level name="Production level">
+
+Gossip mechanics: each round, a node picks a few random peers (the fanout) and sends what it knows. Spread is epidemic: the number of informed nodes roughly multiplies each round until saturation. Cluster membership, schema versions and load information in systems like Cassandra spread this way.
+
+```ts
+function gossipRounds(n: number, fanout: number, seed = 1): number {
+  let s = seed >>> 0;                                          // xorshift32, seeded
+  const rnd = () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 2 ** 32; };
+  const informed = new Set([0]); let rounds = 0;
+  while (informed.size < n) {
+    for (const node of [...informed]) for (let f = 0; f < fanout; f++) informed.add(Math.floor(rnd() * n));
+    rounds++;
+  }
+  return rounds;
+}
+console.log(gossipRounds(1000, 3), gossipRounds(100000, 3));
+```
+
+Output: `8 13`. A hundred times more nodes costs only five more rounds. (A different seed gives slightly different counts.)
+
+Common mistake: a fanout so high that gossip floods the network. Fix: a fanout of a few, with periodic rounds.
+
+</Level>
+
+<Level name="Mindset">
+
+Convergence is work someone has to do. If nothing repairs, nothing converges. For every replicated store I run, I can name the repair mechanisms and how often they run.
+
+<Compare left="mechanism" right="what it misses" rows={[
+  ['read repair', 'data that is never read'],
+  ['hinted handoff', 'outages longer than the hint window'],
+  ['Merkle repair', 'nothing, but it is expensive and must be scheduled'],
+]} caption="Each repair mechanism has a gap that another covers." />
+
+Common mistake: relying on read repair alone. Fix: background repair for cold data.
+
+</Level>
+
+<Level name="System design">
+
+Merkle trees and gossip appear outside databases: Git and content-addressed storage use hash trees to find what to transfer; package mirrors and certificate transparency logs use them for verification; service meshes and cluster managers gossip membership.
+
+```text
+git fetch: compare commit and tree hashes, send only missing objects
+same idea: equal hash -> equal subtree -> skip
+```
+
+Common mistake: syncing two large datasets by sending everything or comparing row by row. Fix: hash ranges, recurse into differences.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: implement read repair with digest reads, hinted handoff with expiry, and Merkle-tree repair in my simulator's replicated store, then run a scenario where a node is down for longer than the hint window and show that only Merkle repair brings it back.
+
+Exercise: reproduce the deleted-data-returns bug by purging tombstones before repair, then fix it by ordering repair before purge.
+
+Done when the simulator's replicas always converge after the network heals, and I can explain the role of each mechanism in one sentence.
+
+</Level>
+</Levels>
+
+### 13. Distributed Transactions
+**Covers:** Making operations appear atomic, two-phase commit and its cohort and coordinator failures, three-phase commit, Calvin, Spanner, database partitioning and consistent hashing, Percolator, and coordination avoidance.
+
+<Figure art={`
+ coordinator              cohort A                cohort B
+     |--- PREPARE -------->|                       |
+     |--- PREPARE ---------------------------------->|
+     |<-- YES (logged) ----|                       |
+     |<-- YES (logged) ----------------------------- |
+  log COMMIT
+     |--- COMMIT --------->|                       |
+     |--- COMMIT ----------------------------------->|
+  crash after PREPARE, before COMMIT: A and B hold locks and wait (blocked)
+`} caption="Two-phase commit, and the window where a coordinator crash blocks everyone." />
+
+<Levels label="Chapter 13, Distributed Transactions">
+
+<Level name="Beginner">
+
+A distributed transaction changes data on several nodes and must commit everywhere or nowhere. The standard protocol is two-phase commit. Phase one: the coordinator asks every participant (cohort) to prepare; each one makes the change durable but not visible, logs that it is prepared, and votes yes, or votes no. Phase two: if all voted yes, the coordinator logs commit and tells everyone to commit; otherwise it tells everyone to abort.
+
+```ts
+type Vote = 'yes' | 'no';
+function twoPC(votes: Vote[]): 'commit' | 'abort' {
+  return votes.every(v => v === 'yes') ? 'commit' : 'abort';
+}
+console.log(twoPC(['yes', 'yes']), twoPC(['yes', 'no']));
+```
+
+Output: `commit abort`.
+
+Common mistake: treating "prepared" as "committed". Fix: a prepared cohort has promised it can commit and must wait for the decision.
+
+</Level>
+
+<Level name="Intermediate">
+
+Cohort failures: a cohort that crashes before voting is treated as a no vote. A cohort that crashes after voting yes must, on restart, read its log, see it is prepared, and ask the coordinator for the outcome. It may not decide alone.
+
+Coordinator failures: if the coordinator crashes after collecting votes but before sending the decision, prepared cohorts are stuck: they hold locks, cannot commit (someone might have voted no) and cannot abort (the coordinator might have decided commit). They block until the coordinator recovers. That is the defining weakness of 2PC.
+
+```sql
+-- Postgres exposes 2PC directly
+BEGIN;
+UPDATE account SET balance = balance - 100 WHERE id = 1;
+PREPARE TRANSACTION 'tx-77';         -- now durable, holds its locks, survives restart
+-- later, from any session:
+COMMIT PREPARED 'tx-77';             -- or ROLLBACK PREPARED 'tx-77'
+SELECT gid, prepared FROM pg_prepared_xacts;   -- lists stuck ones
+```
+
+(`PREPARE TRANSACTION` requires `max_prepared_transactions` above zero.)
+
+Common mistake: forgotten prepared transactions holding locks and blocking vacuum for days. Fix: monitor `pg_prepared_xacts`, and have a recovery procedure.
+
+</Level>
+
+<Level name="Advanced">
+
+Three-phase commit adds a pre-commit phase so that cohorts can decide safely without the coordinator, assuming bounded message delays. Under a real partition the assumption fails and 3PC can reach inconsistent decisions, which is why it is rare in practice.
+
+Calvin avoids distributed commit work by agreeing on the order of transactions first (through a replicated log), then every replica executes them deterministically in that order. Spanner runs 2PC across Paxos groups, so each participant is itself replicated and does not simply disappear, and uses tightly bounded clock uncertainty (TrueTime) to assign commit timestamps that respect real-time order, waiting out the uncertainty before making a commit visible. Percolator builds snapshot-isolated transactions on top of a key-value store (Bigtable) with a timestamp oracle and locks stored as data.
+
+```text
+Spanner commit-wait idea:
+  pick commit timestamp s >= now.latest
+  wait until now.earliest > s     (the uncertainty interval has passed)
+  then make the commit visible     -> any later transaction gets a larger timestamp
+```
+
+Common mistake: "Spanner beats CAP". Fix: it chooses consistency, and is highly available because of engineering (redundant networks, Paxos groups), not because the trade-off vanished.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: the participant crashes after voting yes and its disk is lost. The coordinator decides commit; the participant's change is gone. 2PC assumes prepared state is durable; a participant that loses it breaks atomicity. Replicating each participant (as Spanner does) addresses this.
+
+```text
+A: prepared (logged), votes yes, disk dies
+coordinator: all yes -> COMMIT
+A restored from an older backup: change missing -> money left account 1, never reached account 2
+```
+
+Common mistake: 2PC across services where one of them cannot durably "prepare" (an email API, a payment provider). Fix: sagas: a sequence of local transactions with compensating actions.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: database partitioning and consistent hashing. Hashing keys modulo N moves almost every key when N changes. Consistent hashing places nodes and keys on a ring; a key belongs to the next node clockwise, so adding a node moves only the keys between it and its predecessor. Virtual nodes even out the load.
+
+```ts
+import { createHash } from 'node:crypto';
+const h = (s: string) => createHash('md5').update(s).digest().readUInt32BE(0);
+function owner(nodes: string[], key: string) {
+  const ring = nodes.flatMap(n => Array.from({ length: 100 }, (_, v) => ({ n, p: h(n + '#' + v) }))).sort((a, b) => a.p - b.p);
+  const k = h(key); return (ring.find(x => x.p >= k) ?? ring[0]).n;
+}
+const keys = Array.from({ length: 10000 }, (_, i) => 'k' + i);
+const before = keys.map(k => owner(['A', 'B', 'C'], k)), after = keys.map(k => owner(['A', 'B', 'C', 'D'], k));
+const moved = keys.filter((_, i) => before[i] !== after[i]).length;
+const modMoved = keys.filter(k => h(k) % 3 !== h(k) % 4).length;
+console.log((moved / 10000).toFixed(2), (modMoved / 10000).toFixed(2));
+```
+
+Output: `0.24 0.75`. Adding a fourth node moves about a quarter of the keys with consistent hashing (the new node's fair share) and three quarters with modulo hashing. With only a few virtual nodes per server the fraction swings much more.
+
+Common mistake: assuming partitioning removes the need for distributed transactions. Fix: transactions that span partitions still need coordination; design keys so most do not.
+
+</Level>
+
+<Level name="Production level">
+
+In production, I avoid distributed transactions where I can. Keep data that changes together in one partition or one database. Where a workflow spans services, use the outbox pattern (write the business change and an event in one local transaction, publish the event afterwards) and sagas with compensations.
+
+<Flow steps={['local tx: create order + outbox row', 'relay publishes event', 'payment service: local tx + outbox', 'on failure: compensating event cancels order']} caption="A saga with outboxes: atomic locally, eventually consistent across services." />
+
+Common mistake: calling another service inside a database transaction and holding locks while waiting on the network. Fix: commit locally, publish via outbox.
+
+</Level>
+
+<Level name="Mindset">
+
+Atomicity across machines costs latency and availability. I pay it only where the business really needs all-or-nothing at the same moment, and I ask whether "eventually all, with compensation" is acceptable instead.
+
+```text
+question                                         if yes
+must both changes be visible at the same instant?   2PC or one database
+is an undo action acceptable?                       saga
+can the work be ordered once and replayed?          deterministic log (Calvin-style)
+```
+
+Common mistake: reaching for XA transactions by default. Fix: start from the business invariant.
+
+</Level>
+
+<Level name="System design">
+
+Coordination avoidance is a design technique: find the invariants that really need coordination and let everything else run without it. Partition by the key that keeps most transactions local (tenant, account, order). Use commutative operations (increments, set additions) that can merge without agreement.
+
+```text
+invariant                        needs coordination?
+balance >= 0 on withdrawals      yes (per account; keep each account on one node)
+count of page views              no (commutative increments)
+unique username                  yes (one owner per name prefix, or a single index)
+```
+
+Common mistake: global serializable transactions for everything. Fix: classify invariants, coordinate only where needed.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: implement 2PC in my simulator with a durable log per node, then crash the coordinator and each cohort at every step and record which states block and how recovery resolves them. Then use Postgres's PREPARE TRANSACTION across two databases from a small TypeScript coordinator and kill it between phases.
+
+Exercise: rebuild the same money transfer as a saga with an outbox and compensation, and compare the failure behaviour.
+
+Done when I can draw every blocked state of 2PC, explain why 3PC does not save us under partitions, and choose between 2PC and a saga for a given invariant.
+
+</Level>
+</Levels>
+
+### 14. Consensus
+**Covers:** Broadcast and atomic broadcast, virtual synchrony, ZooKeeper Atomic Broadcast (ZAB), Paxos (the algorithm, quorums, failure scenarios, Multi-Paxos, Fast Paxos, Egalitarian Paxos, Flexible Paxos, a generalized solution), Raft (the leader role, failure scenarios), and Byzantine consensus (PBFT, recovery and checkpointing).
+
+<Figure art={`
+          timeout                 majority votes
+ Follower ---------> Candidate -------------------> Leader
+    ^                   |  ^                          |
+    |   sees higher     |  | split vote: new term     |
+    |   term or leader  |  +--------------------------+
+    +-------------------+                             |
+    +---------------- sees higher term ---------------+
+`} caption="Raft's three roles. Every transition is driven by timeouts, votes or a higher term." />
+
+<Levels label="Chapter 14, Consensus">
+
+<Level name="Beginner">
+
+Consensus is how a group of processes agrees on one value, or on a sequence of values, even if some fail. A replicated log built on consensus lets every replica apply the same commands in the same order, so they all reach the same state: state machine replication. That is how etcd, ZooKeeper and the metadata layers of many databases stay consistent.
+
+Atomic broadcast (deliver the same messages in the same order to all) is equivalent to consensus: either can be built from the other.
+
+```ts
+// state machine replication: same log, same order -> same state
+const log = [['set', 'x', 1], ['incr', 'x', 2], ['set', 'y', 5]] as const;
+function apply(entries: typeof log) {
+  const s: Record<string, number> = {};
+  for (const [op, k, v] of entries) s[k] = op === 'set' ? v : (s[k] ?? 0) + v;
+  return s;
+}
+console.log(JSON.stringify(apply(log)) === JSON.stringify(apply(log)), apply(log));
+```
+
+Output: `true { x: 3, y: 5 }`. Every replica that applies this log gets this state.
+
+Common mistake: replicating state snapshots without agreeing on order. Fix: agree on the log, derive the state.
+
+</Level>
+
+<Level name="Intermediate">
+
+Paxos in one round: proposers, acceptors and learners. A proposer picks a unique ballot number and sends prepare(n) to acceptors. Each acceptor promises not to accept lower ballots and returns any value it already accepted. With promises from a majority, the proposer sends accept(n, v), where v is the value from the highest-numbered accepted proposal it heard (or its own if none). A value is chosen once a majority accepts it. Majorities overlap, so a later proposer always learns a chosen value and re-proposes it.
+
+```text
+5 acceptors, majority 3
+P1: prepare(1) -> A1 A2 A3 promise    accept(1, 'x') -> A1 A2 A3 accept  => 'x' chosen
+P2: prepare(2) -> A3 A4 A5 promise; A3 reports accepted (1,'x')
+P2 must propose 'x', not its own value   => safety preserved
+```
+
+Common mistake: a new proposer using its own value after hearing an accepted one. Fix: always adopt the highest-ballot accepted value from the promises.
+
+</Level>
+
+<Level name="Advanced">
+
+Multi-Paxos keeps a stable leader that skips the prepare phase for later slots, so each value costs one round trip. Fast Paxos lets clients send directly to acceptors to save a step when there is no conflict, at the cost of larger quorums. Egalitarian Paxos has no fixed leader and orders only conflicting commands. Flexible Paxos observes that only the leader-election quorum and the replication quorum must intersect, so replication quorums can be smaller if election quorums are larger.
+
+Raft is designed for understandability: leader election with randomised timeouts and terms, log replication where the leader appends entries and followers accept them only if the previous entry matches, and a safety rule that a candidate can win only if its log is at least as up to date as a majority's. An entry is committed once stored on a majority in the leader's current term.
+
+```ts
+// Raft vote rule: grant only if candidate's log is at least as up to date as mine
+function upToDate(cand: { lastTerm: number; lastIndex: number }, me: { lastTerm: number; lastIndex: number }) {
+  return cand.lastTerm !== me.lastTerm ? cand.lastTerm > me.lastTerm : cand.lastIndex >= me.lastIndex;
+}
+console.log(upToDate({ lastTerm: 3, lastIndex: 5 }, { lastTerm: 2, lastIndex: 9 }),
+            upToDate({ lastTerm: 3, lastIndex: 5 }, { lastTerm: 3, lastIndex: 6 }));
+```
+
+Output: `true false`. A higher last term wins regardless of length; with equal terms, the longer log wins.
+
+Common mistake: comparing only log lengths. Fix: last term first, then index.
+
+</Level>
+
+<Level name="Edge cases">
+
+Edge: quorum arithmetic. A cluster of N tolerates floor((N-1)/2) failures. Four nodes tolerate one, like three, but need three for a majority, so the fourth node adds load without adding fault tolerance.
+
+```ts
+const tolerates = (n: number) => Math.floor((n - 1) / 2);
+console.log([3, 4, 5, 6, 7].map(n => `${n}:${tolerates(n)}`).join(' '));
+```
+
+Output: `3:1 4:1 5:2 6:2 7:3`.
+
+Common mistake: even-sized clusters "for more safety". Fix: odd sizes; three or five is typical.
+
+</Level>
+
+<Level name="Corner cases">
+
+Corner: Raft's commit rule across terms. A leader may not count replicas of an entry from an earlier term to mark it committed; it commits only entries from its current term, and earlier ones become committed indirectly. Without this rule, an entry stored on a majority could still be overwritten after another leader change (the Raft paper illustrates this scenario with a figure).
+
+Corner: Byzantine consensus. If nodes can lie, majorities are not enough: PBFT needs 3f+1 nodes to tolerate f Byzantine ones, with several rounds of signed messages, and checkpointing to truncate logs and help recovering replicas catch up.
+
+```text
+crash faults:     2f+1 nodes tolerate f   (f=1 -> 3 nodes)
+Byzantine faults: 3f+1 nodes tolerate f   (f=1 -> 4 nodes), more messages per decision
+```
+
+Common mistake: using Byzantine protocols inside one trusted data centre. Fix: crash-fault protocols unless participants are mutually untrusted.
+
+</Level>
+
+<Level name="Production level">
+
+Use an existing implementation. etcd (Raft), ZooKeeper (ZAB) and Raft libraries have years of failure testing behind them. The hard parts in production are around the algorithm: membership changes, snapshots and log compaction, disk fsync latency (every commit waits on a majority's fsync), and clock-free timeouts tuned to the network.
+
+```text
+etcd symptoms and causes (typical):
+  frequent leader elections   -> slow disk fsync or network latency spikes
+  write latency high          -> fsync on the slowest of the majority
+  "database space exceeded"   -> needs compaction and defragmentation
+```
+
+Common mistake: running consensus nodes on slow shared disks. Fix: fast local storage; monitor fsync latency.
+
+</Level>
+
+<Level name="Mindset">
+
+Consensus is the tool for "exactly one": one leader, one order, one owner of a lock, one value of a configuration. When a design needs "exactly one" across machines, it needs consensus or something built on it, and I should know which component provides it.
+
+<Compare left="need" right="consensus-backed tool" rows={[
+  ['one leader', 'election via etcd or ZooKeeper'],
+  ['one order of events', 'replicated log'],
+  ['one owner of a lock', 'lease with fencing token'],
+  ['one config value', 'linearizable key-value store'],
+]} caption="Exactly-one problems and where consensus solves them." />
+
+Common mistake: building "exactly one" with a database row and a timestamp. Fix: use the consensus-backed primitive, or a single-leader database with transactions.
+
+</Level>
+
+<Level name="System design">
+
+Keep consensus small. Put membership, leadership, configuration and metadata in a consensus service; keep the bulk data path outside it, partitioned, with each partition led by one node chosen through the consensus service. That is the shape of many large systems: a small strongly consistent control plane and a large data plane.
+
+<Flow steps={['control plane: Raft group (3 or 5 nodes)', 'assigns partition leaders', 'data plane: partitions replicate from their leaders', 'clients find leaders via control plane']} caption="Small consensus core, large data plane." />
+
+Common mistake: pushing every write through one global consensus group. Fix: consensus per partition, or consensus only for metadata.
+
+</Level>
+
+<Level name="Strategy">
+
+How I would learn it: implement Raft leader election and log replication in my simulator, following the Raft paper's rules, with message loss, reordering, partitions and crashes. Write randomised tests that check election safety (one leader per term), log matching and that committed entries never change. Then read how etcd handles membership changes and snapshots.
+
+Exercise: break the commit rule deliberately (count old-term entries) and find the failing scenario with the randomised tests.
+
+Done when the tests pass thousands of randomised runs under partitions, and the broken version fails; the deeper study of consensus continues in phase 10.
+
+</Level>
+</Levels>
+
+The part closes with its own conclusion and source list, and the book ends with a bibliography and an index.
+
+## Misreadings to avoid
+
+- "LSM trees are faster than B-trees." They make different trade-offs; which is faster depends on the read, write and space mix of the workload. Measure amplification, not headlines.
+- "CAP means pick two of three." It describes what a system can do during a partition, and it uses a narrow definition of consistency (linearizability). Outside a partition, the trade-off is latency against consistency.
+- "Eventual consistency means it will be consistent soon." It promises convergence only if writes stop and repair runs; it promises nothing about when.
+- "Two-phase commit and two-phase locking are the same idea." They solve different problems: atomic commit across nodes, and serializable concurrency on one node.
+- "Snapshot isolation is serializable." It still allows write skew.
+- "A timeout tells me the node is dead." It tells me I did not hear back. Fence before acting.
+- "I should implement Paxos or Raft for my service." Use a proven implementation; the book explains them so I can reason about the ones I use.
+
+## Done with this book when
+
+- I have a key-value store of my own with slotted pages, an on-disk B+-tree with a bulk loader, a write-ahead log and crash recovery that survives a thousand random kills.
+- I have a small LSM store beside it and a benchmark that shows read, write and space amplification for both.
+- I can reproduce a lost update, write skew and a serialization failure in Postgres and say which isolation level prevents each.
+- My message-passing simulator runs a failure detector, a leader election with terms and fencing, a quorum-replicated register with a linearizability checker, 2PC with crash injection, and Raft with randomised tests.
+- I can explain a consistency model by what a client may observe, and pick one per operation in a design.
+- Gate: I can pass the phase 8 gate in the <a href={withBase('/plans/traditional-software-developer/')}>traditional core plan</a>: defend a schema, read a query plan, explain an isolation anomaly and its prevention, and restore a database from backup, using the internals from this book to explain why each works.
