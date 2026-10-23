@@ -1,0 +1,919 @@
+---
+title: "Validating at the boundary, not trusting the client"
+series: "backend"
+seriesOrder: 4
+undated: true
+readTime: "about 25 min"
+description: "Why every byte from a client is untrusted, how to parse unknown input into typed values, and the numbers, strings and objects that slip past naive checks."
+tags: ['security', 'http', 'narrowing']
+related: ['backend/01', 'backend/02']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+The form had `maxlength="40"`, a required checkbox and a dropdown with
+three options, and the database still filled up with 9,000-character names
+and a fourth option nobody had designed. None of the form's rules had ever
+run on the server. The browser is a convenience for honest users; the
+server is talking to whoever can send bytes. This note is about drawing that
+line, the **trust boundary**, and checking everything that crosses it.
+
+## Before you start
+
+After this note you will be able to:
+
+- say where the trust boundary is in a web app and why client-side checks
+  do not count as security;
+- write a parser that turns `unknown` input into a typed value or a list
+  of field errors, instead of a validator that only says yes or no;
+- define a schema once and get both the runtime check and the TypeScript
+  type from it, including strict objects and query-string coercion;
+- recognise the inputs that slip past naive checks: odd numbers, Unicode
+  strings, extra fields and `__proto__`;
+- let database constraints be the last line, and turn their error codes
+  into clean 409 and 422 responses.
+
+What you should already know: status codes from
+[the second note](/sanjay/posts/backend/02/), and TypeScript's `unknown`
+and narrowing with `typeof`.
+
+Reading time: about 25 minutes.
+
+## Note map
+
+<Flow steps={[
+  "Bytes arrive from a client you do not control",
+  "Parse: JSON text to a JavaScript value, or 400",
+  "Validate and convert: unknown value to a typed, normalised value, or 422 with field errors",
+  "Use: the handler only ever sees the typed value",
+  "Constrain: the database rejects anything the code missed, mapped to 409 or 422",
+]} caption="The note as a pipeline. Each stage narrows what can get through; the handler sits after the narrowing and the database sits behind everything." />
+
+## The trust boundary
+
+### In one sentence
+
+The trust boundary is the line where data enters code you control from code
+you do not, and everything that crosses it must be checked on your side of
+the line.
+
+### The idea
+
+A web app has an obvious boundary: the HTTP request. Everything in it, the
+path, the query string, the headers, the cookies and the body, was produced
+by a program the server does not control. Most of the time that program is
+the app's own frontend, which is why it is easy to forget that it does not
+have to be. `curl`, a script, a modified copy of the app, or a proxy that
+edits requests in flight can all send anything.
+
+**Client-side validation** is the checks the browser does before
+sending: `required`, `maxlength`, `type="email"`, a disabled submit
+button. These are good for the user, because they give instant feedback.
+They are worthless as protection, because the attacker simply does not run
+them. The server has to repeat every rule that matters.
+
+There are quieter boundaries too. A webhook from a payment provider, a
+message from a queue, a file uploaded by a user, a row written by another
+service, an environment variable, even a response from a third-party API:
+all are input from outside this code. The rule is the same for each: parse
+and check where it enters, then trust the checked value inside.
+
+The opposite mistake is also real. Checking the same thing in every
+function, deep inside the code, makes it noisy and still misses the one
+place where it was forgotten. The goal is one strong check at each
+boundary and none inside, because inside, the types say it was already
+checked.
+
+### Worked example
+
+The simple case is the form from the introduction. Its HTML said:
+
+```html
+<input name="name" required maxlength="40">
+<select name="plan"><option>free</option><option>pro</option><option>team</option></select>
+```
+
+One `curl` command skips all of it:
+
+```text
+curl -X POST localhost:3000/signup -H 'content-type: application/json' \
+  -d '{"name":"' + 9000 x's + '","plan":"enterprise-free-forever"}'
+```
+
+The browser's rules never ran, so a server that trusted the form stores a
+9,000-character name and an unknown plan.
+
+The realistic case is a price. An online shop's cart page sends
+`{"productId": 7, "quantity": 2, "price": 1999}`. If the order handler
+uses that `price`, anyone can buy anything for one cent. The fix is not a
+check on the price; it is to not accept a price at all. The server looks up
+the price of product 7 itself. **Only accept from the client what the
+client is allowed to decide.**
+
+### Step by step
+
+<Layers layers={[
+  { name: "Browser form rules", note: "user convenience only; skipped by any non-browser client" },
+  { name: "HTTP request", note: "the trust boundary: path, query, headers, cookies, body" },
+  { name: "Parse and validate", note: "unknown becomes typed, or the request stops here" },
+  { name: "Handler and domain code", note: "trusts the typed value; no re-checking" },
+  { name: "Database constraints", note: "the backstop for every writer, not just this handler" },
+]} caption="Where checks live. Read down the notes column: only the middle layer and the bottom one protect anything, and only the middle one can give a friendly error." />
+
+### Common mistake
+
+The common mistake is "the frontend already validates that". It is true
+only for requests that came from the frontend, unchanged. The fix is to
+treat the frontend as one client among many and give the server its own
+complete rules.
+
+<Compare left="Trusting the client" right="Owning the rules" caption="The same signup, two attitudes. Every row on the left is a real way data gets corrupted without any hacking skill." rows={[
+  ["maxlength in HTML is the only length check", "server rejects names over 40 characters"],
+  ["price comes from the cart request", "server reads the price from the products table"],
+  ["role field accepted if present", "role is never read from the body"],
+  ["dropdown limits the plan", "server checks plan is one of free, pro, team"],
+]} />
+
+### In real systems
+
+Security standards such as the OWASP Top 10 list injection and broken
+access control near the top, and both start with trusted input. Mature
+APIs publish a schema for every endpoint and reject requests that do not
+match it before any handler runs. Webhook receivers verify a signature
+before parsing the body, because the boundary there includes "is this
+really from the provider".
+
+### Check yourself
+
+<details>
+<summary>1. Name three boundaries in a typical web app besides the HTTP request body.</summary>
+
+Query strings and headers on the same request; webhooks and queue messages
+from other systems; uploaded files; responses from third-party APIs;
+environment variables and config files. Any of them can carry data the code
+did not produce.
+
+</details>
+
+<details>
+<summary>2. The cart sends a discount code and a total. Which should the server accept?</summary>
+
+The discount code, which it then looks up and applies itself. The total is
+something the server computes; accepting it lets the client set its own
+price.
+
+</details>
+
+## Parse, don't validate
+
+### In one sentence
+
+A parser takes an `unknown` value and returns either a typed, cleaned value
+or a list of errors, so the rest of the code can never see the unchecked
+version.
+
+### The idea
+
+A **validator** answers yes or no: `isValidSignup(body)` returns a boolean.
+After it says yes, the code goes on using `body`, which TypeScript still
+types as `any` or `unknown`. Nothing ties the check to the use, so the next
+change can read a field the validator never checked.
+
+A **parser** returns a new value of a precise type, such as
+`{ email: string; name: string; age: number }`. The only way to get that
+type is through the parser. The handler takes that type as its parameter,
+so it cannot be called with unchecked data. The phrase "parse, don't
+validate" names this idea: make the type system carry the proof that the
+check happened.
+
+Parsing is also the right moment to **normalise**: trim whitespace,
+lowercase the email, put Unicode into one standard form. Then every later
+comparison works on the clean form. And a good parser collects **all**
+errors, not just the first, so a form can show every bad field at once.
+
+The result type is a **discriminated union**: either `{ ok: true, value }`
+or `{ ok: false, issues }`. The `ok` field lets TypeScript narrow which one
+it is holding.
+
+### Worked example
+
+Here is a hand-written parser for a signup. It starts from `unknown` and
+earns every property:
+
+```ts
+type Signup = { email: string; name: string; age: number };
+function parseSignup(input: unknown): { ok: true; value: Signup } | { ok: false; issues: Issue[] } {
+  const issues: Issue[] = [];
+  if (typeof input !== 'object' || input === null || Array.isArray(input))
+    return { ok: false, issues: [{ path: '', message: 'expected an object' }] };
+  const o = input as Record<string, unknown>;
+  const email = typeof o.email === 'string' ? o.email.trim().toLowerCase() : undefined;
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+    issues.push({ path: 'email', message: 'must be an email address' });
+  // name and age follow the same pattern
+  if (issues.length) return { ok: false, issues };
+  return { ok: true, value: { email: email!, name: name!, age: age as number } };
+}
+```
+
+The name check uses `[...name].length`, which counts characters as people
+see them more closely than `name.length` does (more on that below), and the
+age check requires `Number.isInteger(age)` and a range. I ran it on seven
+inputs; the real results:
+
+```text
+{"email":" Sanjay@Example.COM ","name":"Sanjay","age":30}  -> {"ok":true,"value":{"email":"sanjay@example.com","name":"Sanjay","age":30}}
+{"email":"nope","name":"","age":"30"}                      -> {"ok":false,"issues":[{"path":"email",...},{"path":"name",...},{"path":"age",...}]}
+{"email":"a@b.co","name":"Ana","age":30,"role":"admin"}    -> {"ok":true,"value":{"email":"a@b.co","name":"Ana","age":30}}
+[1,2]                                                      -> {"ok":false,"issues":[{"path":"","message":"expected an object"}]}
+null                                                       -> {"ok":false,"issues":[{"path":"","message":"expected an object"}]}
+{"email":"a@b.co","name":"Ana","age":1e309}                -> {"ok":false,"issues":[{"path":"age",...}]}
+{"email":"a@b.co","name":"Ana","age":30.5}                 -> {"ok":false,"issues":[{"path":"age",...}]}
+```
+
+Look at three lines. The first returned a normalised email: trimmed and
+lowercased. The second reported all three problems in one response. And
+the third quietly dropped `role`: the parser builds a fresh object with
+only the fields it knows, so an attacker's extra field cannot reach the
+database. That is the realistic payoff of building a new value instead of
+passing the input along.
+
+The handler then looks like this, and cannot be called with raw input:
+
+```ts
+async function createUser(input: Signup) { /* insert input.email, input.name, input.age */ }
+const parsed = parseSignup(body);
+if (!parsed.ok) return send(res, 422, { error: 'invalid input', issues: parsed.issues });
+await createUser(parsed.value);
+```
+
+### Step by step
+
+<Trace
+  columns={["input field", "check", "result for {email:'nope', name:'', age:'30'}"]}
+  rows={[
+    ["whole body", "is it a non-null, non-array object?", "yes: continue"],
+    ["email", "string? trim, lowercase, matches the pattern?", "'nope' has no @: issue on email"],
+    ["name", "string? normalise, trim, 1 to 40 characters?", "empty after trim: issue on name"],
+    ["age", "number? integer? 13 to 130?", "a string '30', not a number: issue on age"],
+    ["result", "any issues?", "three: return ok false with all three"],
+  ]}
+  caption="The parser on a bad body. It keeps going after the first failure so the client gets every field error in one round trip."
+/>
+
+### Common mistake
+
+The common mistake is the cast: `const body = JSON.parse(raw) as Signup`.
+The `as` tells TypeScript to believe something nobody checked. Everything
+after it type-checks, and the program crashes or stores garbage at
+runtime. The fix is to type the parsed JSON as `unknown`, which forces a
+check before any property can be read.
+
+A second mistake is a validator that checks the input and then passes the
+input itself on: `if (isValid(body)) save(body)`. Any extra fields go along
+with it. The fix is to pass on a new object built from checked fields only.
+
+### In real systems
+
+Typed APIs push this to the edge of every service. Request bodies,
+responses from other services, queue messages and even config files go
+through a parser at load time, so a bad config fails at startup with a
+clear message rather than at 3 a.m. with `cannot read properties of
+undefined`.
+
+### Check yourself
+
+<details>
+<summary>1. Why type JSON.parse's result as unknown and not any?</summary>
+
+`any` turns off checking, so `body.email.trim()` compiles even when `body`
+is `null`. `unknown` refuses every property access until the code has
+narrowed the type, which makes forgetting a check a compile error.
+
+</details>
+
+<details>
+<summary>2. How did the hand-written parser stop the role field?</summary>
+
+It never copied the input. It built a fresh object from the three fields it
+checked, so anything else in the input was dropped.
+
+</details>
+
+## Schemas: one definition, two uses
+
+### In one sentence
+
+A schema library lets me describe the shape once and get both the runtime
+parser and the TypeScript type from that one description, so they can never
+drift apart.
+
+### The idea
+
+The hand-written parser has a weakness: the type `Signup` and the checks
+are written separately. Add a field to the type and forget the check, and
+the compiler is happy. A **schema** is a value that describes the shape, and
+a schema library generates both the parsing function and the type from it.
+Zod, Valibot and TypeBox are common choices in TypeScript; JSON Schema is
+the language-neutral version used by OpenAPI.
+
+Two schema options matter most at a boundary. A **strict** object rejects
+unknown keys instead of dropping them, which turns "someone is sending a
+`role` field" into a visible error. And **coercion** converts strings to
+numbers or booleans, which is necessary for query strings and form posts,
+because everything in a URL is a string.
+
+The schema becomes the contract. It can generate documentation, client
+types and OpenAPI, and it is the one place to read to know what an endpoint
+accepts.
+
+### Worked example
+
+The simple case is the signup again, as a Zod schema:
+
+```ts
+import { z } from 'zod';
+const Signup = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  name: z.string().trim().min(1).max(40),
+  age: z.number().int().min(13).max(130),
+}).strict();
+type Signup = z.infer<typeof Signup>;
+const r = Signup.safeParse(JSON.parse(raw));
+```
+
+The real results for a good body, a body with an extra `role`, and a bad
+body:
+
+```text
+{"email":"sanjay@example.com","name":"Sanjay","age":30}
+[{"path":"","code":"unrecognized_keys","message":"Unrecognized key(s) in object: 'role'"}]
+[{"path":"email","code":"invalid_string","message":"Invalid email"},{"path":"name","code":"too_small","message":"String must contain at least 1 character(s)"},{"path":"age","code":"invalid_type","message":"Expected number, received string"}]
+```
+
+`.strict()` made the extra field an error instead of a silent drop. Each
+issue has a machine-readable `code` as well as a message, which lets a
+client map errors to its own wording.
+
+The realistic case is a list endpoint's query string, where every value
+arrives as text and most are optional:
+
+```ts
+const Query = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+Query.safeParse(Object.fromEntries(new URLSearchParams(qs)));
+```
+
+```text
+""                 {"page":1,"limit":20}
+"page=3&limit=50"  {"page":3,"limit":50}
+"page=abc"         "invalid"
+"limit=1000"       "invalid"
+"page="            "invalid"
+```
+
+The last row is a trap worth seeing. `page=` gives the empty string, and
+JavaScript's `Number('')` is `0`, not `NaN`. Coercion turns it into 0, and
+only the `min(1)` rule catches it. Without the minimum, an empty parameter
+would silently mean "page zero".
+
+### Step by step
+
+<Flow steps={[
+  "Write the schema: fields, types, limits, strictness",
+  "Infer the TypeScript type from it: z.infer",
+  "Parse at the boundary with safeParse: data or issues",
+  "On issues: 422 with path, code and message per issue",
+  "On data: call the handler with the typed value",
+  "Export the schema to OpenAPI so clients see the same contract",
+]} caption="One schema, many uses. The arrow from the schema to the type is the point: they are generated from the same source, so adding a field updates both." />
+
+### Common mistake
+
+The common mistake is reusing the database row type as the input type: the
+`User` type has `id`, `role` and `createdAt`, so a schema derived from it
+accepts them in a create request. That is **mass assignment**: the client
+sets fields it should never control. The fix is separate schemas per use:
+`CreateUserInput`, `UpdateUserInput`, `UserResponse`, each with only the
+fields that direction allows.
+
+### In real systems
+
+Frameworks integrate schemas directly: a route declares its body, query
+and params schemas, and the framework parses before the handler runs and
+generates the OpenAPI document from the same schemas. The note on error
+shapes and OpenAPI later in this series uses exactly that.
+
+### Check yourself
+
+<details>
+<summary>1. Why is strict mode useful even though dropping unknown keys is already safe?</summary>
+
+Dropping is safe but silent. Strict mode makes a client that sends
+unexpected fields fail loudly, which catches typos like `emial` and
+probing like `role` during development instead of hiding them.
+
+</details>
+
+<details>
+<summary>2. Why does a query-string schema need coercion and a body schema usually not?</summary>
+
+Query strings and form posts are always text, so numbers arrive as strings
+like "3". JSON bodies carry real numbers and booleans, so coercing there
+would hide client bugs such as sending "30" for an age.
+
+</details>
+
+## The inputs that slip past naive checks
+
+### In one sentence
+
+Numbers, strings and objects each have a few values that look fine to a
+quick check and break things later, and a boundary parser has to know them
+by name.
+
+### The idea
+
+**Numbers.** JSON numbers become JavaScript doubles. `1e309` is too big and
+becomes `Infinity`; `30.5` passes `typeof age === 'number'`; `-0` exists.
+Query-string numbers are worse: `Number('')` is 0, `Number(' 12 ')` is 12,
+and `parseInt('12abc')` is 12 because it stops at the first non-digit.
+Money must never be a float: `0.1 + 0.2` is not `0.3`. Use integer cents or
+a decimal string.
+
+**Strings.** JavaScript's `length` counts UTF-16 code units, not characters
+people see. An emoji with a skin tone is two characters on screen and four
+code units. The same visible letter can be stored two ways: `é` as one code
+point, or `e` plus a combining accent. They look identical, compare
+unequal, and let someone register a username that looks exactly like
+someone else's. **Unicode normalisation** to NFC fixes the second; counting
+with `[...str]` or a grapheme segmenter fixes most of the first.
+
+**Objects.** A JSON body can carry a key called `__proto__`. `JSON.parse`
+makes it an ordinary own property, which is harmless until some code merges
+the body into another object with a naive recursive merge. Then the merge
+writes into `Object.prototype`, and every object in the process inherits
+the attacker's property. That is **prototype pollution**.
+
+### Worked example
+
+I ran each of these to see the real values:
+
+```ts
+console.log('0.1+0.2 =', 0.1 + 0.2, '| Number("") =', Number(''),
+  '| Number(" 12 ") =', Number(' 12 '), '| parseInt("12abc") =', parseInt('12abc'));
+console.log('"é" vs "é":', 'é' === 'e\u0301', 'é'.length, 'e\u0301'.length,
+  'e\u0301'.normalize('NFC').length);
+console.log('emoji length:', '👍🏽'.length, [...'👍🏽'].length, Buffer.byteLength('👍🏽'));
+```
+
+```text
+0.1+0.2 = 0.30000000000000004 | Number("") = 0 | Number(" 12 ") = 12 | parseInt("12abc") = 12
+"é" vs "é": false 1 2 1
+emoji length: 4 2 8
+```
+
+The thumbs-up with a skin tone is 4 UTF-16 units, 2 code points and 8 bytes
+in UTF-8, and a person sees 1 character. Which number is "the length"
+depends on what the limit protects: bytes for storage and body size, code
+points or graphemes for what a user typed.
+
+The realistic case is prototype pollution, which I reproduced with a
+ten-line merge function of the kind found in many utility files:
+
+```ts
+const body = JSON.parse('{"name":"Ana","__proto__":{"isAdmin":true}}');
+console.log('own keys:', Object.keys(body));
+function merge(target: any, src: any) {
+  for (const k in src) {
+    if (typeof src[k] === 'object') { target[k] ??= {}; merge(target[k], src[k]); }
+    else target[k] = src[k];
+  }
+  return target;
+}
+const settings = merge({}, body);
+console.log('settings.isAdmin:', settings.isAdmin, '| a brand-new {} .isAdmin:', ({} as any).isAdmin);
+```
+
+```text
+own keys: [ 'name', '__proto__' ]
+settings.isAdmin: true | a brand-new {} .isAdmin: true
+```
+
+The second value on the last line is the frightening one. A brand-new,
+empty object now says `isAdmin` is true, because `target['__proto__']` is
+the shared prototype, and the merge wrote into it. Any later
+`if (user.isAdmin)` on an object without its own `isAdmin` passes. A strict
+schema blocks this at the boundary, because `__proto__` is not a known key.
+
+### Step by step
+
+<Trace
+  columns={["merge step", "k", "target[k] is", "effect"]}
+  rows={[
+    ["1", "name", "missing", "settings.name = 'Ana'"],
+    ["2", "__proto__", "Object.prototype (inherited getter)", "not created; recurse into the shared prototype"],
+    ["3 (inner)", "isAdmin", "missing on the prototype", "Object.prototype.isAdmin = true"],
+    ["after", "", "", "every plain object in the process now has isAdmin true"],
+  ]}
+  caption="How the naive merge pollutes. Step 2 is the hinge: reading target['__proto__'] returns the prototype itself rather than an own property, so the recursion writes into it."
+/>
+
+<Compare left="Looks fine" right="What it really is" caption="A cheat sheet of boundary values. Each left-hand value passes a naive typeof or length check." rows={[
+  ["age: 30.5", "not an integer"],
+  ["age: 1e309", "Infinity after parsing"],
+  ["page=", "Number('') is 0"],
+  ["amount: 0.1 + 0.2", "0.30000000000000004; use integer cents"],
+  ["name: 'e' + combining accent", "different bytes from 'é'; normalise to NFC"],
+  ["key: __proto__", "prototype pollution through a naive merge"],
+]} />
+
+### Common mistake
+
+The common mistake is checking `typeof x === 'number'` and stopping. It
+passes `NaN`, `Infinity` and fractions. The fix is `Number.isFinite` or
+`Number.isInteger` plus a range. For strings, the mistake is checking
+`length` against a limit meant for people; use code points or graphemes
+for that, and bytes for storage limits. For objects, never deep-merge
+untrusted input into anything; if you must, skip `__proto__`,
+`constructor` and `prototype`, or build objects with `Object.create(null)`.
+
+### In real systems
+
+Prototype pollution has been reported in widely used merge and query-string
+libraries, which is why many now refuse those keys. Unicode lookalikes are
+why registrars and platforms normalise and restrict usernames. And money as
+floats is a classic source of accounting drift, which is why payment APIs
+take amounts as integers in the smallest currency unit.
+
+### Check yourself
+
+<details>
+<summary>1. A username limit of 20 uses str.length. Who gets unfairly rejected?</summary>
+
+Users whose names include characters outside the Basic Multilingual Plane,
+such as many emoji and some scripts, because each counts as two UTF-16
+units. Count code points or graphemes for a person-facing limit.
+
+</details>
+
+<details>
+<summary>2. Why does a strict schema stop prototype pollution?</summary>
+
+`__proto__` is not a declared key, so strict parsing rejects the body
+before any merge runs. Even a non-strict parser that builds a fresh object
+from known keys drops it.
+
+</details>
+
+## The database as the last line
+
+### In one sentence
+
+Constraints in the table enforce the rules for every writer, forever, and
+the handler's job is to turn their errors into responses a client can act
+on.
+
+### The idea
+
+Code-level validation protects one code path. The database is shared by
+every code path, every service, every migration script and every person
+with a SQL prompt. Rules that must always hold belong in the schema as
+**constraints**: `not null`, `check`, `unique`, foreign keys.
+
+Some rules can only be enforced there. **Uniqueness** is the clearest: "is
+this email taken?" checked in code has a race, because two signups can both
+check before either inserts. The unique index decides atomically.
+
+When a constraint fails, Postgres returns an error with a five-character
+**SQLSTATE code** and the constraint's name. `23505` is a unique violation,
+`23514` a check violation, `23503` a foreign-key violation, `23502` a not-null
+violation. The handler maps those to HTTP: a unique violation on email is
+409 Conflict, a check violation is 422. The constraint name says which
+field to blame, which is a good reason to name constraints deliberately.
+
+### Worked example
+
+The simple case is the users table with the same rules as the parser:
+
+```sql
+create table users (
+  id bigint generated always as identity primary key,
+  email text not null unique check (email = lower(email)),
+  name text not null check (char_length(name) between 1 and 40),
+  age int not null check (age between 13 and 130)
+);
+```
+
+`char_length` counts characters (code points), matching the parser's
+`[...name].length`. The `email = lower(email)` check enforces the
+normalisation, so a writer that forgets to lowercase cannot create a second
+account with different capitals.
+
+I inserted four rows, skipping the code-level checks on purpose, and printed
+each error's code and constraint:
+
+```text
+["a@b.co","Ana",30] -> inserted
+["A@B.co","Ana",30] -> 23514 users_email_check
+["a@b.co","Ana",31] -> 23505 users_email_key
+["c@d.co","Bo",7] -> 23514 users_age_check
+```
+
+The realistic case is the mapping in the handler:
+
+```ts
+try { await createUser(parsed.value); }
+catch (e: any) {
+  if (e.code === '23505' && e.constraint === 'users_email_key')
+    return send(res, 409, { error: 'email already registered', field: 'email' });
+  if (e.code === '23514')
+    return send(res, 422, { error: 'invalid input', constraint: e.constraint });
+  throw e; // anything else is a real 500
+}
+```
+
+The race-free uniqueness check is this `catch`, not a `select` before the
+insert. The `select` can still be useful to show "taken" while the user
+types, but the insert decides.
+
+### Step by step
+
+<Timeline items={[
+  { when: "t1", what: "signup A: select by email, none found" },
+  { when: "t2", what: "signup B: select by email, none found" },
+  { when: "t3", what: "signup A: insert, succeeds" },
+  { when: "t4", what: "signup B: insert, unique index rejects with 23505" },
+  { when: "t5", what: "handler maps 23505 on users_email_key to 409 email already registered" },
+]} caption="Why uniqueness lives in the database. Both code-level checks at t1 and t2 said 'free'; only the unique index at t4 could tell the truth." />
+
+<Figure art={`
+   client --> [ schema parse ] --422--> client
+                    |
+                    v
+              [ handler logic ] --403/404--> client
+                    |
+                    v
+              [ database constraints ] --23505--> map to 409
+                    |                  --23514--> map to 422
+                    v
+                  row stored                --other--> 500
+`} caption="Every exit from the write path. Each layer has its own way to say no, and the handler turns database errors into the same kind of response the schema gives." />
+
+### Common mistake
+
+The common mistake is skipping constraints because "the app checks it".
+The first bulk import script, admin panel or second service then writes
+rows the app never would. The fix is to put every invariant that must
+always hold in the schema, even if it duplicates a code check.
+
+The opposite mistake is letting raw database errors reach the client:
+`{"error":"duplicate key value violates unique constraint
+\"users_email_key\""}`. It leaks table and constraint names and gives the
+user a message they cannot act on. The fix is the mapping above.
+
+### In real systems
+
+Production schemas name constraints explicitly (`constraint
+users_email_key unique (email)`) so the mapping code does not depend on
+generated names. Error-mapping lives in one helper used by every handler,
+and unmapped database errors are logged with the request id and returned as
+a generic 500. The notes on schema design and migrations later in this
+series go deeper on constraints.
+
+### Check yourself
+
+<details>
+<summary>1. Why is a code-level 'is this email taken?' check not enough?</summary>
+
+Two requests can both run the check before either inserts, so both see
+"free" and both insert. Only a unique index makes the check and the insert
+one atomic step.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Validating at the boundary, not trusting the client">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, learn one rule: every value from a request is
+untrusted until the server has checked it, even if the frontend checked it
+first. Then write the checks: types, required fields, lengths, ranges.
+
+A worked example: a "create todo" endpoint checks that `title` is a string
+of 1 to 200 characters and `done` is a boolean, and answers 422 with both
+problems if both fail. A test sends a number for `title` and a string for
+`done` and expects two errors.
+
+The mistake at this level is checking only that fields exist. `"title":
+123` and `"title": "   "` both exist. The fix is type, then content, then
+range, for every field.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, switch from validators to parsers and schemas.
+Parse to a typed value, pass only that value on, and generate the type from
+the schema. Use separate schemas per direction: create input, update input,
+response.
+
+A worked example: `UpdateTodoInput` is the create schema with every field
+optional (Zod's `.partial()`) and `.strict()`. A `PATCH` with
+`{"ownerId": 9}` fails with an unrecognised-key error instead of moving the
+todo to another user.
+
+The mistake is one schema for everything, which leaks fields like `id` and
+`ownerId` into inputs. The fix is per-direction schemas.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, handle the hard values: normalise Unicode, count
+characters correctly, use integers for money, reject non-finite numbers,
+and block prototype keys. Also validate cross-field rules, such as "end
+date after start date", in the schema with a refinement.
+
+A worked example: a booking schema checks `start` and `end` are ISO dates,
+then a refinement checks `end` is after `start` and the range is at most
+30 days, reporting the error on the `end` path so the form highlights the
+right field.
+
+The mistake is putting cross-field rules in the handler, after parsing,
+where they produce a different error shape. The fix is refinements in the
+schema so every rule produces the same issue format.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: an empty object, an empty array where an object was
+expected, `null` for an optional field (is `null` the same as missing?),
+a string of exactly the maximum length, a number at exactly the minimum.
+
+A worked example: `{"nickname": null}` on a `PATCH`. Does it mean "clear the
+nickname" or "leave it alone"? Pick a rule (commonly: missing means leave,
+`null` means clear), write it in the schema with `.nullable().optional()`,
+and test both.
+
+The mistake is treating `null` and missing the same by accident. The fix is
+an explicit rule and a test for each.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a name at exactly 40 characters that contains a
+combining accent, so it is 40 after NFC normalisation but 41 before. Which
+count wins depends on whether you normalise before checking; normalise
+first. An email that is valid but has trailing spaces and capitals, and
+already exists in lowercase: normalise first, then the unique check
+catches it.
+
+A worked example: `" Ana@B.co"` and `"ana@b.co"` both arrive in one second.
+Both normalise to `ana@b.co`, and the unique index lets one through and
+maps the other to 409.
+
+The mistake is checking before normalising. The fix is the order:
+normalise, then validate, then store.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, validation errors are data. Log the issue codes and paths
+(never the values, which may be personal data), count them per endpoint,
+and watch for spikes after client releases.
+
+A worked example: a dashboard of 422s by endpoint and issue path shows
+`unrecognized_keys: promoCode` jumping after a mobile release. The mobile
+team shipped a field the server does not support yet. The strict schema
+turned a silent drop into a visible signal.
+
+The mistake is logging whole request bodies on validation failure, which
+copies passwords and emails into logs. The fix is logging paths and codes
+only.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is "accept only what the client is allowed to decide". Before
+asking how to validate a field, ask whether the client should send it at
+all. Prices, owners, roles, timestamps and totals are usually the server's
+to decide.
+
+A worked example: an order request shrinks from ten fields to three:
+product ids, quantities and a discount code. Everything else is looked up
+or computed. Seven validation rules disappear because seven fields do.
+
+The mistake is validating fields that should not exist. The fix is
+removing them from the input schema.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, every boundary between services is a trust boundary too.
+A service parses messages from a queue with the same rigour as HTTP bodies,
+and a contract (a shared schema or OpenAPI document) defines what each side
+may send.
+
+A worked example: an events topic carries a versioned schema. Consumers
+parse each message, send unparseable ones to a dead-letter queue with the
+issues attached, and keep going, instead of crashing on the first bad
+message.
+
+The mistake is trusting messages because they come from "our own" service.
+A bug there is as damaging as an attacker. The fix is parsing at every
+boundary.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is one schema per boundary, generated types, constraints in
+the database, and a shared error shape for both. Make the schema the source
+of truth for docs and clients, and test the boundary with the nasty inputs
+from this note.
+
+A worked example: a test helper takes a schema and runs a table of hostile
+inputs against every endpoint: wrong types, extra keys, `__proto__`,
+`1e309`, empty strings, combining characters. Every result must be 400 or
+422, never 500.
+
+Done when: no handler in your codebase receives an unchecked value, every
+input schema is strict and per direction, every invariant has a database
+constraint, and a hostile-input test suite returns no 500s.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I validate on the client at all?** Yes, for the user: instant
+feedback beats a round trip. Share the schema between client and server if
+you can, so the rules match. The server's check is still the one that
+counts.
+
+**Where should the email format check stop?** At "has one @ and a dot after
+it", plus a length limit. The only real proof an address works is sending
+a confirmation email. Overly clever patterns reject valid addresses.
+
+**Is it bad to return all the validation errors at once?** No, it is better
+for forms. The exception is authentication: never say which of username or
+password was wrong.
+
+**Should I sanitise HTML in input?** Store what the user wrote and escape it
+on output, for the context where it is shown. Sanitise only when you must
+store and render rich HTML, and then with a well-maintained library.
+
+**Zod, Valibot or JSON Schema?** Any of them, used consistently. Pick the
+one your framework integrates with for OpenAPI generation.
+
+## Key takeaways
+
+- The server must check everything that crosses the trust boundary;
+  browser checks are for convenience only.
+- Accept only what the client is allowed to decide; compute the rest.
+- Parse to a typed value instead of validating and passing the raw input.
+- One schema gives both the runtime check and the type.
+- Use strict schemas and separate input schemas per direction.
+- Know the slippery values: fractions, `Infinity`, empty strings,
+  combining characters, emoji lengths and `__proto__`.
+- Normalise before you validate and before you compare.
+- Constraints are the last line, and their error codes map to 409 and 422.
+
+## Glossary
+
+- **Trust boundary**: where data enters your code from code you do not
+  control.
+- **Client-side validation**: checks in the browser, for user convenience.
+- **Parser**: a function from unknown input to a typed value or errors.
+- **Normalisation**: putting input into one canonical form.
+- **Discriminated union**: a union whose members are told apart by a field.
+- **Schema**: a value that describes a data shape.
+- **Strict object**: a schema that rejects unknown keys.
+- **Coercion**: converting text to numbers or booleans while parsing.
+- **Mass assignment**: a client setting fields it should not control.
+- **Prototype pollution**: writing to `Object.prototype` through a key
+  such as `__proto__`.
+- **NFC**: the Unicode normal form that composes characters.
+- **SQLSTATE**: Postgres's five-character error code.
+
+## Practice
+
+**Warm-up.** Pick one endpoint you wrote. List every field it reads from
+the request and mark each as "client decides" or "server should decide".
+Remove the second kind.
+
+**Build.** Write a strict schema for that endpoint, infer the type, parse at
+the boundary, map database errors 23505 and 23514 to 409 and 422, and test
+it with the hostile values from this note.
+
+**Stretch.** Write a generic hostile-input test that takes any schema and
+endpoint, generates bad values for each field type, and asserts no 500s.
+Run it over your whole API.
