@@ -1,0 +1,1268 @@
+---
+book: the-pragmatic-programmer
+number: 6
+title: "Concurrency"
+description: "Breaking temporal coupling, why shared state is incorrect state, actors and processes, and blackboards: how to make work happen at the same time without corrupting it."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Almost every modern program does several things at once: serving many
+users, waiting on networks, running background jobs. This chapter is about
+doing that safely. It first finds where work can overlap, then explains why
+sharing mutable data between concurrent tasks causes bugs, and finally
+offers two models, actors and blackboards, that avoid most of them.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- explain the difference between concurrency and parallelism;
+- find temporal coupling in a workflow and remove it with an activity diagram;
+- recognise a race condition in a read-modify-write and fix it with a lock, a transaction or a queue;
+- structure concurrent work as actors that share nothing and talk through messages;
+- coordinate independent agents through a blackboard, and know when that helps.
+
+What I should already know: functions, promises and `async`/`await` in
+JavaScript, and the decoupling ideas from the
+<a href={withBase('/books/the-pragmatic-programmer/05-bend-or-break/')}>previous chapter</a>,
+since concurrency is decoupling in time.
+
+Reading time: about 70 minutes for this page, plus two hours for the
+exercises.
+
+## Chapter map
+
+<Flow caption="The chapter's four topics in order. Read left to right: find where work can overlap, see the danger, then use two safe structures." steps={[
+  "33. Find work that can overlap",
+  "34. Shared mutable state breaks",
+  "35. Actors share nothing",
+  "36. Blackboards coordinate",
+]} />
+
+Two definitions come first, because the book uses them precisely.
+**Concurrency** is when two or more pieces of code act as if they run at
+the same time; their execution can interleave.
+
+**Parallelism** is when they
+really do run at the same time, on separate cores or machines. A single
+JavaScript thread has concurrency through its event loop but no
+parallelism within that thread. The bugs in this chapter come from
+concurrency, so they appear even without parallel hardware.
+
+## Topic 33. Breaking Temporal Coupling
+
+### In one sentence
+
+Temporal coupling is depending on things happening in a fixed order when
+they do not need to, and finding it lets independent work run at the same
+time.
+
+### The idea
+
+#### Time as a hidden dependency
+
+Most code is written as a list of steps: do A, then B, then C. That order
+is often an accident of how the code was typed, not a requirement. If B
+does not need A's result, then running B after A is temporal coupling, a
+dependency on time that the problem does not have. It makes programs
+slower than they need to be and harder to change, because nobody can tell
+which orderings matter.
+
+The book asks me to think about two aspects of time: concurrency, things
+happening at the same time, and ordering, the relative positions of things
+in time. Both should be decisions, not accidents.
+
+#### Activity diagrams
+
+The tool the book uses to find concurrency is the **activity diagram**, a
+UML notation. Each action is a box.
+
+Arrows show which actions must
+complete before another can start. A thick bar called a synchronisation
+bar means "wait until everything arriving here is done". Actions with no
+arrows between them can run in any order, or at the same time.
+
+The book's example is a recipe for a cocktail with steps such as opening
+the blender, measuring the mix, adding ice, blending, and getting glasses.
+Written as a list it looks sequential. Drawn as a diagram, several steps
+turn out to be independent: measuring ingredients and getting glasses can
+happen while other steps go on. A bartender who sees that is faster.
+
+The tip is to analyse workflow to improve concurrency. The diagram makes
+visible which order is required and which is just habit.
+
+#### Opportunities for concurrency and parallelism
+
+The book separates two kinds of opportunity. Concurrency helps when the
+program spends time waiting: for the network, a disk, a database, a user.
+While one task waits, another can run. Parallelism helps when there is a
+lot of computation that splits into independent pieces, such as processing
+each file in a large batch or each region of an image.
+
+In web applications, the common case is the first: a page needs data from
+three services, and each request mostly waits. Starting all three at once
+and waiting for all of them is the single most common concurrency win in
+everyday JavaScript.
+
+#### Limits on concurrency
+
+Starting everything at once is not always right. A batch of ten thousand
+requests started together can exhaust connections, hit rate limits or
+overload the server on the other end. The usual pattern is a concurrency
+limit: keep, say, ten requests in flight, and start the next as each one
+finishes. That keeps most of the speed and none of the stampede.
+
+There is also a limit set by the slowest dependency. When three requests
+run together, the total time is the longest of the three. If one of them
+is much slower than the others, concurrency helps less, and the real fix
+may be caching or changing that one dependency.
+
+#### Ordering that does matter
+
+Removing temporal coupling does not mean removing all order. Some orders
+are real: a user must exist before their first order, a payment must
+succeed before shipping, a migration must run before the code that uses
+the new column. The point of the activity diagram is to separate these
+real dependencies from accidental ones, so that the real ones are written
+down and enforced, and the accidental ones disappear.
+
+### Worked example
+
+**Simple.** Three independent requests, first awaited one after another,
+then started together with `Promise.all`:
+
+```ts
+// Temporal coupling: independent work done in sequence versus concurrently.
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const fetchUser = async () => { await sleep(100); return 'user'; };
+const fetchOrders = async () => { await sleep(150); return 'orders'; };
+const fetchAds = async () => { await sleep(120); return 'ads'; };
+
+let t = Date.now();
+const a = await fetchUser(); const b = await fetchOrders(); const c = await fetchAds();
+console.log('sequential', [a, b, c], Math.round((Date.now() - t) / 50) * 50, 'ms');
+t = Date.now();
+const all = await Promise.all([fetchUser(), fetchOrders(), fetchAds()]);
+console.log('concurrent', all, Math.round((Date.now() - t) / 50) * 50, 'ms');
+```
+
+The output, with times rounded to the nearest 50 milliseconds:
+
+```text
+sequential [ 'user', 'orders', 'ads' ] 350 ms
+concurrent [ 'user', 'orders', 'ads' ] 150 ms
+```
+
+Sequential time is the sum of the three waits, about 370 milliseconds.
+Concurrent time is the longest single wait, 150. The results are the same.
+The only change was removing an ordering that the problem never required.
+
+**Realistic.** An order confirmation step charges the card, reserves stock,
+sends an email and updates analytics. Charging and reserving are both
+required before confirming, but they do not depend on each other, so they
+can run together. The email depends on both succeeding. Analytics depends
+on nothing the user is waiting for, so it can be queued and done later.
+Drawing this as an activity diagram turns a four-step chain into two
+parallel steps, a join, and a background task, and the user waits for
+only the slowest of the first two.
+
+A third example is about computation rather than waiting. A nightly job
+resizes fifty thousand product images. Each image is independent, so the
+job is a perfect fit for parallelism: split the list into chunks and give
+each chunk to a separate worker process or thread, one per core. On an
+eight-core machine the job finishes in roughly an eighth of the time,
+minus some overhead for starting workers and collecting results.
+
+The activity diagram for this job is wide and shallow: one "split" box, many
+independent "resize" boxes, and one synchronisation bar before "write the
+report". When a diagram has that shape, parallelism pays. When it is a
+long chain of dependent boxes, no amount of hardware will make it faster;
+only changing the chain will.
+
+### Step by step
+
+<Figure caption="An activity diagram for order confirmation. Look at the synchronisation bar: the email waits for both charge and reserve, but analytics hangs off to the side." art={`
+                 [ start ]
+                     |
+          +----------+----------+
+          |                     |
+   +------+------+       +------+------+
+   | charge card |       | reserve     |
+   |             |       | stock       |
+   +------+------+       +------+------+
+          |                     |
+   ===========================================  sync bar: wait for both
+                     |
+              +------+------+
+              | send email  |  ---->  ( queue analytics, later )
+              +------+------+
+                     |
+                  [ done ]
+`} />
+
+<Trace columns={["Time (ms)", "Sequential: running", "Concurrent: running"]} rows={[
+  ["0", "fetchUser", "fetchUser, fetchOrders, fetchAds"],
+  ["100", "fetchOrders (user done)", "fetchOrders, fetchAds (user done)"],
+  ["120", "fetchOrders", "fetchOrders (ads done)"],
+  ["150", "fetchOrders", "all done"],
+  ["250", "fetchAds (orders done)", "finished"],
+  ["370", "all done", "finished"],
+]} caption="Timelines of the two versions. Look at the 150 ms row: the concurrent version has already finished, while the sequential one is still on its second request." />
+
+1. **List the actions** in the workflow.
+2. **For each pair, ask whether one needs the other's result.** Draw an
+   arrow only if it does.
+3. **Group actions with no arrows between them.** These can run together.
+4. **Mark joins** where later work needs several earlier results.
+5. **Move work nobody is waiting for** to a background queue.
+
+The diagram is also a communication tool. When I show a teammate the
+activity diagram for a slow endpoint, the fix often becomes obvious to both
+of us at once: two boxes in a chain with no arrow that needs to be there.
+It is quicker to agree on a picture of dependencies than on a description
+of code, and the picture stays useful as documentation afterwards.
+
+### Common mistake
+
+The common mistake is `await` inside a loop over independent items, such as
+fetching a hundred product records one by one. It looks tidy and takes a
+hundred times the latency. The fix is to start the requests together, with
+a limit on how many run at once so the server is not overwhelmed.
+
+The opposite mistake is making dependent steps concurrent. Charging the
+card and sending the "payment received" email at the same time means the
+email can go out for a payment that then fails. The diagram prevents this:
+the email has an arrow from the charge.
+
+### In real systems
+
+Build tools run independent tasks in parallel based on a dependency graph,
+which is an activity diagram in code. Continuous integration pipelines run
+lint, tests and type checks as parallel jobs with a join before deploy.
+Workflow engines model business processes as graphs with explicit joins.
+
+### Check yourself
+
+**What is the difference between concurrency and parallelism?**
+
+<details>
+<summary>Answer</summary>
+
+Concurrency is code that acts as if it runs at the same time, with
+execution interleaved. Parallelism is code that really runs at the same
+time on separate hardware.
+
+</details>
+
+**What does a synchronisation bar mean in an activity diagram?**
+
+<details>
+<summary>Answer</summary>
+
+Wait until every action with an arrow into the bar has finished before
+continuing.
+
+</details>
+
+## Topic 34. Shared State Is Incorrect State
+
+### In one sentence
+
+When two concurrent tasks can read and change the same data, the result
+depends on timing, so shared mutable state must be protected or, better,
+avoided.
+
+### The idea
+
+#### The last slice of pie
+
+The book tells a story set in a diner. Two waiters each see that one slice
+of pie is left in the display case.
+
+Each promises it to a customer. One
+returns with a plate; the other finds the case empty and has a disappointed
+customer. Each waiter's view of the case was correct when they looked, and
+wrong by the time they acted.
+
+That is a **race condition**: the outcome depends on the timing of two
+concurrent activities. The underlying pattern is a **non-atomic
+read-modify-write**.
+
+Each task reads the shared value, decides based on
+it, and writes. Between the read and the write, another task can change
+the value. The tip is blunt: shared state is incorrect state.
+
+#### Why it happens even in JavaScript
+
+JavaScript runs one piece of code at a time on its main thread, so many
+people assume it has no races. But any `await` between a read and a write
+gives other tasks a chance to run. If the read is "fetch stock from the
+database" and the write is "save stock minus one", two requests can both
+read 1 and both write 0, and two items are sold from a stock of one. The
+race is between the requests, not between threads.
+
+#### Semaphores and mutual exclusion
+
+The classic fix is **mutual exclusion**: only one task at a time may be in
+the section of code that reads and writes the shared value. A **semaphore**
+is a counter-based primitive for this; with a count of one it acts as a
+lock, often called a **mutex**. A task must acquire the lock before
+entering and release it after. In the diner, the case gets a single token;
+a waiter must hold it to take or promise pie.
+
+The book notes the weakness: every piece of code that touches the shared
+resource must remember to use the lock. One forgetful path breaks it. So
+it suggests a better design: make the resource itself transactional, so
+the only way to change it is through an operation that handles the
+exclusion internally. The display case offers "take a slice if available",
+which either succeeds or fails, atomically.
+
+#### Multiple resources and non-transactional updates
+
+The book extends the pie story: a customer wants pie and ice cream
+together. Now two resources must be acquired, and the order matters.
+
+Taking pie, then failing to get ice cream, means putting pie back. And two
+waiters acquiring the two in opposite orders can deadlock, as chapter 4
+noted. The fix is a single operation that acquires both or neither, or a
+consistent acquisition order.
+
+It also stresses that shared state is not just memory. Files, database
+rows, external APIs and even the system clock are shared resources, and the
+same races appear with them. The book's other tip is that random failures
+are often concurrency issues: a bug that shows up one time in a thousand
+and disappears under the debugger is very often a race.
+
+#### Optimistic and pessimistic approaches
+
+There are two broad ways to protect shared data. A **pessimistic** approach
+locks first: take the lock, read, change, write, release. Nobody else can
+interfere, but everyone waits in line, even when conflicts are rare.
+
+An **optimistic** approach reads without locking, along with a version
+number, does its work, and writes only if the version has not changed. If
+someone else changed it in the meantime, the write fails and the task
+retries with fresh data. When conflicts are rare, as they are for most
+user profiles or documents, optimistic concurrency is faster and avoids
+deadlocks. When conflicts are common, as with a hot item in a sale,
+pessimistic locking or a single-writer queue avoids endless retries.
+
+#### Immutable data
+
+The simplest way to avoid shared mutable state is to make the data
+immutable. If nothing can change a value after it is created, any number
+of tasks can read it safely. Changes produce new values, which are then
+published in one atomic step, such as replacing a reference. This links
+back to the transforming style of chapter 5: data that flows through
+functions and is never changed in place cannot race.
+
+### Worked example
+
+**Simple.** Two buyers race for the last item. Each reads the stock, waits
+for a simulated database round trip, then writes. The second half runs the
+same buyers through a simple lock that chains operations one after another.
+
+```ts
+// Shared state: an async read-modify-write loses updates; a lock fixes it.
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+let stock = 1;
+async function buy(who: string) {
+  const seen = stock;            // read
+  await sleep(10);               // e.g. a database round trip
+  if (seen > 0) { stock = seen - 1; return `${who}: sold`; }   // write
+  return `${who}: out of stock`;
+}
+console.log(await Promise.all([buy('A'), buy('B')]), 'stock =', stock);
+
+let chain: Promise<unknown> = Promise.resolve();
+const lock = <T,>(f: () => Promise<T>) => { const p = chain.then(f); chain = p.catch(() => {}); return p; };
+stock = 1;
+console.log(await Promise.all([lock(() => buy('A')), lock(() => buy('B'))]), 'stock =', stock);
+```
+
+The output:
+
+```text
+[ 'A: sold', 'B: sold' ] stock = 0
+[ 'A: sold', 'B: out of stock' ] stock = 0
+```
+
+In the first run both buyers are told "sold" for one item, and the stock
+still ends at 0, so nothing even looks wrong in the data. That is what
+makes races dangerous. With the lock, B's read happens after A's write, and
+B is correctly told the item is gone.
+
+**Realistic.** In a real service, the lock above only works inside one
+process; with three server instances, each has its own chain. The robust
+fix moves the atomic operation into the database: a single statement that
+decrements stock only where stock is above zero and reports how many rows
+changed. If zero rows changed, the item was gone. The database makes the
+read-modify-write one transactional step, which is the book's
+"make the resource transactional".
+
+#### Shared state beyond memory
+
+The book's warning applies to every shared resource, not only variables.
+Two cron jobs that write the same report file can interleave lines.
+
+Two
+deploys running at once can each apply half of a set of migrations. Two
+processes that each call an external API with a "set balance" request,
+based on balances they read earlier, can overwrite each other. Even a
+shared clock can mislead, when two servers disagree about the time and
+each decides a token has or has not expired.
+
+For each of these, the same questions apply. Who can change this, and
+when? Is there a gap between deciding and acting? And can the resource
+itself offer an atomic operation, such as an exclusive file lock, a
+migration lock table, or a conditional update API, so the exclusion does
+not depend on every caller's discipline?
+
+#### When updates cannot be transactional
+
+Sometimes the resource offers no transaction, such as a third-party API
+that only has "set". The book suggests other kinds of exclusive access: a
+single process that owns all calls to that API, so requests queue through
+it, or a lease, a lock with an expiry so a crashed holder does not block
+everyone forever. Both are ways of creating one owner for a resource that
+cannot protect itself.
+
+### Step by step
+
+<Trace columns={["Step", "Buyer A", "Buyer B", "stock"]} rows={[
+  ["1", "reads stock: 1", "", "1"],
+  ["2", "awaits database", "reads stock: 1", "1"],
+  ["3", "writes 1 - 1 = 0, says sold", "awaits database", "0"],
+  ["4", "", "writes 1 - 1 = 0, says sold", "0"],
+  ["result", "sold", "sold (wrong)", "0 (one item sold twice)"],
+]} caption="The race, step by step. Look at step 2: B reads before A writes, so both decisions are based on the same stale value." />
+
+<Compare left="Lock in application code" right="Transactional resource" caption="Two ways to fix the race. Look at the second row: the transactional version cannot be bypassed by a forgetful caller." rows={[
+  ["Every caller must take the lock", "The only operation is take-if-available"],
+  ["One forgotten path breaks it", "No path can bypass it"],
+  ["Works inside one process", "Works across many servers"],
+  ["Easy to add, easy to misuse", "Needs the resource to support it"],
+]} />
+
+1. **Find every read-modify-write** on shared data.
+2. **Ask whether anything can run between the read and the write.** In
+   JavaScript, any `await` counts.
+3. **Prefer an atomic operation on the resource**, such as a conditional
+   update or a transaction.
+4. **Otherwise, guard the section with a lock** used by every path.
+5. **For several resources, acquire all or none**, in a consistent order.
+
+#### Pie and ice cream: two resources at once
+
+The book's extension of the diner story is worth working through. A
+customer orders pie with ice cream. Waiter one grabs the last slice of pie,
+then goes for ice cream.
+
+Waiter two, serving the same order for another
+customer, grabbed the last scoop of ice cream first and now goes for pie.
+Each holds one item and waits for the other. Neither can finish, and
+neither will give up what it holds. That is a deadlock.
+
+There are three standard ways out. Acquire both in one operation, so a
+waiter either gets pie and ice cream or neither, which is what a database
+transaction over two rows does.
+
+Acquire in a fixed order, always pie before
+ice cream, so two waiters cannot each hold the item the other needs first.
+Or acquire with a timeout and give everything back on failure, then retry,
+which breaks the wait at the cost of occasional retries. Any of them works;
+mixing them in one system is where trouble starts.
+
+### Common mistake
+
+The common mistake is "check then act" across an `await`: check whether a
+username is free, then insert it. Two signups at once both pass the check.
+The fix is a unique constraint in the database, so the insert itself is
+the check, and the losing request gets a clear error.
+
+Another mistake is believing a bug is random. The fix is to suspect
+concurrency first for intermittent failures, then add logging with
+timestamps and request ids to see the interleaving.
+
+A practical habit follows from all this. When I review a pull request
+that touches shared data, I look for three things: a read and a write with
+an `await` between them, a check followed by an insert, and an update that
+computes a new value from an old one in application code.
+
+Each is a
+candidate race. For each, I ask whether the database or resource can do
+the whole step itself, and if not, which single owner should do it. That
+review takes a few minutes and catches bugs that would otherwise take days
+to reproduce.
+
+### In real systems
+
+Databases provide transactions, row locks, conditional updates and unique
+constraints. Distributed systems use optimistic concurrency with version
+numbers, where an update succeeds only if the version has not changed
+since it was read. Caches use compare-and-set. Each is a way of turning a
+read-modify-write into one indivisible step.
+
+### Check yourself
+
+**Why can JavaScript code have race conditions if it is single-threaded?**
+
+<details>
+<summary>Answer</summary>
+
+Any `await` between reading and writing shared state lets other tasks run
+in between, so they can change the value after it was read.
+
+</details>
+
+**What does it mean to make a resource transactional?**
+
+<details>
+<summary>Answer</summary>
+
+Give it operations that do the whole read-decide-write as one indivisible
+step, so callers cannot get the exclusion wrong.
+
+</details>
+
+## Topic 35. Actors and Processes
+
+### In one sentence
+
+An actor is an independent unit with private state that handles one
+message at a time from its mailbox, so concurrency happens without any
+shared memory.
+
+### The idea
+
+#### What an actor is
+
+The book defines an **actor** as an independent virtual processor with its
+own local, private state. Each actor has a **mailbox**.
+
+When a message
+arrives and the actor is idle, it wakes up, processes the message, and may
+change its own state, send messages to other actors, or create new actors.
+Then it takes the next message. A **process**, in the book's usage, is a
+more general version of the same idea, often implemented by the operating
+system or a language runtime.
+
+There are rules. No actor can see another's state.
+
+There is no central
+control, no scheduler deciding what runs. Messages are one-way: if a reply
+is needed, it is another message. And an actor processes one message at a
+time, completely, so inside an actor there is no concurrency to worry
+about.
+
+#### Why it removes races
+
+Races need shared state. Actors have none, so the pie problem from the
+previous topic cannot happen inside them.
+
+If the display case is an actor,
+waiters send it "give me pie" messages. It handles them one at a time, so
+the second request always sees the result of the first. The exclusion is
+built into the model rather than added by each caller.
+
+The book's tip: use actors for concurrency without shared state.
+
+#### The restaurant example
+
+The book models a diner with actors: a customer, a waiter and a pie case.
+The customer sends the waiter an order.
+
+The waiter asks the pie case for a
+slice. The pie case replies with a slice or with an error if none are
+left, and the waiter tells the customer. Each actor's code is simple and
+sequential. The concurrency, many customers and waiters at once, comes
+from many actors exchanging messages.
+
+#### Where actors run
+
+Erlang and Elixir build their whole runtime on this model, with millions of
+lightweight processes and supervisors that restart them, as chapter 4
+described. Akka offers actors on the JVM. In JavaScript, Web Workers and
+Node worker threads are process-like: they share no memory by default and
+communicate with messages. Separate microservices talking through queues
+are actors at a larger scale.
+
+#### What actors cost
+
+Actors are not free. Because every interaction is a message, a simple call
+becomes a send and a later reply, which is more code and harder to follow
+than a function call. Messages can queue up if an actor is slow, so
+mailboxes need monitoring. And operations that span several actors, such
+as moving money between two account actors, need a protocol of messages,
+because there is no transaction that covers both.
+
+The book's view is that these costs are worth paying where concurrency is
+central, because the alternative, shared memory with locks, fails in ways
+that are much harder to find. For code that is mostly sequential, plain
+functions remain simpler.
+
+### Worked example
+
+**Simple.** A tiny actor in TypeScript. It has a private `done` counter
+and a mailbox. Sending three orders at once still has them handled one
+after another, in order:
+
+```ts
+// Actors: each owns its state and handles one message at a time from a mailbox.
+type Msg = { type: 'order'; dish: string; reply: (s: string) => void };
+function actor(name: string, handle: (m: Msg, state: { done: number }) => Promise<void>) {
+  const state = { done: 0 }; const box: Msg[] = []; let busy = false;
+  const drain = async () => { if (busy) return; busy = true;
+    while (box.length) await handle(box.shift()!, state); busy = false; };
+  return { send: (m: Msg) => { box.push(m); void drain(); }, name };
+}
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const chef = actor('chef', async (m, st) => { await sleep(20); st.done++; m.reply(`chef cooked ${m.dish} (#${st.done})`); });
+const results: string[] = [];
+await new Promise<void>(res => {
+  for (const dish of ['dal', 'roti', 'rice']) chef.send({ type: 'order', dish, reply: s => { results.push(s); if (results.length === 3) res(); } });
+});
+console.log(results.join('\n'));
+```
+
+The output:
+
+```text
+chef cooked dal (#1)
+chef cooked roti (#2)
+chef cooked rice (#3)
+```
+
+Even though each order involves an `await`, the counter never races,
+because the `busy` flag means only one message is in progress at a time.
+Nothing outside the actor can touch `state`; the only way in is `send`.
+
+**Realistic.** A ride-sharing system models each driver as an actor. The
+driver actor holds that driver's location and status. Ride requests,
+location updates and cancellations arrive as messages. Because one actor
+handles one driver's messages in sequence, a cancellation and a new
+assignment can never interleave in a way that leaves the driver assigned
+to two riders. Thousands of drivers run concurrently as thousands of
+independent actors.
+
+#### Supervision and failure
+
+Actors pair naturally with crash early from chapter 4. Because an actor's
+state is private and its mailbox is its only input, an actor that hits a
+bad state can simply stop.
+
+A supervisor actor notices and starts a fresh
+one, and the rest of the system carries on. The failed message can be
+logged or retried. This is why Erlang systems are known for staying up for
+years: individual actors fail all the time, and the structure absorbs it.
+
+In JavaScript, the same structure appears with worker threads or child
+processes managed by a pool. A worker that throws is replaced, and the
+pool retries or reports the job. The principle is the same: isolate state,
+fail small, restart clean.
+
+#### Actors in the browser
+
+Web Workers bring the model to the front end. A worker has its own global
+scope, shares no variables with the page, and talks to it only through
+`postMessage`. Heavy work, such as parsing a large file or running a search
+index, moves into a worker, and the page stays responsive. Thinking of the
+worker as an actor, with a clear set of messages it accepts and sends,
+keeps the interface between the two small and testable.
+
+### Step by step
+
+<Figure caption="The diner as actors. Look at the arrows: every interaction is a one-way message, and the pie case handles requests one at a time." art={`
+  +----------+   order pie    +--------+   get slice    +----------+
+  | customer | -------------> | waiter | -------------> | pie case |
+  +----------+                +--------+                | mailbox: |
+       ^                        |    ^                  | [w1][w2] |
+       |     here is your pie   |    |  slice / none    +----------+
+       +------------------------+    +----------------------+
+`} />
+
+<Layers caption="Inside one actor. Look at the middle layer: messages wait in the mailbox, so the handler never runs twice at once." layers={[
+  "send(message): the only public operation",
+  "Mailbox: a queue of messages in arrival order",
+  "Handler: takes one message, runs to completion",
+  "Private state: visible only to the handler",
+]} />
+
+1. **Identify the things that own state**, such as a driver, an account or
+   a cart.
+2. **Make each one an actor** with private state and a mailbox.
+3. **Turn every interaction into a message**, with replies as messages too.
+4. **Process one message at a time** inside each actor.
+5. **Get concurrency from many actors**, not from concurrency inside one.
+
+A second realistic example is a chat server. Each chat room is an actor
+holding its member list and recent messages.
+
+A user joining, leaving or
+posting sends a message to the room actor, which updates its state and
+sends the new message to each member's connection actor. Two people posting
+at the same moment are simply two messages in the room's mailbox, handled
+in order, so every member sees the same sequence. Nothing needs a lock,
+and a room that crashes is restarted by its supervisor with its history
+reloaded from storage, while every other room carries on.
+
+### Common mistake
+
+The common mistake is sharing an object between actors by putting it in a
+message and then changing it, so two actors hold the same mutable object.
+That reintroduces shared state through the back door. The fix is to send
+copies or immutable data.
+
+Another mistake is synchronous request-reply chains between actors, where
+A waits for B, which waits for A. That is a deadlock. The fix is one-way
+messages and a design where no actor blocks waiting for another.
+
+The model also changes how I design APIs between parts of a system. If I
+think of a component as an actor, I describe it by the messages it accepts
+and the messages it sends, not by its internal methods. That list is a
+small, stable contract, and it makes the component easy to replace or move
+to another process later.
+
+### In real systems
+
+WhatsApp's back end on Erlang and many telecom systems are famous actor
+systems. Orleans offers virtual actors in .NET. In JavaScript, worker pools
+and message queues apply the same model. The common thread is ownership:
+each piece of state has exactly one owner that processes changes in order.
+
+### Check yourself
+
+**Why does an actor not need locks for its own state?**
+
+<details>
+<summary>Answer</summary>
+
+Only the actor can see its state, and it handles one message at a time to
+completion, so no two operations on that state ever interleave.
+
+</details>
+
+**How does an actor reply to a message?**
+
+<details>
+<summary>Answer</summary>
+
+By sending another one-way message, for example to a reply address or
+callback included in the original message.
+
+</details>
+
+## Topic 36. Blackboards
+
+### In one sentence
+
+A blackboard is a shared space where independent agents post facts and
+react to facts, so work can be coordinated without any agent knowing the
+others or the order of events.
+
+### The idea
+
+#### The detective's blackboard
+
+The book's image is a group of detectives working on a case. Nobody is in
+charge of the order of work.
+
+Each detective writes discoveries on a shared
+blackboard and reads what others have written. A fact posted by one may
+trigger an insight in another. The case is solved by the combined facts,
+whatever order they arrived in.
+
+A software **blackboard** works the same way. **Agents** are independent
+pieces of code.
+
+Each watches the blackboard for the facts it cares about,
+does its work, and posts new facts. No agent knows which others exist.
+Agents can be added, removed or replaced without changing the rest.
+
+#### Why it fits some workflows
+
+The book's example is a loan application. Processing it needs many
+checks: identity, credit history, income, employment, property valuation.
+
+Some depend on others, some arrive from outside parties, some take days,
+and the rules change often. Hard-coding the order in one workflow is
+brittle. With a blackboard, each check posts its result, and rules fire
+when the facts they need are all present, in whatever order they came.
+
+The tip: use blackboards to coordinate workflow.
+
+#### Modern blackboards
+
+Early blackboard systems were tuple spaces such as Linda and JavaSpaces.
+The book points out that today's messaging systems, such as Kafka and
+NATS, are blackboard-like: producers post events to topics, consumers
+react, events are persisted and can be replayed. They add delivery
+guarantees and history that the old systems lacked.
+
+#### The cost
+
+The book is honest about the downside. Because nothing in the code says
+"after identity, check credit", it is hard to reason about the overall
+flow. Debugging needs tooling: a log of every fact posted, with timestamps
+and the agent that posted it, and a way to trace one application through
+all of them. Without that, a blackboard becomes a mystery.
+
+#### Blackboards and rules that change
+
+The loan example has a second benefit beyond ordering: rules change. A
+regulator adds a new requirement, the business adds a fast track for
+existing customers, a credit agency is replaced. In a hard-coded workflow,
+each change edits the central function and risks breaking the others. On a
+blackboard, a new requirement is a new agent and a changed rule; existing
+agents keep working without change.
+
+That makes the blackboard a good fit when the domain is full of
+independent checks run by different teams or outside parties, and a poor
+fit when the process is short, stable and owned by one team. Choosing
+between them is a design decision worth writing down, with the reason.
+
+### Worked example
+
+**Simple.** A blackboard for a loan decision. Three agents report results
+in an arbitrary order; the approval rule fires only once all three facts
+are present.
+
+```ts
+// A blackboard: independent agents post facts; a rule fires when its facts are present.
+type Facts = Map<string, unknown>;
+const board: Facts = new Map();
+const rules = [
+  { name: 'approve', needs: ['identity_ok', 'credit_ok', 'income_ok'], fired: false },
+  { name: 'reject', needs: ['credit_bad'], fired: false },
+];
+function post(key: string, value: unknown) {
+  board.set(key, value);
+  console.log(`posted ${key}`);
+  for (const r of rules) if (!r.fired && r.needs.every(k => board.has(k))) { r.fired = true; console.log(`  rule ${r.name} fires`); }
+}
+// Agents report in whatever order their checks finish.
+post('income_ok', true);
+post('identity_ok', true);
+post('credit_ok', 742);
+```
+
+The output:
+
+```text
+posted income_ok
+posted identity_ok
+posted credit_ok
+  rule approve fires
+```
+
+Swapping the order of the three `post` calls gives the same decision; the
+only difference is which line triggers it. Adding a new check, such as
+employment verification, means adding one agent and one fact to the rule,
+with no change to the existing agents.
+
+**Realistic.** An insurance claims platform publishes "claim filed" to a
+topic. A fraud agent, a policy-coverage agent and a document-check agent
+each consume it and publish their findings to another topic. A decision
+service subscribes to findings and acts when it has all it needs for a
+claim, or when a deadline passes. Every fact is stored, so investigators
+can replay exactly what was known when the decision was made.
+
+#### Designing good facts
+
+A blackboard is only as clear as the facts on it. Good facts are named for
+what happened, in the past tense, such as "credit checked" or "identity
+verified", rather than commands such as "check income". They carry the id
+of the case they belong to, the time they were established and the agent
+that posted them. And they are immutable: a correction is a new fact, not
+an edit to the old one, so the history of what was known when stays
+intact.
+
+These rules make debugging possible. Given a loan id, I can list every
+fact in order and see exactly why the decision rule fired, or why it did
+not. Without them, the blackboard turns into a pile of anonymous notes, and
+the flexibility that justified it becomes a liability.
+
+### Step by step
+
+<Figure caption="A blackboard for loan processing. Look at the agents: none points to another; all arrows go to or from the board." art={`
+   +-----------+     +-----------+     +-----------+
+   | identity  |     |  credit   |     |  income   |
+   |   agent   |     |   agent   |     |   agent   |
+   +-----+-----+     +-----+-----+     +-----+-----+
+         | post            | post            | post
+         v                 v                 v
+   +-----------------------------------------------+
+   |                  BLACKBOARD                   |
+   |  identity_ok   credit_ok: 742   income_ok     |
+   +-----------------------+-----------------------+
+                           | watches
+                     +-----+------+
+                     |  decision  |  fires when all three are present
+                     +------------+
+`} />
+
+<Compare left="Hard-coded workflow" right="Blackboard" caption="Two ways to run the loan checks. Look at the last row: the blackboard trades a visible flow for flexibility, and needs tooling to make up for it." rows={[
+  ["One function calls each check in order", "Agents react to facts as they appear"],
+  ["Adding a check edits the workflow", "Adding a check adds an agent"],
+  ["Order is fixed, even when it need not be", "Any arrival order works"],
+  ["Flow is readable in one place", "Flow needs logs and tracing to see"],
+]} />
+
+1. **List the facts** the workflow needs to reach a decision.
+2. **Make each source of facts an agent** that posts to the board.
+3. **Write rules as "when these facts are present, do this"**.
+4. **Log every post** with time, agent and correlation id.
+5. **Handle missing facts** with deadlines, not by waiting forever.
+
+It helps to compare the blackboard with the other structures in this
+chapter. An actor owns state and handles messages in order; a blackboard
+holds shared facts that many agents read.
+
+That sounds like the shared state
+topic 34 warned about, and the difference is that facts are only added,
+never changed in place. Agents never race to update the same value; they
+post new facts, and rules read the accumulated set. Append-only data is
+the same idea as immutable data, applied to a whole workflow.
+
+In practice the two combine well. Each agent can be an actor with its own
+private working state, and the blackboard is the shared, append-only record
+of what the agents have concluded. Many event-driven systems look exactly
+like this, even when nobody calls them a blackboard.
+
+### Common mistake
+
+The common mistake is using a blackboard for a simple, fixed sequence. If
+the steps always happen in the same order and rarely change, a plain
+function is clearer and easier to debug. The fix is to reserve blackboards
+for workflows with many independent, changing parts.
+
+Another mistake is agents that post facts without identifiers, so facts
+from two applications mix. Every fact needs the id of the case it belongs
+to.
+
+### In real systems
+
+Event-driven architectures built on Kafka or cloud event buses are the
+common modern form. Workflow engines combine blackboard-style events with
+explicit state. Observability tools that trace events across services
+exist largely because blackboard-style systems need them.
+
+### Check yourself
+
+**What is the main advantage of a blackboard over a hard-coded workflow?**
+
+<details>
+<summary>Answer</summary>
+
+Agents are independent, facts can arrive in any order, and new agents can
+be added or changed without editing the others or a central workflow.
+
+</details>
+
+**What is the main cost?**
+
+<details>
+<summary>Answer</summary>
+
+The overall flow is no longer visible in the code, so it is harder to
+reason about and debug without logs and tracing of every fact.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 6, Concurrency">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, concurrency starts with `async` and `await` and one
+question: does this step need the previous one's result? If not, the two
+can start together. Learning to spot independent requests and combine them
+with `Promise.all` is the first real win.
+
+Example: a profile page fetches the user, their posts and their followers.
+None depends on another, so all three start at once.
+
+Mistake: `await` inside a `for` loop over independent ids. Fix: map the ids
+to promises and await them together, with a concurrency limit if there are
+many.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level I recognise races. I know that any `await`
+between reading and writing shared state is a gap another task can use,
+and I reach for atomic operations, unique constraints and transactions.
+
+Example: a "like" counter updated with a single database increment
+statement instead of reading the count, adding one and writing it back.
+
+Mistake: protecting a read-modify-write with an in-memory lock in a service
+that runs on several servers. Fix: move the exclusion into the database or
+a distributed lock designed for it.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level I design ownership. Each piece of mutable state has
+one owner that processes changes in order: an actor, a single-writer
+queue, or a database row with optimistic locking. Other code sends
+requests rather than touching the state.
+
+Example: all changes to a shopping cart go through a per-cart queue, so
+add, remove and checkout for one cart never interleave, while different
+carts proceed in parallel.
+
+Mistake: one global queue for all carts, which serialises everything and
+becomes the bottleneck. Fix: partition by owner, one queue or actor per
+cart or per shard.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include a `Promise.all` where one request fails, a lock whose
+holder throws, and a blackboard rule whose facts never all arrive.
+
+Example: `Promise.all` rejects as soon as one promise rejects, discarding
+the others' results; `Promise.allSettled` returns every outcome when
+partial results are useful.
+
+Mistake: a lock helper that never releases when the guarded function
+throws, so every later caller waits forever. Fix: release in `finally`, as
+the `lock` helper in this chapter does by catching on the chain.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine timing with failure: a request that times out on the
+client but succeeds on the server; a message delivered twice by a queue;
+two actors that each wait for a reply from the other.
+
+Example: a payment request times out, the client retries, and the customer
+is charged twice because the first attempt had actually succeeded.
+
+Mistake: retrying non-idempotent operations. Fix: send an idempotency key
+with each operation so the server recognises and ignores a repeat.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production, concurrency bugs are found with evidence. Logs carry
+request ids and precise timestamps so interleavings can be reconstructed.
+Load tests run the same operation from many clients at once to provoke
+races before users do. Metrics track lock waits, queue lengths and retry
+counts.
+
+Example: a nightly test fires a hundred concurrent purchases of an item
+with stock ten and asserts exactly ten succeed.
+
+Mistake: testing concurrency only with one user. Fix: every operation on
+shared data gets at least one concurrent test.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is suspicion of shared mutable state. When I see a variable or
+row that several tasks can change, I treat it as a bug until proven safe.
+And when a failure is intermittent, I suspect timing first.
+
+Example: on reading new code, I list every piece of shared state and ask
+who can change it and when.
+
+Mistake: "it works on my machine" for concurrent code, where the timing on
+one laptop hides the race. Fix: reason about every possible interleaving,
+and test under load.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+At system design level, the choices are about where state lives and who
+owns it: databases with transactions for shared business data, partitioned
+queues or actors for per-entity ordering, and event logs as blackboards
+between services.
+
+Example: an order system where each order id maps to one partition of an
+event log, so all events for an order are processed in order by one
+consumer, while thousands of orders proceed in parallel.
+
+Mistake: assuming global ordering across a distributed system. Fix:
+require ordering only per entity, and design for events from different
+entities to arrive in any order.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+Strategically, concurrency is a scaling lever and a risk. Teams that pick
+a clear model, such as actors, single writers or event logs, and apply it
+consistently, scale more safely than teams that add threads and locks case
+by case.
+
+Example: a platform team publishes a short guide: shared business state
+goes in the database with constraints; per-entity workflows use
+partitioned queues; nothing else shares memory.
+
+Mistake: letting each team invent its own locking scheme. Fix: a small set
+of approved patterns, with libraries that make the safe way the easy way.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Does Node.js really need to worry about races?</summary>
+
+Yes. One thread does not mean one task. Every `await` lets other requests
+run, and every external resource, such as a database or file, is shared
+with other processes and servers too.
+
+</details>
+
+<details>
+<summary>When should I use worker threads in Node.js?</summary>
+
+When there is heavy computation that would block the event loop, such as
+image processing or large parsing jobs. Workers give parallelism with
+message passing, which is the actor model. For waiting on input and
+output, plain `async` code is enough.
+
+</details>
+
+<details>
+<summary>Are actors the same as microservices?</summary>
+
+They share the idea of private state and message passing. Actors are
+usually much smaller and lighter, often millions in one runtime.
+Microservices are deployable units that may each contain many actors or
+none.
+
+</details>
+
+<details>
+<summary>Is a message queue a blackboard?</summary>
+
+Close to one. A persistent event log where many independent consumers
+react to facts and post new ones behaves like the book's blackboard, with
+history and delivery guarantees added.
+
+</details>
+
+<details>
+<summary>Is optimistic or pessimistic locking better?</summary>
+
+It depends on how often conflicts happen. With rare conflicts, optimistic
+locking with version numbers is faster and avoids deadlocks. With frequent
+conflicts on the same data, pessimistic locks or a single-writer queue
+avoid wasted retries.
+
+</details>
+
+<details>
+<summary>How do I test for a race condition?</summary>
+
+Run the operation many times concurrently and check an invariant, such as
+"items sold never exceed stock". Adding small random delays between steps
+in a test build makes rare interleavings more likely to appear.
+
+</details>
+
+## Key takeaways
+
+- Concurrency is interleaved execution; parallelism is simultaneous execution. Races need only the first.
+- Temporal coupling is an unnecessary dependency on order; activity diagrams reveal it.
+- Start independent work together and join where results are needed.
+- Shared mutable state is incorrect state: a read-modify-write with a gap can lose updates.
+- Prefer transactional resources and atomic operations over locks every caller must remember.
+- Random failures are often concurrency issues.
+- Actors own private state and process one message at a time, so they need no locks.
+- Blackboards let independent agents coordinate through facts, at the cost of a less visible flow.
+
+## Glossary
+
+- **Concurrency**: code acting as if it runs at the same time, with execution interleaved.
+- **Parallelism**: code actually running at the same time on separate hardware.
+- **Temporal coupling**: depending on an order of execution the problem does not require.
+- **Activity diagram**: a diagram of actions and the dependencies between them.
+- **Synchronisation bar**: a point in an activity diagram that waits for several actions to finish.
+- **Race condition**: an outcome that depends on the timing of concurrent tasks.
+- **Atomic**: happening as one indivisible step that others cannot observe halfway.
+- **Semaphore**: a counter-based primitive that limits how many tasks can enter a section at once.
+- **Mutex**: a lock that lets only one task into a section at a time.
+- **Actor**: an independent unit with private state that handles one message at a time.
+- **Mailbox**: the queue of messages waiting for an actor.
+- **Blackboard**: a shared space where independent agents post and react to facts.
+- **Idempotent**: giving the same result whether performed once or many times.
+
+## Exercises and self-check
+
+**Warm-up.** Draw an activity diagram for a morning routine or a build
+script I use. Mark which steps could run at the same time, and how much
+time that would save.
+
+**Build.** Write an inventory service function that sells an item. First
+write the racy version and a test that fires twenty concurrent buys of a
+stock of five and shows overselling. Then fix it with a single-writer
+queue, and the test should show exactly five sales.
+
+**Stretch.** Build a small blackboard for a job application: agents for a
+CV parser, a skills match and a reference check, each posting facts after
+a random delay. A rule fires an interview invitation when all three are
+positive. Run it ten times and log the order of facts each time.
+
+<details>
+<summary>Self-check: why is a lock in one process not enough for a service on three servers?</summary>
+
+Each server has its own memory and its own lock, so requests on different
+servers do not exclude each other. The exclusion must live in a shared
+resource such as the database.
+
+</details>
+
+<details>
+<summary>Self-check: what makes the actor counter safe without a lock?</summary>
+
+Only the actor's handler can touch its state, and the mailbox ensures one
+message is processed at a time, so updates never interleave.
+
+</details>
+
+<details>
+<summary>Self-check: what tooling does a blackboard system need?</summary>
+
+A log of every fact posted, with time, posting agent and a correlation id,
+and a way to trace one case through all its facts.
+
+</details>
+
+## How I'd study this chapter
+
+<Timeline caption="A one-week plan for the chapter. Look at day 2: seeing a race happen in my own code is what makes the rest stick." items={[
+  { label: "Day 1", text: "Read topic 33; draw activity diagrams for two real workflows." },
+  { label: "Day 2", text: "Read topic 34; write the racy inventory code and watch it oversell." },
+  { label: "Day 3", text: "Fix the race with a queue and with a conditional database update." },
+  { label: "Day 4", text: "Read topic 35; build the actor and send it concurrent messages." },
+  { label: "Day 5", text: "Read topic 36; build the job-application blackboard." },
+]} />
+
+Done when: I can show a race in my own code and two different fixes for
+it, my actor handles concurrent messages in order, and my blackboard
+reaches the same decision for any arrival order.
