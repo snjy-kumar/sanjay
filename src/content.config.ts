@@ -8,7 +8,16 @@ const blog = defineCollection({
     title: z.string(),
     series: z.string(),
     seriesOrder: z.number(),
-    date: z.coerce.date(),
+    /** The day the note goes live. Required for a dated series (TypeScript,
+     *  React, JavaScript, Redux): their notes are merged by date, and a
+     *  note whose date has not come is not in the collection at all. Left
+     *  out, with `undated: true`, for a note in a dedicated series: it is
+     *  released as soon as it is merged and has no place in the timeline.
+     *  See docs/UNDATED_NOTE_GUIDE.md. */
+    date: z.coerce.date().optional(),
+    /** True for a note that has no date. Its order is its seriesOrder,
+     *  which is its position in the series' `planned` list in series.ts. */
+    undated: z.boolean().default(false),
     readTime: z.string(),
     description: z.string(),
     /** Topic slugs from src/data/tags.ts. Every one of them gets a page at
@@ -20,6 +29,16 @@ const blog = defineCollection({
     /** Ids of related notes, in the form "<series>/<number>". Cross-series
      *  on purpose: the same mistake often shows up in two languages. */
     related: z.array(z.string()).default([]),
+  }).superRefine((data, ctx) => {
+    // Exactly one of the two: a dated note carries its day, an undated note
+    // says so. A dated note with no date would otherwise drop silently out
+    // of the timeline.
+    if (data.undated && data.date) {
+      ctx.addIssue({ code: 'custom', path: ['date'], message: 'an undated note has no date' });
+    }
+    if (!data.undated && !data.date) {
+      ctx.addIssue({ code: 'custom', path: ['date'], message: 'is required unless the note sets undated: true' });
+    }
   }),
 });
 

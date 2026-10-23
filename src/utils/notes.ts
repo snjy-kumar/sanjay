@@ -43,9 +43,44 @@ export function monthLabel(date: Date): string {
   }).format(date);
 }
 
-/** Newest first. */
+/** A note in a dedicated series: no date, released when it is merged. */
+export function isUndated(note: Note): boolean {
+  return note.data.undated || !note.data.date;
+}
+
+/** The notes that have a day: the daily series. Only these go into the
+ *  timeline, the month groups and the counters. */
+export function datedNotes(notes: Note[]): (Note & { data: { date: Date } })[] {
+  return notes.filter((note) => !isUndated(note)) as (Note & { data: { date: Date } })[];
+}
+
+/** The undated notes, series by series in series.ts order, then by their
+ *  number in the series. That order is stable: it never depends on when a
+ *  note was merged. */
+export function undatedNotes(notes: Note[]): Note[] {
+  const order = (id: string) => series.findIndex((s) => s.id === id);
+  return notes
+    .filter(isUndated)
+    .sort((a, b) =>
+      order(a.data.series) - order(b.data.series) || a.data.seriesOrder - b.data.seriesOrder,
+    );
+}
+
+/** Newest first. Undated notes have no day, so they come after every dated
+ *  one, in series and then note order. */
 export function byDateDesc(a: Note, b: Note): number {
-  return b.data.date.valueOf() - a.data.date.valueOf();
+  const aDate = a.data.date;
+  const bDate = b.data.date;
+  if (aDate && bDate && !isUndated(a) && !isUndated(b)) return bDate.valueOf() - aDate.valueOf();
+  if (!isUndated(a)) return -1;
+  if (!isUndated(b)) return 1;
+  const order = (id: string) => series.findIndex((s) => s.id === id);
+  return order(a.data.series) - order(b.data.series) || a.data.seriesOrder - b.data.seriesOrder;
+}
+
+/** What a list row shows where a dated note shows its day: "Note 03". */
+export function undatedLabel(note: Note): string {
+  return `Note ${String(note.data.seriesOrder).padStart(2, '0')}`;
 }
 
 /** In series order — the order the series reads in. */
@@ -130,10 +165,14 @@ const DAY = 86_400_000;
 
 /** The numbers the path page and the homepage quote. Every one is derived
  *  from the collection at build time, so none of them can go stale. */
-export function counters(notes: Note[]): Counters {
-  if (notes.length === 0) {
+export function counters(all: Note[]): Counters {
+  // The streak, the days and the weeks are about the daily series, so the
+  // undated notes are counted in `notes` and `series` but have no day.
+  const notes = datedNotes(all);
+  if (all.length === 0 || notes.length === 0) {
     return {
-      notes: 0, series: 0, days: 0, weeks: 0, thisWeek: 0, streak: 0,
+      notes: all.length, series: new Set(all.map((note) => note.data.series)).size,
+      days: 0, weeks: 0, thisWeek: 0, streak: 0,
       first: null, last: null,
     };
   }
@@ -152,8 +191,8 @@ export function counters(notes: Note[]): Counters {
   const thisWeek = times.filter((time) => dayOf(time) >= lastWeek).length;
 
   return {
-    notes: notes.length,
-    series: new Set(notes.map((note) => note.data.series)).size,
+    notes: all.length,
+    series: new Set(all.map((note) => note.data.series)).size,
     days: dayOf(last.getTime()) - dayOf(first.getTime()) + 1,
     weeks: Math.ceil(
       (dayOf(last.getTime()) - dayOf(first.getTime()) + 1) / 7,
@@ -165,13 +204,13 @@ export function counters(notes: Note[]): Counters {
   };
 }
 
-/** The notes grouped by the month they were published in, newest month
- *  first. */
+/** The dated notes grouped by the month they were published in, newest
+ *  month first. Undated notes have no month and are left out. */
 export function notesByMonth(notes: Note[]): { month: string; notes: Note[] }[] {
-  const sorted = [...notes].sort(byDateDesc);
+  const sorted = [...datedNotes(notes)].sort(byDateDesc);
   const groups: { month: string; notes: Note[] }[] = [];
   for (const note of sorted) {
-    const label = monthLabel(note.data.date);
+    const label = monthLabel(note.data.date!);
     const last = groups[groups.length - 1];
     if (last && last.month === label) last.notes.push(note);
     else groups.push({ month: label, notes: [note] });
