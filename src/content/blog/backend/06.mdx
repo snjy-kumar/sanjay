@@ -1,0 +1,1052 @@
+---
+title: "SQL: joins, aggregates, CTEs and window functions"
+series: "backend"
+seriesOrder: 6
+undated: true
+readTime: "about 25 min"
+description: "Read SQL in the order it runs, then use joins, aggregates, CTEs and window functions on a real Postgres dataset, including the NULL and fan-out traps that give wrong totals."
+tags: ['databases', 'performance', 'debugging']
+related: ['backend/05']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+The worst SQL bugs do not throw. A dashboard showed one customer with five
+orders when she had three, and nothing failed: a join had quietly
+multiplied her rows before the count ran. SQL is a language where a wrong
+query usually returns a confident, wrong number. This note builds the
+mental model that catches that: read a query in the order the database
+runs it, and know exactly how many rows exist at each step.
+
+Every query here ran against Postgres 17 on a small shop dataset, and every
+result table is the real output.
+
+## Before you start
+
+After this note you will be able to:
+
+- read any `select` in its logical order and say what each clause can and
+  cannot see;
+- choose between inner and left joins, and avoid the `where` clause that
+  silently turns a left join back into an inner one;
+- count correctly through a join without fan-out, and know what `NULL`
+  does to `count`, `=` and `not in`;
+- break a long query into named steps with CTEs, including a recursive one;
+- use window functions for running totals, top-N per group and
+  "previous row" questions without self-joins.
+
+What you should already know: `select`, `from`, `where` and `order by` on
+one table, and what a primary key and a foreign key are.
+
+Reading time: about 25 minutes. Typing the queries into `psql` as you go
+makes it stick.
+
+The dataset is four customers, six orders and eight order lines:
+
+```sql
+create table customers (id int primary key, name text not null, city text);
+create table orders (id int primary key, customer_id int references customers,
+                     placed_on date not null, status text not null);
+create table order_items (order_id int references orders, sku text, qty int,
+                          price_cents int, primary key (order_id, sku));
+-- customers: Asha (Pune), Ravi (Delhi), Meera (no city), Kabir (Pune, no orders)
+-- orders: Asha 10, 11, 15 paid; Ravi 12 refunded, 13 paid; Meera 14 paid
+```
+
+## Note map
+
+<Flow steps={[
+  "Logical order: the sequence the clauses really run in",
+  "Joins: combining tables, and how many rows come out",
+  "Aggregates and NULL: collapsing rows, and the value that is not a value",
+  "CTEs: naming each step so a long query reads top to bottom",
+  "Window functions: per-row answers that look at neighbouring rows",
+]} caption="The note's path. Each part depends on the first: once you know when a clause runs, joins, groups and windows stop being surprising." />
+
+## Reading a query in the order it runs
+
+### In one sentence
+
+SQL is written `select` first, but runs `from` first, and almost every
+"column does not exist" error comes from forgetting that.
+
+### The idea
+
+A `select` statement is written in this order: `select`, `from`, `where`,
+`group by`, `having`, `order by`, `limit`. The database evaluates it, in
+logical terms, in a different order:
+
+1. `from` and `join`: build one big row set from the tables.
+2. `where`: keep only rows that pass the condition.
+3. `group by`: collapse rows into groups.
+4. `having`: keep only groups that pass a condition.
+5. `select`: compute the output columns, including aliases.
+6. Window functions: computed over the selected rows.
+7. `distinct`, then `order by`, then `limit` and `offset`.
+
+The optimiser is free to execute the work in any physical order that gives
+the same result, but the **logical order** decides what each clause can
+see. `where` runs before `select`, so it cannot use a `select` alias.
+`where` runs before `group by`, so it cannot use an aggregate. `order by`
+runs after `select`, so it can use aliases.
+
+The habit that follows is to count rows at each step. After `from`, how
+many rows? After `where`? After `group by`, how many groups? Most wrong
+results come from a step having a different count than you assumed.
+
+### Worked example
+
+The simple case is the alias error. I wrote a line total and filtered on
+it:
+
+```sql
+select sku, qty * price_cents as line_total
+from order_items
+where line_total > 10000;
+```
+
+```text
+ERROR:  column "line_total" does not exist
+```
+
+The alias is created in step 5; `where` runs in step 2. Repeat the
+expression in `where`, and use the alias where it is allowed, in `order
+by`:
+
+```sql
+select sku, qty * price_cents as line_total
+from order_items
+where qty * price_cents > 10000
+order by line_total desc;
+```
+
+```text
+ sku  | line_total
+------+------------
+ lamp |     120000
+ lamp |     110000
+ book |      56000
+ book |      30000
+```
+
+The realistic case is filtering on a count:
+
+```sql
+select customer_id, count(*) from orders where count(*) > 1 group by customer_id;
+```
+
+```text
+ERROR:  aggregate functions are not allowed in WHERE
+```
+
+`where` filters rows before groups exist. Filters on groups go in
+`having`, which runs after `group by`.
+
+### Step by step
+
+<Figure art={`
+  written order              logical order
+  -------------              -------------
+  select   ......... 5       1  from / join     build the row set
+  from     ......... 1       2  where           filter rows
+  where    ......... 2       3  group by        collapse into groups
+  group by ......... 3       4  having          filter groups
+  having   ......... 4       5  select          compute columns, aliases
+  window   ......... 6       6  window          per-row over the result
+  order by ......... 7       7  order by        sort, may use aliases
+  limit    ......... 8       8  limit           cut
+`} caption="The same clauses in two orders. Each clause can only see what was made in the steps above it in the right-hand column; that one rule explains every error in this part." />
+
+### Common mistake
+
+The common mistake is moving a row filter into `having` "because it works".
+`having city = 'Pune'` on a grouped query does run, but it filters after
+the expensive grouping instead of before it, and on large tables it is
+slower. The fix is: row conditions in `where`, group conditions in
+`having`.
+
+### In real systems
+
+Query plans, covered in the indexes note later in this series, show the
+physical order the optimiser picked. It often pushes `where` conditions
+down into the table scans and reorders joins. The logical order is still
+the one to reason about for correctness; the physical order is for speed.
+
+### Check yourself
+
+<details>
+<summary>1. Can order by use a select alias? Can where?</summary>
+
+`order by` can, because it runs after `select`. `where` cannot, because it
+runs before `select` has created the alias.
+
+</details>
+
+## Joins and how many rows come out
+
+### In one sentence
+
+A join pairs rows from two tables that match a condition, and the number of
+rows out can be smaller, equal or much larger than either input.
+
+### The idea
+
+An **inner join** keeps only pairs that match. A customer with no orders
+disappears; an order with no customer (if that were allowed) disappears. A
+**left join** keeps every row from the left table and fills the right
+table's columns with `NULL` when nothing matches. Right and full joins are
+the mirror and the union of that.
+
+The number of output rows is the number of matching pairs. If each order
+has one customer, joining orders to customers keeps the order count. If
+each order has several lines, joining orders to order lines multiplies:
+one row per line. That multiplication is called **fan-out**, and it is the
+cause of most wrong totals.
+
+The second trap is where to put a condition on the right table of a left
+join. In the `on` clause, it decides which right rows match, and unmatched
+left rows still survive with `NULL`s. In the `where` clause, it runs after
+the join, sees those `NULL`s, and throws the rows away, which silently
+turns the left join into an inner join.
+
+### Worked example
+
+The simple case is inner versus left on customers and orders:
+
+```sql
+select c.name, o.id as order_id
+from customers c left join orders o on o.customer_id = c.id
+order by c.name, o.id;
+```
+
+```text
+ name  | order_id
+-------+----------
+ Asha  |       10
+ Asha  |       11
+ Asha  |       15
+ Kabir |
+ Meera |       14
+ Ravi  |       12
+ Ravi  |       13
+(7 rows)
+```
+
+Kabir has no orders, so he appears once with an empty `order_id`. The same
+query with `join` instead of `left join` returned 6 rows, without Kabir.
+
+The realistic case is "paid orders per customer, including customers with
+none". Here is the condition in the `on` clause, then in `where`:
+
+```sql
+select c.name, count(o.id) as orders
+from customers c
+left join orders o on o.customer_id = c.id and o.status = 'paid'
+group by c.name order by c.name;
+```
+
+```text
+ name  | orders
+-------+--------
+ Asha  |      3
+ Kabir |      0
+ Meera |      1
+ Ravi  |      1
+```
+
+```sql
+-- the same, but with the status test moved to where
+... left join orders o on o.customer_id = c.id
+where o.status = 'paid' ...
+```
+
+```text
+ name  | orders
+-------+--------
+ Asha  |      3
+ Meera |      1
+ Ravi  |      1
+```
+
+Kabir is gone. His joined row had `o.status` equal to `NULL`, `NULL =
+'paid'` is not true, so `where` removed him. The report now says nothing
+about customers with zero paid orders, which was half the question.
+
+### Step by step
+
+The fan-out trap, traced. "How many paid orders does each customer have?"
+written with a join to order lines, because the same query also needs
+revenue:
+
+```sql
+select c.name, count(o.id) as orders_wrong, count(distinct o.id) as orders_right
+from customers c
+join orders o on o.customer_id = c.id
+join order_items oi on oi.order_id = o.id
+where o.status = 'paid' group by c.name order by c.name;
+```
+
+```text
+ name  | orders_wrong | orders_right
+-------+--------------+--------------
+ Asha  |            5 |            3
+ Meera |            1 |            1
+ Ravi  |            1 |            1
+```
+
+<Trace
+  columns={["step", "rows for Asha", "why"]}
+  rows={[
+    ["customers", "1", "one Asha"],
+    ["join orders, paid only", "3", "orders 10, 11, 15"],
+    ["join order_items", "5", "order 10 has 2 lines, 11 has 1, 15 has 2"],
+    ["count(o.id)", "5", "counts rows, and each order repeats once per line"],
+    ["count(distinct o.id)", "3", "counts distinct order ids"],
+  ]}
+  caption="Where Asha's 5 came from. The second join multiplied her rows by the number of lines per order before the count saw them."
+/>
+
+`count(distinct ...)` fixes the count here, but not a `sum` of an
+order-level column, which would be added once per line. The robust fix is
+to aggregate the lines to one row per order first, then join, which is
+exactly what CTEs are for (two parts below).
+
+### Common mistake
+
+<Compare left="Wrong" right="Right" caption="Three join mistakes and their fixes. Each wrong version runs without error and returns a plausible number." rows={[
+  ["left join, then where on a right-table column", "put the right-table condition in the on clause"],
+  ["count(*) after joining to a one-to-many table", "aggregate the many side first, or count(distinct id)"],
+  ["sum(order.shipping) after joining to lines", "sum shipping in a per-order step before joining"],
+]} />
+
+### In real systems
+
+Fan-out bugs are the classic analytics bug: revenue that is too high,
+conversion rates over 100 percent. ORMs can produce them too when they
+eagerly join several one-to-many relations in one query; that is why many
+ORMs load each relation with a separate query.
+
+### Check yourself
+
+<details>
+<summary>1. Why did Kabir disappear when the status test moved to where?</summary>
+
+The left join gave him one row with every order column `NULL`. `where
+o.status = 'paid'` compares `NULL` with 'paid', which is unknown, not true,
+so the row was removed.
+
+</details>
+
+<details>
+<summary>2. Each order has 1 to 3 lines. You join orders to lines and sum orders.shipping_cents. What happens?</summary>
+
+Each order's shipping is added once per line, so the total is inflated by
+the average number of lines. Sum shipping per order before joining to
+lines.
+
+</details>
+
+## Aggregates, groups and NULL
+
+### In one sentence
+
+Aggregates collapse many rows into one value per group, and `NULL`, which
+means "unknown", changes the answer of almost every aggregate and
+comparison in a way that is consistent but rarely what people expect.
+
+### The idea
+
+An **aggregate function** takes a set of rows and returns one value:
+`count`, `sum`, `avg`, `min`, `max`, and many more. Without `group by`, the
+whole result is one group. With `group by city`, there is one group per
+distinct city, and every column in the `select` must be either grouped or
+aggregated, because a group has many rows and the database will not guess
+which one you meant.
+
+`NULL` is not a value; it is the absence of one, read as "unknown". SQL
+uses **three-valued logic**: a comparison can be true, false or unknown.
+`NULL = NULL` is unknown, because two unknowns are not known to be equal.
+`where` keeps only rows where the condition is true, so unknown rows are
+dropped. Arithmetic with `NULL` gives `NULL`. Aggregates other than
+`count(*)` skip `NULL`s.
+
+These rules produce three classic surprises. `count(column)` is smaller
+than `count(*)` when the column has `NULL`s. `where city <> 'Pune'` does not
+return rows where `city` is `NULL`. And `not in (subquery)` returns nothing
+at all if the subquery contains a single `NULL`.
+
+### Worked example
+
+The simple case is the three counts on customers, where Meera has no city:
+
+```sql
+select count(*), count(city), count(distinct city) from customers;
+```
+
+```text
+ count | count | count
+-------+-------+-------
+     4 |     3 |     2
+```
+
+Four rows, three non-null cities, two distinct cities. A "customers per
+city" chart built on `count(city)` silently leaves Meera out.
+
+The comparison surprise, with `NULL` itself:
+
+```sql
+select null = null as eq, null is not distinct from null as same,
+       1 + null as plus, coalesce(null, 'x') as co;
+```
+
+```text
+ eq | same | plus | co
+----+------+------+----
+    | t    |      | x
+```
+
+`eq` and `plus` are empty because they are `NULL`. `is not distinct from`
+is the comparison that treats two `NULL`s as the same, and `coalesce`
+returns its first non-null argument. Those two are the tools for writing
+`NULL`-aware conditions on purpose.
+
+And `<>` on a column with a `NULL`:
+
+```sql
+select * from customers where city <> 'Pune';
+```
+
+```text
+ id | name | city
+----+------+-------
+  2 | Ravi | Delhi
+```
+
+Meera is not in Pune, but she is not returned either, because `NULL <>
+'Pune'` is unknown.
+
+The realistic case is `not in`. "Customers who have never had a refund"
+works:
+
+```sql
+select * from customers
+where id not in (select customer_id from orders where status = 'refunded');
+```
+
+```text
+ id | name  | city
+----+-------+------
+  1 | Asha  | Pune
+  3 | Meera |
+  4 | Kabir | Pune
+```
+
+Now suppose `orders.customer_id` allowed `NULL` and one guest order had
+none. I simulated that by adding a `NULL` to the subquery:
+
+```sql
+select * from customers
+where id not in (select customer_id from orders union all select null);
+```
+
+```text
+ id | name | city
+----+------+------
+(0 rows)
+```
+
+Every customer vanished. `id not in (10, 11, NULL)` means `id <> 10 and id
+<> 11 and id <> NULL`, and the last part is unknown for every id, so the
+whole condition is never true. The safe form is `not exists`, which asks
+"is there no matching row?" and is not affected by `NULL`s:
+
+```sql
+select * from customers c
+where not exists (select 1 from orders o where o.customer_id = c.id);
+```
+
+```text
+ id | name  | city
+----+-------+------
+  4 | Kabir | Pune
+```
+
+### Step by step
+
+<Trace
+  columns={["expression", "result", "kept by where?"]}
+  rows={[
+    ["'Delhi' <> 'Pune'", "true", "yes"],
+    ["'Pune' <> 'Pune'", "false", "no"],
+    ["NULL <> 'Pune'", "unknown", "no"],
+    ["4 not in (1, 2)", "true", "yes"],
+    ["4 not in (1, 2, NULL)", "unknown", "no"],
+    ["not exists (no matching row)", "true", "yes"],
+    ["coalesce(city, '') <> 'Pune' with city NULL", "true", "yes"],
+  ]}
+  caption="Three-valued logic, row by row. where keeps only 'true'; every 'unknown' row is dropped, which is where the surprises come from."
+/>
+
+`having` filters groups. Cities with more than one customer:
+
+```sql
+select city, count(*) from customers group by city having count(*) > 1;
+```
+
+```text
+ city | count
+------+-------
+ Pune |     2
+```
+
+### Common mistake
+
+The common mistake is `not in` with a subquery on a nullable column. It
+works for years until the first `NULL` arrives, then returns nothing. The
+fix is to use `not exists` by default, or to make the column `not null` if
+it should be.
+
+A second mistake is averaging with `NULL`s and expecting them to count as
+zero. `avg(rating)` ignores unrated rows; `avg(coalesce(rating, 0))` counts
+them as zero. Neither is wrong; they answer different questions, so choose
+on purpose.
+
+### In real systems
+
+Production schemas reduce `NULL` surprises at the source: columns are `not
+null` unless "unknown" is a real state, and defaults fill in sensible
+values. Query reviews look for `not in` with subqueries, `count(column)`
+where `count(*)` was meant, and `<>` on nullable columns.
+
+### Check yourself
+
+<details>
+<summary>1. How many rows does select * from customers where city = null return?</summary>
+
+None, ever. `city = NULL` is unknown for every row. Use `city is null`.
+
+</details>
+
+<details>
+<summary>2. Why is not exists safe where not in is not?</summary>
+
+`not exists` asks whether any row matches the condition. A `NULL` in the
+other table simply does not match, so it cannot poison the answer. `not in`
+compares against every value, and one unknown comparison makes the whole
+condition unknown.
+
+</details>
+
+## CTEs: naming the steps
+
+### In one sentence
+
+A common table expression, written with `with`, gives a name to an
+intermediate result so a long query reads as a sequence of small, checkable
+steps.
+
+### The idea
+
+A **CTE** is a named subquery defined before the main query: `with
+order_totals as (select ...) select ... from order_totals`. Each CTE can use
+the ones before it. The query then reads top to bottom, like code with
+well-named variables, instead of inside out like nested subqueries.
+
+CTEs are also how to fix fan-out properly: aggregate the many side to the
+right grain first, in its own named step, then join. **Grain** is what one
+row means: one row per order line, one row per order, one row per customer.
+Mixing grains in one aggregate is the root of fan-out bugs; CTEs make each
+step's grain explicit.
+
+Since Postgres 12, a CTE used once is usually inlined into the main query
+by the optimiser, so naming steps costs nothing. A CTE can be forced to be
+computed once with `as materialized`, which is occasionally useful when it
+is expensive and used several times.
+
+A **recursive CTE** refers to itself. It has a starting query and a
+recursive query joined by `union all`, and repeats the recursive part until
+it returns no new rows. It is how SQL walks trees (categories, org charts,
+comment threads) and generates series.
+
+### Worked example
+
+The simple case is the revenue report done right. First reduce lines to one
+row per order, then join to customers:
+
+```sql
+with order_totals as (
+  select o.id, o.customer_id, o.placed_on, sum(oi.qty * oi.price_cents) as total_cents
+  from orders o join order_items oi on oi.order_id = o.id
+  where o.status = 'paid'
+  group by o.id
+)
+select c.name, count(*) as orders, sum(total_cents) as revenue,
+       round(avg(total_cents)) as avg_order
+from order_totals t join customers c on c.id = t.customer_id
+group by c.name order by revenue desc;
+```
+
+```text
+ name  | orders | revenue | avg_order
+-------+--------+---------+-----------
+ Asha  |      3 |  147000 |     49000
+ Ravi  |      1 |   56000 |     56000
+ Meera |      1 |     500 |       500
+```
+
+Asha's order count is 3, without `distinct`, because `order_totals` has one
+row per order. Her average order is computed over orders, not lines. (The
+`group by o.id` lets me select `o.customer_id` and `o.placed_on` because
+`id` is the primary key, so every other column of `orders` is determined by
+it.)
+
+The realistic case is a monthly report with a cumulative column. My first
+attempt put a window over a grouped expression and failed:
+
+```text
+ERROR:  column "orders.placed_on" must appear in the GROUP BY clause or be used in an aggregate function
+```
+
+Splitting it into a named monthly step and a window over that step works,
+and reads better:
+
+```sql
+with monthly as (
+  select date_trunc('month', placed_on)::date as month, count(*) as orders
+  from orders where status = 'paid' group by 1
+)
+select month, orders, sum(orders) over (order by month) as cumulative
+from monthly order by month;
+```
+
+```text
+   month    | orders | cumulative
+------------+--------+------------
+ 2026-01-01 |      2 |          2
+ 2026-02-01 |      3 |          5
+```
+
+And a recursive CTE that generates days, the building block for "fill in
+the days with zero orders" reports:
+
+```sql
+with recursive days(d) as (
+  select date '2026-01-01'
+  union all
+  select d + 1 from days where d < date '2026-01-05'
+)
+select d from days;
+```
+
+```text
+     d
+------------
+ 2026-01-01
+ 2026-01-02
+ 2026-01-03
+ 2026-01-04
+ 2026-01-05
+```
+
+### Step by step
+
+<Trace
+  columns={["iteration", "working table", "new rows", "stop?"]}
+  rows={[
+    ["start", "", "2026-01-01", "no"],
+    ["1", "2026-01-01", "2026-01-02", "no"],
+    ["2", "2026-01-02", "2026-01-03", "no"],
+    ["3", "2026-01-03", "2026-01-04", "no"],
+    ["4", "2026-01-04", "2026-01-05", "no"],
+    ["5", "2026-01-05", "none: 2026-01-05 is not before 2026-01-05", "yes"],
+  ]}
+  caption="How the recursive CTE runs. Each iteration feeds only the previous iteration's new rows into the recursive part, and the loop ends when that part returns nothing."
+/>
+
+<Layers layers={[
+  { name: "order_items", note: "grain: one row per order line" },
+  { name: "order_totals (CTE)", note: "grain: one row per order, lines summed" },
+  { name: "join customers", note: "grain still one row per order, now with a name" },
+  { name: "group by customer", note: "grain: one row per customer" },
+]} caption="The revenue report as a stack of grains. Each step changes the grain exactly once, which is why the counts are right without distinct." />
+
+### Common mistake
+
+The common mistake with recursive CTEs is a missing or wrong stop
+condition, or a cycle in the data, such as a category that is its own
+grandparent. The query then runs until it exhausts memory or a timeout.
+The fix is a depth column with a limit (`where depth < 20`) and, on Postgres
+14 and later, the `cycle` clause that detects revisited rows.
+
+### In real systems
+
+Analytics SQL is mostly CTEs: one step per grain, named after what a row
+means. Application code uses recursive CTEs for threaded comments and
+category trees, with a depth limit and an index on the parent column.
+
+### Check yourself
+
+<details>
+<summary>1. Why did order_totals fix Asha's order count without distinct?</summary>
+
+It changed the grain to one row per order before the join to customers, so
+there was no line-level fan-out left for the count to see.
+
+</details>
+
+## Window functions
+
+### In one sentence
+
+A window function computes a value for each row from a set of related
+rows, its window, without collapsing those rows the way `group by` does.
+
+### The idea
+
+`group by` turns many rows into one. Often I want to keep every row and add
+something computed from its neighbours: a running total, its rank, the
+previous row's value, its share of a group total. That is what **window
+functions** do. They are written `function() over (...)`.
+
+The `over` clause defines the window with three optional parts.
+`partition by` splits rows into groups that are computed separately, like
+`group by` without collapsing. `order by` orders rows within each
+partition. The **frame** says which rows, relative to the current one, the
+function sees: by default, with an `order by`, it is "from the start of the
+partition up to the current row, including rows tied with it".
+
+The common functions are **ranking** (`row_number`, `rank`, `dense_rank`),
+**offset** (`lag` for the previous row, `lead` for the next), and ordinary
+aggregates used as windows (`sum(...) over`, `avg(...) over`). Window
+functions run after `where` and `group by`, so they cannot be filtered in
+the same query's `where`; wrap them in a CTE and filter outside.
+
+### Worked example
+
+The simple case is a per-customer history with four window columns at once,
+over the `order_totals` CTE from the previous part:
+
+```sql
+select customer_id, id, placed_on, total_cents,
+  sum(total_cents) over (partition by customer_id order by placed_on) as running,
+  row_number()     over (partition by customer_id order by placed_on) as nth,
+  lag(placed_on)   over (partition by customer_id order by placed_on) as previous_order,
+  rank()           over (order by total_cents desc) as size_rank
+from order_totals order by customer_id, placed_on;
+```
+
+```text
+ customer_id | id | placed_on  | total_cents | running | nth | previous_order | size_rank
+-------------+----+------------+-------------+---------+-----+----------------+-----------
+           1 | 10 | 2026-01-03 |       31500 |   31500 |   1 |                |         3
+           1 | 11 | 2026-01-20 |        4500 |   36000 |   2 | 2026-01-03     |         4
+           1 | 15 | 2026-02-28 |      111000 |  147000 |   3 | 2026-01-20     |         1
+           2 | 13 | 2026-02-02 |       56000 |   56000 |   1 |                |         2
+           3 | 14 | 2026-02-14 |         500 |     500 |   1 |                |         5
+```
+
+Every order is still there. `running` restarts for each customer because of
+`partition by`. `previous_order` is empty for each customer's first order.
+`size_rank` has no partition, so it ranks across all orders.
+
+The realistic case is **top-N per group**, "each customer's biggest
+order", which without windows needs an awkward self-join:
+
+```sql
+with ranked as (
+  select *, row_number() over (partition by customer_id order by total_cents desc) as rn
+  from order_totals
+)
+select customer_id, id, total_cents from ranked where rn = 1 order by customer_id;
+```
+
+```text
+ customer_id | id | total_cents
+-------------+----+-------------
+           1 | 15 |      111000
+           2 | 13 |       56000
+           3 | 14 |         500
+```
+
+Change `rn = 1` to `rn <= 3` for the top three per customer. Use `rank`
+instead of `row_number` if ties should all be included.
+
+### Step by step
+
+The frame trap, traced. Pen order lines sorted by price, where three lines
+share the price 500:
+
+```sql
+select sku, qty, price_cents,
+  sum(qty) over () as all_qty,
+  sum(qty) over (order by price_cents rows between unbounded preceding and current row) as rows_frame,
+  sum(qty) over (order by price_cents) as range_frame
+from order_items where sku = 'pen' order by price_cents;
+```
+
+```text
+ sku | qty | price_cents | all_qty | rows_frame | range_frame
+-----+-----+-------------+---------+------------+-------------
+ pen |  10 |         450 |      16 |         10 |          10
+ pen |   3 |         500 |      16 |         13 |          16
+ pen |   1 |         500 |      16 |         14 |          16
+ pen |   2 |         500 |      16 |         16 |          16
+```
+
+<Trace
+  columns={["row", "price", "rows frame sees", "range frame sees"]}
+  rows={[
+    ["1", "450", "row 1: 10", "all rows with price up to 450: 10"],
+    ["2", "500", "rows 1 to 2: 13", "all rows with price up to 500, ties included: 16"],
+    ["3", "500", "rows 1 to 3: 14", "same: 16"],
+    ["4", "500", "rows 1 to 4: 16", "same: 16"],
+  ]}
+  caption="ROWS versus the default RANGE frame. With ties in the order by, the default frame includes all tied rows at once, so a 'running total' jumps instead of growing row by row."
+/>
+
+The default frame is `range between unbounded preceding and current row`,
+which treats tied rows as one step. For a true row-by-row running total,
+either make the order unique (add `id`) or say `rows between unbounded
+preceding and current row`.
+
+### Common mistake
+
+<Compare left="Surprise" right="Fix" caption="Window-function mistakes that return numbers without errors." rows={[
+  ["running total jumps on ties", "order by a unique key, or use a rows frame"],
+  ["where rn = 1 in the same query: error", "compute rn in a CTE, filter outside"],
+  ["last_value returns the current row", "its default frame ends at the current row; widen it"],
+  ["rank skips numbers after ties", "use dense_rank for 1, 2, 2, 3"],
+]} />
+
+### In real systems
+
+Window functions answer most "for each X, compared with its neighbours"
+questions in reporting: month-over-month change with `lag`, retention
+cohorts, de-duplication (keep `row_number() = 1` per key), and sessionising
+events by comparing each event's time with the previous one.
+
+### Check yourself
+
+<details>
+<summary>1. You want only the latest order per customer. Write the shape of the query.</summary>
+
+A CTE that adds `row_number() over (partition by customer_id order by
+placed_on desc, id desc) as rn`, then `select ... where rn = 1` from it. The
+`id` breaks ties between orders on the same day.
+
+</details>
+
+<details>
+<summary>2. Why can't the window be filtered in the same query's where?</summary>
+
+Window functions are computed after `where`, in the select step, so the
+value does not exist yet when `where` runs.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="SQL: joins, aggregates, CTEs and window functions">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, learn the logical order and the row-count habit.
+Before trusting a result, run the `from` and `join` part alone with
+`count(*)` and check it matches what you expect.
+
+A worked example: "orders per customer" is wrong. Run `select count(*)
+from customers c join orders o on ...` and get 6, as expected; add the join
+to lines and get 8. The 8 shows the fan-out before any aggregate hides it.
+
+The mistake at this level is reading a final number without checking the
+intermediate counts. The fix is to build queries one clause at a time,
+checking the count each time.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, use left joins correctly, handle `NULL` on
+purpose, and structure queries as CTEs by grain.
+
+A worked example: a "customers with their last order date, including
+customers who never ordered" report: a CTE of `max(placed_on)` per customer
+from orders, then customers left-joined to it, with `coalesce` for display.
+
+The mistake is filtering the right table in `where`. The fix is the `on`
+clause, and a test row for a customer with no orders.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, use windows for questions that would need
+self-joins, recursive CTEs for trees, and know how the optimiser treats
+CTEs and windows.
+
+A worked example: sessionising page views. `lag(viewed_at) over (partition
+by user_id order by viewed_at)` gives the previous view; a new session
+starts when the gap is over 30 minutes; a running `sum` of "new session"
+flags numbers the sessions.
+
+The mistake is doing this in application code by loading every row. The
+fix is letting the database do the ordered scan once.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: an empty table (`sum` returns `NULL`, `count` returns
+0), one row per partition (`lag` is `NULL`), all rows tied, a group with
+only `NULL` values.
+
+A worked example: `select sum(total) from orders where false` returns one
+row with `NULL`, not 0. A dashboard showing "revenue: null" needs
+`coalesce(sum(total), 0)`.
+
+The mistake is assuming an aggregate over no rows returns 0. The fix is
+`coalesce` where the product needs a number.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a left join to a table that also has `NULL`s in the
+joined column, so "no match" and "matched a row with a `NULL`" look the
+same. Or a window over ties combined with `last_value` and the default
+frame.
+
+A worked example: `left join promotions p on ...` then `where p.code is
+null` meant "orders without a promotion", but some promotions have a `NULL`
+code, so those orders are counted too. Test the join key instead: `where
+p.id is null`.
+
+The mistake is testing a nullable column to detect a missing join. The fix
+is testing the right table's primary key.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, SQL correctness bugs reach dashboards and invoices. Write
+tests for important queries with tiny fixed datasets that include the
+traps: a customer with no orders, an order with several lines, a `NULL`
+city, ties.
+
+A worked example: the revenue query gets a test fixture of four customers
+and expected results written by hand. A later refactor that joins lines
+before aggregating fails the test immediately.
+
+The mistake is testing queries only against production-like data, where
+the expected answer is unknown. The fix is small fixtures with known
+answers.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is to always know the grain. Say out loud what one row means at
+each step: "one row per order line", "one row per order". When an aggregate
+looks wrong, find the step where the grain changed by accident.
+
+A worked example: "average order value" came out too low. The grain check
+showed the average was taken over lines, not orders. A per-order CTE fixed
+it.
+
+The mistake is thinking about tables instead of row sets. The fix is
+thinking about the row set after each clause.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, decide which questions the application database answers
+directly and which go to an analytics copy. Heavy window and aggregate
+queries over large tables compete with user traffic.
+
+A worked example: monthly cohort reports move to a read replica or a
+warehouse, fed nightly. The application database keeps indexed, narrow
+queries; the replica runs the CTE-heavy reports.
+
+The mistake is running a full-table report on the primary during peak
+hours. The fix is routing reporting to a replica, with its staleness made
+explicit.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is to treat SQL as real code: version it, review it, test it
+with fixtures, and keep the traps in a checklist used in reviews.
+
+A worked example: a review checklist with five lines: grain per step,
+left-join filters in `on`, `not exists` over `not in`, unique tiebreaker in
+every `order by`, `coalesce` on aggregates shown to users.
+
+Done when: you can write a correct per-group top-N, running total and
+"including zero" report from scratch, and explain the row count at every
+step of each.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Are CTEs slower than subqueries?** In current Postgres, a CTE referenced
+once is inlined and planned like a subquery, so no. Before version 12 every
+CTE was materialised, which is where the old advice came from.
+
+**Should I put business logic in SQL or in application code?** Put set
+operations (filtering, joining, aggregating) in SQL, where the data is.
+Put rules that need external calls or complex branching in code.
+
+**Is `count(1)` faster than `count(*)`?** No. They mean the same thing in
+Postgres; `count(*)` is the idiomatic form.
+
+**When do I need `distinct`?** Rarely, if the grain is right. A `distinct`
+added to "fix duplicates" usually hides a fan-out that will break the next
+aggregate.
+
+## Key takeaways
+
+- SQL runs `from`, `where`, `group by`, `having`, `select`, windows, then
+  `order by` and `limit`.
+- Count the rows at each step; most wrong results are a step with the
+  wrong count.
+- A right-table condition in a left join's `where` turns it into an inner
+  join.
+- Joining to a one-to-many table multiplies rows; aggregate the many side
+  first.
+- `NULL` is unknown: `= NULL` never matches and `not in` with a `NULL`
+  returns nothing; use `is null` and `not exists`.
+- CTEs name steps and make each step's grain explicit.
+- Window functions keep every row; filter them in an outer query.
+- With ties, the default window frame groups tied rows; use a unique order
+  or a `rows` frame.
+
+## Glossary
+
+- **Logical order**: the order in which a query's clauses are evaluated.
+- **Inner join**: keeps only matching pairs.
+- **Left join**: keeps every left row, with `NULL`s when nothing matches.
+- **Fan-out**: row multiplication from joining to a one-to-many table.
+- **Aggregate function**: a function from many rows to one value.
+- **Three-valued logic**: true, false and unknown.
+- **Grain**: what one row of a result means.
+- **CTE**: a named subquery introduced with `with`.
+- **Recursive CTE**: a CTE that refers to itself to walk trees or series.
+- **Window function**: a per-row value computed over related rows.
+- **Partition**: a group of rows a window function computes over.
+- **Frame**: the subset of the partition visible to the current row.
+
+## Practice
+
+**Warm-up.** Recreate the dataset from this note and run the left join with
+the status test in `on`, then in `where`. Explain the missing row in one
+sentence.
+
+**Build.** Write a report of revenue per customer per month, including
+months with zero revenue, using a recursive or `generate_series` CTE for
+months, a per-order CTE, and a left join.
+
+**Stretch.** Add a column with each month's change from the previous month
+using `lag`, and a column with each customer's rank within the month using
+`dense_rank`. Write a fixture test with a hand-computed answer.
