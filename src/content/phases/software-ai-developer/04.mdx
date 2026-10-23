@@ -10,138 +10,168 @@ import Layers from '../../../components/book/Layers.astro';
 import Compare from '../../../components/book/Compare.astro';
 import Timeline from '../../../components/book/Timeline.astro';
 import Figure from '../../../components/book/Figure.astro';
+import { withBase } from '../../../utils/base';
 
-Six weeks on the data, because most AI products are data products with a model attached: retrieval
-quality, permissions and the bill all start in the schema. The primary book is *Designing
-Data-Intensive Applications*, with the PostgreSQL docs, Use The Index, Luke and CMU 15-445 as free
-references and *Database Internals* for depth. Everything runs on one Postgres, plus Redis and object
-storage, and the phase ends with a restore drill and a tenant deletion I can prove.
+Six weeks on the layer most AI products actually are. A RAG feature is a data problem before it is a model
+problem: retrieval quality, permissions and the bill all start in the schema. This phase takes Postgres from
+"the place rows go" to a system I can design, tune, migrate, back up, restore and prove deletions in. The
+primary book is *Designing Data-Intensive Applications*, with the PostgreSQL docs, *Use The Index, Luke* and
+CMU 15-445 as free references and *Database Internals* as optional depth. The traditional core's
+<a href={withBase('/plans/traditional-software-developer/')}>databases phase</a> builds the storage engine
+underneath; here I stay at the level of a developer who owns production data.
 
 #### Phase 4: how I would learn it
 
-Fourteen topics. I learn each one with a real dataset rather than a toy: I generate a million notes across
-a thousand teams with a seed script, so query plans, index choices and migration timings behave like
-production. Every claim in this phase comes with an `EXPLAIN` or a timing.
+I work with one real schema, the capstone's, and a dataset big enough to make bad queries hurt: a seed script
+that generates a million notes across a thousand tenants with realistic skew (a few tenants are huge). Every
+topic ends with a query I ran, its `EXPLAIN (ANALYZE, BUFFERS)` output, and a sentence on why the plan is what
+it is. Reading *DDIA* chapters alongside: data models (2), storage and retrieval (3), encoding and evolution
+(4), replication (5), partitioning (6), transactions (7).
 
 <Timeline
-  caption="Phase 4's six weeks"
+  caption="Phase 4's six weeks. Each week leaves a migration, a measured query or a drill in the repository."
   items={[
-    { when: 'week 19', what: 'The relational model and SQL: joins, aggregates, CTEs, window functions.' },
-    { when: 'week 20', what: 'Schema design for users, teams, roles, resources, events, billing, audit, soft deletes.' },
-    { when: 'week 21', what: 'Indexes and query plans, with the million-row seed.' },
-    { when: 'week 22', what: 'Transactions, isolation and MVCC; migrations and backfills.' },
-    { when: 'week 23', what: 'Backups and restore; replication; partitioning and sharding; caching; object storage.' },
-    { when: 'week 24', what: 'Vector data and retrieval evaluation; privacy and deletion. Then the gate.' },
+    { when: "week 19", what: "Relational model, SQL from joins to window functions, schema for users, teams, roles, events, billing, audit." },
+    { when: "week 20", what: "Indexes and query plans on the million-row seed: three slow queries tuned with before-and-after numbers." },
+    { when: "week 21", what: "Transactions and isolation: reproduce two anomalies, then prevent them. Migrations with expand and contract." },
+    { when: "week 22", what: "Backups, point-in-time recovery and a timed restore drill; replication, lag and failover concepts." },
+    { when: "week 23", what: "Partitioning and when not to; caching and object storage revisited at the data layer." },
+    { when: "week 24", what: "Vector data with pgvector and a retrieval evaluation; privacy and tenant deletion; then the gate." },
   ]}
 />
 
-<Flow
-  caption="The loop for every data topic"
-  steps={['State the requirement', 'Write the schema or query', 'Seed a million rows', 'EXPLAIN ANALYZE', 'Change one thing', 'Measure again', 'Write down the number']}
+<Layers
+  caption="Where a row lives, top to bottom. Each topic in this phase is a decision about one of these layers."
+  layers={[
+    { name: "Application", note: "queries, transactions, migrations, the ORM if any" },
+    { name: "SQL and the planner", note: "statistics, plans, join strategies" },
+    { name: "Indexes", note: "B-tree, GIN, HNSW: extra structures kept in sync" },
+    { name: "Tables and MVCC", note: "row versions, visibility, vacuum" },
+    { name: "WAL", note: "the write-ahead log: durability, replication, PITR" },
+    { name: "Disk and backups", note: "pages, base backups, archived WAL" },
+  ]}
 />
 
-#### Phase 4: the relational model: keys, constraints, relationships and normalisation
+#### Phase 4: The relational model: keys, constraints, relationships and normalization
 
 <Figure art={`
-  teams                memberships                 users
-  +---------+         +------------------+         +---------+
-  | id  PK  |<--------| team_id  FK      |   +---->| id  PK  |
-  | name    |         | user_id  FK -----+---+     | email U |
-  +---------+         | role  check(...) |         +---------+
-       ^              | PK(team_id,      |
-       |              |    user_id)      |
-       |              +------------------+
-  notes: id PK, team_id FK -> teams, author_id FK -> users, title not null
-`} caption="Keys and relationships: a many-to-many between users and teams through memberships, with the role on the join table." />
+  tenants (id PK)
+     | 1
+     |---< memberships (tenant_id FK, user_id FK, role)  >---| users (id PK, email UNIQUE)
+     | 1                                                        | 1
+     |---< notes (id PK, tenant_id FK, author_id FK -> users) >-'
+                 |
+                 '---< note_tags (note_id FK, tag_id FK)  >--- tags (id PK, tenant_id, name)
+                       PK (note_id, tag_id)
+  ---<  means one-to-many;  a join table turns many-to-many into two one-to-manys
+`} caption="The core schema as relationships. Every arrow is a foreign key the database enforces, not a convention in code." />
 
-<Levels label="Phase 4, keys, constraints, relationships and normalisation">
+<Levels label="Phase 4, the relational model: keys, constraints, relationships and normalization">
 
 <Level name="Beginner">
 
-A table holds rows of one kind. A primary key identifies a row; a foreign key points at a row in another
-table; constraints (`not null`, `unique`, `check`) state rules the database enforces.
+A relational database stores data in tables of rows and columns. Each row has a primary key that identifies
+it. A foreign key in one table points at the primary key of another, which is how relationships are stored.
+Constraints are rules the database enforces on every write: `not null`, `unique`, `check`, foreign keys.
 
 ```sql
-create table users (id uuid primary key default gen_random_uuid(), email text not null);
-create unique index users_email_lower on users (lower(email));
-create table teams (id uuid primary key default gen_random_uuid(), name text not null);
-create table memberships (
-  team_id uuid references teams on delete cascade,
-  user_id uuid references users on delete cascade,
-  role text not null check (role in ('owner','admin','member','viewer')),
-  primary key (team_id, user_id));
+create table users (id bigint generated always as identity primary key,
+                    email text not null unique check (email = lower(email)));
+create table notes (id bigint generated always as identity primary key,
+                    author_id bigint not null references users(id),
+                    title text not null check (length(title) between 1 and 200));
 ```
 
-Common mistake: enforcing rules only in application code. Fix: the database is the last line; put the
-invariant in a constraint so no code path can break it.
+```text
+insert into notes(author_id, title) values (999, 'x');
+ERROR:  insert or update on table "notes" violates foreign key constraint "notes_author_id_fkey"
+DETAIL:  Key (author_id)=(999) is not present in table "users".
+```
+
+The common mistake is enforcing rules only in application code. The next script, migration or developer
+bypasses them; a constraint cannot be bypassed.
 
 </Level>
 
 <Level name="Intermediate">
 
-Relationships: one-to-many is a foreign key on the many side; many-to-many is a join table; one-to-one is a
-foreign key with a unique constraint. Normalisation removes duplicated facts so updates happen in one
-place: third normal form means every non-key column depends on the key, the whole key and nothing but the
-key.
+Relationships come in three shapes: one-to-one (a user and their settings), one-to-many (a tenant and its
+notes), many-to-many (notes and tags, through a join table whose primary key is the pair). Normalisation means
+each fact is stored once: the tenant's name lives in `tenants`, not copied onto every note. The practical test
+is "if this fact changes, how many rows must I update?" The answer should be one.
 
 ```sql
--- denormalised: team name copied into every note; renaming a team means updating a million rows
--- normalised: notes.team_id references teams; the name lives once
+create table note_tags (note_id bigint references notes(id) on delete cascade,
+                        tag_id  bigint references tags(id)  on delete cascade,
+                        primary key (note_id, tag_id));
 ```
+
+`on delete cascade` here means deleting a note removes its tag links. The mistake is cascading everywhere:
+cascading from `users` to `notes` means deleting a user silently deletes their team's shared content.
 
 </Level>
 
 <Level name="Advanced">
 
-Deliberate denormalisation is a performance choice with a consistency cost: a `notes_count` on teams is
-fast to read and must be maintained by a trigger or in the same transaction. Natural keys (email) change;
-surrogate keys (UUID, bigint identity) do not. UUIDv7 is time-ordered, which keeps B-tree inserts local and
-avoids the index bloat random UUIDv4 keys cause.
+The theory underneath: a relation is a set of tuples, a key is a minimal set of attributes that determines
+the rest, and the normal forms remove kinds of redundancy. Third normal form says every non-key column depends
+on the key, the whole key, and nothing but the key. Denormalisation (copying a value for speed) is a deliberate
+trade-off, and the copy needs a rule for staying correct, such as a trigger or a job. Surrogate keys (an
+identity column) are stable; natural keys (an email) change. Postgres checks most constraints per row as it
+writes, but foreign keys and unique constraints can be `deferrable` to the end of the transaction, which allows
+swapping two values.
 
 </Level>
 
 <Level name="Edge cases">
 
-- `unique` allows multiple `NULL`s in Postgres (unless `nulls not distinct` in 15+).
-- `on delete cascade` from a team deletes every note: correct for tenant deletion, dangerous by accident.
-- A `check` constraint cannot reference other rows.
+A nullable foreign key means "optional relationship"; a `unique` constraint allows many nulls (until Postgres
+15's `nulls not distinct`); a `check` constraint that calls a function only sees the current row; an email
+uniqueness check that is case-sensitive lets `A@x.io` and `a@x.io` both exist; deleting a row referenced by a
+foreign key without a cascade or `set null` fails with an error, which is usually what I want.
 
 </Level>
 
 <Level name="Corner cases">
 
-Soft deletes plus a unique constraint: a deleted user's email still blocks re-registration. Uniqueness
-plus soft deletion. A partial unique index `where deleted_at is null` fixes it. Another: a cycle of foreign
-keys between two tables that both need the other on insert; one must be deferrable.
+A soft-delete column plus a `unique` email: a deleted user still holds the email, so the person cannot sign up
+again. A partial unique index (`unique (email) where deleted_at is null`) fixes it. A self-referencing foreign
+key (a comment's parent) plus cascade delete: deleting the top comment deletes the whole thread, which may or
+may not be the product rule. A composite foreign key `(tenant_id, note_id)` makes it impossible for a tag link
+to join a note from another tenant, which is tenant isolation enforced by the schema itself.
 
 </Level>
 
 <Level name="Production level">
 
-Adding a constraint to a large table locks it while it validates. Postgres lets me add it `not valid` and
-validate later without blocking writes. Constraint violations surface as error codes (`23505` unique,
-`23503` foreign key) that the API maps to 409 or 422.
+In production constraints are my last line of defence against bugs, races and bad imports. I name them (so
+errors are readable), map their violations to useful API errors (`23505` unique, `23503` foreign key, `23514`
+check), and add them to existing large tables with `not valid` then `validate constraint`, which avoids a long
+lock.
 
 </Level>
 
 <Level name="Mindset">
 
-The schema is the most durable code in the system. Model the facts, not the screens.
+The habit is "make illegal states unrepresentable in the database," the same idea as a discriminated union in
+TypeScript, one layer down. If two rows should never both exist, a constraint says so.
 
 </Level>
 
 <Level name="System design">
 
-Data ownership is an architecture boundary: one module owns a table and others read through it. That makes
-phase 10's boundaries real.
+The schema is the most expensive decision to reverse in the system. Code is rewritten often; data outlives it.
+Normalised core tables with deliberate, documented denormalisations (read models, counters, search documents)
+is the shape that survives change, and *DDIA*'s chapter on data models is the reference for when a document or
+graph model would fit better.
 
 </Level>
 
 <Level name="Strategy">
 
-Model the capstone's ten core tables on paper, write every invariant in a sentence, then turn each sentence
-into a constraint and a test that violates it. Done when every invariant has a constraint and a failing
-insert proves it.
+I draw the capstone's entity diagram on paper, write every table with every constraint, then try to insert ten
+kinds of bad data and confirm each is refused. Done when no rule that can be a constraint lives only in
+application code.
 
 </Level>
 
@@ -150,1240 +180,1419 @@ insert proves it.
 #### Phase 4: SQL: joins, aggregates, subqueries, CTEs, window functions and transactions
 
 <Figure art={`
-  notes (n)                 memberships (m)
-  team | author             team | user | role
-  A    | u1          JOIN   A    | u1   | admin      inner: only matching
-  A    | u2          on     A    | u2   | member     left:  all notes, nulls
-  B    | u9          team   (no B rows)              where no member row
-  window: row_number() over (partition by team order by created_at desc)
-  A: 1,2,3...   B: 1,2...   restarts per partition, rows are not collapsed
-`} caption="A join combines rows by a condition; a window function computes across a partition without collapsing rows the way GROUP BY does." />
+  logical order of a SELECT (not the order it is written)
+  FROM / JOIN  ->  WHERE  ->  GROUP BY  ->  HAVING  ->  window functions
+       ->  SELECT list  ->  DISTINCT  ->  ORDER BY  ->  LIMIT / OFFSET
+  so: WHERE cannot use a SELECT alias, HAVING filters groups,
+      a window function sees the rows after WHERE and GROUP BY
+`} caption="The order SQL evaluates a query in. Most 'why does this not work' questions are answered by it." />
 
-<Levels label="Phase 4, joins, aggregates, subqueries, CTEs and window functions">
+<Levels label="Phase 4, SQL: joins, aggregates, subqueries, CTEs, window functions and transactions">
 
 <Level name="Beginner">
 
-SQL describes what I want, not how to get it. `join` combines tables; `group by` with aggregates (`count`,
-`sum`, `avg`) summarises.
+SQL describes the result I want, and the database decides how to get it. `select` picks columns, `from` and
+`join` combine tables, `where` filters rows, `group by` with `count` or `sum` summarises, `order by` sorts.
 
 ```sql
-select t.name, count(n.id) as notes
-from teams t left join notes n on n.team_id = t.id
-group by t.id, t.name
-order by notes desc;
+select u.email, count(n.id) as notes
+from users u left join notes n on n.author_id = u.id
+group by u.email
+order by notes desc
+limit 5;
 ```
 
-Common mistake: `count(*)` with a left join, which counts 1 for a team with no notes. Fix: `count(n.id)`
-counts only non-null matches.
+An inner join drops users with no notes; a left join keeps them with a count of 0. The common mistake is
+`count(*)` with a left join, which counts the joined null row as 1 for a user with no notes; `count(n.id)`
+counts only real notes.
 
 </Level>
 
 <Level name="Intermediate">
 
-Subqueries and CTEs (`with`) name intermediate results. Window functions compute across related rows
-without grouping them away: the latest three notes per team, a running total, a rank.
+Real queries combine subqueries, CTEs and window functions. A CTE (`with`) names a step so the query reads top
+to bottom. A window function computes over related rows without collapsing them, which is how I get "the latest
+note per user" or a running total.
 
 ```sql
 with ranked as (
-  select n.*, row_number() over (partition by team_id order by created_at desc) as rn
-  from notes n)
-select * from ranked where rn <= 3;
+  select n.*, row_number() over (partition by author_id order by created_at desc) as rn
+  from notes n where tenant_id = 7
+)
+select author_id, title, created_at from ranked where rn = 1;
 ```
+
+`exists` is the clear way to ask "has at least one": `where exists (select 1 from notes n where n.author_id =
+u.id)`. The mistake is `where id not in (select author_id from notes)` when `author_id` can be null: one null
+makes `not in` return no rows at all. `not exists` does not have that trap.
 
 </Level>
 
 <Level name="Advanced">
 
-Logical order of evaluation: `from` and joins, `where`, `group by`, `having`, window functions, `select`,
-`distinct`, `order by`, `limit`. That is why a `select` alias cannot be used in `where`. `exists` stops at
-the first match and handles NULLs correctly, unlike `not in`. Lateral joins run a subquery per row, ideal for
-"top N per group" with an index.
-
-```sql
-select t.id, latest.* from teams t
-cross join lateral (select id, title from notes where team_id = t.id order by created_at desc limit 3) latest;
-```
-
-</Level>
-
-<Level name="Edge cases">
-
-- `not in (subquery)` returns nothing if the subquery contains a NULL.
-- `avg` of an integer column returns numeric; integer division `5/2` is 2.
-- `order by` without a unique tiebreaker gives unstable pagination.
-
-</Level>
-
-<Level name="Corner cases">
-
-A join that fans out (notes join tags join comments) then `sum`s a column from notes: each note is counted
-once per tag times comment. Join fan-out plus aggregation. Aggregate in subqueries before joining. Another:
-a CTE that was an optimisation fence before Postgres 12 and is inlined after, changing plans on upgrade.
-
-</Level>
-
-<Level name="Production level">
-
-Every query the app runs is parameterised, has a bounded result, and is visible in `pg_stat_statements`
-with its total time, so the worst ones are found by data rather than guesswork.
-
-</Level>
-
-<Level name="Mindset">
-
-Think in sets, not loops. If application code loops over rows to run a query per row, SQL could do it once.
-
-</Level>
-
-<Level name="System design">
-
-Analytics queries (window functions over events) and transactional queries (one row by key) want different
-indexes and sometimes different databases; knowing which is which decides when a read replica or a
-warehouse is needed.
-
-</Level>
-
-<Level name="Strategy">
-
-Solve twenty query exercises on the seeded data: per-team counts, top N per group, running totals, gaps,
-duplicates, funnels. Done when each runs in under 100 ms on a million rows with the right indexes, and I
-can state its logical evaluation order.
-
-</Level>
-
-</Levels>
-
-#### Phase 4: schema design for real features
-
-<Layers
-  caption="The tables nearly every multi-tenant product needs"
-  layers={[
-    { name: 'Identity', note: 'users, sessions, credentials' },
-    { name: 'Tenancy', note: 'teams, memberships, roles, invitations' },
-    { name: 'Resources', note: 'notes, files, each with team_id' },
-    { name: 'Events and audit', note: 'append-only: who did what, when' },
-    { name: 'Billing', note: 'plans, subscriptions, usage, invoices' },
-  ]}
-/>
-
-<Levels label="Phase 4, schema design for users, teams, roles, resources, events, billing, audit and soft deletes">
-
-<Level name="Beginner">
-
-The plan lists the features: users, teams, roles, resources, events, billing, audit logs and soft deletes.
-Every resource table has `team_id`, `created_at`, `updated_at`, and an author.
-
-```sql
-create table notes (
-  id uuid primary key default gen_random_uuid(),
-  team_id uuid not null references teams on delete cascade,
-  author_id uuid references users on delete set null,
-  title text not null check (length(title) between 1 and 200),
-  body text not null default '',
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  deleted_at timestamptz);
-```
-
-Common mistake: forgetting `team_id` on child tables (comments on notes) and joining through the parent for
-every check. Fix: put the tenant on every row.
-
-</Level>
-
-<Level name="Intermediate">
-
-Audit logs are append-only: actor, action, target, before and after (or a diff), time, request ID. Events
-record facts for analytics. Billing tables record usage as immutable rows (`usage(team_id, metric, qty,
-at)`) and derive totals, rather than mutating a counter.
-
-```sql
-create table audit_log (id bigint generated always as identity primary key, team_id uuid not null,
-  actor_id uuid, action text not null, target_type text not null, target_id uuid, diff jsonb,
-  request_id text, at timestamptz not null default now());
-```
-
-</Level>
-
-<Level name="Advanced">
-
-Soft deletes (`deleted_at`) keep data recoverable but leak into every query and complicate uniqueness and
-privacy. Alternatives: move deleted rows to an archive table, or hard-delete with an audit record. JSONB is
-right for genuinely variable attributes and wrong for fields I filter and join on. Money is `numeric` or
-integer minor units with a currency column.
-
-</Level>
-
-<Level name="Edge cases">
-
-- An invitation for an email that already has an account; an invitation that expires.
-- The last owner of a team leaving.
-- A user in fifty teams: the session must know which team is active.
-
-</Level>
-
-<Level name="Corner cases">
-
-Soft-deleted rows plus a privacy deletion request: "deleted" data is still there. Soft delete plus legal
-deletion. The privacy path must hard-delete or anonymise, including in the audit log's diffs. Another:
-billing usage recorded in one transaction and the resource creation in another, so a rollback leaves usage
-billed for nothing.
-
-</Level>
-
-<Level name="Production level">
-
-Every table has an owner, a retention rule and a note on what personal data it holds. `updated_at` is set
-by a trigger so no code path forgets it.
-
-</Level>
-
-<Level name="Mindset">
-
-Design for the questions I will be asked later: who changed this, what did it cost, what did we delete.
-
-</Level>
-
-<Level name="System design">
-
-The audit log and usage tables are the source for support, billing and security investigations. Phase 8's
-AI metering writes into the same usage table.
-
-</Level>
-
-<Level name="Strategy">
-
-Write the capstone schema from the plan's list, then defend each tradeoff in an ADR-style note: soft
-deletes or not, JSONB or columns, UUID or bigint. Done when the gate item "design a schema from requirements
-and defend the tradeoffs" is a document I can walk through.
-
-</Level>
-
-</Levels>
-
-#### Phase 4: indexes: B-trees, composite, covering and partial indexes, and selectivity
-
-<Figure art={`
-  B-tree on notes (team_id, created_at desc)
-                     [ B..., M... ]
-                 +---------+---------+
-                 |         |         |
-           [A, A, A]   [B, C, ...]  [M, ...]
-            |  leaf pages, sorted by team_id then created_at
-            v
-  (A, 10:05) (A, 10:01) (A, 09:58) ...  -> heap row pointers
-  query: where team_id = A order by created_at desc limit 20
-  = descend once, read 20 leaf entries, done
-`} caption="A composite B-tree index stores entries sorted by its columns, so a query that filters by the first and orders by the second reads only the rows it returns." />
-
-<Levels label="Phase 4, B-tree, composite, covering and partial indexes, and selectivity">
-
-<Level name="Beginner">
-
-An index is a sorted structure that lets the database find rows without scanning the table. Postgres's
-default is a B-tree, good for equality and ranges.
-
-```sql
-create index notes_team_created on notes (team_id, created_at desc);
-```
-
-Common mistake: an index on every column. Fix: index for the queries the app actually runs; every index
-slows writes and costs space.
-
-</Level>
-
-<Level name="Intermediate">
-
-Composite index column order matters: equality columns first, then the range or sort column. An index on
-`(team_id, created_at)` serves `where team_id = $1 order by created_at` but not `where created_at
-greater than a date` alone. A covering index includes extra columns (`include (title)`) so the query never
-visits the table: an index-only scan. A partial index covers a subset (`where deleted_at is null`).
-
-```sql
-create index notes_live on notes (team_id, created_at desc) include (title) where deleted_at is null;
-```
-
-</Level>
-
-<Level name="Advanced">
-
-Selectivity is the fraction of rows a condition matches. The planner uses statistics (`pg_stats`) to
-estimate it; an index on a column where 90% of rows share a value is rarely used. Other index types: GIN
-for JSONB and full-text, GiST for ranges and geometry, BRIN for huge append-only tables ordered by time, and
-HNSW or IVFFlat (pgvector) for vectors later in this phase.
-
-</Level>
-
-<Level name="Edge cases">
-
-- A function in the condition (`where lower(email) = $1`) needs an expression index on `lower(email)`.
-- `like '%term'` cannot use a B-tree; trigram GIN can.
-- An implicit type cast (comparing uuid to text) disables the index.
-
-</Level>
-
-<Level name="Corner cases">
-
-A partial index on `deleted_at is null` and a query written `where deleted_at is null or $2` that the
-planner cannot prove matches the predicate, so the index is ignored. Index predicate plus query shape.
-Another: `create index` on a big table blocks writes; `create index concurrently` does not, but cannot run
-inside a transaction and leaves an invalid index if it fails.
-
-</Level>
-
-<Level name="Production level">
-
-`pg_stat_user_indexes` shows unused indexes to drop; `pg_stat_statements` shows the slow queries to index.
-Indexes are created concurrently in migrations, and their size is watched.
-
-</Level>
-
-<Level name="Mindset">
-
-An index is a copy of data sorted for one access pattern. Name the pattern before creating the copy.
-
-</Level>
-
-<Level name="System design">
-
-Indexes are the main lever between "a single Postgres is fine" and "we need something else". Most scaling
-problems in year one are missing or wrong indexes.
-
-</Level>
-
-<Level name="Strategy">
-
-For the five most frequent queries in the app, design the index on paper, create it, and record the
-before-and-after time. Done when each query's plan uses the intended index and its time dropped by a
-measured factor.
-
-</Level>
-
-</Levels>
-
-#### Phase 4: query plans: EXPLAIN, statistics, join strategies and the cost of a scan
-
-<Figure art={`
-  EXPLAIN (ANALYZE, BUFFERS)
-  Limit  (actual time=0.05..0.21 rows=20)
-    ->  Index Scan using notes_team_created on notes
-          Index Cond: (team_id = 'A')
-          Filter: (deleted_at IS NULL)
-          Rows Removed by Filter: 3
-          Buffers: shared hit=6
-  Planning Time: 0.1 ms   Execution Time: 0.3 ms
-  read from the innermost node outwards; compare estimated and actual rows
-`} caption="Reading a plan: the innermost node runs first, actual rows show what really happened, and buffers show how much data was touched." />
-
-<Levels label="Phase 4, EXPLAIN, statistics, join strategies and scan cost">
-
-<Level name="Beginner">
-
-`EXPLAIN` shows the plan the database chose; `EXPLAIN ANALYZE` runs it and shows real timings and row
-counts. A sequential scan reads the whole table; an index scan reads the index then the matching rows.
-
-```sql
-explain analyze select * from notes where team_id = '...' order by created_at desc limit 20;
-```
-
-Common mistake: reading only the top line's cost. Fix: read from the innermost node outwards and compare
-estimated rows to actual rows at each node.
-
-</Level>
-
-<Level name="Intermediate">
-
-Join strategies: nested loop (good when one side is small and the other has an index), hash join (builds a
-hash table of one side, good for large unsorted inputs), merge join (both sides sorted). The planner picks
-by estimated cost. A huge gap between estimated and actual rows means stale or insufficient statistics; run
-`analyze` or raise the statistics target.
-
-</Level>
-
-<Level name="Advanced">
-
-Cost units are arbitrary but proportional to page reads (`seq_page_cost`, `random_page_cost`). On SSDs,
-lowering `random_page_cost` toward 1.1 makes index scans more attractive. `BUFFERS` shows shared hits
-(memory) and reads (disk). Correlated columns fool the planner's independence assumption; extended
-statistics (`create statistics`) fix it.
-
-</Level>
-
-<Level name="Edge cases">
-
-- A seq scan on a 100-row table is correct; the index would be slower.
-- A query fast with one parameter and slow with another (a tiny team versus the largest team).
-- `limit` with an `order by` the index cannot serve sorts everything first.
-
-</Level>
-
-<Level name="Corner cases">
-
-A prepared statement's generic plan, chosen after five executions, is good for typical teams and terrible
-for the one team with half the rows. Plan caching plus data skew. `plan_cache_mode = force_custom_plan` for
-that query, or a different query shape for large tenants.
-
-</Level>
-
-<Level name="Production level">
-
-`auto_explain` logs plans of slow queries automatically. The gate asks me to read a plan and explain why an
-index is or is not used: I keep three examples of each in the study log.
-
-</Level>
-
-<Level name="Mindset">
-
-The planner is a cost model with estimates. When it is wrong, find the wrong estimate.
-
-</Level>
-
-<Level name="System design">
-
-Query plans tie schema design, indexes and data distribution together. A multi-tenant app with very uneven
-tenants needs plans checked for the largest tenant, not the average.
-
-</Level>
-
-<Level name="Strategy">
-
-Take the slowest query from `pg_stat_statements`, tune it with before-and-after plans and timings, and write
-up each step. Done when the write-up is the plan's "slow query tuned with before-and-after numbers".
-
-</Level>
-
-</Levels>
-
-#### Phase 4: transactions: ACID, isolation levels, anomalies, MVCC and locking
-
-<Figure art={`
-  lost update under READ COMMITTED
-  T1: select balance -> 100
-                          T2: select balance -> 100
-  T1: update set 100+50 -> 150; commit
-                          T2: update set 100-30 -> 70; commit
-  final: 70   (T1's +50 lost)
-  fixes: update set balance = balance + 50   (atomic)
-         select ... for update               (row lock)
-         serializable + retry on 40001
-`} caption="A lost update: two transactions read the same value and both write based on it; one write silently disappears." />
-
-<Levels label="Phase 4, ACID, isolation levels, anomalies, MVCC and locking">
-
-<Level name="Beginner">
-
-A transaction groups statements so they all happen or none do (atomicity), leave the data valid
-(consistency), do not see each other's partial work (isolation) and survive a crash once committed
-(durability).
+The exact semantics underneath: SQL uses three-valued logic, so a comparison with null is unknown, not false,
+and `where x = null` never matches (`is null` does). Aggregates ignore nulls except `count(*)`. Window frames
+default to "from the start to the current row" when there is an `order by`, which is why a `sum() over (order
+by day)` is a running total. CTEs in Postgres 12 and later are inlined into the main query unless marked
+`materialized`. A transaction groups statements so they all commit or none do.
 
 ```sql
 begin;
-insert into notes (...) values (...);
-insert into outbox (...) values (...);
-commit;
-```
-
-Common mistake: running related writes as separate autocommitted statements. Fix: one transaction per
-business operation.
-
-</Level>
-
-<Level name="Intermediate">
-
-Isolation levels trade anomalies for concurrency. Postgres defaults to read committed: each statement sees
-data committed before it began. Repeatable read gives the transaction one snapshot. Serializable makes the
-result equivalent to some serial order, aborting transactions with error `40001` when it cannot.
-
-The lost update in the figure is the anomaly I explain at the gate; my code prevents it with atomic updates
-where possible and `select ... for update` where the new value needs application logic.
-
-</Level>
-
-<Level name="Advanced">
-
-MVCC: each row version has creating and deleting transaction IDs; readers see the versions visible to their
-snapshot, so readers do not block writers. Old versions are cleaned up by vacuum. Write skew is the anomaly
-repeatable read allows: two doctors both check "at least one on call" and both go off call. Only
-serializable, or a lock on a shared row, prevents it.
-
-```ts
-async function withSerializable<T>(fn: (tx: Tx) => Promise<T>, tries = 3): Promise<T> {
-  for (let i = 0; ; i++) {
-    try { return await db.tx({ mode: 'serializable' }, fn); }
-    catch (e: any) { if (e.code !== '40001' || i === tries - 1) throw e; }
-  }
-}
+update accounts set balance = balance - 100 where id = 1;
+update accounts set balance = balance + 100 where id = 2;
+commit;   -- or rollback; and neither update is visible
 ```
 
 </Level>
 
 <Level name="Edge cases">
 
-- A long-running transaction holds back vacuum and bloats tables.
-- An HTTP call inside a transaction holds locks for the call's duration.
-- `idle in transaction` connections from a crashed request.
+`avg` of an integer column returns a numeric with many decimals; `sum` over zero rows is null, not 0
+(`coalesce(sum(x), 0)`); `group by` on a timestamp groups by the exact microsecond, so I truncate with
+`date_trunc('day', created_at at time zone 'Asia/Calcutta')`; `order by` without a unique tiebreaker returns ties
+in any order, which makes pagination flaky; `limit` without `order by` returns arbitrary rows.
 
 </Level>
 
 <Level name="Corner cases">
 
-Two transactions lock rows in opposite order and deadlock; Postgres aborts one with `40P01`. Locks plus
-ordering. Always lock in a consistent order (by ID). Another: a serializable retry re-runs a side effect
-(an email) that was not part of the database.
+A join that multiplies rows plus an aggregate: joining notes to tags and to comments in one query, then
+counting, multiplies each note's tags by its comments and inflates both counts. The fix is to aggregate each in
+its own subquery and then join. A daily report grouped by UTC date plus users in India: anything between
+midnight and 05:30 IST lands on the previous day.
 
 </Level>
 
 <Level name="Production level">
 
-`idle_in_transaction_session_timeout` and `statement_timeout` bound damage. Lock waits are monitored
-(`pg_locks`, `pg_stat_activity`). Retry logic is centralised.
+In production SQL is code: it lives in version control, has tests against a real database, uses parameters for
+every value, and is reviewed with its plan for any query on a large table. I log slow queries
+(`log_min_duration_statement`) and use `pg_stat_statements` to find the queries that take the most total time,
+which are often fast queries run millions of times.
 
 </Level>
 
 <Level name="Mindset">
 
-For every read-then-write, ask what happens if someone else writes in between.
+The habit is to think in sets, not loops. If application code loops over rows and runs a query per row, the
+database could probably answer the whole question in one statement, faster and atomically.
 
 </Level>
 
 <Level name="System design">
 
-Transactions end at the database edge. Across services or with external APIs, the tools become outboxes,
-idempotency keys and sagas (phase 10).
+Where computation happens is a design choice: in SQL close to the data, or in the application. Aggregations
+over many rows belong in the database; business rules that need external calls belong in code. An ORM is fine
+for simple reads and writes, and its generated SQL must be readable when performance matters.
 
 </Level>
 
 <Level name="Strategy">
 
-Reproduce a lost update and a write skew with two `psql` sessions side by side, then fix each in code with a
-test that runs concurrent requests. Done when the concurrent tests pass a hundred runs in a row.
+I write twenty queries against the seed data, from simple joins to "top three notes per tenant by comment
+count, last 30 days, in IST", and check each result by hand on a tiny dataset first. Done when I can write the
+window-function and anti-join queries without looking anything up.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: migrations: forward, backward, zero-downtime and data backfills
+#### Phase 4: Schema design for real features: users, teams, roles, resources, events, billing, audit logs and soft deletes
 
-<Timeline
-  caption="Renaming a column with zero downtime: expand, migrate, contract"
-  items={[
-    { when: 'deploy 1', what: 'Add the new column, nullable. Code writes both, reads old.' },
-    { when: 'backfill', what: 'Copy old to new in batches of a few thousand rows, throttled.' },
-    { when: 'deploy 2', what: 'Code reads new, still writes both. Add not null with not valid, then validate.' },
-    { when: 'deploy 3', what: 'Code stops writing old.' },
-    { when: 'deploy 4', what: 'Drop the old column, after a waiting period.' },
+<Compare
+  left="Table"
+  right="Design rule I follow"
+  caption="The tables nearly every product needs, and the one rule that keeps each correct."
+  rows={[
+    ["users, tenants, memberships", "role lives on the membership, not the user, because a user can be in two tenants"],
+    ["resources (notes, documents)", "every row carries tenant_id, and composite foreign keys keep children in the same tenant"],
+    ["events", "append-only, with an occurred_at, an actor and a type; never updated"],
+    ["billing (plans, subscriptions, invoices)", "store the provider's IDs and copy amounts at the time; never recompute history"],
+    ["audit_log", "who did what to which row, when, from where; written in the same transaction"],
+    ["soft deletes", "deleted_at plus partial unique indexes, and a hard-delete job for retention"],
   ]}
 />
 
-<Levels label="Phase 4, migrations, rollbacks, zero downtime and backfills">
+<Levels label="Phase 4, schema design for real features">
 
 <Level name="Beginner">
 
-A migration is a versioned script that changes the schema. Migrations run in order, are recorded in a table,
-and are committed with the code that needs them.
+Schema design is turning product requirements into tables. I start from nouns (user, team, note, invoice) and
+the relationships between them, then the rules (a note belongs to exactly one team; an email is unique). The
+core of a multi-tenant product is three tables: tenants, users and memberships.
 
 ```sql
--- 0007_add_note_pinned.sql
-alter table notes add column pinned boolean not null default false;
+create table tenants (id bigint generated always as identity primary key, name text not null);
+create table memberships (tenant_id bigint references tenants(id), user_id bigint references users(id),
+                          role text not null check (role in ('owner','admin','member','viewer')),
+                          primary key (tenant_id, user_id));
 ```
 
-Common mistake: editing a migration that already ran in production. Fix: write a new one.
+The common mistake is a `role` column on `users`, which breaks the first time someone joins a second team.
 
 </Level>
 
 <Level name="Intermediate">
 
-A backward (down) migration undoes the change, but some changes cannot be undone without data loss (a
-dropped column). The real rollback plan is usually "roll the code back, and keep the schema compatible with
-both versions". That is the expand-and-contract pattern in the timeline.
+Real features add history and money. Events record what happened (`note.created`, `member.invited`) for
+analytics and debugging. The audit log records security-relevant changes. Billing stores the payment
+provider's customer and subscription IDs and a copy of what was charged. Soft deletes keep a row recoverable
+for a while.
+
+```sql
+create table audit_log (id bigint generated always as identity primary key, tenant_id bigint not null,
+  actor_id bigint, action text not null, target_type text not null, target_id bigint,
+  before jsonb, after jsonb, ip inet, at timestamptz not null default now());
+```
+
+The mistake is recomputing an old invoice from today's prices. Money rows copy the amounts at the time they
+were created and are never updated afterwards.
 
 </Level>
 
 <Level name="Advanced">
 
-Lock levels matter: most `alter table` forms take an access exclusive lock. Adding a column with a constant
-default is instant in Postgres 11+; adding one with a volatile default rewrites the table. A migration
-waiting for a lock blocks every query queued behind it, so set `lock_timeout` and retry.
+The exact trade-offs underneath: `jsonb` columns are flexible and indexable with GIN, and they give up
+constraints and clear types, so I use them for genuinely variable data (event payloads, provider metadata) and
+not for core fields. Enums as `check` constraints are easier to change than Postgres `enum` types. Money is
+stored as integer minor units (paise, cents) or `numeric`, never as floating point. Timestamps are
+`timestamptz`. IDs exposed in URLs can be UUIDs (v7 is time-ordered and indexes well) to avoid leaking counts.
+
+```ts
+0.1 + 0.2   // 0.30000000000000004, which is why money is never a float
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A tenant with zero members after the last one leaves; a membership for a user who has been soft-deleted; an
+event payload from an old app version with a different shape (version the payload); an invoice in a currency
+with no minor unit (Japanese yen) or three (Kuwaiti dinar); an audit log row whose actor was deleted (keep the
+ID and a name snapshot, not a cascading foreign key).
+
+</Level>
+
+<Level name="Corner cases">
+
+Soft delete plus every query: forgetting `where deleted_at is null` in one place shows deleted data. A view
+(`create view active_notes as select * from notes where deleted_at is null`) or row-level security makes the
+safe version the default. Soft delete plus a privacy deletion request: "deleted" rows still hold personal data,
+so soft delete is a recovery window with a hard-delete job at the end, not deletion.
+
+</Level>
+
+<Level name="Production level">
+
+In production the schema has to support questions I will be asked later: who changed this permission, when did
+this customer downgrade, what did we charge in March. Append-only events and audit logs answer them. I partition
+or archive them by time when they grow (the partitioning topic), and I document every table's owner and
+retention in the repository.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "design for the question someone will ask in a year." Current state is easy to store; history,
+money and accountability need to be designed in from the start, because they cannot be reconstructed later.
+
+</Level>
+
+<Level name="System design">
+
+These tables are the system's spine. Events feed analytics (Phase 11) and can drive other services (Phase 10's
+event-driven design). The audit log is evidence for security reviews (Phase 6). Tenant IDs on every row make
+isolation, deletion and later sharding possible.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the capstone's requirements as a list of questions the data must answer, design the schema, and test it
+by writing the SQL for each question. Done when the gate's "design a schema from requirements and defend the
+trade-offs" is a document with the diagram, each decision and its alternative.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Indexes: B-trees, composite, covering and partial indexes, and selectivity
+
+<Figure art={`
+  index on notes (tenant_id, created_at desc)
+                         [ 7 | 412 ]
+                        /           \\
+            [ 3 | 7,2026-10 ]     [ 412 | 900 ]
+             /        \\              ...
+   leaf: (7, 2026-10-23, ctid) (7, 2026-10-22, ctid) (7, 2026-10-20, ctid) -> next leaf
+   where tenant_id = 7 order by created_at desc limit 20
+     -> descend to tenant 7, read 20 leaf entries in order, done
+   where created_at > now() - '1 day'  (no tenant)
+     -> leading column unused: this index barely helps
+`} caption="A composite B-tree is sorted by the first column, then the second. It helps queries that start from the left." />
+
+<Levels label="Phase 4, indexes: B-trees, composite, covering and partial indexes, and selectivity">
+
+<Level name="Beginner">
+
+An index is a separate sorted structure that lets the database find rows without reading the whole table, like
+the index at the back of a book. Postgres's default is a B-tree, which supports equality, ranges and sorting.
+Primary keys and unique constraints create one automatically; foreign keys do not.
+
+```sql
+create index notes_author_idx on notes (author_id);
+```
+
+The common mistake is forgetting the index on a foreign key column, so every "notes by this author" query and
+every delete of a user scans the whole notes table.
+
+</Level>
+
+<Level name="Intermediate">
+
+A composite index covers several columns in order, and it serves queries that filter on a left prefix of them.
+An index on `(tenant_id, created_at desc)` answers "latest notes in tenant 7" by reading just 20 entries. A
+covering index includes extra columns (`include (title)`) so the query never touches the table. A partial
+index covers only some rows (`where deleted_at is null`), which is smaller and faster.
+
+```sql
+create index notes_tenant_recent on notes (tenant_id, created_at desc) include (title) where deleted_at is null;
+```
+
+The mistake is one index per column. Postgres can combine them with a bitmap, but one composite index in the
+right order usually beats several single ones.
+
+</Level>
+
+<Level name="Advanced">
+
+The rules underneath: selectivity (the fraction of rows a condition matches) decides whether an index helps.
+For a condition matching a large share of the table, a sequential scan is cheaper because it reads pages in
+order, while an index scan jumps around. Column order in a composite index: equality columns first, then the
+range or sort column. Every index slows writes (each insert updates every index) and takes space. Postgres has
+other index types: GIN for `jsonb`, arrays and full-text search; GiST for ranges and geometry; BRIN for huge
+time-ordered tables; HNSW and IVFFlat (from pgvector) for vectors.
+
+</Level>
+
+<Level name="Edge cases">
+
+A function on the column defeats the index: `where lower(email) = $1` needs an index on `lower(email)`. A type
+mismatch (comparing a `bigint` column to a `numeric` parameter) can stop the index being used. `like 'abc%'`
+can use a B-tree with the `text_pattern_ops` operator class or the C collation; `like '%abc'` cannot (use a
+trigram GIN index). An index on a boolean column with half true and half false is almost useless.
+
+</Level>
+
+<Level name="Corner cases">
+
+Creating an index on a big, busy table with plain `create index` locks writes for the whole build; `create index
+concurrently` avoids the lock but cannot run inside a transaction, and if it fails it leaves an invalid index
+behind that must be dropped. A partial index plus a query whose `where` does not literally imply the index's
+condition (a parameter instead of a constant): the planner cannot prove it applies and ignores it.
+
+</Level>
+
+<Level name="Production level">
+
+In production I index for the queries I actually run, found with `pg_stat_statements`, and I drop unused
+indexes found with `pg_stat_user_indexes` (`idx_scan = 0` over a long period). Every new index on a large table
+is created concurrently in its own migration, and I measure the write cost on a busy table before and after.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "an index is designed for a query, not for a column." I write the query first, then the index
+that makes its plan cheap, then check that the plan uses it.
+
+</Level>
+
+<Level name="System design">
+
+Indexes are the same trade-off at every scale: faster reads, slower writes, more storage, and another
+structure to keep consistent. A search index, a vector index and a read replica are all forms of it. *Use The
+Index, Luke* is the reference I keep open for this topic.
+
+</Level>
+
+<Level name="Strategy">
+
+On the million-row seed I take the five most common queries, record their plans and timings, design indexes,
+and record again. Done when each has a before-and-after number and I can predict from the query alone whether
+an index will be used.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Query plans: EXPLAIN, statistics, join strategies and the cost of a scan
+
+<Figure art={`
+  EXPLAIN (ANALYZE, BUFFERS) select ... from notes n join users u on u.id = n.author_id
+                             where n.tenant_id = 7 order by n.created_at desc limit 20;
+
+  Limit  (cost=0.85..91.2 rows=20) (actual time=0.041..0.212 rows=20 loops=1)
+    ->  Nested Loop  (actual rows=20 loops=1)
+          ->  Index Scan using notes_tenant_recent on notes n  (actual rows=20 loops=1)
+                Index Cond: (tenant_id = 7)
+          ->  Index Scan using users_pkey on users u  (actual rows=1 loops=20)
+                Index Cond: (id = n.author_id)
+        Buffers: shared hit=84
+  Planning Time: 0.3 ms    Execution Time: 0.25 ms
+  read it inside out: the deepest node runs first; rows x loops = rows produced
+`} caption="A healthy plan. Estimated and actual rows agree, every lookup uses an index, and 84 pages came from cache." />
+
+<Levels label="Phase 4, query plans: EXPLAIN, statistics, join strategies and the cost of a scan">
+
+<Level name="Beginner">
+
+Postgres turns each query into a plan: a tree of steps such as scanning a table, using an index, joining and
+sorting. `explain` shows the plan it would use, and `explain analyze` runs the query and shows what actually
+happened, with times and row counts.
+
+```text
+explain analyze select * from notes where title = 'groceries';
+Seq Scan on notes  (cost=0.00..24812.00 rows=5 width=96) (actual time=0.02..121.7 rows=3 loops=1)
+  Filter: (title = 'groceries'::text)
+  Rows Removed by Filter: 999997
+Execution Time: 121.8 ms
+```
+
+A sequential scan read a million rows to find three. The common mistake is adding an index and not running
+`explain` again to see whether it is used.
+
+</Level>
+
+<Level name="Intermediate">
+
+Reading a plan: start from the most indented node. Compare estimated `rows` with actual `rows`; a big gap means
+the planner was guessing badly. Look for the node with the most time. `BUFFERS` shows pages read from cache
+(`hit`) and from disk (`read`). The three join strategies: a nested loop (for each outer row, look up the inner,
+good when the outer side is small), a hash join (build a hash table of one side, good for big unsorted inputs),
+and a merge join (walk two sorted inputs together).
+
+```text
+Hash Join  (actual time=310.2..1840.5 rows=420000 loops=1)
+  Hash Cond: (n.author_id = u.id)
+  ->  Seq Scan on notes n ...
+  ->  Hash  (actual rows=100000)  Buckets: 131072  Batches: 4  Memory Usage: 4097kB
+```
+
+`Batches: 4` means the hash table did not fit in `work_mem` and spilled to disk.
+
+</Level>
+
+<Level name="Advanced">
+
+The model underneath: the planner estimates cost from statistics in `pg_statistic` (row counts, most common
+values, histograms, distinct counts), gathered by `analyze` (and autovacuum). Cost units are relative (a
+sequential page read is 1.0 by default, a random one 4.0), not milliseconds. Estimates for correlated columns
+are poor because Postgres assumes independence; `create statistics` on the column pair fixes it. A prepared
+statement may switch to a generic plan after five executions, which can be bad for skewed values.
+
+```sql
+create statistics notes_tenant_author (dependencies) on tenant_id, author_id from notes;
+analyze notes;
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+`explain analyze` really runs the query, so on an `update` or `delete` I wrap it in `begin; ... rollback;`. A
+freshly loaded table with no `analyze` yet gets terrible estimates. `limit` changes the plan: a query fast with
+`limit 20` can be slow with `limit 2000`. Timing overhead in `explain analyze` makes very fast nodes look
+slower than they are.
+
+</Level>
+
+<Level name="Corner cases">
+
+Skew plus a generic plan: a query for tenant 7 (ten rows) and the same query for tenant 1 (half the table) want
+different plans. With a cached generic plan, one of them gets the wrong one. Setting `plan_cache_mode =
+force_custom_plan` for that query, or a partial index per huge tenant, fixes it. A plan that is fast in
+development with a hundred rows and slow in production with a million: always test plans on realistic volume
+and skew.
+
+</Level>
+
+<Level name="Production level">
+
+In production I use `auto_explain` to log plans of slow queries, `pg_stat_statements` to rank queries by total
+time, and a plan review for any new query on a large table. When a query regresses, I compare plans from before
+and after, check statistics freshness, and look for a changed parameter distribution before reaching for
+hints or configuration.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "measure, do not guess." A slow query has a plan, and the plan tells me exactly where the time
+went. I do not add an index until I know which node is slow and why.
+
+</Level>
+
+<Level name="System design">
+
+Plan reading is how I decide whether a feature needs a schema change, an index, a cache, a read replica or a
+denormalised read model. Each fixes a different slow node; choosing without the plan is how systems get caches
+in front of queries that only needed an index.
+
+</Level>
+
+<Level name="Strategy">
+
+I make three queries slow on purpose (missing index, bad estimate from correlation, a join that spills), read
+each plan, fix each, and record before and after. Done when the gate's "explain a query plan and improve it"
+is three written walkthroughs with numbers.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Transactions: ACID, isolation levels, anomalies, MVCC and locking
+
+<Figure art={`
+  lost update under READ COMMITTED (both read stock = 1)
+  T1: begin; select stock from items where id=1;   -> 1
+  T2: begin; select stock from items where id=1;   -> 1
+  T1: update items set stock = 0 where id=1; commit;   (sold one)
+  T2: update items set stock = 0 where id=1; commit;   (sold the same one again)
+  fixes:  select ... for update          (T2 waits for T1, then reads 0)
+          update ... set stock = stock - 1 where id=1 and stock > 0   (atomic, check rowcount)
+          SERIALIZABLE                    (T2 fails: could not serialize access; retry)
+`} caption="A lost update, the most common concurrency bug in application code, and three ways to prevent it." />
+
+<Levels label="Phase 4, transactions: ACID, isolation levels, anomalies, MVCC and locking">
+
+<Level name="Beginner">
+
+A transaction is a group of statements that succeed or fail together. ACID describes the guarantees: atomic
+(all or nothing), consistent (constraints hold), isolated (concurrent transactions do not see each other's
+half-done work), durable (once committed, it survives a crash). In Node with `pg`, a transaction must run on one
+client checked out from the pool.
+
+```ts
+const c = await pool.connect();
+try { await c.query('begin'); /* ... */ await c.query('commit'); }
+catch (e) { await c.query('rollback'); throw e; }
+finally { c.release(); }
+```
+
+The common mistake is `pool.query('begin')` followed by `pool.query(...)`: each call can use a different
+connection, so the statements are not in the same transaction at all.
+
+</Level>
+
+<Level name="Intermediate">
+
+Isolation is a dial. Postgres's default, read committed, means each statement sees data committed before it
+started. That allows a lost update when application code reads a value, computes and writes it back. The fixes
+are an atomic update in SQL, a row lock with `select ... for update`, or a stricter isolation level.
+
+```sql
+update items set stock = stock - 1 where id = $1 and stock > 0 returning stock;
+-- zero rows returned means sold out; no read-then-write gap exists
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The model underneath is MVCC (multi-version concurrency control): an update writes a new row version and
+marks the old one as dead for later transactions; readers see the versions visible to their snapshot, so
+readers do not block writers. Repeatable read gives one snapshot for the whole transaction. Serializable adds
+detection of dangerous patterns (write skew) and aborts one transaction with SQLSTATE `40001`, which the
+application must retry.
+
+```text
+ERROR:  could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+```
+
+Write skew example: two doctors each check "at least one other doctor is on call", both see yes, both go off
+call. Neither row conflicts, so only serializable (or locking the set) prevents it. Dead row versions are
+cleaned up by vacuum.
+
+</Level>
+
+<Level name="Edge cases">
+
+Two transactions locking rows in opposite order deadlock; Postgres detects it and kills one (`ERROR: deadlock
+detected`), so I lock in a consistent order (by ID). `for update skip locked` is for queues; `for update
+nowait` fails immediately instead of waiting. A long transaction holding a lock blocks every writer behind it.
+Calling an external API inside a transaction holds locks for the network's duration.
+
+</Level>
+
+<Level name="Corner cases">
+
+A transaction left open (`idle in transaction`) by a bug: it holds locks and stops vacuum from cleaning up dead
+rows across the whole database, so tables bloat. `idle_in_transaction_session_timeout` limits it. Serializable
+plus retries plus side effects: if the transaction sent an email before failing with `40001`, the retry sends
+another. Side effects go after commit, or into an outbox table inside the transaction.
+
+</Level>
+
+<Level name="Production level">
+
+In production transactions are short, contain no network calls, lock rows in a consistent order, and are
+retried on serialization failures and deadlocks with a capped number of attempts. I monitor long-running and
+idle-in-transaction sessions, lock waits and deadlock counts. Money and inventory paths have concurrency tests
+that run two transactions at once.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "read-modify-write in application code is a race until proven otherwise." I ask what happens if
+two requests do this at the same moment, and I write the test that does it.
+
+</Level>
+
+<Level name="System design">
+
+Transactions are the simplest consistency tool there is, and once data spans two systems (a database and a
+queue, or two services) they no longer cover it. The outbox pattern, idempotent consumers and sagas in Phase 10
+exist to get transaction-like behaviour across that boundary. *DDIA* chapter 7 is the reading.
+
+</Level>
+
+<Level name="Strategy">
+
+I reproduce a lost update and a write skew with two `psql` sessions side by side, then prevent each two ways.
+Done when the gate's "prevent a lost update" is a failing test turned passing, with the explanation of why
+read committed allowed it.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Migrations: forward, backward, zero-downtime and data backfills
+
+<Flow
+  caption="Expand and contract: renaming a column with no downtime. Every step is one deploy, and the app works between any two."
+  steps={["Expand: add new column (nullable, no default rewrite)", "Deploy: app writes both columns", "Backfill old rows in batches", "Deploy: app reads new column", "Add constraint not valid, then validate", "Deploy: app stops writing old column", "Contract: drop old column"]}
+/>
+
+<Levels label="Phase 4, migrations: forward, backward, zero-downtime and data backfills">
+
+<Level name="Beginner">
+
+A migration is a versioned script that changes the schema, kept in the repository and applied in order by a
+tool that records which have run (node-pg-migrate, Drizzle, Prisma Migrate or plain SQL files). Every
+environment reaches the same schema by running the same scripts.
+
+```text
+migrations/
+  0001_create_users.sql
+  0002_create_notes.sql
+  0003_add_notes_tenant_id.sql
+```
+
+The common mistake is changing the schema by hand in production, so the next migration fails because the
+database is not in the state the scripts expect.
+
+</Level>
+
+<Level name="Intermediate">
+
+During a rolling deploy, old and new versions of the app run at the same time against the same database. So a
+migration must work with both: add before use, stop using before remove. Renaming a column directly breaks the
+old version instantly. Expand and contract splits it into safe steps. A backfill updates existing rows in small
+batches so it does not lock the table or flood replication.
+
+```sql
+update notes set tenant_id = a.tenant_id from authors a
+where notes.author_id = a.id and notes.id in (select id from notes where tenant_id is null limit 5000);
+-- repeat until 0 rows; sleep between batches
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The locking rules underneath: most `alter table` forms take an `access exclusive` lock, which blocks reads and
+writes. Since Postgres 11, adding a column with a constant default does not rewrite the table; changing a
+column type usually does. The dangerous part is often not the operation but the wait: an `alter` queued behind a
+long query blocks every query that arrives after it. A `lock_timeout` makes the migration fail fast and retry
+instead of stalling the app.
 
 ```sql
 set lock_timeout = '3s';
-alter table notes add column summary text;
-```
-
-Backfills run in batches, outside the migration transaction, with progress logged and resumable.
-
-```sql
-update notes set summary = left(body, 200)
-where id in (select id from notes where summary is null limit 5000);
+alter table notes add column tenant_id bigint;       -- instant, no rewrite
+alter table notes add constraint notes_tenant_fk foreign key (tenant_id) references tenants(id) not valid;
+alter table notes validate constraint notes_tenant_fk;   -- scans without blocking writes
 ```
 
 </Level>
 
 <Level name="Edge cases">
 
-- A migration that runs in one second locally and an hour on production data.
-- A default value that triggers a table rewrite.
-- Two developers' migrations with the same number.
+`create index concurrently` cannot run inside the transaction many migration tools wrap around each file, so
+it needs a non-transactional migration. A `not null` on a big table needs a validated `check (col is not null)`
+first so `set not null` can skip the scan (Postgres 12 and later). Enum changes, renames of tables used by
+views, and dropping a column an old app version still selects with `select *`.
 
 </Level>
 
 <Level name="Corner cases">
 
-A deploy runs the migration, the new code fails health checks, the platform rolls the code back, and the old
-code crashes on the new schema. Code rollback plus schema change, the case from phase 0. Expand-and-contract
-makes every intermediate schema valid for both versions. Another: a backfill and live writes update the same
-rows; the backfill must not overwrite newer values.
+A "down" migration that drops a column created by "up": once real data is written to it, rolling back destroys
+data. In practice I roll forward (a new migration that fixes the problem) and treat down migrations as useful
+only before data exists. A backfill plus replication: one giant update produces a burst of WAL that puts
+replicas minutes behind, so reads from replicas go stale.
 
 </Level>
 
 <Level name="Production level">
 
-Migrations run in CI against a copy of production-sized data to estimate time. Each migration has a written
-rollback plan, and destructive steps wait one release.
+In production every migration is reviewed for its lock, its duration on production-sized data and its
+compatibility with the running app version. Migrations run as a separate step before the deploy, with a lock
+timeout, and long backfills run as jobs with progress logging. I rehearse risky migrations on a restored copy of
+production.
 
 </Level>
 
 <Level name="Mindset">
 
-Schema changes are deploys of data. Every intermediate state must be safe.
+The habit is "the database is shared by two versions of my app during every deploy." Each change must be safe
+for the version before and the version after.
 
 </Level>
 
 <Level name="System design">
 
-Migration strategy shapes deploy strategy: if every migration is backward compatible, code can deploy and
-roll back freely.
+Expand and contract is the same idea as API versioning and the encoding evolution in *DDIA* chapter 4: keep
+backward and forward compatibility so parts of the system can change independently. Event payloads, queue
+messages and cached values need the same discipline.
 
 </Level>
 
 <Level name="Strategy">
 
-Do one full expand-and-contract rename and one backfill on the million-row seed while a load test runs.
-Done when the load test shows no errors and the plan's "migration with a rollback plan and a backfill" is
-written up with timings.
+I rename a column on the million-row seed while a load test runs, once naively and once with expand and
+contract, and count errors. Done when the gate's "zero-downtime migration" is the step list with the error
+counts for both runs.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: backups: full, incremental, point-in-time recovery and restore drills
+#### Phase 4: Backups: full, incremental, point-in-time recovery and restore drills
 
-<Figure art={`
-  Sun base backup                         now
-  |-----------------------------------------|
-  [base] WAL WAL WAL WAL WAL WAL WAL WAL WAL
-                         ^
-            bad delete at Thu 14:32:10
-  PITR: restore base, replay WAL until Thu 14:32:09, stop
-`} caption="Point-in-time recovery: a base backup plus the write-ahead log lets me restore to any moment, such as one second before a bad delete." />
+<Timeline
+  caption="Point-in-time recovery after a bad delete at 14:32 IST. A base backup plus archived WAL replays to just before the mistake."
+  items={[
+    { when: "02:00", what: "Nightly base backup completes (a full copy of the data files)." },
+    { when: "02:00 to 14:32", what: "Every change is written to WAL segments, which are archived to object storage." },
+    { when: "14:32:10", what: "A migration runs delete from notes without the where clause." },
+    { when: "14:40", what: "Restore the base backup to a new server and replay WAL with recovery_target_time = 14:32:00." },
+    { when: "15:05", what: "New server is consistent as of 14:32:00; compare, then copy the lost rows back or switch over." },
+  ]}
+/>
 
-<Levels label="Phase 4, full and incremental backups, point-in-time recovery and restore drills">
+<Levels label="Phase 4, backups: full, incremental, point-in-time recovery and restore drills">
 
 <Level name="Beginner">
 
-A backup is useless until a restore has worked. `pg_dump` makes a logical backup of one database; it is
-easy, portable and slow for large data.
+A backup is a copy of the data I can restore from when something goes wrong: hardware failure, a bad migration,
+a deleted table, ransomware. A logical backup (`pg_dump`) exports schema and data as SQL or a custom archive. A
+physical backup copies the data files. A backup I have never restored is a hope, not a backup.
 
-```sh
-pg_dump -Fc "$DATABASE_URL" > backup.dump
-createdb restore_test && pg_restore -d restore_test backup.dump
-psql restore_test -c 'select count(*) from notes'
+```bash
+pg_dump -Fc -d app -f app-2026-10-23.dump
+createdb app_restore && pg_restore -d app_restore app-2026-10-23.dump
+psql -d app_restore -c 'select count(*) from notes'
 ```
 
-Common mistake: backups that are never restored. Fix: a scheduled restore drill with a row-count check.
+The common mistake is backups stored on the same server or account as the database, so the event that kills
+one kills both.
 
 </Level>
 
 <Level name="Intermediate">
 
-Physical backups copy the data files; with continuous WAL archiving they enable point-in-time recovery
-(PITR). Managed Postgres providers do this for me, with a retention window. Incremental backups store only
-changes since the last one.
+Two numbers define a backup strategy. RPO (recovery point objective) is how much data I can afford to lose;
+nightly dumps mean up to 24 hours. RTO (recovery time objective) is how long a restore may take. Point-in-time
+recovery (PITR) combines a base backup with continuous WAL archiving, so I can restore to any second, which
+brings RPO to seconds. Managed databases offer it as a setting; on my own server, tools like pgBackRest or
+WAL-G do it.
 
 </Level>
 
 <Level name="Advanced">
 
-Recovery point objective (RPO) is how much data I can lose; recovery time objective (RTO) is how long
-restoring may take. PITR gives an RPO of seconds; the RTO depends on database size and WAL replay speed,
-which only a drill measures. Backups need their own access controls and encryption, ideally in another
-account or region.
+How it works underneath: every change is written to the WAL before the data files, so replaying WAL from a
+consistent base backup reproduces every committed transaction in order. Recovery stops at a target time,
+transaction ID or named restore point. Incremental and differential backups copy only changed files or blocks
+since the last full one (Postgres 17 added built-in incremental base backups). Backups are encrypted, stored in
+another region or account, and protected with object lock or versioning so an attacker with my credentials
+cannot delete them.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A backup taken during a migration.
-- A dump that omits roles and extensions.
-- A restore onto a different major version.
+`pg_dump` of a big database takes hours and is consistent only to its start; a dump restores into a different
+major version more easily than a physical backup; extensions (pgvector) must be installed on the restore
+target; roles and permissions are not in a per-database dump (`pg_dumpall --globals-only`); a gap in archived
+WAL makes every point after it unreachable.
 
 </Level>
 
 <Level name="Corner cases">
 
-Ransomware or a compromised credential deletes the database and the backups in the same account. Backup
-plus access. Immutable, separately owned backups. Another: a restore brings back data a user asked to delete,
-so the privacy deletion log must be replayed after any restore.
+A restore that succeeds but is not correct: the app's object storage, Redis and search index are at a different
+point in time from the restored database, so files referenced by rows are missing or orphaned. The restore plan
+covers every store. A privacy deletion followed by a restore from an older backup brings the deleted person's
+data back, so deletions are recorded and re-applied after any restore.
 
 </Level>
 
 <Level name="Production level">
 
-Backups cover Postgres, object storage (versioning), Redis if it holds anything durable, and configuration.
-The restore drill is in the runbook with the measured RTO.
+In production I schedule restore drills (monthly at least), time them against the RTO, verify the restored data
+with checks (row counts, latest timestamps, a sample query), and alert when backups or WAL archiving fail. The
+runbook says who restores, where, and how traffic moves.
 
 </Level>
 
 <Level name="Mindset">
 
-Nobody wants backups; everyone wants restores. Practise the restore.
+The habit is "the restore is the product; the backup is an implementation detail." I judge my backups only by
+the last successful timed restore.
 
 </Level>
 
 <Level name="System design">
 
-Backup strategy is part of every store's design: the vector index, the object store and the search index
-each need a rebuild or restore path.
+RPO and RTO are business decisions that drive architecture: seconds of RPO need PITR or synchronous replicas;
+minutes of RTO need a warm standby. Backups protect against mistakes; replicas do not, because a replica
+faithfully copies the bad delete.
 
 </Level>
 
 <Level name="Strategy">
 
-Run a timed PITR drill: delete rows on purpose, note the time, restore to one second before it into a new
-instance, verify counts. Done when the gate's "restore from backup" has a dated record with RPO and RTO.
+I set up WAL archiving on a local Postgres, delete a table on purpose, and restore to the second before. Done
+when the gate's "restore a backup and verify it" has a timed log, a verification query and the RPO and RTO I
+achieved.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: replication, read replicas, lag, failover and split brain
+#### Phase 4: Replication, read replicas, lag, failover and split brain
 
 <Figure art={`
-          writes                      reads (may lag)
-  app ----------> [ primary ] --WAL--> [ replica 1 ]
-   |                   |       --WAL--> [ replica 2 ]
-   '----- reads ------>|
-  failover: primary dies -> promote replica 1 -> repoint app
-  split brain: old primary comes back still accepting writes -> two truths
-`} caption="Streaming replication sends the write-ahead log to replicas; failover promotes one, and split brain is two nodes both believing they are primary." />
+              writes                     WAL stream
+  app  ------------------>  primary  ===================>  replica 1  (async, lag 40 ms)
+   |                           \\=========================>  replica 2  (sync, waits for ack)
+   |  reads (can be stale)                                     ^
+   '-----------------------------------------------------------'
+  failover: primary dies -> promote replica -> repoint app -> old primary must NEVER come back as primary
+  split brain: two nodes both accept writes -> divergent data, no automatic merge
+`} caption="Streaming replication. Replicas give read scale and failover, at the cost of lag and a promotion process." />
 
 <Levels label="Phase 4, replication, read replicas, lag, failover and split brain">
 
 <Level name="Beginner">
 
-Replication copies data from a primary to replicas. Replicas serve reads and stand by for failover.
+Replication keeps copies of the database on other servers. The primary accepts writes and streams its changes
+to replicas. Replicas can serve reads and can be promoted to primary if the primary fails. Because the stream
+takes time, a replica can be slightly behind, which is called replication lag.
 
-Common mistake: reading from a replica immediately after a write and showing stale data. Fix: read your own
-writes from the primary, or wait for the replica to catch up.
+The common mistake is writing to the primary and immediately reading from a replica: the user saves a note,
+the page reloads from the replica, and the note is not there yet.
 
 </Level>
 
 <Level name="Intermediate">
 
-Asynchronous replication is fast but loses the latest commits if the primary dies. Synchronous replication
-waits for a replica to confirm, trading latency for durability. Lag is measured in bytes or seconds
-(`pg_stat_replication`).
+Asynchronous replication (the default) commits on the primary without waiting for replicas, so it is fast but a
+crash can lose the last moments of writes that had not reached a replica. Synchronous replication waits for at
+least one replica to confirm, so no committed write is lost, at the cost of latency. For read-your-writes, I
+route a user's reads to the primary for a short time after they write, or check the replica's position.
+
+```sql
+select now() - pg_last_xact_replay_timestamp() as lag;   -- on the replica
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Failover needs a decision-maker (the managed service, Patroni) and fencing so the old primary cannot keep
-accepting writes. Split brain happens without fencing. Session consistency strategies: route a user to the
-primary for a few seconds after their write, or track the WAL position of their last write and wait for the
-replica to pass it.
+The consistency models underneath, from *DDIA* chapter 5: read-your-writes (a user sees their own changes),
+monotonic reads (a user never sees time go backwards, which can happen when consecutive reads hit replicas with
+different lag) and consistent prefix reads. Failover is the hard part: detecting that the primary is really dead
+(not just slow), choosing the most up-to-date replica, promoting it and redirecting clients. Managed databases
+and tools like Patroni automate this with a consensus store, so only one node can hold the leader role.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A long query on a replica conflicts with replication and is cancelled.
-- Lag spikes during a large backfill on the primary.
-- A replica in another region adds latency to every read it serves.
+A replica that falls too far behind and needs WAL the primary already removed (replication slots prevent this
+but can fill the primary's disk if a replica disappears); a long query on a replica cancelled because
+replication needs to remove rows it is reading (`hot_standby_feedback` trades this for bloat on the primary);
+DNS caching delaying failover for clients.
 
 </Level>
 
 <Level name="Corner cases">
 
-Failover during a migration: the promoted replica has half the migration. Failover plus schema change.
-Migrations are transactional in Postgres, so it has either all or none, but the application may be on the
-wrong version of code for it.
+Split brain: a network partition makes the old primary unreachable but alive, a replica is promoted, and both
+accept writes. The data diverges and there is no automatic merge. Fencing (making sure the old primary cannot
+accept writes, for example by revoking its access) prevents it. Async replication plus failover: the writes
+that had not replicated are lost, and if the old primary later rejoins without being rebuilt, it conflicts.
 
 </Level>
 
 <Level name="Production level">
 
-Monitor lag, alert on it, and test failover. Connection strings use a service endpoint that follows the
-primary.
+In production I alert on replication lag, test failover on a schedule (not only when it happens for real), know
+my managed database's failover time and data-loss window, and route reads to replicas only for queries that
+tolerate staleness, such as dashboards and search, never for "did my payment go through."
 
 </Level>
 
 <Level name="Mindset">
 
-Every copy of data is a consistency question. Ask how stale each read may be.
+The habit is "every replica is a little bit in the past." When I read from one, I decide explicitly that the
+answer may be stale and that this is acceptable for this screen.
 
 </Level>
 
 <Level name="System design">
 
-Replicas scale reads, not writes. When writes are the bottleneck, the answers are batching, queues, better
-indexes or partitioning, not more replicas.
+Replication is the first step from one database to a distributed system, and it brings in the CAP and PACELC
+trade-offs Phase 10 covers. For most products, one primary with a synchronous or quickly-failing-over standby and
+a read replica or two is enough for a long time.
 
 </Level>
 
 <Level name="Strategy">
 
-Set up a primary and replica in Docker, measure lag under the backfill, and reproduce a stale read after a
-write, then fix it. Done when I can explain the gate-style question "what happens to the last second of
-writes on failover" for my setup.
+I run a primary and a replica in Docker Compose, measure lag under a write load, reproduce a stale read after a
+write, and fix it with primary routing. Done when I can explain read-your-writes, failover and split brain with
+my own setup's numbers.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: partitioning, sharding, and when a single Postgres is still the right answer
+#### Phase 4: Partitioning, sharding, and when a single Postgres is still the right answer
 
 <Compare
-  caption="Partitioning against sharding"
-  left="Partitioning (one database)"
-  right="Sharding (many databases)"
+  left="Technique"
+  right="What it solves, and what it costs"
+  caption="Three ways to split data, in the order I would reach for them."
   rows={[
-    ["Splits one table into child tables by range or list", "Splits data across servers by a shard key"],
-    ["Queries and transactions still work across partitions", "Cross-shard queries and transactions are hard"],
-    ["Drop old data by dropping a partition", "Rebalancing shards is a project"],
-    ["Helps maintenance and pruning", "Helps write throughput and size beyond one server"],
+    ["archive or delete old rows", "solves most growth; costs a retention policy and a job"],
+    ["partitioning (one server, many child tables)", "fast drops of old data, smaller indexes; costs queries that must include the partition key"],
+    ["sharding (many servers)", "write scale beyond one machine; costs cross-shard queries, transactions and rebalancing"],
   ]}
 />
 
-<Levels label="Phase 4, partitioning, sharding and the single Postgres">
+<Levels label="Phase 4, partitioning, sharding, and when a single Postgres is still the right answer">
 
 <Level name="Beginner">
 
-Partitioning splits a large table into smaller ones inside the same database, usually by time. Sharding
-splits data across databases. Both add complexity; a single well-indexed Postgres handles far more than most
-products need.
+Partitioning splits one big table into smaller child tables inside the same database, usually by time or by
+tenant, while queries still use the parent table name. Sharding splits data across several database servers.
+One well-tuned Postgres on a modern machine handles far more than most products ever need, so both are tools
+for specific problems, not defaults.
 
 ```sql
-create table events (id bigint, team_id uuid, at timestamptz not null, kind text) partition by range (at);
+create table events (id bigint generated always as identity, tenant_id bigint not null,
+                     type text not null, occurred_at timestamptz not null, payload jsonb,
+                     primary key (id, occurred_at)) partition by range (occurred_at);
 create table events_2026_10 partition of events for values from ('2026-10-01') to ('2026-11-01');
 ```
 
+The common mistake is sharding early "for scale" and paying the complexity before there is any load.
+
 </Level>
 
 <Level name="Intermediate">
 
-Partition pruning skips partitions that cannot match the `where` clause, so queries must filter on the
-partition key. Old partitions are detached and dropped instantly, which beats deleting millions of rows.
+Time partitioning fits append-heavy tables like events and audit logs: queries for "last 7 days" read only the
+recent partitions (partition pruning), and removing a month of old data is `drop table events_2025_10`, which
+is instant, instead of a huge `delete` that bloats the table. A job (or pg_partman) creates future partitions
+ahead of time.
+
+```text
+explain select count(*) from events where occurred_at > now() - interval '7 days';
+  ->  Seq Scan on events_2026_10   (only this partition; the others were pruned)
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Sharding by tenant keeps each tenant's data together, which suits multi-tenant apps; the hard parts are the
-largest tenant outgrowing a shard, cross-tenant analytics, and global uniqueness. Citus or application-level
-routing are the usual tools.
+The rules underneath: a primary key or unique constraint on a partitioned table must include the partition
+key, which is why the example's key is `(id, occurred_at)`. Pruning needs the partition key in the `where`
+clause, and pruning at execution time works with parameters. Sharding needs a shard key that spreads load and
+keeps related data together; for a multi-tenant product, `tenant_id` is the natural one, because nearly every
+query is within one tenant. Tools like Citus distribute Postgres tables by such a key.
 
 </Level>
 
 <Level name="Edge cases">
 
-- An insert with a date outside every partition fails unless a default partition exists.
-- A unique constraint must include the partition key.
+An insert with a timestamp outside every partition fails (`no partition of relation "events" found for row`)
+unless there is a default partition. Too many partitions (thousands) slow planning. A query without the
+partition key scans every partition. One giant tenant (skew) makes its shard hot, whatever the hashing.
 
 </Level>
 
 <Level name="Corner cases">
 
-A query without the partition key on a table with hundreds of partitions plans slowly and scans all.
-Partitions plus a missing filter. Another: one tenant with 40% of the data on a tenant-sharded system.
+Sharding by tenant plus a feature that spans tenants (an admin report, cross-team sharing): every such query
+fans out to every shard. Moving a growing tenant to its own shard while it is being written to needs a
+dual-write or logical-replication migration. A foreign key cannot point across shards, so integrity across them
+moves into application code.
 
 </Level>
 
 <Level name="Production level">
 
-Partition creation is automated ahead of time (pg_partman or a scheduled job), and alerts fire if next
-month's partition is missing.
+In production I watch table and index sizes, the rate of growth, and the top queries. When one table dominates,
+I first add retention, then time partitioning. I consider sharding only when write volume or data size truly
+exceeds one primary with headroom, and I write down the numbers that justified it.
 
 </Level>
 
 <Level name="Mindset">
 
-Scale when measurements demand it, not when a diagram looks impressive.
+The habit is "the boring answer first." A single Postgres with good indexes, retention and a replica is the
+right answer until measurements say otherwise.
 
 </Level>
 
 <Level name="System design">
 
-I write down the numbers that would trigger each step: table size for partitioning, write rate for sharding.
-Until then, one Postgres.
+Partitioning by tenant or time is also a privacy and operations tool: dropping a partition deletes data
+cleanly, and per-tenant placement can meet data-residency requirements. *DDIA* chapter 6 covers the rebalancing
+strategies a sharded system needs.
 
 </Level>
 
 <Level name="Strategy">
 
-Partition the events table by month, prove pruning with `EXPLAIN`, and write the "when one Postgres is
-enough" note with real numbers from my load tests. Done when the note has thresholds I could act on.
+I partition the events table by month on the seed data, compare a "last 7 days" query and a retention delete
+before and after, and write a page on when I would shard and by which key. Done when both measurements are
+recorded and the page names the numbers that would change my mind.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: caching at the data layer: Redis, TTLs, invalidation and stampedes
+#### Phase 4: Caching at the data layer: Redis, TTLs, invalidation and stampedes
 
 <Flow
-  caption="A read through the cache, with stampede protection"
-  steps={['Get key', 'Hit: return', 'Miss: try lock', 'Lock won: query DB, set key with TTL plus jitter', 'Lock lost: wait briefly, read again', 'Return']}
+  caption="Invalidation on write, with a version key. Bumping the version makes every old cache entry unreachable at once."
+  steps={["Write commits in Postgres", "After commit: incr notes_ver:tenant:7", "Readers build key notes:7:v42:page1", "Old v41 keys are never read again", "TTL removes them later"]}
 />
 
-<Levels label="Phase 4, Redis, TTLs, invalidation and stampedes">
+<Levels label="Phase 4, caching at the data layer: Redis, TTLs, invalidation and stampedes">
 
 <Level name="Beginner">
 
-Phase 3 introduced caching at the API. Here the question is what the database can stop doing. A Redis key
-with a TTL holds a computed result such as a team's dashboard counts.
+A cache stores the result of an expensive read so the next one is fast. Redis is an in-memory key-value store
+used for this. Each entry has a TTL (time to live) after which it expires. The hard part is invalidation:
+making sure the cache does not serve old data after the database changes.
 
 ```ts
-await redis.set(`dash:${teamId}`, JSON.stringify(counts), 'EX', 60 + Math.floor(Math.random() * 15));
+await redis.set(`tenant:${id}:summary`, JSON.stringify(summary), 'EX', 300); // 5 minutes
 ```
 
-The random jitter keeps many keys from expiring at once.
+The common mistake is caching without a TTL, so a missed invalidation means stale data forever.
 
 </Level>
 
 <Level name="Intermediate">
 
-Invalidation strategies: TTL only (simple, stale up to TTL), delete on write (fresh, racy), write-through
-(update cache in the write path) and versioned keys (`dash:v42:team`) bumped on change.
+Strategies for invalidation: delete the key after a write (simple, but every key that depends on the data must
+be found), version keys (bump a counter so all old keys are unused, shown above), or short TTLs where slight
+staleness is fine. The delete or bump happens after the transaction commits; doing it before allows a reader
+to repopulate the cache from the old data.
+
+```ts
+await db.tx(async (t) => { await t.query('update notes set title=$1 where id=$2', [title, id]); });
+await redis.incr(`notes_ver:tenant:${tenantId}`);   // after commit, not inside
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Stampede protection with a short lock:
+The race underneath: reader A misses, reads the old row, is delayed; writer B updates the row and deletes the
+key; A then writes the old value into the cache, which stays until TTL. Short TTLs bound it; version keys avoid
+most of it. A stampede (the plan's "cache stamps") is many readers missing the same hot key at once and all
+hitting the database. The fixes: a lock so one reader recomputes (Phase 3's caching topic), serving stale while
+one refreshes, and jittered TTLs so keys created together do not expire together.
 
 ```ts
-const v = await redis.get(k); if (v) return JSON.parse(v);
-if (await redis.set(`${k}:lock`, '1', 'NX', 'PX', 5000)) {
-  const fresh = await compute(); await redis.set(k, JSON.stringify(fresh), 'EX', 60); await redis.del(`${k}:lock`); return fresh;
-}
-await sleep(50); return getWithLock(k, compute);
+const ttl = 300 + Math.floor(Math.random() * 60); // 5 to 6 minutes
 ```
-
-Redis eviction policies (`allkeys-lru`, `volatile-ttl`) decide what goes when memory is full.
 
 </Level>
 
 <Level name="Edge cases">
 
-- TTL of zero or negative deletes immediately.
-- A value too large to be worth caching.
-- Keys never deleted because their TTL was forgotten: memory grows.
+Caching a "not found" result (negative caching) protects the database from repeated lookups for missing keys,
+but must be invalidated on create. Redis eviction under memory pressure removes keys before their TTL
+(`maxmemory-policy`). A cached value whose shape changed in a deploy: include a schema version in the key.
 
 </Level>
 
 <Level name="Corner cases">
 
-Delete-on-write plus a replica: the write commits on the primary, the cache key is deleted, the next read
-misses and fills the cache from a lagging replica with old data. Cache plus replication. Fill from the
-primary, or delay the delete.
+A cache shared across tenants plus a key without the tenant ID: one tenant sees another's data, which is a
+security bug, not a performance one. Every key includes the tenant and, for per-user data, the user. A cached
+permission check plus a revoked role: the user keeps access until the TTL, so permission caches are very short
+or invalidated on role change.
 
 </Level>
 
 <Level name="Production level">
 
-Track hit ratio per key prefix, memory, evictions and latency. The app degrades, not fails, with Redis down.
+In production I measure the hit rate, the latency with and without the cache, and Redis memory. The app works
+correctly (if slower) when Redis is down, because the cache is an optimisation, not a store of record. I name
+every key pattern in one module so invalidation is findable.
 
 </Level>
 
 <Level name="Mindset">
 
-A cache is a second database that is allowed to be wrong for a while. Decide how long.
+The habit is "every cache is a second copy that can be wrong." Before adding one, I write down how stale it can
+be, how it is invalidated, and what happens if it lies.
 
 </Level>
 
 <Level name="System design">
 
-Caching sits between query tuning and replicas in the scaling order: tune the query, then cache, then
-replicate.
+Caches sit at many layers: the browser, a CDN, the app's memory, Redis, the database's own buffer cache. In
+Phase 9 a semantic cache for model responses brings the same invalidation questions with a fuzzier key.
 
 </Level>
 
 <Level name="Strategy">
 
-Cache the dashboard counts, measure database load before and after under k6, then force a stampede. Done when
-the database sees one query per expiry under load.
+I cache the tenant dashboard query, measure, then write a test that updates a note and asserts the next read is
+fresh, and a load test of a hot key expiring. Done when the freshness test passes and the stampede is flattened
+in the database's query count.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: object storage: buckets, signed URLs, lifecycle rules and metadata
+#### Phase 4: Object storage: buckets, signed URLs, lifecycle rules and metadata
 
 <Layers
-  caption="Where a file's information lives"
+  caption="An object's life, with the metadata row that keeps it findable and deletable"
   layers={[
-    { name: 'Postgres row', note: 'owner, team, key, size, type, status, checksum' },
-    { name: 'Object metadata', note: 'content type, cache control, custom headers' },
-    { name: 'Object bytes', note: 'in a private bucket, random key' },
-    { name: 'Lifecycle rules', note: 'expire temp uploads, move old objects to cold storage' },
+    { name: "Database row", note: "uploads(id, tenant_id, key, sha256, size, mime, status, created_at)" },
+    { name: "Bucket and key", note: "app-uploads / t/7/u/0192f3... (no user-supplied names)" },
+    { name: "Object metadata", note: "content type, size, ETag, optional tags such as tenant=7" },
+    { name: "Versioning and lifecycle", note: "temp/ expires after 1 day, old versions after 30" },
+    { name: "Encryption and access", note: "private bucket, encryption at rest, access by signed URL only" },
   ]}
 />
 
-<Levels label="Phase 4, buckets, signed URLs, lifecycle rules and metadata">
+<Levels label="Phase 4, object storage: buckets, signed URLs, lifecycle rules and metadata">
 
 <Level name="Beginner">
 
-Object storage holds files by key in buckets. It is cheap and durable, has no folders (only key prefixes),
-and objects are replaced whole, not edited.
+Object storage keeps files (objects) in buckets, addressed by a key like a path. It is cheap, durable and nearly
+unlimited, and it is not a file system: there are no real folders, and objects are replaced whole, not edited.
+Phase 3 covered the upload flow; here the focus is the data: how objects relate to rows, how they are found and
+how they are removed.
 
-Common mistake: a public bucket. Fix: private buckets and signed URLs, as phase 3 built.
+The common mistake is storing objects with no database row, so nobody knows which tenant owns which file or
+which can be deleted.
 
 </Level>
 
 <Level name="Intermediate">
 
-The database row is the index of files; the bucket is the bytes. Key prefixes by tenant
-(`t/team-id/...`) make per-tenant listing, deletion and lifecycle rules possible.
+The database row is the source of truth for ownership and status; the object is the bytes. Keys start with the
+tenant (`t/7/...`) so listing or deleting a tenant's objects is one prefix operation. Lifecycle rules delete
+temporary uploads after a day, move old objects to cheaper storage classes, and expire old versions.
+
+```json
+{ "Rules": [ { "ID": "expire-temp", "Filter": { "Prefix": "temp/" }, "Status": "Enabled", "Expiration": { "Days": 1 } } ] }
+```
+
+Storing a SHA-256 of each file allows deduplication and integrity checks.
 
 </Level>
 
 <Level name="Advanced">
 
-Lifecycle rules expire temporary uploads, delete old versions, and move cold objects to cheaper tiers.
-Versioning protects against overwrites and deletes. Checksums (stored in the row) detect corruption and
-duplicates.
+The semantics underneath: major providers (S3 since 2020) now give strong read-after-write consistency for
+objects, but listing is not transactional with my database, so "row exists, object missing" and "object
+exists, no row" both happen after crashes. A reconciliation job compares them. Versioning keeps old versions on
+overwrite or delete (a delete adds a delete marker), which protects against mistakes and means "deleted" data is
+still there until versions expire.
 
 </Level>
 
 <Level name="Edge cases">
 
-- Listing a prefix with a million objects is paginated and slow.
-- Eventual consistency in some older or compatible stores.
-- Keys with special characters need encoding in URLs.
+Keys with special characters need URL encoding in signed URLs; very large files use multipart upload, and
+abandoned multipart uploads keep costing money until a lifecycle rule aborts them; listing a prefix with millions
+of objects is paginated and slow; the content type stored with the object decides how the browser treats it on
+download.
 
 </Level>
 
 <Level name="Corner cases">
 
-A tenant deletion removes the rows but not the objects, or the objects but not old versions. Deletion plus
-versioning. The deletion job lists the prefix, deletes every version, and verifies the prefix is empty.
+Versioning plus a privacy deletion: deleting the current version leaves earlier versions. Proving deletion means
+deleting every version or relying on a short noncurrent-version expiry, documented. A CDN in front of the bucket
+plus a deleted object: the CDN can serve it until its cache expires, so deletion also purges the CDN.
 
 </Level>
 
 <Level name="Production level">
 
-Storage cost is tracked per tenant; access logs are enabled; CORS on the bucket is limited to my origin.
+In production I run the reconciliation job, track storage per tenant (for quotas and billing), alert on public
+access settings changing, and include buckets, versions and CDN caches in the tenant deletion script.
 
 </Level>
 
 <Level name="Mindset">
 
-Files are data with the same ownership, retention and deletion rules as rows.
+The habit is "every object has an owner row and an end date." A file nobody owns is a cost and a privacy risk.
 
 </Level>
 
 <Level name="System design">
 
-Object storage is the raw document store for RAG ingestion; the extracted text and chunks live in Postgres.
+Object storage is the base of the AI data pipeline: raw documents, extracted text, chunk files, evaluation sets
+and model outputs all live there, keyed by tenant and version, with the database pointing at them.
 
 </Level>
 
 <Level name="Strategy">
 
-Add tenant prefixes, versioning and lifecycle rules, then delete a test tenant and verify every version is
-gone. Done when a script proves an empty prefix after deletion.
+I add the uploads table, a tenant prefix, a lifecycle rule and a reconciliation script to the capstone, then
+create orphans on purpose and let the script find them. Done when the script reports zero orphans after cleanup
+and the deletion script removes every version.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: vector data: embeddings, dimensions, distance metrics, indexes, and a vector store is not a search engine
+#### Phase 4: Vector data: embeddings, dimensions, distance metrics, indexes, and a vector store is not a search engine
 
 <Figure art={`
-  "reset my password"   -> [0.12, -0.40, 0.88, ...]  (1536 numbers)
-  "forgot login"        -> [0.10, -0.37, 0.91, ...]  close: cosine 0.93
-  "invoice for March"   -> [-0.55, 0.20, 0.03, ...]  far:   cosine 0.11
-  query -> embed -> nearest k by distance (HNSW graph, approximate)
-        -> filter by team_id -> top k chunks
-  a search engine also does: keywords, exact match, filters, facets, ranking signals
-`} caption="Embeddings place text as points in a high-dimensional space; nearness approximates meaning, which is different from keyword search." />
+  "reset my password"   --embed-->  [ 0.12, -0.03, 0.88, ... ]  (1536 numbers)
+  chunk 41 "To reset your password, open Settings..."  --> [ 0.10, -0.01, 0.91, ... ]
+  chunk 87 "Billing is monthly..."                     --> [ -0.40, 0.22, 0.05, ... ]
 
-<Levels label="Phase 4, embeddings, dimensions, distance metrics and vector indexes">
+  cosine distance(query, chunk 41) = 0.08   (close: similar meaning)
+  cosine distance(query, chunk 87) = 0.71   (far)
+
+  exact search: compare with every vector        -> correct, O(n)
+  HNSW index:   walk a graph of neighbours        -> fast, approximate (may miss a few)
+  hybrid:       vector rank + keyword rank, fused -> catches exact terms like error codes
+`} caption="Embeddings turn text into points; similar meaning means nearby points. An index trades a little recall for a lot of speed." />
+
+<Levels label="Phase 4, vector data: embeddings, dimensions, distance metrics, indexes, and a vector store is not a search engine">
 
 <Level name="Beginner">
 
-An embedding model turns text into a fixed-length vector of numbers so that similar meanings land near
-each other. pgvector stores vectors in Postgres and finds the nearest ones.
+An embedding is a list of numbers (a vector) produced by a model from text, such that texts with similar
+meaning get vectors that are close together. Vector search finds the stored vectors closest to a query's
+vector. The pgvector extension adds a `vector` type and distance operators to Postgres, so vectors can live next
+to the rows they describe.
 
 ```sql
 create extension if not exists vector;
-create table chunks (id bigserial primary key, team_id uuid not null, note_id uuid not null,
-  content text not null, embedding vector(1536) not null);
-select content from chunks where team_id = $1 order by embedding <=> $2 limit 5;
+create table chunks (id bigint generated always as identity primary key, tenant_id bigint not null,
+                     doc_id bigint not null, content text not null, embedding vector(1536) not null);
+select id, content from chunks where tenant_id = 7 order by embedding <=> $1 limit 5;  -- <=> is cosine distance
 ```
 
-`<=>` is cosine distance in pgvector. Common mistake: mixing embeddings from two models in one column.
-Fix: store the model name and dimension, and re-embed everything on a model change.
+The common mistake is mixing embeddings from two different models in one column; their numbers are not
+comparable, and the results are nonsense with no error.
 
 </Level>
 
 <Level name="Intermediate">
 
-Distance metrics: cosine (angle, ignores length), inner product (fast when vectors are normalised, then
-equivalent to cosine), Euclidean (L2). Use the metric the embedding model was trained for. Dimensions are
-fixed by the model; more dimensions cost storage and time.
+The dimension is fixed by the model (for example 1536 or 3072), and the column must match. Distance metrics:
+cosine distance (`<=>`) compares direction, inner product (`<#>`) is fastest for normalised vectors, Euclidean
+(`<->`) compares position. Use the one the model recommends. Without an index, Postgres compares the query with
+every row (exact, slow at scale). An HNSW index makes it fast and approximate.
+
+```sql
+create index on chunks using hnsw (embedding vector_cosine_ops);
+set hnsw.ef_search = 100;   -- higher: better recall, slower
+```
+
+```text
+ERROR:  expected 1536 dimensions, not 3072
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Exact nearest neighbour scans every vector. Approximate indexes trade recall for speed: HNSW builds a layered
-graph (good recall, more memory, slower builds), IVFFlat clusters vectors into lists (faster builds, needs
-training data). Filtering by tenant after approximate search can return too few results; pgvector's
-iterative scans or a per-tenant partial index help.
-
-```sql
-create index on chunks using hnsw (embedding vector_cosine_ops) with (m = 16, ef_construction = 64);
-set hnsw.ef_search = 100;  -- higher: better recall, slower
-```
-
-The plan's point: a vector store is not a search engine. It finds "similar" text but misses exact matches
-(an error code, a name), cannot facet or sort by date, and has no notion of freshness or authority. Real
-retrieval usually combines vector search with keyword search (Postgres full-text) and metadata filters:
-hybrid search, phase 7.
+How it works underneath: HNSW builds a layered graph where each vector links to near neighbours; search starts
+at the top layer and greedily walks closer. It is approximate, so recall (the share of the true nearest
+neighbours found) is below 100%, and I measure it against exact search. Build parameters (`m`,
+`ef_construction`) trade build time and memory for recall. IVFFlat clusters vectors and searches the nearest
+clusters; it needs data present before building. Filtering matters: with `where tenant_id = 7`, an approximate
+index may return fewer than five results because it finds neighbours first and filters after (pgvector 0.8 added
+iterative scans to help).
 
 </Level>
 
 <Level name="Edge cases">
 
-- An empty string still gets an embedding, near other empty-ish text.
-- Very short queries ("pricing?") embed poorly.
-- A zero vector has undefined cosine distance.
+An empty or whitespace chunk still gets an embedding, and it is close to many queries; an exact identifier like
+an error code `E1042` or a product SKU is poorly matched by embeddings; very long text is truncated by the model
+before embedding; a query in Hindi against English chunks works only if the model is multilingual.
 
 </Level>
 
 <Level name="Corner cases">
 
-Tenant filtering plus an approximate index: the 100 nearest vectors globally are all from other tenants, the
-filter removes them, and the user gets zero results. Approximation plus filtering. Filter-aware search,
-iterative scans or partitioning by tenant. Another: a document is updated, its old chunks are not deleted,
-and retrieval returns stale text.
+A vector store is not a search engine: it ranks by meaning only, with no keyword matching, no phrase search,
+no typo handling, no business ranking and no access control of its own. Hybrid search (Postgres full-text rank
+plus vector rank, combined with reciprocal rank fusion) catches what each alone misses. Filtering by tenant plus
+a shared HNSW index: the filter must be applied inside the query, every time, or retrieval leaks other tenants'
+chunks into the prompt, which is a data leak through the model.
 
 </Level>
 
 <Level name="Production level">
 
-Re-embedding a corpus is a backfill with cost; plan for it. Index build time and memory grow with the corpus.
-Every chunk carries `team_id`, source, version and the embedding model.
+In production I store the model name and version with every embedding, re-embed in a background job when the
+model changes (a new column, then switch, like expand and contract), measure recall and latency on a fixed
+question set, and enforce the tenant filter in one function that every retrieval call goes through.
 
 </Level>
 
 <Level name="Mindset">
 
-Similarity is not relevance. Measure retrieval; do not assume it.
+The habit is "retrieval is measured, not felt." A few good-looking results in a demo say nothing; recall at 5 on
+twenty real questions says something.
 
 </Level>
 
 <Level name="System design">
 
-Keeping vectors in Postgres keeps permissions, transactions and backups in one place; a separate vector
-database becomes worth it at scales most products never reach.
+Keeping vectors in Postgres with pgvector means one database, one backup, one permission model and joins with
+real data, which is the right start for most products. A dedicated vector database earns its place at very
+large scale or with special needs. Phase 7 builds RAG on this table.
 
 </Level>
 
 <Level name="Strategy">
 
-Embed a small corpus (my own notes), build twenty questions with known correct chunks, and measure recall at
-5 with exact search, HNSW and hybrid search. Done when the plan's "vector search table for a small corpus,
-with a retrieval evaluation" has a recall table.
+I embed a small corpus, write twenty questions with expected chunk IDs, and compare exact, HNSW and hybrid
+retrieval on recall at 5. Done when the table of results exists and I can explain each miss.
 
 </Level>
 
 </Levels>
 
-#### Phase 4: privacy: data minimisation, retention, deletion and tenant isolation
+#### Phase 4: Privacy: data minimization, retention, deletion and tenant isolation
 
 <Flow
-  caption="Deleting a tenant, provably"
-  steps={['Request recorded', 'Postgres rows deleted by cascade', 'Objects and versions deleted', 'Vectors and caches purged', 'Search and analytics purged', 'Backups expire on schedule', 'Verification script reports zero']}
+  caption="Deleting a tenant, store by store, with proof at the end. Each step is idempotent so the job can be retried."
+  steps={["Mark tenant deleting; block sign-ins", "Delete Postgres rows (children first, or cascade)", "Delete object prefix t/7/ and all versions", "Delete Redis keys tenant:7:*", "Delete vectors and search documents", "Request deletion from processors (email, analytics)", "Record deletion; re-apply after any restore", "Run the verification script: zero everywhere"]}
 />
 
-<Levels label="Phase 4, data minimisation, retention, deletion and tenant isolation">
+<Levels label="Phase 4, privacy: data minimization, retention, deletion and tenant isolation">
 
 <Level name="Beginner">
 
-Collect only what the feature needs, keep it only as long as needed, and be able to delete it everywhere.
-A data map lists each store and what personal data it holds.
+Privacy at the data layer means four habits. Minimisation: collect only what the feature needs. Retention:
+decide how long each kind of data is kept, and delete it after. Deletion: when a user or customer asks, remove
+their data everywhere. Tenant isolation: one customer's data is never visible to another.
 
-Common mistake: logging full request bodies, so personal data lands in the log store with no deletion
-path. Fix: redact at the logger.
+The common mistake is "keep everything, just in case," which makes every breach worse and every deletion
+request impossible.
 
 </Level>
 
 <Level name="Intermediate">
 
-Retention rules per table: sessions 30 days after expiry, audit logs per policy, raw uploads until deleted.
-A scheduled job enforces them. Deletion covers Postgres, object storage, Redis, vector chunks, search
-indexes, analytics and third parties.
+In practice I keep a data inventory: a table of every store (Postgres tables, buckets, Redis, logs, vectors,
+third-party processors), what personal data it holds, why, and its retention. Retention runs as a scheduled
+job. Isolation is enforced in the database with tenant IDs on every row and, as a backstop, row-level security.
+
+```sql
+alter table notes enable row level security;
+create policy tenant_isolation on notes using (tenant_id = current_setting('app.tenant_id')::bigint);
+-- per transaction: select set_config('app.tenant_id', '7', true);
+```
 
 </Level>
 
 <Level name="Advanced">
 
-The gate asks to delete a tenant's data and prove it is gone from every store. The proof is a script that
-queries each store for the tenant ID and reports counts, run after deletion.
-
-```ts
-const checks = {
-  postgres: () => db.one('select (select count(*) from notes where team_id=$1) + (select count(*) from chunks where team_id=$1) as n', [id]),
-  objects: () => countObjects(`t/${id}/`, { includeVersions: true }),
-  redis: () => countKeys(`*:${id}*`),
-};
-for (const [store, f] of Object.entries(checks)) console.log(store, await f());
-```
-
-Backups are the exception: they expire on their schedule, and the deletion is re-applied after any restore.
+The details underneath: RLS does not apply to the table owner or superusers by default, so the app connects as
+a separate role (or uses `force row level security`). With a connection pool, the tenant setting must be
+transaction-local (`set_config(..., true)`) so it cannot leak to the next request on the same connection. Laws
+such as the EU's GDPR and India's Digital Personal Data Protection Act 2023 give people rights over their data,
+including erasure; I read the official texts for the exact obligations rather than summaries.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A user who belongs to two tenants: delete one membership, not the user.
-- Data in the audit log about a deleted user: anonymise the actor.
-- Derived data: embeddings of deleted text are still the text, in a different form.
+Personal data in logs (emails in error messages), in backups (restores bring it back), in analytics events, in
+embeddings (an embedding of a private note is derived from that note, so it is personal data too), and in
+prompts sent to model providers, whose retention terms I need to know.
 
 </Level>
 
 <Level name="Corner cases">
 
-A restore from last week's backup resurrects a deleted tenant. Deletion plus backups. Keep a deletion log
-outside the database and replay it after every restore.
+Deleting a user who wrote shared content in a team: delete their personal data but keep the team's notes,
+reassigning authorship to "deleted user." Deleting a tenant plus a cached response or a CDN copy that outlives
+the database row. A restore from last week's backup after a deletion brings the data back unless deletions are
+recorded and re-applied.
 
 </Level>
 
 <Level name="Production level">
 
-Deletion requests have an SLA, an audit trail and a verification report. Vendors (email, analytics, model
-providers) are on the data map with their retention terms.
+In production deletion is a tested job, not a manual procedure: it runs on staging data in CI, produces an
+audit record, and has a verification script that counts the tenant's data in every store and must print zero.
+The data inventory is reviewed whenever a new store or processor is added.
 
 </Level>
 
 <Level name="Mindset">
 
-Data I do not have cannot leak. Minimise first.
+The habit is "data I do not have cannot leak." Before storing a field, I ask what it is for and when it will be
+deleted.
 
 </Level>
 
 <Level name="System design">
 
-Tenant ID on every row, object key, vector, cache key and log line is the design choice that makes isolation
-and deletion possible at all.
+Privacy is easiest when it is in the schema from the start: tenant IDs everywhere, key prefixes per tenant,
+retention per table, and one deletion job that knows every store. Phase 6 builds on this with threat modelling
+and AI-specific risks such as data leaking through retrieval.
 
 </Level>
 
 <Level name="Strategy">
 
-Write the data map, the retention job and the deletion-with-verification script, and run it on a seeded
-tenant. Done when the script reports zero in every store.
+I write the data inventory for the capstone, the retention job, and the tenant deletion job with its
+verification script. Done when the gate's deletion proof is a script run whose output shows zero rows, objects,
+keys and vectors for the deleted tenant.
 
 </Level>
 
@@ -1402,53 +1611,75 @@ tenant. Done when the script reports zero in every store.
               |
               v
   chunks table + HNSW + hybrid  --->  retrieval eval: recall@5 on 20 questions
-`} caption="The phase 4 build as five artefacts, each with a number attached." />
+`} caption="The Phase 4 build as five artefacts, each with a number attached." />
 
 <Levels label="Phase 4, the build: schema, migration, tuning, restore and vector search">
 
 <Level name="Beginner">
 
-Five artefacts: the capstone schema with constraints and indexes; a migration with a rollback plan and a
-backfill; a slow query tuned with before-and-after numbers; a backup and restore drill; and a vector search
-table for a small corpus with a retrieval evaluation.
+The build has five artefacts: the capstone schema with constraints and indexes; a migration with a rollback plan
+and a backfill; a slow query tuned with before-and-after numbers; a backup and restore drill; and a vector search
+table for a small corpus with a retrieval evaluation. Each is a folder in the repository with its SQL, its
+script and a short write-up. I start with the schema, because every other artefact uses it, and the seed script
+that generates a million notes with skewed tenants.
 
 </Level>
 
 <Level name="Intermediate">
 
-Each artefact is a folder in the repository with its SQL, its script and a short write-up. The million-row
-seed makes the numbers real.
+The migration is the plan's "with a rollback plan": I add `tenant_id` to a table that lacks it with expand and
+contract, a batched backfill, and a written plan for each step saying how to undo it before data depends on it
+and how to roll forward after. The tuned query comes from `pg_stat_statements` on a load test, not from my
+guess.
+
+```text
+before: Seq Scan on notes ... Execution Time: 412.8 ms
+after:  Index Scan using notes_tenant_recent ... Execution Time: 0.31 ms
+```
 
 </Level>
 
 <Level name="Advanced">
 
-The retrieval evaluation is the first eval in the plan: a JSON file of questions with expected chunk IDs, and
-a script computing recall at 5 and mean reciprocal rank for exact, HNSW and hybrid retrieval.
+The retrieval evaluation is the first eval in the plan: a JSON file of questions with expected chunk IDs, and a
+script computing recall at 5 and mean reciprocal rank for exact, HNSW and hybrid retrieval.
 
 ```ts
-const recallAt5 = qs.filter(q => top5(q).some(id => q.expected.includes(id))).length / qs.length;
+type Q = { q: string; expected: number[] };
+const recallAt5 = (qs: Q[], top5: (q: string) => number[]) =>
+  qs.filter((x) => top5(x.q).some((id) => x.expected.includes(id))).length / qs.length;
 ```
+
+```text
+exact   recall@5 = 0.85   mrr = 0.71   p95 = 38 ms
+hnsw    recall@5 = 0.85   mrr = 0.70   p95 = 4 ms
+hybrid  recall@5 = 0.95   mrr = 0.79   p95 = 9 ms
+```
+
+(These are the shape of the table I fill in, not results I am claiming.)
 
 </Level>
 
 <Level name="Edge cases">
 
-- Questions with no answer in the corpus: retrieval returns something anyway; mark them for phase 7.
-- A migration that the seed size makes slow: that is a finding, not a failure.
+Questions with no answer in the corpus: retrieval returns something anyway, and I mark them for Phase 7, where
+the app must say "I do not know." A migration that is slow at seed size is a finding to write up, not a
+failure. A restore drill that misses the RTO is the most useful result of the phase.
 
 </Level>
 
 <Level name="Corner cases">
 
-Tuning a query by adding an index that slows the backfill or the write path. Read speed plus write cost:
-measure both.
+Tuning a query by adding an index that slows the backfill or the write path: I measure both read speed and
+write cost. Running the retrieval eval after changing the chunking: the expected chunk IDs change, so the eval
+set stores expected text spans, not only IDs.
 
 </Level>
 
 <Level name="Production level">
 
-Everything here runs against a production-like database in CI or staging, not only on my laptop.
+Everything runs against a production-like database in CI or staging, not only my laptop: migrations are tested
+against a restored copy, the deletion verification runs in CI, and the restore drill is scheduled.
 
 </Level>
 
@@ -1460,18 +1691,34 @@ Each artefact ends with a number. A data claim without one is a guess.
 
 <Level name="System design">
 
-This schema and retrieval table are what phase 7's RAG app builds on.
+This schema and retrieval table are what Phase 7's RAG app builds on, and the deletion and isolation work is
+what Phase 6's security review will test.
 
 </Level>
 
 <Level name="Strategy">
 
-One commit per artefact, each with its write-up. Done when all five have numbers and the write-ups link to
-the SQL.
+One commit per artefact, each with its write-up. Done when all five have numbers and the write-ups link to the
+SQL.
 
 </Level>
 
 </Levels>
+
+#### Phase 4: exercises
+
+- Insert ten kinds of bad data and confirm each is refused by a constraint, with the error code mapped to an API
+  error.
+- Write the latest-note-per-user query three ways (window function, `distinct on`, lateral join) and compare plans.
+- Find the `not in` with a null trap in a query of your own and rewrite it with `not exists`.
+- Build an index that the planner refuses to use, and explain why from the statistics.
+- Reproduce a lost update and a write skew in two `psql` sessions, then prevent each.
+- Rename a column under load naively and with expand and contract, counting errors.
+- Delete a table on purpose and restore to the second before with PITR, timing it.
+- Measure replication lag under load and reproduce a stale read after a write.
+- Partition the events table and drop an old month instantly.
+- Compare exact, HNSW and hybrid retrieval on twenty questions.
+- Write the data inventory and run the tenant deletion verification.
 
 #### Phase 4: the gate
 
@@ -1480,14 +1727,14 @@ the SQL.
   left="Gate item"
   right="Evidence"
   rows={[
-    ["Design a schema from requirements and defend it", "Requirements to tables walkthrough, with each tradeoff note"],
-    ["Read a query plan; explain index use or not", "Three plans each way, annotated, from the seeded data"],
-    ["Explain an isolation anomaly and how my code prevents it", "Lost update and write skew demos plus the concurrent tests"],
-    ["Restore from backup", "Dated PITR drill record with RPO and RTO"],
-    ["Delete a tenant and prove it is gone everywhere", "Verification script output, zero in every store"],
+    ["Design a schema from requirements and defend it", "requirements to tables walkthrough, with each trade-off and its alternative"],
+    ["Read a query plan; explain index use or not", "three plans each way, annotated, from the seeded data"],
+    ["Explain an isolation anomaly and how my code prevents it", "lost update and write skew demos plus the concurrent tests"],
+    ["Restore from backup", "dated PITR drill record with RPO and RTO"],
+    ["Delete a tenant and prove it is gone everywhere", "verification script output: zero in every store"],
   ]}
 />
 
-I run the gate as a mock review: someone (or a recording of me) gives a new requirement, such as "teams can
-share a note with another team", and I change the schema, migration, indexes, isolation rules and deletion
-script live. If any of the five breaks, the gate waits.
+I run the gate as a mock review: a new requirement arrives, such as "teams can share a note with another team",
+and I change the schema, migration, indexes, isolation rules and deletion script live, explaining each choice.
+If any of the five items breaks, the gate waits.
