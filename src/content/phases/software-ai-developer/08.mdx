@@ -1,0 +1,1343 @@
+---
+plan: software-ai-developer
+phase: 8
+title: "RAG and AI product engineering: from a demo to a feature people can rely on"
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Eight weeks, weeks 43 to 50. Phase 7 ended with a RAG app that answers and measures itself. Phase 8
+turns it into a product feature inside the main app: one that handles uncertainty, abuse,
+permissions, cost and change, and that a user can trust because it tells them when not to. The
+books are *AI Engineering* and *Hands-On Large Language Models*, with *Designing Machine Learning
+Systems* for monitoring and drift, plus the LlamaIndex and Ragas documentation. All explanations
+below are my own paraphrase and my own examples.
+
+#### Phase 8: how I would learn it
+
+I pick one feature for the main app (a document Q&A over the user's own uploaded files is the one I
+would choose, because it forces permissions and tenant isolation) and build it as if a support team
+had to run it. Each week adds one product concern and one test that proves it. I keep two logs from
+day one: a failure taxonomy (every bad answer, classified) and a release log (every prompt, model or
+retrieval change with its eval numbers).
+
+<Timeline
+  caption="Phase 8's eight weeks"
+  items={[
+    { when: 'week 43', what: 'Use-case selection: write why the feature should exist and what a rule could do instead. Pick the feature.' },
+    { when: 'week 44', what: 'AI UX: streaming, cancel, retry, citations, uncertainty display, feedback buttons, degraded state.' },
+    { when: 'week 45', what: 'Conversation design and memory; guardrails on input and output; safe fallbacks.' },
+    { when: 'week 46', what: 'Human-in-the-loop review queue; moderation and abuse handling; rate limits per user.' },
+    { when: 'week 47', what: 'Privacy: redaction, retention, tenant isolation tests, provider terms recorded. Billing and metering with caps.' },
+    { when: 'week 48', what: 'Prompt and model registry with rollback; offline evals in CI; an online experiment plan.' },
+    { when: 'week 49', what: 'Observability: redacted traces, eval dashboard, drift checks. Incident runbooks for four AI incidents.' },
+    { when: 'week 50', what: 'Product metrics, a red-team exercise, the failure taxonomy write-up. Then the gate.' },
+  ]}
+/>
+
+<Compare
+  caption="What phase 8 adds on top of phase 7"
+  left="A demo (phase 7)"
+  right="A product feature (phase 8)"
+  rows={[
+    ['Answers my questions', 'Answers any user, and refuses usefully'],
+    ['One corpus, mine', 'Many tenants, strict isolation'],
+    ['Runs when I run it', 'Runs with limits, caps, alerts and a rollback'],
+    ['Wrong answers are interesting', 'Wrong answers are traced, classified and fixed'],
+    ['Model chosen once', 'Prompt and model versions released and rolled back'],
+  ]}
+/>
+
+#### Phase 8: Use-case selection: where a model adds value, where a rule is better
+
+<Figure art={`
+  Is the input unstructured (free text, documents)?
+      no  -> use a rule, a form, or a query. Stop.
+      yes -> Is a wrong answer cheap, visible, and correctable?
+                no  -> human review required, or do not use a model
+                yes -> Can I write an eval for "right"?
+                          no  -> not ready; define success first
+                          yes -> candidate for a model feature
+`} caption="A decision tree I run before writing any prompt." />
+
+<Levels label="Phase 8, use-case selection">
+
+<Level name="Beginner">
+
+A model is worth using where the input is messy and language-shaped (free text, documents,
+conversations) and the output can be checked. It is the wrong tool where a rule, a database query or
+a form gives an exact answer: validating an email, computing a total, looking up an order status.
+Using a model there adds cost, latency and error for no gain.
+
+```ts
+// wrong: asking a model to compute what code can compute exactly
+await llm(`What is the total of these line items? ${JSON.stringify(items)}`);
+// right
+const total = items.reduce((s, i) => s + i.qty * i.unitPrice, 0);
+```
+
+Mistake: starting with "where can I add AI?". Fix: start with a user problem and ask which part is
+genuinely unstructured.
+
+</Level>
+
+<Level name="Intermediate">
+
+I score candidate features on four questions: how often users hit the problem, how much time it
+costs them now, how bad a wrong answer is, and whether success is measurable. A document Q&A over a
+user's own files scores well: frequent, slow to do by hand, wrong answers are visible because
+sources are shown, and success is measurable with a golden set. Auto-sending emails to customers
+scores badly on "how bad is a wrong answer".
+
+</Level>
+
+<Level name="Advanced">
+
+Many good AI features are hybrids: a deterministic workflow with one model step in the middle. A
+support assistant might classify the ticket with a model, route it with a rule, retrieve with
+search, draft a reply with a model, and require a human to send it. The model does the language
+part; code does everything with an exact answer.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A feature that works for 90% of inputs and is dangerous for 10%:** detect the 10% (a classifier,
+  a keyword list, a confidence threshold) and route it to a human or a rule.
+- **Low volume:** if users need it twice a year, a help page may beat a model feature on cost and
+  maintenance.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A feature valuable to users but impossible to evaluate offline** (subjective writing help):
+  ship behind a flag to a few users with feedback capture, and treat online metrics as the eval.
+- **A rule that already exists plus a model that is "smarter":** run both, compare on real cases;
+  keep the rule as the fallback.
+
+</Level>
+
+<Level name="Production level">
+
+The decision is written down: the problem, the users, the alternative without AI, the success
+metric, the acceptable failure rate, and the kill criterion (what number would make me remove the
+feature). That last one is what makes the decision honest.
+
+</Level>
+
+<Level name="Mindset">
+
+The question is not "can a model do this?" but "should this product depend on a probabilistic
+component here, given what a wrong answer costs?".
+
+</Level>
+
+<Level name="System design">
+
+A model step is a node in a workflow, with deterministic steps around it and a non-AI path beside it.
+Drawing the workflow first shows how few steps actually need the model.
+
+</Level>
+
+<Level name="Strategy">
+
+I list five candidate AI features for my app and score each, then write a one-page decision for the
+winner including the kill criterion. Done when the decision doc exists and names one feature I chose
+not to build and why.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: UX for AI: uncertainty, citations, streaming, cancel, retry, feedback, degradation
+
+<Figure art={`
+  +-----------------------------------------------------+
+  | Q: Can I get a refund after 30 days?                |
+  |                                                     |
+  | A: Refunds are available within 45 days of          |
+  |    delivery for unused items [1]. Opened software   |
+  |    is excluded [2].                                 |
+  |    Sources: [1] Refund policy (updated 2 Oct)       |
+  |             [2] Software terms (updated 14 Aug)     |
+  |    Confidence: answered from 2 sources              |
+  |                                                     |
+  |  [ Stop ]  [ Retry ]  [ Helpful ] [ Not helpful ]   |
+  +-----------------------------------------------------+
+`} caption="Every element has a job: sources to verify, dates for freshness, stop and retry for control, feedback for the eval set." />
+
+<Levels label="Phase 8, UX for AI">
+
+<Level name="Beginner">
+
+An AI answer needs more interface than a normal one, because it can be wrong. The basics: show
+sources next to claims, stream the answer so the user sees progress, let them stop it, let them
+retry, and let them say it was not helpful. When the model is unavailable, show something useful
+(the search results it would have used) rather than an error.
+
+```tsx
+function AnswerView({ a }: { a: Answer }) {
+  if (a.state === 'refused') return <p>I couldn't find this in your documents. <a href={a.searchUrl}>Search instead</a></p>;
+  return (<>
+    <p>{a.text}</p>
+    <ol>{a.sources.map((s) => <li key={s.id}><a href={s.url}>{s.title}</a> (updated {s.updatedAt})</li>)}</ol>
+  </>);
+}
+```
+
+Mistake: hiding sources behind a tooltip. Fix: show them by default; trust comes from being able to
+check.
+
+</Level>
+
+<Level name="Intermediate">
+
+**Streaming** uses server-sent events or a streamed fetch body; the UI appends tokens and shows a
+"generating" state. **Cancel** aborts the fetch and, server side, the model call, so I stop paying.
+**Retry** re-runs with the same input and logs that it was a retry (a signal of a bad first answer).
+**Uncertainty** is shown in plain terms derived from things I can measure: how many sources, how
+recent, whether the model marked it partly answerable. I do not show a made-up percentage.
+
+```ts
+// client: stream and cancel
+const ac = new AbortController();
+const res = await fetch('/api/answer', { method: 'POST', body, signal: ac.signal });
+const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+for (;;) { const { value, done } = await reader.read(); if (done) break; append(value); }
+// Stop button: ac.abort()
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Citations should be inline and clickable, ideally scrolling to the exact passage. Streaming and
+citations conflict: labels arrive mid-stream before I have validated them. I stream text, then
+validate citations at the end and mark any invalid label visibly, or I stream into a draft state and
+swap in the validated answer. Accessibility applies: streamed text should not make a screen reader
+announce every token; I announce completion with a polite live region instead.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Answer arrives after the user navigated away:** ignore it; abort on unmount.
+- **Zero sources:** the refusal state, never an uncited answer.
+- **Very long answer:** cap length, offer "show more" from the same response.
+- **Double-click on Send:** disable while pending, or dedupe by request id.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Stop pressed after the server finished but before the client rendered:** the user sees no answer
+  but was billed; show the completed answer anyway or mark it cancelled consistently on both sides.
+- **Feedback on a retried answer:** attach feedback to the specific answer id, not the question, or
+  the eval data gets mixed.
+
+</Level>
+
+<Level name="Production level">
+
+UX events are analytics events: shown, streamed, stopped, retried, source clicked, thumbs up/down,
+copied. Each is tied to the trace id. The degraded state is tested in CI by forcing the provider
+mock to fail.
+
+</Level>
+
+<Level name="Mindset">
+
+The UI is where uncertainty becomes either honesty or a trap. I design for the wrong answer first,
+then make the right answer pleasant.
+
+</Level>
+
+<Level name="System design">
+
+<Flow
+  caption="States of one AI answer in the UI"
+  steps={['idle', 'retrieving', 'streaming', 'validating', 'done | refused | degraded | cancelled | error']}
+/>
+
+The state machine is shared by client and server so both agree on what happened.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the state machine first with a fake model that streams canned text and fails on demand, then
+plug in the real one. Done when every state is reachable in a test and a keyboard-only user can
+stop, retry and give feedback.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Conversation design: context, memory, clarification, the limits of chat
+
+<Layers
+  caption="What goes into the context window on turn N, in priority order when space runs out"
+  layers={[
+    { name: 'system rules', note: 'never trimmed' },
+    { name: 'retrieved sources for this turn', note: 'trimmed by relevance' },
+    { name: 'summary of earlier turns', note: 'refreshed every few turns' },
+    { name: 'last few turns verbatim', note: 'trimmed oldest first' },
+    { name: 'the new message', note: 'never trimmed; rejected if too long' },
+  ]}
+/>
+
+<Levels label="Phase 8, conversation design">
+
+<Level name="Beginner">
+
+A chat model has no memory between calls; "memory" is me resending earlier turns. Every turn I
+decide what to include. The simplest policy, resend everything, works until the conversation
+outgrows the context window and the cost per turn keeps climbing.
+
+Mistake: assuming the model remembers. Fix: treat history as data I choose to send, with a budget.
+
+</Level>
+
+<Level name="Intermediate">
+
+A practical policy: keep the last few turns verbatim, keep a running summary of older turns, and
+retrieve fresh sources per turn using a rewritten standalone question. **Clarification:** when a
+question is ambiguous ("the contract", but there are three), asking one short question beats
+guessing. I make "ask a clarifying question" an allowed output type in the schema.
+
+```ts
+const Turn = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('answer'), text: z.string(), cites: z.array(z.string()) }),
+  z.object({ type: z.literal('clarify'), question: z.string(), options: z.array(z.string()).max(4) }),
+  z.object({ type: z.literal('refuse'), reason: z.string() }),
+]);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Chat is a weak interface for many tasks: users do not know what to ask, outputs are hard to compare,
+and results are buried in scrollback. Often a structured UI with one AI-powered step (a "summarize"
+button, a field that suggests a value, a search box that answers) beats an open chat. Long-term
+memory (facts about the user saved across sessions) is a product decision with privacy weight: the
+user should see, edit and delete what is remembered.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **First turn is a greeting:** no retrieval, a short fixed reply with example questions.
+- **The user changes topic:** the summary and rewrite should not drag the old topic in.
+- **Pasted huge text mid-conversation:** counts against the budget; treat it as an attachment.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A summary that drops a constraint the user set early** ("only 2025 contracts"): later answers
+  silently ignore it. Pin explicit user constraints as structured state, outside the summary.
+- **A clarification loop:** the model keeps asking. Limit to one clarifying question per request.
+
+</Level>
+
+<Level name="Production level">
+
+Conversations are stored with retention rules, per-turn token counts and costs. A per-conversation
+cap prevents a single endless chat from costing more than a seat's revenue.
+
+</Level>
+
+<Level name="Mindset">
+
+Chat is one interface, not the default. I pick the interface for the task.
+
+</Level>
+
+<Level name="System design">
+
+Conversation state (pinned constraints, summary, recent turns) is a small record in the database,
+assembled by one function per turn, testable without a model.
+
+</Level>
+
+<Level name="Strategy">
+
+I write ten multi-turn eval scripts (follow-ups, topic changes, ambiguous references) and run them
+after every change. Done when constraints survive ten turns and the clarify path fires on the
+ambiguous cases.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Guardrails: input filtering, output validation, allowlists, safe fallbacks
+
+<Flow
+  caption="Guardrails at both ends of the model call"
+  steps={[
+    'input: length, rate, topic and policy check',
+    'model call',
+    'output: schema, citations, allowlists, policy check',
+    'pass: show',
+    'fail: safe fallback, log the reason',
+  ]}
+/>
+
+<Levels label="Phase 8, guardrails">
+
+<Level name="Beginner">
+
+A guardrail is a check before or after the model that can block, change or replace the result.
+Input guardrails reject what the feature should not handle (too long, off-topic, abusive). Output
+guardrails reject what should not be shown (invalid shape, uncited claims, forbidden content, links
+to unknown domains).
+
+```ts
+const allowedHosts = new Set(['docs.myapp.example', 'myapp.example']);
+const linksOk = (md: string) => [...md.matchAll(/\]\((https?:\/\/[^)]+)\)/g)]
+  .every(([, url]) => allowedHosts.has(new URL(url).host));
+```
+
+Mistake: a guardrail that only logs. Fix: each guardrail has a defined action: block, redact,
+replace or escalate.
+
+</Level>
+
+<Level name="Intermediate">
+
+Guardrails are cheap code first (length, regex, allowlists, schema), a small classifier second, and a
+model-based check last, because each model check adds latency and its own error rate. The **safe
+fallback** is designed per failure: off-topic gets a pointer to what the feature does; policy
+violation gets a neutral refusal; invalid output gets the sources without a generated answer.
+
+</Level>
+
+<Level name="Advanced">
+
+Guardrails have false positives (blocking good answers) and false negatives (letting bad ones
+through). Both rates are measured on labelled cases. Tightening one usually loosens the other, so the
+threshold is a product decision tied to the cost of each error type in this feature.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A legitimate question that mentions a blocked word** ("how do I kill a process?"): keyword
+  filters fail here; test with such cases.
+- **A link to an allowed domain with a dangerous path or query:** allowlist on host plus path
+  prefix where it matters.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Guardrail service down:** fail closed (fallback) for high-risk features, fail open with logging
+  only where the risk is low, decided in advance.
+- **Streaming plus an output guardrail:** the bad content was already displayed. For risky features,
+  buffer and validate before display, accepting the latency.
+
+</Level>
+
+<Level name="Production level">
+
+A dashboard of guardrail triggers by type and version. A spike means an attack, a prompt regression
+or a new user population; each has a runbook step.
+
+</Level>
+
+<Level name="Mindset">
+
+Guardrails are like input validation: boring, essential, and never the only defence.
+
+</Level>
+
+<Level name="System design">
+
+Guardrails are a pipeline of small functions with a common result type, configured per feature,
+each traced as a span with its decision.
+
+</Level>
+
+<Level name="Strategy">
+
+I build three cheap guardrails and one model-based check, then label 40 cases to measure false
+positive and negative rates. Done when each guardrail has an action, a rate and a test.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Human-in-the-loop: review queues, approvals, escalation
+
+<Figure art={`
+  model draft --> confidence/risk check --+--> low risk: show to user
+                                          |
+                                          +--> high risk: review queue
+                                                   |  reviewer: approve / edit / reject
+                                                   v
+                                               user sees reviewed result
+                                                   |
+                                    edits become eval cases and training data
+`} caption="Humans review where the risk is, and their decisions feed back into the evals." />
+
+<Levels label="Phase 8, human-in-the-loop">
+
+<Level name="Beginner">
+
+Human-in-the-loop means a person checks or approves some model outputs before they take effect. A
+review queue holds drafts; a reviewer approves, edits or rejects. Escalation hands a conversation to
+a person when the model cannot or should not continue.
+
+Mistake: reviewing everything forever. Fix: review by risk and sample the rest.
+
+</Level>
+
+<Level name="Intermediate">
+
+Routing rules decide what goes to review: refusals the user disputes, low-source answers, sensitive
+topics, high-value customers, or a random sample for quality tracking. The queue shows the question,
+the sources, the draft and the trace, so the reviewer judges the same evidence the model had.
+
+```sql
+CREATE TABLE review_items (
+  id bigserial PRIMARY KEY, tenant_id bigint NOT NULL, trace_id text NOT NULL,
+  reason text NOT NULL CHECK (reason IN ('low_sources','sensitive','sampled','disputed')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','edited','rejected')),
+  created_at timestamptz NOT NULL DEFAULT now(), decided_by bigint, decided_at timestamptz
+);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Reviewers drift too: they rubber-stamp under load. I measure review time and agreement between
+reviewers on a shared sample. Every edit is data: the difference between draft and approved text
+becomes a golden case.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Queue empty for days:** routing may be broken; alert on zero as well as on backlog.
+- **Reviewer not authorized for the tenant:** the queue must respect the same tenant isolation.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Review SLA missed plus a waiting user:** after a deadline, the user gets a clear "a person will
+  reply" message, not an unreviewed draft.
+- **Two reviewers act on the same item:** optimistic locking on status.
+
+</Level>
+
+<Level name="Production level">
+
+Queue depth, age of oldest item and decision mix are dashboard metrics with alerts. The escalation
+path to a human works when the AI feature is fully off.
+
+</Level>
+
+<Level name="Mindset">
+
+Humans are the most expensive and most trusted component. I spend them where the risk is.
+
+</Level>
+
+<Level name="System design">
+
+The review queue is an ordinary CRUD feature with authorization and audit, built on phase 3 skills.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the queue, route three risk types into it, review 30 items myself, and turn edits into eval
+cases. Done when a risky answer cannot reach a user without approval, proven by a test.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Content moderation and abuse handling
+
+<Layers
+  caption="Abuse arrives in layers; so do the defences"
+  layers={[
+    { name: 'volume abuse', note: 'scripts hammering the endpoint: rate limits, quotas' },
+    { name: 'cost abuse', note: 'huge inputs, long outputs: token caps per user and plan' },
+    { name: 'content abuse', note: 'harmful requests: moderation check and refusal' },
+    { name: 'manipulation', note: 'jailbreaks and injection: output limits, no hidden powers' },
+  ]}
+/>
+
+<Levels label="Phase 8, content moderation and abuse">
+
+<Level name="Beginner">
+
+Any public text box attached to a model will be abused: to generate harmful content, to burn my
+money, to extract the system prompt, or to use my app as a free proxy to the model. Moderation checks
+inputs and outputs against a content policy; abuse handling limits who can do how much.
+
+Mistake: no rate limit because "it's behind login". Fix: per-user and per-IP limits on every AI
+endpoint.
+
+</Level>
+
+<Level name="Intermediate">
+
+I write a short content policy for the feature: what it will help with, what it refuses. Moderation
+uses a provider moderation endpoint or a classifier on input and output, and records the decision.
+Repeated violations lead to throttling, then suspension, with a human review before suspension.
+
+```ts
+if (await limiter.consume(`ai:${user.id}`, 1).catch(() => false) === false)
+  return json({ error: 'rate_limited', retryAfter: 60 }, 429);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Off-topic use is a form of abuse: a document Q&A used as a general chatbot costs money and creates
+liability. Scope enforcement (retrieval-only answers with refusal when no source matches) is both a
+quality and an abuse control.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A user quoting harmful content to report it:** moderation may block a legitimate report; offer a
+  human path.
+- **Moderation false positives on medical or security topics:** test with domain cases.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Distributed abuse across many free accounts:** per-user limits pass; global and per-signup-cohort
+  limits catch it.
+- **Abuse via uploaded documents** containing harmful text that later appears in answers: moderate at
+  ingest too.
+
+</Level>
+
+<Level name="Production level">
+
+An abuse dashboard: top users by tokens, moderation hits, rate-limit hits. A one-switch kill for the
+AI feature per tenant and globally.
+
+</Level>
+
+<Level name="Mindset">
+
+If it is public and costs money per request, someone will try to make it cost more.
+
+</Level>
+
+<Level name="System design">
+
+Rate limiting and moderation sit in middleware before the AI route, sharing the limiter built in
+phase 3.
+
+</Level>
+
+<Level name="Strategy">
+
+I run a script that floods the endpoint, a set of jailbreak prompts and an off-topic set. Done when
+each is stopped by a named control and shows up on the dashboard.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Privacy: redaction, retention, tenant isolation, provider terms
+
+<Figure art={`
+  DATA MAP for the Q&A feature
+  ------------------------------------------------------------
+  data              where stored        sent to provider?  kept
+  user question     traces (redacted)   yes, redacted      30 d
+  uploaded docs     Postgres + vectors  chunks only        until deleted
+  answers           conversations       n/a                90 d
+  feedback          feedback table      no                 1 y
+  ------------------------------------------------------------
+`} caption="A data map: every row answers where it lives, who sees it, and when it goes." />
+
+<Levels label="Phase 8, privacy">
+
+<Level name="Beginner">
+
+Privacy starts with a data map: what personal data the feature touches, where it is stored, whether
+it leaves my system, and how long it is kept. Then four controls: **redaction** (remove what the
+model does not need), **retention** (delete on schedule), **tenant isolation** (one customer never
+sees another's data), and **provider terms** (what the model provider does with what I send).
+
+Mistake: logging full prompts "for debugging". Fix: log ids and redacted text, with a short retention.
+
+</Level>
+
+<Level name="Intermediate">
+
+Tenant isolation in RAG is enforced at retrieval with a mandatory tenant filter and tested with two
+tenants that hold near-identical documents:
+
+```ts
+test('tenant B never retrieves tenant A chunks', async () => {
+  await ingest(tenantA, 'Our secret launch date is 3 March.');
+  const r = await retrieve('when is the launch date?', userOf(tenantB));
+  expect(r.every((c) => c.tenantId === tenantB.id)).toBe(true);
+  expect(r.map((c) => c.text).join(' ')).not.toContain('3 March');
+});
+```
+
+Deletion is end to end: deleting a document removes the row, the chunks, the vectors, cached answers
+that cited it, and trace snippets that contain it, within a stated time.
+
+</Level>
+
+<Level name="Advanced">
+
+Postgres row-level security can enforce the tenant filter at the database, so a missing `WHERE` in
+application code fails closed. Provider terms are recorded per provider: retention period, training
+use, region, sub-processors; the feature's privacy notice to users says the same in plain words.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A document mentioning another person** (an employee's review): the uploader may be allowed to
+  see it, but sending it to a provider is still disclosure; the notice must cover that.
+- **A deletion request while a job is ingesting the same document:** the job must check for deletion
+  before writing.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A semantic cache shared across tenants:** a cached answer for tenant A served to tenant B. Cache
+  keys always include the tenant.
+- **Backups containing deleted data:** deletion policy states how long backups keep it.
+
+</Level>
+
+<Level name="Production level">
+
+A privacy runbook: how to answer "what do you hold about me", how to delete it, how to prove it is
+gone. Isolation tests run in CI on every change to retrieval.
+
+</Level>
+
+<Level name="Mindset">
+
+Data I never collected cannot leak. I send the model the minimum it needs.
+
+</Level>
+
+<Level name="System design">
+
+Tenant id flows from the session through every layer: API, retrieval, cache keys, queues, traces.
+No layer accepts it from the request body.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the data map, then a deletion test that checks every store. Done when the two-tenant test
+and the deletion test pass in CI and the provider terms are recorded with a date.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Billing and metering: tokens, seats, usage caps, cost alerts
+
+<Flow
+  caption="From a model call to an invoice line"
+  steps={['model call', 'usage event: tenant, feature, tokens, cost', 'usage table', 'daily rollup', 'cap check', 'invoice or plan limit']}
+/>
+
+<Levels label="Phase 8, billing and metering">
+
+<Level name="Beginner">
+
+AI features have a real marginal cost per use, unlike most features. Metering records every use per
+tenant; billing turns it into a price (included in a seat, a usage allowance, or pay per use); caps
+stop one tenant from costing more than they pay.
+
+```sql
+CREATE TABLE ai_usage (
+  id bigserial PRIMARY KEY, tenant_id bigint NOT NULL, feature text NOT NULL,
+  request_id text NOT NULL UNIQUE, in_tokens int NOT NULL, out_tokens int NOT NULL,
+  cost_micros bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Mistake: storing cost as a float. Fix: integer micro-units, as with money everywhere.
+
+</Level>
+
+<Level name="Intermediate">
+
+The cap check runs before the call: sum of today's or this month's usage plus an estimate for this
+request against the plan limit. Near the cap, the UI warns; at the cap, the feature degrades to the
+non-AI path with an upgrade message. Cost alerts fire on per-tenant spikes and on global spend
+versus forecast.
+
+</Level>
+
+<Level name="Advanced">
+
+Pricing needs margin data: cost per successful task times expected tasks per seat, against seat
+price. A heavy-usage tail exists in most products; plans need either caps or usage pricing for it.
+For a learning project, a test-mode payment integration (Stripe test mode, for example) with real
+webhooks is enough to learn invoices and failed payments.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Request fails after tokens were spent:** still metered as cost, maybe not billed to the user;
+  keep both numbers.
+- **The `request_id` unique key** makes metering idempotent under retries.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Concurrent requests near the cap:** both pass the check, both run, the tenant exceeds the cap.
+  Reserve estimated usage atomically, then reconcile.
+- **Price change by the provider mid-month:** costs use the price at call time, stored per row.
+
+</Level>
+
+<Level name="Production level">
+
+Daily reconciliation compares my metered cost with the provider's invoice; a mismatch is an
+incident. Alerts: tenant spend over threshold, global hourly spend over a multiple of baseline.
+
+</Level>
+
+<Level name="Mindset">
+
+Every AI request spends money on someone's behalf. I always know whose.
+
+</Level>
+
+<Level name="System design">
+
+Metering is an append-only event table written in the same code path as the model call log;
+billing reads rollups, never the hot path.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the usage table, cap check and an alert, then simulate a runaway tenant. Done when the cap
+stops it, the alert fires, and the daily rollup matches the sum of call logs.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Experimentation: offline evals, online A/B tests, better model versus better product
+
+<Compare
+  caption="Offline and online evaluation answer different questions"
+  left="Offline eval"
+  right="Online experiment"
+  rows={[
+    ['Is version B more correct on my golden set?', 'Do users succeed more often with B?'],
+    ['Fast, cheap, repeatable', 'Slow, needs traffic, noisy'],
+    ['Guards against regressions', 'Measures real value'],
+    ['Runs in CI', 'Runs behind a flag with a split'],
+  ]}
+/>
+
+<Levels label="Phase 8, experimentation">
+
+<Level name="Beginner">
+
+An offline eval says whether a change is more correct on known cases. An online experiment (an A/B
+test) shows two versions to different users and compares what they do. A better model on offline
+evals is not always a better product: a more thorough answer may be slower and less read.
+
+Mistake: shipping on offline score alone. Fix: offline to qualify, online to decide, where traffic
+allows.
+
+</Level>
+
+<Level name="Intermediate">
+
+Assignment is stable per user (hash of user id), so a user does not flip between versions. I choose
+one primary metric (task success: answer accepted without rephrase or escalation) and guard metrics
+(latency, cost, refusal rate, thumbs down). I decide the sample size and duration before starting.
+
+```ts
+const bucket = (userId: string, exp: string) =>
+  parseInt(createHash('sha256').update(`${exp}:${userId}`).digest('hex').slice(0, 8), 16) % 100;
+const variant = bucket(user.id, 'prompt-v5') < 50 ? 'A' : 'B';
+```
+
+</Level>
+
+<Level name="Advanced">
+
+With small traffic, differences need to be large to be distinguishable from noise; for a small
+product I lean on offline evals plus qualitative review of real sessions rather than pretend a tiny
+A/B test is conclusive. Peeking at results daily and stopping when it looks good inflates false
+wins; I fix the stopping rule upfront.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **One heavy user in variant B** skews totals; analyse per user.
+- **Novelty effect:** a new UI gets clicked more in week one.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Variants that differ in cost:** B wins on success but costs twice as much; the decision needs
+  cost per successful task, not success alone.
+- **An experiment plus a model provider change mid-test:** invalidates the comparison; pause.
+
+</Level>
+
+<Level name="Production level">
+
+Experiments are registered (hypothesis, metrics, duration, owner), flagged, logged with the variant
+in every trace, and closed with a written result.
+
+</Level>
+
+<Level name="Mindset">
+
+The goal is a better product, and a better model is one possible input to that.
+
+</Level>
+
+<Level name="System design">
+
+Variant assignment comes from the same flag system as releases; the prompt registry serves the
+version per variant.
+
+</Level>
+
+<Level name="Strategy">
+
+I write one experiment plan for a prompt change, run the offline eval, and if traffic is too small,
+say so in the plan and use a review of 20 real sessions instead. Done when the decision is written
+with its evidence.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Prompt and model versioning: a registry, a changelog, a rollback
+
+<Figure art={`
+  registry
+  --------------------------------------------------------
+  feature   prompt          model             status
+  qa        qa-answer@7     provider/model-x  live 100%
+  qa        qa-answer@8     provider/model-x  canary 5%
+  qa        qa-answer@6     provider/model-x  previous (rollback)
+  --------------------------------------------------------
+  rollback = set @8 to 0%, @7 stays live. No deploy needed.
+`} caption="A registry makes the live prompt and model a piece of data that can be switched back in seconds." />
+
+<Levels label="Phase 8, prompt and model versioning">
+
+<Level name="Beginner">
+
+Every prompt and model choice has a version. The registry maps each feature to the live version.
+The changelog records each change with date, reason and eval result. Rollback is switching the
+registry back, without a code deploy.
+
+Mistake: changing the prompt in place. Fix: a new version, an eval, a release.
+
+</Level>
+
+<Level name="Intermediate">
+
+Prompts are files in the repo (reviewed), and the registry row selects which version is live, with a
+percentage for canaries. Every trace records the versions used, so any answer can be reproduced.
+
+```ts
+const live = await registry.resolve('qa', user.id); // -> { prompt: 'qa-answer@7', model: '...' }
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Versions include everything that changes behaviour: prompt text, model id, temperature, retrieval
+parameters (k, reranker, chunking version), guardrail config. I bundle them into one release id, so
+"what changed?" has one answer.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A prompt that references a schema field removed in code:** the release id must pin a compatible
+  code version, or the registry checks compatibility.
+- **Rollback to a model version the provider retired:** keep the rollback target on a supported model.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Re-chunked index plus a rollback of the prompt:** the old prompt now meets new chunks. Index
+  versions are part of the release, and the old index is kept until the new release is stable.
+
+</Level>
+
+<Level name="Production level">
+
+Releases go canary, then full; the eval dashboard compares live versions; rollback is rehearsed.
+
+</Level>
+
+<Level name="Mindset">
+
+Behaviour changes are deploys, even when no code changed.
+
+</Level>
+
+<Level name="System design">
+
+The registry is a small table plus a cached resolver, read on every request, written only through a
+reviewed release script.
+
+</Level>
+
+<Level name="Strategy">
+
+I ship three prompt versions through the registry and roll one back on purpose. Done when the
+rollback takes under a minute and the trace shows the switch.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Observability: redacted traces, eval dashboards, feedback loops, drift
+
+<Figure art={`
+  trace  qa-request 7f3c                     total 3.2 s   cost recorded
+  |-- auth                       12 ms
+  |-- rewrite_query             410 ms   model-s  in 210 out 18
+  |-- retrieve (hybrid)         140 ms   20 chunks, top score 0.81
+  |-- rerank                    260 ms   5 kept
+  |-- generate                 2310 ms   model-m  in 2900 out 240  ttft 610 ms
+  |-- validate_citations          3 ms   ok 3/3
+  '-- guardrails                  9 ms   pass
+`} caption="One trace per answer, with a span per stage. This is what makes a bad answer explainable." />
+
+<Levels label="Phase 8, observability">
+
+<Level name="Beginner">
+
+Observability means I can answer questions about the feature without adding new code: why was this
+answer wrong, why was it slow, why did cost spike. The core is a trace per request with a span per
+stage, recording timings, versions, token counts and stage outputs, with prompts and responses
+redacted.
+
+Mistake: logging only errors. Most AI failures are not errors; they are wrong answers with status 200.
+
+</Level>
+
+<Level name="Intermediate">
+
+I use OpenTelemetry spans with attributes for each stage, sent to a tracing backend. Redaction
+happens before export. An eval dashboard shows offline scores per release and online feedback rates
+per day. Feedback rows link to trace ids, so every thumbs-down opens to its full trace.
+
+```ts
+await tracer.startActiveSpan('retrieve', async (span) => {
+  const chunks = await retrieve(q, user);
+  span.setAttributes({ 'rag.k': chunks.length, 'rag.top_score': chunks[0]?.score ?? 0,
+    'rag.chunk_ids': chunks.map((c) => c.id).join(',') });
+  span.end();
+  return chunks;
+});
+```
+
+</Level>
+
+<Level name="Advanced">
+
+**Drift** is change over time in inputs (users ask new kinds of questions), in the corpus (documents
+change), or in the model (a provider update). I watch input drift with simple signals: share of
+queries with no source above threshold, refusal rate, new top query clusters each week. A weekly
+sample of real queries is graded and added to the eval set.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Traces sampled at 10%:** the one bad answer a customer reports may not be sampled. Always keep
+  traces for requests with negative feedback, errors or guardrail hits.
+- **Huge spans** (full prompts) blow storage budgets; store hashes and redacted excerpts.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Redaction that removes the information needed to debug:** keep chunk ids and versions; those
+  are not personal and are usually enough to reproduce.
+
+</Level>
+
+<Level name="Production level">
+
+Dashboards: requests, p50/p95 per stage, cost per hour, refusal rate, guardrail hits, thumbs down
+rate, no-source rate. Alerts on each with thresholds from a baseline week.
+
+</Level>
+
+<Level name="Mindset">
+
+If I cannot explain a bad answer from its trace, the system is not observable yet.
+
+</Level>
+
+<Level name="System design">
+
+Traces, metrics and feedback share one request id from the browser to the provider call and back.
+
+</Level>
+
+<Level name="Strategy">
+
+I take five thumbs-down answers and explain each from its trace alone. Done when all five are
+classified as retrieval, context or generation failures without rerunning anything.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: Incident response for AI: a bad update, an injection, an outage, a cost spike
+
+<Compare
+  caption="Four AI incidents, their first signal and their first move"
+  left="Incident and signal"
+  right="First move"
+  rows={[
+    ['Bad model or prompt update: thumbs-down and refusal rates jump', 'Roll back the release in the registry'],
+    ['Prompt injection: guardrail hits, odd outputs citing one document', 'Quarantine the document, disable risky tools'],
+    ['Provider outage: timeouts, 5xx from provider', 'Fallback model or non-AI mode, status note'],
+    ['Cost spike: spend alert, one tenant or one feature', 'Cap the tenant or feature, find the loop or the abuse'],
+  ]}
+/>
+
+<Levels label="Phase 8, incident response for AI">
+
+<Level name="Beginner">
+
+AI incidents are like other incidents, with a few new shapes: quality drops without errors, the
+provider goes down, an injected document steers answers, or costs spike. Each needs a detection
+signal, a first move that limits damage, and a runbook.
+
+Mistake: no off switch. Fix: a feature flag that turns the AI path into the non-AI path instantly.
+
+</Level>
+
+<Level name="Intermediate">
+
+Runbook entries have the same shape: signal, severity, first move, diagnosis steps (which dashboards
+and traces), fix, communication. I practise each once with a game day: point the provider URL at a
+mock that returns 500s, publish a poisoned document to a test tenant, deploy a deliberately worse
+prompt to canary.
+
+```md
+## Provider outage
+Signal: provider_5xx_rate above 20% for 5 min, or p95 above 10 s.
+First move: flag ai.qa.mode = "fallback" (search results only).
+Check: provider status page, our egress, recent deploys.
+Recover: canary 5% back to AI mode; watch errors for 15 min; then 100%.
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Postmortems for AI incidents classify the cause (retrieval, prompt, model, data, guardrail, ops) and
+always add an eval case or alert, so the same failure is caught earlier next time.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Partial outage** (slow, not down): timeouts and circuit breakers must trip on latency, not only
+  on errors.
+- **A provider silently changes behaviour on a pinned version:** the eval dashboard is the only
+  detector; nightly eval runs catch it.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Outage plus fallback model with different privacy terms:** see model selection; the fallback must
+  be pre-approved.
+- **Cost spike caused by retries during an outage:** retry storms; budgets and circuit breakers cap it.
+
+</Level>
+
+<Level name="Production level">
+
+Every AI incident type has a runbook, an alert and a rehearsal date. Status communication to users
+is templated.
+
+</Level>
+
+<Level name="Mindset">
+
+The provider is a dependency that will fail; my feature's job is to fail usefully.
+
+</Level>
+
+<Level name="System design">
+
+A circuit breaker around the provider adapter, a mode flag per feature, and the non-AI path as a
+first-class route.
+
+</Level>
+
+<Level name="Strategy">
+
+I run all four game days. Done when each has a written timeline and one improvement merged.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: AI product metrics: task success, time to answer, acceptance, escalation, retention, cost per success
+
+<Layers
+  caption="A metric tree for the Q&A feature"
+  layers={[
+    { name: 'retention of users who use the feature', note: 'does it keep people?' },
+    { name: 'task success rate', note: 'answer accepted, no rephrase, no escalation' },
+    { name: 'acceptance, escalation, time to answer', note: 'the drivers' },
+    { name: 'cost per successful task', note: 'the economics' },
+    { name: 'eval scores, refusal rate, latency', note: 'the engineering signals underneath' },
+  ]}
+/>
+
+<Levels label="Phase 8, AI product metrics">
+
+<Level name="Beginner">
+
+Product metrics tell me whether the feature helps people. **Task success**: the user got what they
+came for. **Time to answer**: from question to usable answer. **Acceptance rate**: answers copied,
+used or marked helpful. **Escalation rate**: handed to a human. **Retention**: users who return.
+**Cost per successful task**: total AI cost divided by successful tasks.
+
+Mistake: counting usage as success. Lots of questions can mean the answers are bad.
+
+</Level>
+
+<Level name="Intermediate">
+
+I define success with observable events. For Q&A: an answer with sources, no rephrased question
+within two minutes, no thumbs-down, no escalation. It is a proxy, so I validate it against a weekly
+manual review.
+
+```sql
+SELECT date_trunc('week', a.created_at) AS week,
+       avg(CASE WHEN a.rephrased = false AND a.escalated = false AND coalesce(a.feedback, 0) >= 0
+                THEN 1 ELSE 0 END) AS task_success
+FROM answers a GROUP BY 1 ORDER BY 1;
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Metrics move for reasons outside the model: a new user cohort, a UI change, a corpus change. I
+annotate the dashboard with releases and corpus updates so a moved line can be explained.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Silent users:** most never click feedback; acceptance proxies matter more than thumbs.
+- **A refusal that was correct** counts as a failed task in a naive metric; segment answerable and
+  unanswerable questions.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Lower cost per success because success fell less than cost:** a cheaper model can look better on
+  this ratio while users suffer. Read it with task success, never alone.
+
+</Level>
+
+<Level name="Production level">
+
+A weekly metrics review with notes, tied to the release log.
+
+</Level>
+
+<Level name="Mindset">
+
+Engineering metrics serve product metrics. An eval score that rises while task success falls means
+the eval is measuring the wrong thing.
+
+</Level>
+
+<Level name="System design">
+
+Events from the UI and traces from the server join on request id into an analytics table.
+
+</Level>
+
+<Level name="Strategy">
+
+I define the metric tree, instrument it, and review two weeks of data. Done when I can explain one
+movement in task success with a cause.
+
+</Level>
+
+</Levels>
+
+#### Phase 8: the build and the gate
+
+<Flow
+  caption="The phase 8 feature, built as a product"
+  steps={[
+    'decision doc with kill criterion',
+    'feature with citations, feedback, streaming',
+    'guardrail + review queue',
+    'privacy + tenant tests',
+    'metering + cap + alert',
+    'registry + rollback',
+    'traces + eval dashboard',
+    'runbooks + red team + failure taxonomy',
+  ]}
+/>
+
+The gate, as checks I can demonstrate:
+
+- A user can tell when an answer is uncertain: the source count, the dates, and the refusal state
+  are visible.
+- A bad answer is traceable to retrieval, prompt or model, using the trace and the failure taxonomy.
+- An eval catches a regression in CI.
+- A simulated cost spike triggers the alert and the cap.
+- A provider outage degrades to search results with a clear message.
+- The decision doc explains why the feature should exist at all, and what would make me remove it.
+
+Done when each check has a link in the study log to a test, a trace or a screenshot of the
+dashboard, dated.
