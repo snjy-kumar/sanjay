@@ -1,0 +1,2111 @@
+---
+book: the-c-programming-language
+number: 4
+title: "Functions and Program Structure"
+description: "K&R chapter 4 in depth: functions, non-int returns, external and static variables, scope and linkage, header files, initialisation, recursion and the C preprocessor."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Chapter 4 is about breaking a program into functions and files: how
+functions return values, how variables are shared or hidden, how a program
+spread over several source files is compiled and linked, and how the
+preprocessor rewrites source before the compiler sees it. It is where C
+stops being one `main` and starts being a project.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- write functions that return any type, and know why a missing prototype is dangerous;
+- split a program into several `.c` files with a shared header, and compile and link them;
+- choose between automatic, external and static variables, and explain scope versus linkage;
+- predict what an uninitialised variable holds, depending on where it is declared;
+- write recursive functions, including quicksort, and reason about their depth;
+- use `#include`, `#define` with arguments, `#` and `##`, and include guards, and avoid the classic macro traps.
+
+What you should already know: <a href={withBase('/books/the-c-programming-language/03-control-flow/')}>chapter 3</a>,
+and chapter 1's functions and external variables.
+
+Reading time: about 90 minutes, plus two evenings for the programs,
+especially the multi-file calculator.
+
+## Chapter map
+
+<Layers caption="Chapter 4 from a single function up to a whole program. Each layer is about who can see a name and for how long it lives." layers={[
+  { name: "4.1 and 4.2 Functions", note: "definitions, return values of any type, prototypes" },
+  { name: "4.3 to 4.6 Sharing and hiding", note: "external variables, scope rules, headers, static" },
+  { name: "4.7 to 4.9 Storage details", note: "register, nested blocks, initialisation" },
+  { name: "4.10 Recursion", note: "functions that call themselves: printd, quicksort" },
+  { name: "4.11 The preprocessor", note: "include, macros, conditional compilation" },
+]} />
+
+<Flow steps={["main.c, stack.c, getop.c (source)", "preprocessor: #include, #define, #if", "compiler: one object file per source file", "linker: resolves external names across objects", "one executable"]} caption="How a multi-file C program is built. Scope and linkage, the subject of this chapter, are the rules that decide which names the linker can connect." />
+
+## 4.1 Basics of Functions
+
+### In one sentence
+
+A function packages a computation behind a name, parameters and a return
+value, so the caller needs to know what it does and not how.
+
+### The idea
+
+A **function definition** has a return type, a name, a parameter list and a
+body: `int max(int a, int b) { return a > b ? a : b; }`. Parts may be
+missing. A function with no useful result returns `void`; a function with
+no parameters is declared `(void)`.
+
+`return expression;` sends a value back to the caller, converted to the
+function's return type if necessary. A caller is free to ignore it.
+Falling off the end of a non-void function and then using the value is
+undefined behaviour; the one exception is `main`, which returns 0.
+
+The book's example is a pattern finder: print every line of input that
+contains a given string. Splitting it into "get a line", "does it contain
+the pattern" and "print it" gives three functions, each simple enough to
+test on its own. That is the whole argument for functions: smaller pieces
+that can be understood, tested and reused separately.
+
+### Worked example
+
+My version of the pattern finder, with my own names. `strindex` returns the
+position of `t` in `s`, or -1:
+
+```c
+/* find.c */
+#include <stdio.h>
+
+#define MAXLINE 1000
+
+static int get_line(char s[], int lim)
+{
+    int c, i = 0;
+    while (i < lim - 1 && (c = getchar()) != EOF && c != '\n')
+        s[i++] = (char)c;
+    if (c == '\n' && i < lim - 1)
+        s[i++] = '\n';
+    s[i] = '\0';
+    return i;
+}
+
+static int strindex(const char s[], const char t[])
+{
+    for (int i = 0; s[i] != '\0'; i++) {
+        int j = i, k = 0;
+        while (t[k] != '\0' && s[j] == t[k])
+            j++, k++;
+        if (k > 0 && t[k] == '\0')
+            return i;
+    }
+    return -1;
+}
+
+int main(void)
+{
+    char line[MAXLINE];
+    int found = 0;
+    while (get_line(line, MAXLINE) > 0)
+        if (strindex(line, "ould") >= 0) {
+            printf("%s", line);
+            found++;
+        }
+    return found > 0 ? 0 : 1;
+}
+```
+
+```text
+$ printf 'I would\nyou will\nthey could\n' | ./find
+I would
+they could
+```
+
+The exit status follows `grep`'s convention: 0 if something matched, 1
+otherwise, so a shell script can test it.
+
+### Step by step
+
+`strindex("they could", "ould")` tries each start `i`. At `i` 0 the first
+characters differ ('t' against 'o'), so `k` stays 0. The first match of
+'o' is at `i` 6: then 'u', 'l', 'd' match too, `k` reaches 4, `t[4]` is the
+terminator, and 6 is returned.
+
+### Common mistake
+
+Using the result of a function that does not `return` a value on every path:
+
+```c
+/* noreturn.c */
+static int sign(int x)
+{
+    if (x > 0) return 1;
+    if (x < 0) return -1;
+}                       /* x == 0: falls off the end */
+
+int main(void)
+{
+    return sign(0);     /* undefined: uses a value never returned */
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -c noreturn.c 2>&1 | grep -o "control reaches end of non-void function"
+control reaches end of non-void function
+```
+
+The program often "works", returning whatever was in the return register.
+At higher optimisation levels compilers may assume the path is impossible
+and generate code that does something else entirely.
+
+### In real systems
+
+Unix tools are written exactly this way: a `main` that parses options and
+loops over input, plus small functions for each step. The exit status
+convention (0 success, non-zero failure) is what makes them composable in
+shell pipelines and `make`.
+
+### Check yourself
+
+**What does `return;` in a function declared `int f(void)` do?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+It returns without a value. Using that value in the caller is undefined;
+compilers warn "'return' with no value, in function returning non-void".
+
+</details>
+
+## 4.2 Functions Returning Non-integers
+
+### In one sentence
+
+A function returning anything other than `int` must be declared before it is
+called, so the caller knows what type comes back.
+
+### The idea
+
+The caller and the function must agree on the return type, because it
+decides how the value is passed back: a `double` comes back in a different
+register from an `int` on most machines. The caller learns the type from a
+**declaration** of the function seen before the call, usually a
+**prototype** like `double atof(const char s[]);`.
+
+In the C89 of the book, calling a function with no declaration in scope made
+the compiler assume it returned `int` (**implicit declaration**). If the
+function really returned `double`, the caller read the wrong register and
+got garbage. C99 removed implicit declarations; gcc 14 makes them an error
+by default.
+
+A prototype also lists the parameter types, so arguments are converted to
+them at the call. Without a prototype, a `float` argument is promoted to
+`double` and an `int` passed to a `double` parameter is reinterpreted, not
+converted.
+
+### Worked example
+
+My `atof` handles sign, digits, a decimal point and an exponent:
+
+```c
+/* myatof.c */
+#include <ctype.h>
+#include <stdio.h>
+
+double myatof(const char s[]);    /* prototype */
+
+int main(void)
+{
+    printf("%g %g %g %g\n", myatof("3.25"), myatof("  -0.5"),
+           myatof("1e3"), myatof("2.5E-2"));
+    return 0;
+}
+
+double myatof(const char s[])
+{
+    int i = 0, sign, esign = 1, exp = 0;
+    double val = 0.0, scale = 1.0;
+    while (isspace((unsigned char)s[i])) i++;
+    sign = (s[i] == '-') ? -1 : 1;
+    if (s[i] == '+' || s[i] == '-') i++;
+    for (; isdigit((unsigned char)s[i]); i++)
+        val = 10.0 * val + (s[i] - '0');
+    if (s[i] == '.') i++;
+    for (; isdigit((unsigned char)s[i]); i++, scale *= 10.0)
+        val = 10.0 * val + (s[i] - '0');
+    if (s[i] == 'e' || s[i] == 'E') {
+        i++;
+        if (s[i] == '-' || s[i] == '+') esign = (s[i++] == '-') ? -1 : 1;
+        for (; isdigit((unsigned char)s[i]); i++) exp = 10 * exp + (s[i] - '0');
+    }
+    val = sign * val / scale;
+    for (; exp > 0; exp--) val = (esign > 0) ? val * 10 : val / 10;
+    return val;
+}
+```
+
+```text
+3.25 -0.5 1000 0.025
+```
+
+The prototype at the top lets `main` call `myatof` before its definition.
+This simple algorithm loses precision on long inputs; the library's
+`strtod` rounds correctly, and is what real code should use.
+
+The book then builds `atoi` on top of `atof` by returning `(int) atof(s)`,
+which converts by truncation. That illustrates that `return` converts the
+value to the declared type.
+
+### Step by step
+
+What goes wrong without the prototype is easiest to see in an old compiler
+mode. Here the caller sees no declaration and the definition is in another
+file:
+
+```c
+/* half.c */
+double half(double x) { return x / 2; }
+```
+
+```c
+/* call_half.c */
+#include <stdio.h>
+
+int main(void)
+{
+    double r = half(5.0);        /* no declaration in scope */
+    printf("%g\n", r);
+    return 0;
+}
+```
+
+```text
+$ LC_ALL=C gcc -std=c11 -c call_half.c 2>&1 | grep -o "implicit declaration of function 'half'"
+implicit declaration of function 'half'
+```
+
+gcc 14 refuses to compile it. Forcing it through with `-std=gnu89` builds a
+program that printed 1 on my machine instead of 2.5, because `main` reads an integer register
+while `half` put its result in a floating-point one. The fix is a
+declaration in a header that both files include.
+
+### Common mistake
+
+Declaring a function in one file with a different type from its
+definition in another, for example `int half(int);` in the caller. Each
+file compiles cleanly; the linker matches only names, not types, so the
+program links and misbehaves. A shared header included by both the caller
+and the defining file is the cure, because the compiler then checks the
+definition against it.
+
+### In real systems
+
+The rule "every function used across files is declared in a header that
+the defining file also includes" is enforced in large codebases with
+`-Wmissing-prototypes` and `-Werror=implicit-function-declaration`. The
+2024 switch of gcc and clang to making implicit declarations a hard error
+broke a surprising number of old packages in Linux distributions, which
+shows how long the C89 habit lasted.
+
+### Check yourself
+
+**Why does an implicitly declared `double` function return garbage?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+The caller assumes `int` and reads the integer return register, but the
+function placed its `double` result in a floating-point register.
+
+</details>
+
+## 4.3 External Variables
+
+### In one sentence
+
+An external variable is defined outside every function, lives for the
+whole run, and can be shared by any function that can see its name.
+
+### The idea
+
+A C program is a set of **external objects**: functions and variables
+defined at file level. Functions are always external, since C does not let
+you define a function inside another. External variables are an
+alternative to arguments for communicating between functions: if two
+functions must share state but neither calls the other, an external
+variable is the natural home for it.
+
+External variables also persist. An automatic variable disappears when its
+function returns; an external one keeps its value between calls. That
+makes them right for state with a lifetime longer than one call, such as
+the contents of a stack.
+
+The cost is coupling. Any function can change an external variable, so to
+understand one you must read every function that can see it. The book's
+advice is to use them for genuinely shared state, and to hide them as much
+as possible, which sections 4.4 and 4.6 make precise.
+
+### Worked example
+
+The book's showcase is a **reverse Polish** calculator. In reverse Polish
+notation (RPN) each operator follows its operands, so `(1 - 2) * (4 + 5)`
+is written `1 2 - 4 5 + *`, and no parentheses are needed. The evaluation
+rule is simple: push numbers on a stack; for an operator, pop the operands,
+apply it and push the result.
+
+The stack and its pointer are external variables, shared by `push` and
+`pop`, which `main` calls but which never call each other. Here is my
+single-file version:
+
+```c
+/* calc.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+#define MAXVAL 100
+static int sp = 0;            /* next free stack position */
+static double val[MAXVAL];    /* the stack */
+
+static void push(double f)
+{
+    if (sp < MAXVAL) val[sp++] = f;
+    else fprintf(stderr, "error: stack full\n");
+}
+
+static double pop(void)
+{
+    if (sp > 0) return val[--sp];
+    fprintf(stderr, "error: stack empty\n");
+    return 0.0;
+}
+
+int main(void)
+{
+    char tok[64];
+    while (scanf("%63s", tok) == 1) {
+        double b;
+        switch (tok[0]) {
+        case '+': push(pop() + pop()); break;
+        case '*': push(pop() * pop()); break;
+        case '-': b = pop(); push(pop() - b); break;
+        case '/': b = pop(); push(b != 0.0 ? pop() / b : (pop(), 0.0)); break;
+        case '=': printf("%.8g\n", pop()); break;
+        default:  push(atof(tok)); break;
+        }
+    }
+    return 0;
+}
+```
+
+```text
+$ printf '1 2 - 4 5 + * =\n10 4 / =\n' | ./calc
+-9
+2.5
+```
+
+The scanning is simpler than the book's character-level `getop` (here
+`scanf` splits on white space), which also means a negative number like
+`-3` would be read as the operator `-`. Section 4.5 replaces it with a
+proper `getop`.
+
+### Step by step
+
+<Trace columns={["token", "action", "stack after (bottom to top)"]} rows={[
+  ["1", "push 1", "1"],
+  ["2", "push 2", "1 2"],
+  ["-", "b = 2, push 1 - 2", "-1"],
+  ["4", "push 4", "-1 4"],
+  ["5", "push 5", "-1 4 5"],
+  ["+", "push 5 + 4", "-1 9"],
+  ["*", "push 9 * -1", "-9"],
+  ["=", "pop and print", "(empty)"],
+]} caption="Evaluating 1 2 - 4 5 + * in reverse Polish. Every operator finds its operands on top of the stack, so no parentheses or precedence rules are needed." />
+
+### Common mistake
+
+Writing `push(pop() - pop())`. The order in which the two arguments of `-`
+are evaluated is unspecified, so the program may compute `2 - 1` instead of
+`1 - 2`. For `+` and `*` it does not matter; for `-` and `/` it does,
+which is why the code pops the right operand into `b` first. This is
+chapter 2's order-of-evaluation rule turning into a real bug.
+
+### In real systems
+
+RPN is how stack-based virtual machines work: the JVM, CPython's bytecode,
+WebAssembly and PostScript all push operands and apply operators to the top
+of a stack. HP calculators used RPN for decades. The external `sp` and
+`val` pair is also the first appearance of a pattern every C program uses:
+module-private state behind a small set of functions.
+
+### Check yourself
+
+**Why are `sp` and `val` external rather than local to `main`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+`push` and `pop` must share them, and they must keep their values between
+calls. Passing them as arguments everywhere would work but clutters every
+call.
+
+</details>
+
+## 4.4 Scope Rules
+
+### In one sentence
+
+The scope of a name is the part of the program where it can be used, and
+an external name defined in one file is used in another through an
+`extern` declaration.
+
+### The idea
+
+The **scope** of an automatic variable or parameter is the function, or
+block, in which it is declared. The same name in different functions refers
+to unrelated variables.
+
+The scope of an external variable or function runs from the point where it
+is declared to the end of the file. A function defined below `main` and
+used in `main` therefore needs a declaration above `main`. Similarly, an
+external variable used before its definition needs a declaration.
+
+This is the distinction between a **declaration**, which announces a name's
+type, and a **definition**, which also creates the storage. There must be
+exactly one definition of each external variable across all the files of a
+program; other files refer to it with `extern int sp;`, which declares
+without defining. Array sizes are required in the definition and optional
+in an `extern` declaration.
+
+<Compare left="Declaration" right="Definition" caption="An external variable may be declared many times but defined only once in the whole program." rows={[
+  ["extern int sp;", "int sp = 0;"],
+  ["extern double val[];", "double val[MAXVAL];"],
+  ["says: this exists somewhere, with this type", "says: create it here"],
+  ["allocates no storage", "allocates storage; may initialise"],
+  ["can appear in many files, usually via a header", "must appear in exactly one file"],
+]} />
+
+### Worked example
+
+Two files share a counter. `counter.c` defines it; `use.c` declares it:
+
+```c
+/* counter.c */
+int hits = 0;                 /* definition */
+
+void hit(void) { hits++; }
+```
+
+```c
+/* use.c */
+#include <stdio.h>
+
+extern int hits;              /* declaration: defined elsewhere */
+void hit(void);
+
+int main(void)
+{
+    hit(); hit(); hits += 10;
+    printf("%d\n", hits);
+    return 0;
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -o use use.c counter.c && ./use
+12
+```
+
+### Step by step
+
+Each file is compiled separately into an object file. `use.o` contains an
+**undefined reference** to `hits` and `hit`; `counter.o` contains their
+definitions. The linker matches the names and patches the addresses.
+Delete `counter.c` from the command and the link fails with "undefined
+reference to `hit'".
+
+### Common mistake
+
+Two files that both define `int hits = 0;`. Each compiles; the link fails
+with "multiple definition of `hits'". Older code relied on "common"
+symbols, where uninitialised definitions like `int hits;` in two files were
+silently merged. gcc 10 changed the default to `-fno-common`, which turned
+those into link errors too:
+
+```c
+/* dup1.c */
+int hits;
+int main(void) { return hits; }
+```
+
+```c
+/* dup2.c */
+int hits;
+```
+
+```text
+$ LC_ALL=C gcc -std=c11 dup1.c dup2.c -o dup 2>&1 | grep -o "multiple definition of .hits."
+multiple definition of `hits'
+```
+
+### In real systems
+
+Every C codebase follows the rule "one definition in a `.c` file, the
+`extern` declaration in its header". Tools such as `nm` show which symbols
+an object file defines (`T`, `D`, `B`) and which it needs (`U`), which is
+the first thing to check when a link fails.
+
+### Check yourself
+
+**Does `extern int x;` allocate storage?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+No. It only declares that an `int` called `x` is defined somewhere. The
+storage comes from the one definition.
+
+</details>
+
+## 4.5 Header Files
+
+### In one sentence
+
+A header file collects the declarations that several source files share,
+so each one is written once and every file sees the same version.
+
+### The idea
+
+Once the calculator is split into files (main loop, stack, token reader,
+character input), each file needs some of the others' declarations. Copying
+them into each file invites them to drift apart. Instead they go in a
+**header**, `calc.h`, which each `.c` file includes with
+`#include "calc.h"`.
+
+The defining file includes the header too. That is what lets the compiler
+check that the definitions match the declarations everyone else is using,
+closing the gap from 4.2's common mistake.
+
+There is a tension between one big header, which is simple, and one header
+per module, which shows exactly what each file uses. The book uses one
+header for a small program, which is right at that size.
+
+<Figure art={`
+                    +-----------+
+                    |  calc.h   |  prototypes, #define NUMBER
+                    +-----------+
+           #include /    |      \\ #include
+                   v     v       v
+          +--------+ +--------+ +---------+
+          | main.c | |stack.c | | getop.c |
+          +--------+ +--------+ +---------+
+              |   sp, val static |  buf, bufp static
+              v          v           v
+            main.o    stack.o     getop.o  --> linker --> calc
+`} caption="The calculator split into files. One header carries the shared declarations; each module keeps its private state static, invisible to the others." />
+
+### Worked example
+
+The header:
+
+```c
+/* calc.h */
+#define NUMBER '0'           /* signal that a number was found */
+
+void push(double);
+double pop(void);
+int getop(char s[]);
+int getch(void);
+void ungetch(int);
+```
+
+The stack module, with its state hidden by `static` (section 4.6):
+
+```c
+/* stack.c */
+#include <stdio.h>
+#include "calc.h"
+
+#define MAXVAL 100
+static int sp = 0;
+static double val[MAXVAL];
+
+void push(double f)
+{
+    if (sp < MAXVAL) val[sp++] = f;
+    else fprintf(stderr, "error: stack full\n");
+}
+
+double pop(void)
+{
+    if (sp > 0) return val[--sp];
+    fprintf(stderr, "error: stack empty\n");
+    return 0.0;
+}
+```
+
+The token reader. `getop` reads one character too many to know a number has
+ended, so it pushes that character back with `ungetch`, using a small
+buffer shared with `getch`:
+
+```c
+/* getop.c */
+#include <ctype.h>
+#include <stdio.h>
+#include "calc.h"
+
+static int buf[16], bufp = 0;          /* pushed-back characters */
+
+int getch(void) { return bufp > 0 ? buf[--bufp] : getchar(); }
+void ungetch(int c) { if (bufp < 16) buf[bufp++] = c; }
+
+int getop(char s[])
+{
+    int i = 0, c;
+    while ((s[0] = (char)(c = getch())) == ' ' || c == '\t')
+        ;
+    s[1] = '\0';
+    if (!isdigit(c) && c != '.')
+        return c;                       /* an operator, or EOF */
+    while (isdigit(c = getch()) || c == '.')
+        if (i < 62) s[++i] = (char)c;
+    s[i + 1] = '\0';
+    if (c != EOF) ungetch(c);           /* read one too many */
+    return NUMBER;
+}
+```
+
+And the main loop:
+
+```c
+/* main.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include "calc.h"
+
+int main(void)
+{
+    char s[64];
+    int type;
+    double op2;
+    while ((type = getop(s)) != EOF) {
+        switch (type) {
+        case NUMBER: push(atof(s)); break;
+        case '+': push(pop() + pop()); break;
+        case '*': push(pop() * pop()); break;
+        case '-': op2 = pop(); push(pop() - op2); break;
+        case '/': op2 = pop(); push(op2 != 0.0 ? pop() / op2 : 0.0); break;
+        case '\n': printf("\t%.8g\n", pop()); break;
+        default: fprintf(stderr, "error: unknown command %s\n", s); break;
+        }
+    }
+    return 0;
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -o calc main.c stack.c getop.c
+$ printf '1 2 - 4 5 + *\n3.5 2 /\n' | ./calc
+	-9
+	1.75
+```
+
+### Step by step
+
+Reading `12+`: `getop` skips no blanks, sees '1', a digit, then reads '2'
+into `s`, then reads '+', which is not a digit. That '+' belongs to the next
+token, so it goes back into `buf`. The next `getop` call gets it from
+`getch` and returns '+'.
+
+### Common mistake
+
+Putting definitions in a header, such as `int sp = 0;`. Every file that
+includes it gets its own definition, and the link fails with "multiple
+definition". Headers hold declarations, macros and type definitions; the
+one exception is `static inline` functions, which each file may have its
+own copy of.
+
+### In real systems
+
+Large projects pair every `foo.c` with a `foo.h` that is its public
+interface, and include it first in `foo.c` so a missing include in the
+header shows up immediately. Tools like include-what-you-use enforce that
+each file includes exactly what it uses.
+
+### Check yourself
+
+**Why does `stack.c` include `calc.h`, even though it defines rather than
+uses `push`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+So the compiler checks the definitions of `push` and `pop` against the
+prototypes that every other file relies on.
+
+</details>
+
+## 4.6 Static Variables
+
+### In one sentence
+
+`static` on an external name hides it inside its file, and `static` on a
+local variable makes it keep its value between calls.
+
+### The idea
+
+The word `static` does two different jobs. On an external variable or
+function it gives it **internal linkage**: the name is visible only in the
+file that defines it, so other files cannot use it and cannot clash with it.
+In `stack.c`, `sp` and `val` are `static`, so no other file can corrupt the
+stack, and another file is free to have its own `sp`.
+
+On a local variable `static` changes the **storage duration**: the variable
+is created once, before the program starts, and keeps its value from one
+call to the next, but its name is still visible only inside its block. It
+is a private, persistent variable.
+
+**Linkage** is the property that decides whether the same name in two
+places refers to the same object. External linkage (the default for
+file-level names) connects them across files; internal linkage (`static`)
+connects them only within one file; local variables have no linkage at
+all.
+
+### Worked example
+
+A function that hands out increasing IDs keeps its counter in a static
+local, so no other code can touch it:
+
+```c
+/* next_id.c */
+#include <stdio.h>
+
+static int next_id(void)          /* internal linkage */
+{
+    static int id = 100;          /* initialised once, persists */
+    return id++;
+}
+
+int main(void)
+{
+    int a = next_id(), b = next_id(), c = next_id();
+    printf("%d %d %d\n", a, b, c);
+    return 0;
+}
+```
+
+```text
+100 101 102
+```
+
+### Step by step
+
+`id` is initialised to 100 once, before `main` runs, not at each call. The
+first call returns 100 and leaves 101; the second returns 101; the third
+102. An automatic `int id = 100;` would return 100 every time.
+
+### Common mistake
+
+Expecting a static local's initialiser to run on each call, or using one in
+code that must be reentrant. A function with static state is not safe to
+call from two threads at once, and not safe to call recursively if it
+relies on the state staying put. The C library's `strtok` is the famous
+example: it keeps its position in a static, so two interleaved
+tokenisations corrupt each other. POSIX added `strtok_r` with the state
+passed in.
+
+### In real systems
+
+`static` on every file-level function and variable that is not part of a
+module's interface is standard practice, enforced with
+`-Wmissing-prototypes` (which flags non-static functions with no prototype
+in a header). Static locals implement lazy one-time initialisation and
+caches, with the thread-safety caveat above.
+
+### Check yourself
+
+**Two files each define `static int count;`. Is that a link error?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+No. Each has internal linkage, so they are two separate variables, one
+per file.
+
+</details>
+
+## 4.7 Register Variables
+
+### In one sentence
+
+`register` was a hint that a variable is heavily used and should live in a
+machine register, and today its only lasting effect is that you cannot take
+its address.
+
+### The idea
+
+In 1978 compilers allocated registers poorly, so the programmer could mark
+an automatic variable or parameter `register` to suggest it be kept in a
+CPU register rather than memory. The compiler was free to ignore the hint,
+and only a few variables of certain types could actually be placed.
+
+Modern compilers do **register allocation** far better than any hand
+hints, and ignore `register` for that purpose. What remains is a rule: you
+cannot apply `&` to a `register` variable, because a register has no
+address. C++17 removed the keyword's meaning entirely.
+
+### Worked example
+
+```c
+/* reg.c */
+#include <stdio.h>
+
+static long sum_to(register int n)
+{
+    register long s = 0;
+    for (register int i = 1; i <= n; i++)
+        s += i;
+    return s;
+}
+
+int main(void)
+{
+    printf("%ld\n", sum_to(1000));
+    return 0;
+}
+```
+
+```text
+500500
+```
+
+### Step by step
+
+At `-O0` gcc does keep `register` variables in registers, which is the one
+place the hint still changes the generated code. At `-O1` and above the
+compiled code is identical with or without the keyword, which you can
+confirm by diffing the output of `gcc -O2 -S` for both versions.
+
+### Common mistake
+
+Taking the address: `register int x; int *p = &x;` is an error, "address of
+register variable 'x' requested". Code that was written with `register`
+everywhere breaks the moment someone passes one of the variables to
+`scanf`.
+
+### In real systems
+
+You will see `register` in old Unix sources and almost nowhere in new code.
+GNU C's `register int x asm("r12");` extension, which pins a variable to a
+named register, survives in kernels and embedded code for special
+registers, but that is a compiler extension, not standard C.
+
+### Check yourself
+
+**Will adding `register` to a loop counter make your program faster today?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+No, at any optimisation level above zero the compiler already chooses
+registers itself and ignores the hint.
+
+</details>
+
+## 4.8 Block Structure
+
+### In one sentence
+
+Variables can be declared at the start of any block, where they hide
+variables of the same name outside it, but functions cannot be nested.
+
+### The idea
+
+C is not fully **block-structured** in the Pascal sense, because a function
+cannot be defined inside another function. But variables can be declared in
+any block, not just at the top of a function, and since C99 anywhere in a
+block, including in a `for` header.
+
+A variable declared in a block **hides** (or **shadows**) any variable of
+the same name in an enclosing scope, from its declaration to the end of the
+block. Automatic variables declared in a block are created on entry to it
+and destroyed on exit; an initialiser runs each time the block is entered.
+A parameter is in the function's outermost scope, so a local of the same
+name declared there is an error, but one in an inner block hides it.
+
+### Worked example
+
+```c
+/* shadow.c */
+#include <stdio.h>
+
+int x = 1;                         /* external */
+
+int main(void)
+{
+    printf("%d ", x);              /* 1: the external */
+    int x = 2;                     /* hides it from here on */
+    printf("%d ", x);
+    {
+        int x = 3;                 /* hides main's x */
+        printf("%d ", x);
+    }
+    printf("%d\n", x);             /* 2 again */
+    return 0;
+}
+```
+
+```text
+1 2 3 2
+```
+
+A realistic use of an inner block is declaring a loop's working variables
+where they are used, so they cannot leak:
+
+```c
+/* inner_decl.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int v[] = {4, 9, 2, 7};
+    for (int i = 0; i < 4; i++) {
+        int doubled = v[i] * 2;     /* fresh each iteration */
+        printf("%d ", doubled);
+    }
+    printf("\n");                   /* i and doubled no longer exist */
+    return 0;
+}
+```
+
+```text
+8 18 4 14 
+```
+
+### Step by step
+
+<Figure art={`
+  file scope:   x = 1 ............................................
+  main block:          x = 2 .....................................
+  inner block:                     x = 3 .......
+                print  |   print   |   print   |   print
+                  1         2           3           2
+`} caption="Scopes as nested regions. A use of x refers to the innermost declaration whose region contains it; leaving a block uncovers the outer name again." />
+
+### Common mistake
+
+Accidental shadowing, especially in long functions: an inner `int err;`
+hides the outer `err` that the error path checks, so the outer one stays 0
+and the error is lost. gcc's `-Wshadow` (not in `-Wall`) warns about every
+case; many teams enable it.
+
+### In real systems
+
+Declaring variables at first use, in the smallest block, is the modern
+style in C99 codebases. Older code, and some strict style guides, still put
+all declarations at the top of a function for C89 compatibility.
+
+### Check yourself
+
+**Can you define a helper function inside `main`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+Not in standard C. GCC offers nested functions as an extension, but it is
+not portable and clang does not support it.
+
+</details>
+
+## 4.9 Initialization
+
+### In one sentence
+
+External and static variables start as zero unless initialised, automatic
+variables start as garbage, and the rules for what an initialiser may
+contain differ between the two.
+
+### The idea
+
+Without an explicit initialiser, objects with **static storage duration**
+(external and static variables) are initialised to zero: integers to 0,
+pointers to null, floating values to 0.0. Automatic variables have
+**indeterminate** values, and reading one is undefined behaviour in
+practice.
+
+For static storage the initialiser must be a **constant expression**,
+because it is computed before the program runs, once. For automatic
+variables it can be any expression, including function calls, and is
+evaluated each time the block is entered.
+
+Arrays are initialised with a brace list, `int days[] = {31, 28, 31};`.
+If the size is omitted, the compiler counts the initialisers. If there are
+fewer initialisers than elements, the rest are zero, so `int a[100] = {0};`
+zeroes the whole array. A character array can be initialised with a string
+literal, which includes the terminating `'\0'`.
+
+### Worked example
+
+```c
+/* init.c */
+#include <stdio.h>
+
+int counter;                      /* static storage: 0 */
+static double ratio;              /* 0.0 */
+
+int main(void)
+{
+    int days[] = {31, 28, 31, 30};          /* size 4, counted */
+    int part[6] = {1, 2};                   /* 1 2 0 0 0 0 */
+    char word[] = "hey";                    /* 4 bytes with '\0' */
+    char letters[] = {'h', 'e', 'y'};       /* 3 bytes, no '\0' */
+    static int calls = 0;                   /* once, constant */
+    calls++;
+    printf("%d %.1f %zu %d %d %zu %zu %d\n", counter, ratio,
+           sizeof days / sizeof days[0], part[1], part[5],
+           sizeof word, sizeof letters, calls);
+    return 0;
+}
+```
+
+```text
+0 0.0 4 2 0 4 3 1
+```
+
+### Step by step
+
+`letters` is not a string, because it has no terminator. Passing it to
+`printf("%s")` reads past the end until it happens to find a zero byte,
+which is undefined. `word` is a string. That one-byte difference is the
+whole story of C strings.
+
+Designated initialisers (C99) name the elements:
+`int a[10] = {[3] = 7, [9] = 1};` sets two and zeroes the rest, which is clearer for sparse
+tables.
+
+### Common mistake
+
+Reading an uninitialised automatic variable. The value is whatever was in
+that stack slot, so the program behaves differently between `-O0` and
+`-O2`, between runs, or after an unrelated change. gcc warns
+"'x' is used uninitialized" with `-Wall`, but only when it can prove it;
+valgrind's memcheck and clang's MemorySanitizer catch the rest at run
+time.
+
+```c
+/* uninit.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int sum;                     /* bug: no initialiser */
+    for (int i = 1; i <= 3; i++)
+        sum += i;
+    printf("%d\n", sum);
+    return 0;
+}
+```
+
+```text
+$ LC_ALL=C gcc -std=c11 -Wall -O2 -c uninit.c 2>&1 | grep -o "'sum' is used uninitialized"
+'sum' is used uninitialized
+```
+
+### In real systems
+
+Security standards forbid reading uninitialised memory because it can leak
+data from earlier use of the stack. Compilers now offer
+`-ftrivial-auto-var-init=zero` (gcc 12 and clang), which zeroes every
+automatic variable; some operating systems build their kernels with it.
+
+### Check yourself
+
+**What are the values of `int a[5] = {1};`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+1 0 0 0 0. Missing initialisers are zero.
+
+</details>
+
+**Can a static local be initialised with a function call?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+Not in C. Its initialiser must be a constant expression, evaluated before
+the program starts. (C++ allows it.)
+
+</details>
+
+## 4.10 Recursion
+
+### In one sentence
+
+A C function may call itself, directly or indirectly, and each call gets its
+own fresh set of automatic variables.
+
+### The idea
+
+A function is **recursive** when it calls itself. It works because every
+call has its own **stack frame**: its own parameters and automatic
+variables, so the inner call cannot disturb the outer one's. A recursive
+function needs a **base case** that does not recurse, and each recursive
+call must move closer to it.
+
+The book's first example prints a number digit by digit without reversing:
+to print 123, print 12 recursively, then print 3. The digits come out in the
+right order because the printing happens as the calls return.
+
+The second is **quicksort**: pick a **pivot** element, partition the array
+so that smaller elements are on its left and larger on its right, then sort
+each part recursively. Each part is smaller, and a part of fewer than two
+elements is already sorted, which is the base case.
+
+Recursion usually saves no time or space compared with a loop, since the
+stack holds a frame per call. It is worth it when the problem is
+recursive, like trees, nested structures and divide-and-conquer
+algorithms.
+
+### Worked example
+
+```c
+/* printd.c */
+#include <stdio.h>
+
+static void printd(int n)
+{
+    if (n < 0) {
+        putchar('-');
+        if (n / 10) printd(-(n / 10));   /* avoid negating INT_MIN */
+        putchar('0' - n % 10);
+        return;
+    }
+    if (n / 10)
+        printd(n / 10);
+    putchar('0' + n % 10);
+}
+
+int main(void)
+{
+    printd(1203); putchar(' ');
+    printd(-45); putchar(' ');
+    printd(-2147483647 - 1); putchar('\n');
+    return 0;
+}
+```
+
+```text
+1203 -45 -2147483648
+```
+
+For negative `n`, `n % 10` is negative or zero in C99 (division truncates
+toward zero), so `'0' - n % 10` gives the right digit, and `-(n / 10)` is
+safe because `n / 10` is never `INT_MIN`.
+
+Quicksort, with the middle element as the pivot:
+
+```c
+/* qsort_mine.c */
+#include <stdio.h>
+
+static void swap(int v[], int i, int j) { int t = v[i]; v[i] = v[j]; v[j] = t; }
+
+static void quicksort(int v[], int left, int right)
+{
+    if (left >= right)                 /* fewer than two elements */
+        return;
+    swap(v, left, left + (right - left) / 2);   /* pivot to v[left] */
+    int last = left;
+    for (int i = left + 1; i <= right; i++)
+        if (v[i] < v[left])
+            swap(v, ++last, i);
+    swap(v, left, last);               /* pivot to its final place */
+    quicksort(v, left, last - 1);
+    quicksort(v, last + 1, right);
+}
+
+int main(void)
+{
+    int v[] = {5, 2, 9, 1, 5, 6, 0, 3};
+    quicksort(v, 0, 7);
+    for (int i = 0; i < 8; i++) printf("%d ", v[i]);
+    printf("\n");
+    return 0;
+}
+```
+
+```text
+0 1 2 3 5 5 6 9 
+```
+
+### Step by step
+
+<Figure art={`
+  printd(1203)
+    printd(120)
+      printd(12)
+        printd(1)        base case: 1/10 is 0, no call
+        putchar '1'
+      putchar '2'
+    putchar '0'
+  putchar '3'            output so far: 1203
+`} caption="The call stack for printd(1203). Each call waits for its inner call to finish before printing its own last digit, so the digits come out most significant first." />
+
+In quicksort, after the partition loop, `v[left+1..last]` are less than the
+pivot and `v[last+1..right]` are at least the pivot. Swapping the pivot into
+`last` puts it in its final sorted position, and the two recursive calls
+never touch it again.
+
+### Common mistake
+
+Unbounded recursion. Each call uses stack, and the stack is limited
+(typically 8 MB on Linux), so deep recursion crashes with a segmentation
+fault. Quicksort on already-sorted input with a first-element pivot
+recurses `n` deep; with a million elements that overflows. Choosing the
+middle or a random pivot, and recursing on the smaller part first while
+looping on the larger, bounds the depth to about log2(n).
+
+### In real systems
+
+The C library's `qsort` (Appendix B) is usually not a plain quicksort:
+glibc uses a merge sort when memory allows, and many libraries use
+introsort, which falls back to heapsort when recursion gets deep. Recursive
+descent parsers, used by gcc and clang, are recursion applied to grammar.
+
+### Check yourself
+
+**What is the base case of `printd`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+A single digit: when `n / 10` is 0 it does not recurse, it just prints the
+digit.
+
+</details>
+
+## 4.11 The C Preprocessor
+
+### In one sentence
+
+The preprocessor is a text-rewriting pass that runs before compilation,
+handling `#include`, `#define` and conditional compilation.
+
+### The idea
+
+Before the compiler proper sees a file, the **preprocessor** processes the
+lines that start with `#`, called **directives**. It knows nothing about C
+types or scope; it works on **tokens**, the words and symbols of the
+source. It also joins lines ending in a backslash and replaces comments
+with a space.
+
+Three facilities matter most, and the book gives each its own subsection
+below: file inclusion, macro substitution and conditional inclusion. There
+are also `#undef`, `#error`, `#line` and `#pragma`, which Appendix A covers.
+
+<Flow steps={["source with # directives", "#include: paste the named file in", "#define: replace macro names by their bodies", "#if / #ifdef: keep or drop blocks of lines", "plain C tokens, to the compiler"]} caption="What the preprocessor does, in order of how often you meet it. Its output, visible with gcc -E, is what the compiler actually compiles." />
+
+### Worked example
+
+You can see the preprocessor's output with `gcc -E` (add `-P` to drop the
+line markers). This is the single most useful command for understanding
+any macro problem:
+
+```c
+/* expand.c */
+#define SQUARE(x) ((x) * (x))
+#define LIMIT 10
+int f(int a) { return SQUARE(a + 1) > LIMIT; }
+```
+
+```text
+$ gcc -E -P expand.c
+int f(int a) { return ((a + 1) * (a + 1)) > 10; }
+```
+
+### Step by step
+
+The preprocessor read the two `#define` lines, removed them, and remembered
+the macros. On the third line it found the token `SQUARE` followed by `(`,
+collected the argument `a + 1`, substituted it for each `x` in the body,
+and then rescanned the result for further macros. `LIMIT` became `10`. The
+compiler never sees the names `SQUARE` or `LIMIT`, which is why a debugger
+cannot show them either.
+
+### Common mistake
+
+Thinking of macros as functions or variables. They have no scope (a macro
+is visible from its `#define` to the end of the file, or an `#undef`), no
+type and no address. A macro named like a common word, such as `#define
+max ...`, will rewrite every later `max` in the file, including in headers
+included afterwards.
+
+### In real systems
+
+Build systems pass configuration in through the preprocessor with `-D`
+flags, such as `-DNDEBUG` to turn off `assert`. Tools like `ccache` hash
+the preprocessed output to decide whether a file needs recompiling.
+
+### Check yourself
+
+**Does the preprocessor know that `int` is a type?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+No. It works on tokens and directives only. Type checking happens later,
+in the compiler.
+
+</details>
+
+## 4.11.1 File Inclusion
+
+### In one sentence
+
+`#include "file"` and `#include <file>` replace the line with the entire
+contents of the named file.
+
+### The idea
+
+`#include "calc.h"` searches first in the directory of the including file,
+then in the system locations; `#include <stdio.h>` searches only the system
+locations and any added with `-I`. Included files can include others.
+
+Inclusion is how declarations are shared, and it has one hazard: a header
+included twice, directly or through two other headers, repeats its
+contents, and repeated structure definitions are errors. The cure is the
+include guard in 4.11.3.
+
+When a header changes, every file that includes it must be recompiled.
+Build tools track that with dependency files, which `gcc -MMD` writes.
+
+### Worked example
+
+```c
+/* greet.h */
+void greet(const char *name);
+```
+
+```c
+/* greet.c */
+#include <stdio.h>
+#include "greet.h"
+
+void greet(const char *name) { printf("hello, %s\n", name); }
+```
+
+```c
+/* greet_main.c */
+#include "greet.h"
+
+int main(void)
+{
+    greet("reader");
+    return 0;
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -o greet greet_main.c greet.c && ./greet
+hello, reader
+$ gcc -MM greet_main.c
+greet_main.o: greet_main.c greet.h
+```
+
+The `-MM` line is the dependency rule a `Makefile` needs: `greet_main.o`
+must be rebuilt when either file changes.
+
+### Step by step
+
+`gcc -E greet_main.c` shows the prototype pasted in where the `#include`
+line was, preceded by line markers like `# 1 "greet.h"` so error messages
+can still name the right file and line.
+
+### Common mistake
+
+Including a `.c` file, `#include "stack.c"`, to avoid setting up a
+multi-file build. It works once and then breaks with "multiple definition"
+errors as soon as a second file does the same, and it recompiles the code
+every time. Include headers; link `.c` files.
+
+### In real systems
+
+Header inclusion is one of the main costs in C and C++ compile times;
+large projects measure it with `-H`, which prints every included file.
+Precompiled headers and C++20 modules exist to reduce it.
+
+### Check yourself
+
+**What is the difference between `"x.h"` and `<x.h>`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+The quoted form looks in the including file's directory first, then the
+system paths. The angle form looks only in the system and `-I` paths.
+
+</details>
+
+## 4.11.2 Macro Substitution
+
+### In one sentence
+
+`#define NAME text` makes the preprocessor replace each later `NAME` token
+with `text`, and a macro can take arguments that are substituted as text.
+
+### The idea
+
+An object-like macro, `#define MAXLINE 1000`, replaces a name. A
+**function-like macro**, `#define SQUARE(x) ((x) * (x))`, replaces a call
+with its body, substituting the arguments. There must be no space between
+the macro name and the opening parenthesis in the definition, or it becomes
+an object-like macro whose text starts with `(`.
+
+Because substitution is textual, every argument use and the whole body
+need parentheses, and an argument with a side effect may be evaluated more
+than once. Macros have no types, so `MAX` works for `int` and `double`
+alike, which was the original attraction.
+
+Two operators work only inside macro bodies. `#x` turns the argument into a
+string literal, called **stringizing**. `a ## b` glues two tokens into one,
+called **token pasting**. Names inside a string literal are never replaced.
+
+### Worked example
+
+```c
+/* macros.c */
+#include <stdio.h>
+
+#define BAD_SQUARE(x) x * x
+#define SQUARE(x)     ((x) * (x))
+#define MAX(a, b)     ((a) > (b) ? (a) : (b))
+#define SHOW(expr)    printf(#expr " = %d\n", (expr))
+#define PASTE(a, b)   a ## b
+
+int main(void)
+{
+    int i = 3, j = 5, var12 = 42;
+    SHOW(BAD_SQUARE(i + 1));      /* i + 1 * i + 1 */
+    SHOW(SQUARE(i + 1));
+    SHOW(MAX(i++, j++));          /* j++ runs twice */
+    printf("i=%d j=%d\n", i, j);
+    SHOW(PASTE(var, 12));
+    return 0;
+}
+```
+
+```text
+BAD_SQUARE(i + 1) = 7
+SQUARE(i + 1) = 16
+MAX(i++, j++) = 6
+i=4 j=7
+PASTE(var, 12) = 42
+```
+
+### Step by step
+
+`BAD_SQUARE(i + 1)` becomes `i + 1 * i + 1`, which is 3 + 3 + 1, so 7.
+`MAX(i++, j++)` becomes `((i++) > (j++) ? (i++) : (j++))`: the test
+increments both, 3 is not greater than 5, so the second `j++` runs, yielding
+6 and leaving `j` at 7. `#expr` shows the argument as written, before
+expansion, and `PASTE(var, 12)` builds the single identifier `var12`.
+
+### Common mistake
+
+The side-effect trap above, and a multi-statement macro without
+`do { } while (0)` from chapter 3. The modern fix for most function-like macros is
+a `static inline` function, which has types, evaluates each argument once
+and can be stepped through in a debugger:
+
+```c
+/* inline_max.c */
+#include <stdio.h>
+
+static inline int max_int(int a, int b) { return a > b ? a : b; }
+
+int main(void)
+{
+    int i = 3, j = 5;
+    int m = max_int(i++, j++);
+    printf("%d i=%d j=%d\n", m, i, j);
+    return 0;
+}
+```
+
+```text
+5 i=4 j=6
+```
+
+### In real systems
+
+Macros remain essential where functions cannot go: `#expr` for assertion
+messages (that is how `assert` prints the failed condition), `##` for
+generating families of names, and `__FILE__` and `__LINE__` for logging.
+C11's `_Generic` plus a macro gives type-generic functions, which is how
+`<tgmath.h>` works.
+
+### Check yourself
+
+**What does `#define SQ(x) x*x` give for `SQ(2+3)`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+11, because it expands to `2+3*2+3`. With `((x)*(x))` it is 25.
+
+</details>
+
+## 4.11.3 Conditional Inclusion
+
+### In one sentence
+
+`#if`, `#ifdef`, `#ifndef`, `#elif`, `#else` and `#endif` keep or discard
+lines depending on constant expressions the preprocessor evaluates.
+
+### The idea
+
+`#if expr` keeps the following lines if the integer constant expression is
+non-zero. Inside it, `defined(NAME)` is 1 if `NAME` is a defined macro.
+`#ifdef NAME` and `#ifndef NAME` are shorthand for `#if defined(NAME)` and
+its negation. Identifiers that are not macros evaluate to 0.
+
+The most important use is the **include guard**, which makes a header safe
+to include twice. The others are platform selection (`#ifdef _WIN32`),
+debug-only code (`#ifndef NDEBUG`) and feature flags passed with `-D` on the
+compiler command line.
+
+### Worked example
+
+```c
+/* guard.h */
+#ifndef GUARD_H
+#define GUARD_H
+
+struct point { int x, y; };
+
+#endif /* GUARD_H */
+```
+
+```c
+/* guard_main.c */
+#include <stdio.h>
+#include "guard.h"
+#include "guard.h"          /* second time: skipped by the guard */
+
+#ifdef VERBOSE
+#define LOG(msg) fprintf(stderr, "log: %s\n", msg)
+#else
+#define LOG(msg) ((void)0)
+#endif
+
+int main(void)
+{
+    struct point p = {1, 2};
+    LOG("starting");
+    printf("%d %d\n", p.x, p.y);
+    return 0;
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -o guard_main guard_main.c && ./guard_main
+1 2
+$ gcc -std=c11 -Wall -DVERBOSE -o guard_main guard_main.c && ./guard_main 2>&1
+log: starting
+1 2
+```
+
+### Step by step
+
+On the first `#include "guard.h"`, `GUARD_H` is not defined, so the lines
+are kept and `GUARD_H` becomes defined. On the second, `#ifndef GUARD_H` is
+false and everything up to `#endif` is dropped. Without the guard, the
+second copy redefines `struct point`, which is an error. `#pragma once`
+does the same job; it is not in the standard but every major compiler
+supports it.
+
+### Common mistake
+
+Two headers that use the same guard name, say both `UTIL_H`. Whichever is
+included second is silently empty, and the error appears far away as an
+undeclared function. Guard names should include the project and path,
+such as `MYPROJ_NET_UTIL_H`. Another is code inside a disabled `#if` branch
+that no longer compiles, which nobody notices until the flag is turned on.
+
+### In real systems
+
+Every system header is guarded. Large projects use conditional compilation
+for portability layers (`config.h` generated by a configure script) and
+feature flags; the Linux kernel's thousands of `CONFIG_` options are
+`#ifdef`s. Using `if (DEBUG)` on a constant instead, which the compiler
+type-checks and then removes, keeps disabled code from rotting.
+
+### Check yourself
+
+**Why do headers start with `#ifndef SOMETHING_H`?**
+
+**Answer**
+
+<details>
+<summary>Answer</summary>
+
+It is an include guard: the first inclusion defines the macro, so later
+inclusions skip the contents and nothing is defined twice.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Functions and Program Structure">
+<Level name="Beginner" depth={3}>
+
+The beginner's core is: write a function for each job, declare it before
+you use it, and give it the right return type. Put shared declarations in a
+header and include it everywhere, including in the file that defines them.
+
+A beginner's worked example: a temperature converter split into a function
+and a caller, with a prototype so `main` can come first.
+
+```c
+/* convert.c */
+#include <stdio.h>
+
+double to_celsius(double fahr);
+
+int main(void)
+{
+    for (int f = 0; f <= 100; f += 50)
+        printf("%3d %6.1f\n", f, to_celsius(f));
+    return 0;
+}
+
+double to_celsius(double fahr) { return (5.0 / 9.0) * (fahr - 32.0); }
+```
+
+```text
+  0  -17.8
+ 50   10.0
+100   37.8
+```
+
+The `int` argument `f` is converted to `double` at the call because the
+prototype says so. Delete the prototype and gcc 14 refuses to compile,
+which is the compiler protecting you from 4.2's garbage result.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate skill is organising a program into modules: one `.c` and
+one `.h` per idea, with private state `static` and the public interface in
+the header. The calculator in 4.5 is the template. A `Makefile` builds it
+and rebuilds only what changed.
+
+```c
+/* counter2.h */
+#ifndef COUNTER2_H
+#define COUNTER2_H
+void counter_add(int n);
+int counter_total(void);
+#endif
+```
+
+```c
+/* counter2.c */
+#include "counter2.h"
+
+static int total;                      /* private to this file */
+
+void counter_add(int n) { total += n; }
+int counter_total(void) { return total; }
+```
+
+```c
+/* counter2_main.c */
+#include <stdio.h>
+#include "counter2.h"
+
+int main(void)
+{
+    counter_add(5);
+    counter_add(7);
+    printf("%d\n", counter_total());
+    return 0;
+}
+```
+
+```text
+$ gcc -std=c11 -Wall -o counter2 counter2_main.c counter2.c && ./counter2
+12
+```
+
+No other file can write `total`; the only way in is through the two
+functions, so all the rules about it live in one place.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level you reason about linkage and the symbol table. `nm`
+shows what each object file defines and needs; reading it explains every
+"undefined reference" and "multiple definition" error.
+
+```text
+$ gcc -std=c11 -c counter2.c && nm counter2.o
+0000000000000000 T counter_add
+000000000000001b T counter_total
+0000000000000000 b total
+```
+
+`T` is a defined function with external linkage; lower-case `b` is an
+uninitialised (BSS) object with internal linkage, which is how `static`
+shows up. A capital letter means visible to the linker; lower-case means
+local to the file.
+
+The other advanced topic is recursion depth. Each frame costs stack; on
+Linux the default limit is 8 MB, shown by `ulimit -s`. A recursive function
+over user-controlled input, like a parser on nested brackets, must bound
+its depth or convert to an explicit stack, or an attacker can crash it with
+deeply nested input.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases in this chapter are about where values start and how far they
+reach. A static local is initialised once, before `main`, even if the
+function is never called. An automatic array with an initialiser list is
+filled on every entry to its block, which costs time in a hot loop. An
+`extern` array declared without a size cannot be used with `sizeof`,
+because its size is unknown in that file.
+
+```c
+/* sizeof_extern.c */
+#include <stdio.h>
+
+int table[] = {1, 2, 3, 4, 5};
+
+static size_t count_here(void) { return sizeof table / sizeof table[0]; }
+
+int main(void)
+{
+    printf("%zu\n", count_here());
+    /* in another file, after "extern int table[];",
+       sizeof table is an error: incomplete type */
+    return 0;
+}
+```
+
+```text
+5
+```
+
+The fix is to export the count too: `extern const size_t table_len;` next
+to the array.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases come from the preprocessor meeting C. A macro argument
+containing a comma must be parenthesised, or the preprocessor sees two
+arguments. A function-like macro name not followed by `(` is not expanded,
+which lets a library provide both a macro and a real function with the same
+name: `(getchar)()` calls the function.
+
+```c
+/* macro_comma.c */
+#include <stdio.h>
+
+#define FIRST(a, b) (a)
+#define TWICE(x) ((x) + (x))
+
+int main(void)
+{
+    int v = TWICE((FIRST(3, 4)));     /* inner comma protected */
+    printf("%d\n", v);
+    printf("%d\n", (TWICE)(2) == 4 ? 1 : 0);
+    return 0;
+}
+```
+
+```text
+$ LC_ALL=C gcc -std=c11 -c macro_comma.c 2>&1 | grep -o "'TWICE' undeclared"
+'TWICE' undeclared
+```
+
+The first use is fine. The second fails: `(TWICE)(2)` suppresses the macro,
+and there is no function or variable called `TWICE`. With a real function of the same
+name, that is exactly how you bypass a macro on purpose.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+Production C splits code into libraries with stable headers, builds with
+dependency tracking (`-MMD -MP`), and checks linkage with warnings:
+`-Wmissing-prototypes`, `-Wmissing-declarations`, `-Wshadow`,
+`-Wstrict-prototypes`. Every non-static function has a prototype in a header
+that its own file includes.
+
+Symbol visibility is the next layer. A shared library exports every
+non-static symbol by default; production libraries compile with
+`-fvisibility=hidden` and mark the public API explicitly, which keeps the
+ABI small and lets the compiler optimise internal calls. Namespacing by
+prefix (`curl_`, `sqlite3_`, `png_`) is C's substitute for namespaces.
+
+Macros are reviewed carefully. Teams prefer `static inline` functions and
+`enum` constants, and keep macros for the cases that need them:
+stringizing, token pasting, `__FILE__` and conditional compilation.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is designing interfaces. A header is a promise to every caller;
+the `.c` file is free to change as long as the promise holds. The question
+for every function is "what does the caller need to know?", and everything
+else should be `static`.
+
+The other half is distrust of global state. Each external variable is a
+hidden parameter to every function that can see it. When a function is
+hard to test, the cause is usually state it reads from outside its
+parameters.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At system scale, the file and linkage rules of this chapter become module
+boundaries. A well-designed C library has an opaque handle (a pointer to a
+structure whose definition is private, chapter 6), a set of functions taking
+that handle, and no global state, so two users in one process cannot
+interfere.
+
+<Figure art={`
+   public header (api.h)          private source (api.c)
+   +----------------------+       +---------------------------+
+   | typedef struct db db;|       | struct db { ... fields }; |
+   | db *db_open(...);    | ----> | static helpers            |
+   | int db_get(db*,...); |       | static int internal_state |
+   | void db_close(db*);  |       | definitions of the API    |
+   +----------------------+       +---------------------------+
+      callers see only this          free to change
+`} caption="A C module as an interface and an implementation. The header is the contract; static functions and the private structure are invisible to callers." />
+
+SQLite, zlib and libcurl are built this way, which is why they can be
+embedded in thousands of programs and upgraded without breaking them.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+My strategy is to build the calculator twice: once as one file, then split
+into modules with a header and a `Makefile`, and to read `nm` and `gcc -E`
+output until linkage and macro expansion hold no surprises. Then I write
+quicksort and `printd` from memory and test them on the edge inputs.
+
+The preprocessor is where I go slowly. I expand every macro on this page by
+hand, check with `gcc -E`, and convert each function-like macro I can to a
+`static inline` function.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I use `static` on functions in a single-file program?** Yes. It
+documents that they are private, lets the compiler warn about unused ones,
+and enables better optimisation.
+
+**What is the difference between scope and linkage?** Scope is where in the
+source a name can be used. Linkage is whether the same name in different
+scopes or files refers to the same object.
+
+**Is `inline` the same as a macro?** No. An inline function is a real
+function with typed parameters, each evaluated once; `inline` is a hint to
+expand it at the call site. A macro is text substitution.
+
+**Why does my program link with `int x;` in two files on an old compiler but
+not a new one?** Before gcc 10, uninitialised globals were "common" symbols
+that the linker merged. Now they are ordinary definitions, so two of them
+conflict. Define in one file, `extern` in the header.
+
+**How deep can recursion go?** It depends on frame size and the stack limit,
+typically 8 MB on Linux for the main thread and less for other threads. A
+few hundred thousand small frames is a rough ceiling; plan for much less.
+
+**Do I still need `#include` guards if I use `#pragma once`?** No, every
+current compiler supports `#pragma once`. Guards are still more common in
+portable code because they are standard.
+
+## Key takeaways
+
+- Declare every function before use with a prototype, so return and parameter types are checked and converted.
+- Implicit declarations are gone in modern C; an undeclared `double` function returning garbage is why.
+- One definition per external variable in the whole program, with `extern` declarations in a header.
+- `static` at file level hides a name in its file; `static` on a local keeps its value between calls.
+- Static storage starts as zero; automatic variables start indeterminate, and reading them is a bug.
+- Recursion gives each call its own variables; bound its depth on untrusted input.
+- The preprocessor rewrites text, so parenthesise macro arguments and bodies and beware side effects.
+- `gcc -E` shows what a macro really does, and `nm` shows what a file really defines.
+- Prefer `static inline` functions and `enum` constants to function-like and constant macros.
+- Guard every header, and include a module's header in its own `.c` file.
+
+## Glossary
+
+- **Function definition**: a function's return type, name, parameters and body.
+- **Prototype**: a declaration of a function with its parameter types.
+- **Implicit declaration**: C89's assumption that an undeclared function returns `int`, removed in C99.
+- **External variable**: a variable defined outside all functions, with static storage duration.
+- **Scope**: the region of source text where a name can be used.
+- **Linkage**: whether a name in different scopes or files refers to the same object (external, internal or none).
+- **Storage duration**: how long an object exists: static (whole run) or automatic (one block entry).
+- **Header file**: a file of shared declarations, included with `#include`.
+- **Internal linkage**: visible only within one file; given by `static` at file level.
+- **Register variable**: a variable with the `register` hint, whose address cannot be taken.
+- **Shadowing**: an inner declaration hiding an outer one with the same name.
+- **Recursion**: a function calling itself, directly or indirectly.
+- **Stack frame**: the memory for one call's parameters, locals and return address.
+- **Pivot**: the element quicksort partitions around.
+- **Preprocessor directive**: a line starting with `#`, handled before compilation.
+- **Function-like macro**: a macro with parameters, expanded by textual substitution.
+- **Stringizing / token pasting**: the `#` and `##` macro operators.
+- **Include guard**: an `#ifndef` wrapper that makes a header safe to include twice.
+
+## Exercises and self-check
+
+These are my own exercises. The book has its own at the end of each section;
+do a selection of those too.
+
+**Warm-up (by hand)**
+
+1. Expand `MAX(a++, b)` by hand for `a` of 7 and `b` of 2, and give the
+   result and the final value of `a`. Check with a program.
+2. For each variable in `init.c`, say its scope, linkage and storage
+   duration.
+3. Trace `quicksort` on `3 1 2` and list every swap.
+
+**Practice (write and test)**
+
+4. Add `%` (modulus, using `fmod`), a "print top without popping" command
+   and a "duplicate top" command to the multi-file calculator.
+5. Give the calculator 26 single-letter variables, where `x=` stores the top
+   of the stack and `x` pushes the stored value.
+6. Write `swap_any(a, b, type)` as a macro using a temporary of the given
+   type, then explain why it fails for `swap_any(t, x, int)` where the
+   temporary is also called `t`.
+7. Write a recursive `itoa` and compare it with chapter 3's loop version on
+   `INT_MIN`, 0 and a single digit.
+
+**Stretch (change the problem)**
+
+8. Make quicksort's recursion depth bounded by log2(n) by recursing on the
+   smaller part and looping on the larger. Measure the maximum depth on a
+   sorted array of a million elements.
+9. Write a header-only module with `static inline` functions and show with
+   `nm` that each file that includes it gets its own copy.
+
+**Self-check**
+
+<details>
+<summary>1. What happens if you call a function before it is declared in C11?</summary>
+
+It is a constraint violation. gcc 14 makes it an error by default; older
+compilers assumed it returned `int`.
+
+</details>
+
+<details>
+<summary>2. What is the value of an uninitialised static local int?</summary>
+
+Zero. All static storage is zero-initialised before the program starts.
+
+</details>
+
+<details>
+<summary>3. Why must the definition file include its own header?</summary>
+
+So the compiler checks the definitions against the declarations other
+files use. Otherwise a mismatch links and misbehaves.
+
+</details>
+
+<details>
+<summary>4. What does `#x` do in a macro body?</summary>
+
+It turns the macro argument `x` into a string literal containing its text
+as written.
+
+</details>
+
+<details>
+<summary>5. Why does quicksort on sorted input with a first-element pivot recurse n deep?</summary>
+
+Each partition puts every other element on one side, so each call reduces
+the size by only one.
+
+</details>
+
+<details>
+<summary>6. What does `nm` letter `U` mean?</summary>
+
+Undefined: the object file uses the symbol but does not define it, so the
+linker must find it elsewhere.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to
+<a href={withBase('/plans/traditional-software-developer/#strategy-1')}>phase 1</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, after the matching chapters of
+<a href={withBase('/books/c-programming-a-modern-approach/')}>King</a>, and it is
+the first chapter where I need a real project layout. I give it three
+sessions.
+
+<Timeline caption="Three sessions for chapter 4: functions and types, then files and linkage, then recursion and the preprocessor." items={[
+  { when: "Session 1", what: "4.1 and 4.2. Write find.c and myatof.c from my own understanding. Delete the prototype and read gcc's error. Force the old behaviour with -std=gnu89 and see the garbage." },
+  { when: "Session 2", what: "4.3 to 4.9. Build the calculator as one file, then split it into main.c, stack.c, getop.c and calc.h with a Makefile. Run nm on every object file and explain each letter." },
+  { when: "Session 3", what: "4.10 and 4.11. Write printd and quicksort from memory with tests. Expand every macro on this page by hand, check with gcc -E, and rewrite MAX as a static inline function." },
+]} />
+
+The calculator lives in `kr-ch04/calc/` with its own `Makefile` using
+`-MMD -MP`, so touching `calc.h` rebuilds everything and touching
+`stack.c` rebuilds one object. I keep a `notes.md` of every linker error I
+caused and what `nm` showed.
+
+Done when I can split any single-file program into modules without
+thinking, explain scope, linkage and storage duration for any declaration,
+and predict the expansion of a macro before running `gcc -E`.
