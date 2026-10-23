@@ -1,0 +1,1641 @@
+---
+book: data-structures-and-algorithm-analysis
+number: 4
+title: "Trees"
+description: "General and binary trees, expression trees, binary search trees, AVL and splay trees, traversals, B-trees and library sets and maps, built and measured in TypeScript."
+part: "The core structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Lists make most operations linear. Trees make most of them logarithmic,
+which is the difference between a million steps and twenty. This chapter
+starts with trees in general (file systems are the running example),
+narrows to binary trees and expression trees, and then builds the binary
+search tree, the structure behind every ordered set and map. A plain
+search tree can degrade into a list, so the chapter shows two repairs: AVL
+trees, which keep themselves balanced with rotations, and splay trees,
+which move what you use to the top. It ends with B-trees, the disk-friendly
+tree inside every database, and the library's `set` and `map`.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Define the vocabulary of trees (root, child, leaf, depth, height, path)
+  and represent a tree with any number of children per node.
+- Traverse a tree in preorder, postorder, inorder and level order, and say
+  which one a given task needs.
+- Build a binary search tree with `contains`, `findMin`, `insert` and
+  `remove`, including the two-children removal case.
+- Explain why random insertions give logarithmic depth and sorted
+  insertions give linear depth, with measured numbers.
+- Perform AVL single and double rotations by hand and in code, and explain
+  what splaying buys.
+- Estimate the height of a B-tree for a given block size and key count,
+  and use ordered maps to solve real problems.
+
+What you should already know: recursion and its four rules from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/01-programming-a-general-overview/')}>chapter 1</a>,
+logarithms and binary search from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/02-algorithm-analysis/')}>chapter 2</a>,
+and linked nodes from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/03-lists-stacks-and-queues/')}>chapter 3</a>.
+
+Reading time: about 100 minutes, plus three evenings for the code.
+
+## Chapter map
+
+<Layers caption="The chapter as layers. Each layer adds one constraint to the one above it: binary, then ordered, then balanced, then disk-friendly." layers={[
+  { name: "4.1 Trees in general", note: "vocabulary, first-child/next-sibling, preorder and postorder" },
+  { name: "4.2 Binary trees", note: "at most two children; expression trees" },
+  { name: "4.3 Binary search trees", note: "ordered: smaller left, larger right; average depth O(log n)" },
+  { name: "4.4–4.5 Keeping it shallow", note: "AVL rotations (worst case) and splaying (amortised)" },
+  { name: "4.6 Traversals revisited", note: "which order for which job" },
+  { name: "4.7 B-trees", note: "wide nodes, few disk reads" },
+  { name: "4.8 Library sets and maps", note: "ordered containers built on balanced trees" },
+]} />
+
+## 4.1 Preliminaries
+
+### In one sentence
+
+A tree is a root node connected to zero or more subtrees, each by one
+edge, so there is exactly one path from the root to every node.
+
+### The idea
+
+A **tree** can be defined recursively: it is either empty, or a **root**
+node r together with zero or more nonempty subtrees, each connected to r by
+a directed **edge**. The root of each subtree is a **child** of r, and r
+is its **parent**. A tree of n nodes has exactly n − 1 edges, because every
+node except the root has one edge to its parent.
+
+The vocabulary:
+
+- **Leaf:** a node with no children.
+- **Siblings:** nodes with the same parent.
+- **Path:** a sequence of nodes, each the parent of the next. Its
+  **length** is the number of edges. There is exactly one path from the
+  root to each node.
+- **Depth** of a node: the length of the path from the root to it. The
+  root has depth 0.
+- **Height** of a node: the length of the longest path from it down to a
+  leaf. Leaves have height 0; the height of the tree is the height of its
+  root.
+- **Ancestor** and **descendant:** if there is a path from a to b, a is an
+  ancestor of b and b a descendant of a. **Proper** excludes the node
+  itself.
+
+#### 4.1.1 Implementation of trees
+
+If every node can have any number of children, giving each node an array
+of children wastes space or needs resizing. The classic trick is
+**first-child/next-sibling**: each node stores two pointers, one to its
+first child and one to its next sibling. The children of a node form a
+linked list hanging from it. Any tree becomes a structure of two-pointer
+nodes, which (turned 45 degrees) is a binary tree.
+
+#### 4.1.2 Tree traversals with an application
+
+A file system is a tree: directories are internal nodes and files are
+leaves. Two traversals do most of the work.
+
+- **Preorder:** process a node, then its children. Listing a directory
+  with indentation is preorder: print the directory, then its contents,
+  one level deeper.
+- **Postorder:** process the children, then the node. Computing the size
+  of a directory is postorder: a directory's total is its own size plus
+  the totals of its children, which must be known first.
+
+Both visit every node once with constant work per node, so both are O(n).
+
+### Worked example
+
+My own small project folder, stored as first-child/next-sibling:
+
+```ts
+class TNode {
+  firstChild: TNode | null = null;
+  nextSibling: TNode | null = null;
+  constructor(public name: string, public size = 0) {}
+}
+function list(n: TNode, depth = 0) {          // preorder
+  console.log('  '.repeat(depth) + n.name);
+  for (let c = n.firstChild; c; c = c.nextSibling) list(c, depth + 1);
+}
+function total(n: TNode): number {            // postorder
+  let s = n.size;
+  for (let c = n.firstChild; c; c = c.nextSibling) s += total(c);
+  console.log(`  ${n.name} ${s}`);
+  return s;
+}
+```
+
+The preorder listing:
+
+```text
+proj/
+  README.md
+  src/
+    main.ts
+    util.ts
+  docs/
+    intro.md
+```
+
+The postorder sizes (each directory counts 1 block for itself), printed in
+the order they finish:
+
+```text
+README.md 1
+main.ts 5
+util.ts 3
+src/ 9
+intro.md 2
+docs/ 3
+proj/ 14
+```
+
+Notice that `proj/` prints last in postorder: it cannot finish until all
+its children have.
+
+### Step by step
+
+<Figure caption="The same folder drawn as a tree (left) and as first-child/next-sibling pointers (right). Down arrows are first-child links, right arrows next-sibling links; every node has at most two." art={`
+        proj/                         proj/
+     /    |    \\                       |
+ README  src/  docs/                README ──▶ src/ ──▶ docs/
+         /  \\     |                           |          |
+    main.ts util.ts intro.md               main.ts ──▶ util.ts   intro.md
+
+ depth:  proj 0 · README, src, docs 1 · main, util, intro 2
+ height: proj 2 · src 1 · leaves 0
+`} />
+
+<Compare left="Preorder" right="Postorder" rows={[
+  ["node first, then children", "children first, then node"],
+  ["listing, printing, copying a tree", "sizes, deletion, evaluating"],
+  ["the root is visited first", "the root is visited last"],
+  ["work flows down (depth, prefix)", "work flows up (totals, heights)"],
+]} caption="The two traversals of a general tree. The question to ask is whether a node needs information from its parent (preorder) or from its children (postorder)." />
+
+### Common mistake
+
+The mistake is mixing up depth and height. Depth is measured from the
+root down (root has depth 0); height from the node down to its deepest
+leaf (leaves have height 0). The root's height is the tree's height; a
+leaf's depth can be anything. A second mistake is writing a recursive
+traversal for a tree that might be very deep, such as a file system with
+symbolic link loops or a degenerate tree: follow links carefully and
+consider an explicit stack.
+
+### In real systems
+
+`du` computes directory sizes in postorder; `ls -R` and `tree` list in
+preorder. The DOM in a browser is a tree with first-child and
+next-sibling pointers exposed directly (`firstChild`, `nextSibling`).
+React's reconciler (Fiber) stores its component tree the same way, with
+`child`, `sibling` and `return` pointers, precisely so it can walk it
+iteratively and pause in the middle.
+
+### Check yourself
+
+1. A tree has 50 nodes. How many edges does it have?
+
+<details>
+<summary>Answer</summary>
+
+49: every node except the root has exactly one edge to its parent.
+
+</details>
+
+2. Which traversal deletes a tree safely, freeing every node?
+
+<details>
+<summary>Answer</summary>
+
+Postorder: free the children before the node, so no pointer is used after
+the node holding it is freed.
+
+</details>
+
+## 4.2 Binary trees
+
+### In one sentence
+
+A binary tree is a tree in which no node has more than two children, left
+and right, and its average depth can be as small as O(log n) or as large
+as n − 1.
+
+### The idea
+
+A **binary tree** has nodes with at most two children, called left and
+right. Each node is an element plus two pointers. Unlike a general tree,
+the two child positions are distinguished: a node with only a left child
+differs from one with only a right child.
+
+Depth varies enormously. A **perfect** binary tree of height h has
+2ʰ⁺¹ − 1 nodes, so n nodes fit in height about log₂ n. But a binary tree
+where every node has only one child is a list of height n − 1. The average
+depth of a randomly *shaped* binary tree is about √n, which is why search
+trees need the ordering rules and balancing of the next sections to stay
+shallow.
+
+#### 4.2.1 Implementation
+
+A node is three fields: the element, `left` and `right`. Many leaves mean
+many null pointers: a tree of n nodes has n + 1 null child pointers, a
+fact that threaded trees and some compact encodings exploit.
+
+#### 4.2.2 An example: expression trees
+
+An **expression tree** stores an arithmetic expression with operands at the
+leaves and operators at internal nodes. The three traversals give the
+three notations:
+
+- **Inorder** (left, node, right) with parentheses gives infix.
+- **Preorder** gives prefix (Polish) notation.
+- **Postorder** gives postfix, the form chapter 3 evaluated.
+
+Building the tree from postfix uses chapter 3's stack: on an operand, push
+a one-node tree; on an operator, pop two trees, make them its children
+(second popped is the left), push the new tree. At the end, one tree
+remains.
+
+### Worked example
+
+My own expression, `x y * z 2 - +`:
+
+```ts
+type E = { op: string; l?: E; r?: E };
+function build(tokens: string[]): E {
+  const st: E[] = [];
+  for (const t of tokens) {
+    if ('+-*/'.includes(t)) { const r = st.pop()!, l = st.pop()!; st.push({ op: t, l, r }); }
+    else st.push({ op: t });
+  }
+  return st[0];
+}
+const inorder = (e: E): string => e.l ? `(${inorder(e.l)} ${e.op} ${inorder(e.r!)})` : e.op;
+const pre     = (e: E): string => e.l ? `${e.op} ${pre(e.l)} ${pre(e.r!)}` : e.op;
+const post    = (e: E): string => e.l ? `${post(e.l)} ${post(e.r!)} ${e.op}` : e.op;
+```
+
+The three readings of the same tree:
+
+```text
+inorder    ((x * y) + (z - 2))
+preorder   + * x y - z 2
+postorder  x y * z 2 - +
+```
+
+With numbers, `3 4 + 5 1 - *` builds `((3 + 4) * (5 - 1))`, and a
+postorder evaluation (evaluate both children, then apply the operator)
+returns 28, the same as chapter 3's stack evaluator.
+
+### Step by step
+
+<Trace columns={["token", "action", "stack of trees (bottom → top)"]} rows={[
+  ["x", "push leaf", "x"],
+  ["y", "push leaf", "x · y"],
+  ["*", "pop y, pop x, push *(x, y)", "*(x,y)"],
+  ["z", "push leaf", "*(x,y) · z"],
+  ["2", "push leaf", "*(x,y) · z · 2"],
+  ["-", "pop 2, pop z, push -(z, 2)", "*(x,y) · -(z,2)"],
+  ["+", "pop both, push +(*, -)", "+(*(x,y), -(z,2))"],
+]} caption="Building an expression tree from postfix. It is chapter 3's evaluator with 'apply the operator' replaced by 'make a node'." />
+
+<Figure caption="The finished expression tree. Operators are internal nodes, operands are leaves; reading it inorder, preorder or postorder gives the three notations." art={`
+              +
+            /   \\
+          *       -
+         / \\     / \\
+        x   y   z   2
+`} />
+
+### Common mistake
+
+The mistake is printing inorder without parentheses. `x * y + z - 2` and
+`x * (y + z) - 2` have different trees but the same unparenthesised
+inorder sequence. The tree is unambiguous; the flat infix string is not.
+Either always parenthesise, or parenthesise only when a child's operator
+binds more loosely than its parent's.
+
+### In real systems
+
+Every compiler and interpreter parses source code into an **abstract
+syntax tree (AST)**, an expression tree generalised to whole programs.
+TypeScript's compiler, Babel, ESLint and Prettier all work by walking
+ASTs: linters inspect nodes, formatters print them, bundlers transform
+them. Spreadsheet formulas and database query plans are expression trees
+too; a query optimiser rewrites the tree before executing it bottom-up,
+in postorder.
+
+### Check yourself
+
+1. A binary tree has 20 nodes. How many null child pointers does it have?
+
+<details>
+<summary>Answer</summary>
+
+21. There are 40 child pointers and 19 edges use non-null ones, leaving
+n + 1 = 21.
+
+</details>
+
+2. What is the prefix form of `(a - b) * c`?
+
+<details>
+<summary>Answer</summary>
+
+`* - a b c`.
+
+</details>
+
+## 4.3 The search tree ADT: binary search trees
+
+### In one sentence
+
+A binary search tree keeps every key in a node's left subtree smaller and
+every key in its right subtree larger, so a search follows one path from
+the root and costs the depth of the key.
+
+### The idea
+
+The **binary search tree (BST)** property: for every node X, all keys in
+X's left subtree are smaller than X's key, and all keys in its right
+subtree are larger. (Duplicates are handled separately, for instance with
+a count in the node.) An inorder traversal of a BST visits keys in sorted
+order, which is the property in one line.
+
+Every operation follows a single path down from the root, so each costs
+O(d), where d is the depth reached. The whole chapter after this point is
+about keeping d small.
+
+#### 4.3.1 contains
+
+Compare the key with the root. Equal: found. Smaller: recurse into the
+left subtree. Larger: the right. Empty subtree: not present. It is tail
+recursive, so it converts directly to a loop, which is what production
+code uses.
+
+#### 4.3.2 findMin and findMax
+
+The smallest key is reached by going left until there is no left child;
+the largest by going right. Neither needs a comparison.
+
+#### 4.3.3 insert
+
+Search for the key. If found, do nothing (or increment a count). If the
+search falls off the tree, attach a new leaf at that spot. The recursive
+version returns the (possibly new) subtree root and assigns it to the
+parent's pointer, which avoids special-casing the empty tree.
+
+#### 4.3.4 remove
+
+Removal has three cases:
+
+1. **Leaf:** delete it.
+2. **One child:** replace the node with its child (the parent's pointer
+   bypasses it).
+3. **Two children:** replace the node's key with the smallest key in its
+   right subtree (its **inorder successor**), then remove that key from
+   the right subtree. The successor has no left child, so that second
+   removal is case 1 or 2.
+
+If removals are rare, **lazy deletion** is an alternative: mark the node
+deleted and leave it. The tree's depth barely changes, and a later insert
+of the same key can just unmark it.
+
+#### 4.3.5 Destructor and copy constructor
+
+In C++ the tree owns its nodes, so the destructor frees them in postorder
+(`makeEmpty`) and the copy constructor clones them in preorder (`clone`
+the root, then each subtree). It is chapter 1's Big-Five applied to a
+recursive structure. In TypeScript the garbage collector frees nodes, but
+a deep copy is still a preorder clone.
+
+#### 4.3.6 Average-case analysis
+
+The cost of an operation is the depth of the node reached. The **internal
+path length** of a tree is the sum of the depths of all its nodes. If all
+insertion orders are equally likely, the expected internal path length
+satisfies D(n) = D(i) + D(n − i − 1) + n − 1, averaged over i, the same
+recurrence as quicksort's in chapter 7, and its solution is O(n log n).
+So the average node depth is O(log n), about 2 ln n, or roughly
+1.39 log₂ n minus a small constant.
+
+Two caveats. First, this is an average over insertion orders, and sorted
+input (a common real case) gives the worst one: a chain of depth n − 1.
+Second, deletions that always use the successor gradually skew trees
+left, and over long mixed workloads the average depth can grow beyond
+logarithmic. Alternating between successor and predecessor, or using a
+balanced tree, avoids it.
+
+### Worked example
+
+A BST with my own keys:
+
+```ts
+class B { left: B | null = null; right: B | null = null; constructor(public key: number) {} }
+function insert(t: B | null, k: number): B {
+  if (!t) return new B(k);
+  if (k < t.key) t.left = insert(t.left, k);
+  else if (k > t.key) t.right = insert(t.right, k);
+  return t;                                   // duplicate: no change
+}
+function findMin(t: B): B { while (t.left) t = t.left; return t; }
+function remove(t: B | null, k: number): B | null {
+  if (!t) return null;
+  if (k < t.key) t.left = remove(t.left, k);
+  else if (k > t.key) t.right = remove(t.right, k);
+  else if (t.left && t.right) {               // two children
+    t.key = findMin(t.right).key;
+    t.right = remove(t.right, t.key);
+  } else t = t.left ?? t.right;               // zero or one child
+  return t;
+}
+```
+
+Inserting 50, 30, 70, 20, 40, 60, 80, 35, 45, 65 gives (written as
+`key(left,right)`, with `-` for an empty child):
+
+```text
+50(30(20,40(35,45)),70(60(-,65),80))        height 3
+```
+
+Then four removals, one per case:
+
+```text
+remove 20 (leaf)         50(30(-,40(35,45)),70(60(-,65),80))
+remove 60 (one child)    50(30(-,40(35,45)),70(65,80))
+remove 30 (one child)    50(40(35,45),70(65,80))
+remove 50 (two children) 65(40(35,45),70(-,80))     inorder 35,40,45,65,70,80
+```
+
+Removing the root replaced 50 with 65, the smallest key in its right
+subtree, and the inorder sequence stayed sorted.
+
+Now the measured average case. Inserting a random permutation of
+0..n−1:
+
+```text
+n=1000    average depth 10.72   height 19
+n=10000   average depth 15.57   height 32
+n=100000  average depth 19.89   height 39
+```
+
+The average depth grows by about 4.6 each time n multiplies by 10, which
+is 2 ln 10: exactly the 2 ln n slope the analysis predicts. And inserting
+1..2000 in sorted order gives a tree of height 1,999: a linked list with
+extra null pointers.
+
+### Step by step
+
+<Figure caption="The ten-key BST, and the two-children removal of the root. The successor 65 is the leftmost node of the right subtree; it moves up, and its own removal is the easy one-child case." art={`
+                 50                               65
+              /      \\                          /    \\
+           30          70        remove 50     40      70
+          /  \\        /  \\       ────────▶    /  \\       \\
+        20    40    60    80                 35   45      80
+             /  \\     \\
+           35    45    65       (after 20, 60 and 30 were removed:
+                                 left shape is 40(35,45))
+`} />
+
+<Trace columns={["step", "at node", "compare 45", "go"]} rows={[
+  ["1", "50", "45 is smaller", "left"],
+  ["2", "30", "45 is larger", "right"],
+  ["3", "40", "45 is larger", "right"],
+  ["4", "45", "equal", "found at depth 3"],
+]} caption="contains(45) on the original tree. One comparison per level; the cost is the depth, here 3 for a 10-node tree." />
+
+<Compare left="Random insertion order" right="Sorted insertion order" rows={[
+  ["average depth about 2 ln n (19.89 at n = 100,000)", "average depth about n / 2"],
+  ["height also logarithmic (39 measured at n = 100,000)", "height n − 1 (1,999 at n = 2,000)"],
+  ["search cost logarithmic", "search cost linear"],
+  ["recursion depth safe", "recursion overflows at large n"],
+]} caption="The same code, two insertion orders. A plain BST is only as good as its input order, which is why the next two sections exist." />
+
+### Common mistake
+
+The mistake is checking the BST property locally: verifying that each
+node's left child is smaller and right child larger. A tree with root 50,
+left child 30 and 30's right child 60 passes that check but is not a BST,
+since 60 is in 50's left subtree. A correct validator passes down the
+allowed range (lower and upper bounds) and narrows it at each step.
+
+A second mistake is forgetting to assign the result of the recursive call
+(`t.left = insert(t.left, k)`): the new node is created and immediately
+lost.
+
+### In real systems
+
+Plain BSTs are rare in production precisely because of the sorted-input
+case, and IDs, timestamps and alphabetical names often arrive sorted.
+What survives is the BST property inside balanced trees (next sections),
+and the idea of **range queries**: because inorder is sorted, a BST finds
+all keys between a and b in O(depth + k) for k results. Database indexes,
+in-memory ordered maps and interval schedulers rely on it.
+
+### Check yourself
+
+1. Which key replaces a removed node with two children, and why does it
+   have at most one child?
+
+<details>
+<summary>Answer</summary>
+
+The smallest key in the right subtree. It is found by going left until
+there is no left child, so it has no left child.
+
+</details>
+
+2. Why does a sorted insertion order produce a chain?
+
+<details>
+<summary>Answer</summary>
+
+Each new key is larger than every existing key, so the search always goes
+right and attaches the new node as the right child of the last one.
+
+</details>
+
+3. Where does the 2 ln n average depth come from?
+
+<details>
+<summary>Answer</summary>
+
+From the internal path length recurrence over a random root, which is the
+same recurrence as quicksort's average case and solves to about
+2n ln n in total.
+
+</details>
+
+## 4.4 AVL trees
+
+### In one sentence
+
+An AVL tree is a binary search tree in which every node's two subtrees
+differ in height by at most one, restored after each insertion by one
+single or double rotation, which guarantees O(log n) height.
+
+### The idea
+
+Balance could mean "left and right subtrees of the root have equal
+height", but that is too weak (both could be chains). It could mean
+"every node's subtrees have equal height", but only perfect trees satisfy
+that. The **AVL condition** (from Adelson-Velskii and Landis) sits in
+between: for every node, the heights of the left and right subtrees differ
+by at most 1. The height of an empty subtree is −1.
+
+Why that is enough: let S(h) be the fewest nodes in an AVL tree of height
+h. The sparsest tree of height h has a root, one subtree of height h − 1
+and one of height h − 2, so S(h) = S(h − 1) + S(h − 2) + 1, with S(0) = 1
+and S(1) = 2. That is a Fibonacci-like recurrence, so S(h) grows
+exponentially in h, and therefore h is O(log n). Precisely, the height is
+at most about 1.44 log₂(n + 2), and in practice it is barely above log₂ n.
+
+Each node stores its height. After an insertion, only nodes on the path
+from the new leaf to the root can have changed height, so only they can be
+out of balance. Fixing the deepest unbalanced node, called α, restores the
+whole tree. There are four cases, by where the insertion went relative
+to α:
+
+1. Into the left subtree of α's left child (left-left).
+2. Into the right subtree of α's left child (left-right).
+3. Into the left subtree of α's right child (right-left).
+4. Into the right subtree of α's right child (right-right).
+
+Cases 1 and 4 (outside) are fixed by a single rotation; cases 2 and 3
+(inside) by a double rotation.
+
+#### 4.4.1 Single rotation
+
+For the left-left case: let k₂ be α and k₁ its left child. Make k₁ the
+new subtree root, with k₂ as its right child, and give k₁'s old right
+subtree to k₂ as its new left subtree. The inorder order is unchanged
+(the subtree that moved holds keys between k₁ and k₂), and the subtree's
+height returns to what it was before the insertion, so nothing above
+needs fixing. Three pointer changes and two height updates.
+
+#### 4.4.2 Double rotation
+
+For the left-right case a single rotation does not help: it just moves the
+imbalance to the other side. Instead, let k₃ be α, k₁ its left child and
+k₂ the right child of k₁ (where the insertion went). Make k₂ the new root,
+with k₁ on its left and k₃ on its right, and distribute k₂'s two subtrees
+between them. It is exactly two single rotations: first at k₁ (rotating
+k₂ up), then at k₃.
+
+Deletion can unbalance every node on the path, so it may need a rotation
+at each level, still O(log n) in total. Many implementations avoid AVL
+deletion's complexity with lazy deletion.
+
+### Worked example
+
+My AVL insertion, with the balance step written once for all four cases:
+
+```ts
+const ht = (t: A | null) => (t ? t.height : -1);
+const fix = (t: A) => { t.height = 1 + Math.max(ht(t.left), ht(t.right)); return t; };
+function rotR(k2: A) { const k1 = k2.left!; k2.left = k1.right; k1.right = k2; fix(k2); return fix(k1); }
+function rotL(k1: A) { const k2 = k1.right!; k1.right = k2.left; k2.left = k1; fix(k1); return fix(k2); }
+function balance(t: A): A {
+  if (ht(t.left) - ht(t.right) > 1) {
+    if (ht(t.left!.left) < ht(t.left!.right)) t.left = rotL(t.left!);  // inside: double
+    return rotR(t);
+  }
+  if (ht(t.right) - ht(t.left) > 1) {
+    if (ht(t.right!.right) < ht(t.right!.left)) t.right = rotR(t.right!);
+    return rotL(t);
+  }
+  return fix(t);
+}
+function ains(t: A | null, k: number): A {
+  if (!t) return new A(k);
+  if (k < t.key) t.left = ains(t.left, k);
+  else if (k > t.key) t.right = ains(t.right, k);
+  return balance(t);
+}
+```
+
+Inserting 10, 20, 30 (right-right) triggers one single rotation and gives
+`20(10,30)`. Inserting 30, 10, 20 (left-right) triggers a double rotation
+(counted as two) and gives the same tree. Inserting 1 to 7 in order, the
+worst input for a plain BST:
+
+```text
++1  1
++2  1(-,2)
++3  2(1,3)                 rotation at 1
++4  2(1,3(-,4))
++5  2(1,4(3,5))            rotation at 3
++6  4(2(1,3),5(-,6))       rotation at the root
++7  4(2(1,3),6(5,7))       rotation at 5
+```
+
+Four rotations, and the result is the perfect tree of height 2. Scaled
+up: inserting 1 to 100,000 in order gives an AVL tree of height 16, while
+log₂ 100,000 is about 16.6. The plain BST on the same input had height
+99,999.
+
+The sparsest-tree recurrence, computed: S(0..9) is 1, 2, 4, 7, 12, 20, 33,
+54, 88, 143, and S(20) is 28,656. So an AVL tree of height 20 has at
+least 28,656 nodes; with fewer, its height must be smaller.
+
+### Step by step
+
+<Figure caption="Single rotation (left-left). k1 rises, k2 becomes its right child, and the middle subtree Y changes parent. Inorder order X k1 Y k2 Z is the same before and after." art={`
+            k2                          k1
+           /  \\                        /  \\
+         k1    Z       rotate         X    k2
+        /  \\          right at k2         /  \\
+       X    Y        ─────────▶           Y    Z
+
+    X grew too tall: height(k1) = height(Z) + 2
+`} />
+
+<Figure caption="Double rotation (left-right). The insertion went under k2, the inside grandchild, so k2 rises two levels and takes k1 and k3 as children. B and C are shared between them." art={`
+           k3                               k2
+          /  \\                            /    \\
+        k1    D     rotate left at k1,   k1      k3
+       /  \\         then right at k3    /  \\    /  \\
+      A    k2       ────────────▶      A    B  C    D
+          /  \\
+         B    C
+`} />
+
+<Trace columns={["insert", "path heights (left − right) on the way up", "unbalanced node", "case", "fix"]} rows={[
+  ["3", "at 1: −2", "1", "right-right", "single rotation left at 1"],
+  ["5", "at 3: −2", "3", "right-right", "single left at 3"],
+  ["6", "at 4: −1, at 2: −2", "2 (root)", "right-right", "single left at 2"],
+  ["7", "at 6: −1, at 5: −2", "5", "right-right", "single left at 5"],
+]} caption="Where rotations happened while inserting 1 to 7. Each time, the deepest unbalanced node on the path is fixed and the nodes above are left alone." />
+
+### Common mistake
+
+The mistake is updating heights in the wrong order after a rotation. The
+node that moves down must be fixed first, because the new root's height
+depends on it. My `rotR` calls `fix(k2)` before `fix(k1)` for that reason.
+The second mistake is choosing single versus double by the sign of the
+inserted key instead of comparing the child's subtree heights; comparing
+heights works for deletion too, where there is no inserted key.
+
+### In real systems
+
+AVL trees are used where lookups dominate, because their height bound is
+tighter than red-black trees' (chapter 12): some in-memory databases and
+the Linux kernel's older virtual memory areas. Most standard libraries
+(C++ `std::map`, Java `TreeMap`) chose red-black trees instead, which
+rotate less on insertion and deletion. The rotation itself is universal:
+every balanced search tree, including treaps and splay trees, moves nodes
+with the same two operations.
+
+### Check yourself
+
+1. What is the minimum number of nodes in an AVL tree of height 4?
+
+<details>
+<summary>Answer</summary>
+
+12, from S(4) = S(3) + S(2) + 1 = 7 + 4 + 1.
+
+</details>
+
+2. After an insertion and one rotation, why does no node above the
+   rotation need fixing?
+
+<details>
+<summary>Answer</summary>
+
+The rotated subtree's height returns to its height before the insertion,
+so every ancestor sees the same heights as before.
+
+</details>
+
+## 4.5 Splay trees
+
+### In one sentence
+
+A splay tree is a binary search tree that, after every access, moves the
+accessed node to the root with a particular pattern of rotations, which
+guarantees that any m operations take O(m log n) time in total, even
+though a single one can be slow.
+
+### The idea
+
+AVL trees spend effort on every operation to guarantee the worst case.
+Splay trees take a different deal: a single operation may cost O(n), but
+any sequence of m operations costs O(m log n). That is an **amortised**
+bound, the same kind as the growable array's. The structure needs no
+height or balance field.
+
+The motivation is that in many workloads, recently accessed items are
+accessed again. Moving each accessed item to the root makes repeat
+accesses cheap, and the rotations on the way also roughly halve the depth
+of nodes along the path.
+
+#### 4.5.1 A simple idea (that does not work)
+
+The obvious way to move a node to the root is to rotate it with its parent
+repeatedly. This works for the node itself, but it can push other nodes
+deep. On a left chain of n nodes, accessing the deepest node, then the
+next deepest, and so on, makes every access cost about the full depth, so
+the sequence costs Θ(n²): no amortised logarithmic bound.
+
+#### 4.5.2 Splaying
+
+**Splaying** moves node X to the root by looking at two levels at a time.
+Let P be X's parent and G its grandparent.
+
+- **Zig:** P is the root. Do one rotation.
+- **Zig-zag:** X is a right child and P a left child, or vice versa (an
+  inside grandchild). Do a double rotation, like AVL's.
+- **Zig-zig:** X and P are both left children, or both right. Rotate P
+  with G first, then X with P.
+
+The zig-zig order (grandparent first) is the difference from the simple
+idea. It makes long paths roughly halve in depth. Deletion splays the node
+to the root, removes it, splays the largest key of the left subtree to
+the left subtree's root (it then has no right child), and attaches the
+right subtree there. Chapter 11 proves the O(log n) amortised bound.
+
+### Worked example
+
+My recursive splay is about 20 lines (the two-level cases for left and
+right mirrored), so instead of listing it I show its effect. A left chain
+7, 6, ..., 1 (each node the left child of the one above), and an access to
+1 at depth 6:
+
+```text
+naive rotate-to-root:  1(-,7(6(5(4(3(2,-),-),-),-),-))   height 6
+splay:                 1(-,6(4(2(-,3),5),7))             height 4
+```
+
+The naive method left a chain under 1. Splaying brought 1 up and folded
+the chain in half on the way.
+
+Over a whole sequence, the difference is dramatic. Starting from a left
+chain of 1,000 nodes and accessing 1, 2, ..., 1000 in order, summing the
+depth of each access:
+
+```text
+naive  total depth 501,499
+splay  total depth   6,259
+```
+
+About 500 per access for the naive method (quadratic over the sequence)
+versus about 6 for splaying, comfortably under log₂ 1000 ≈ 10. Splaying
+does not make the tree balanced at every moment (sequential access ends
+with a tall tree again), but the total cost stays low.
+
+### Step by step
+
+<Figure caption="Zig-zig at X with parent P and grandparent G, all left links. Rotate P over G first, then X over P. The subtrees A, B, C, D keep their inorder order." art={`
+              G                                X
+             / \\                              / \\
+            P   D                            A   P
+           / \\          zig-zig                 / \\
+          X   C        ────────▶               B   G
+         / \\                                      / \\
+        A   B                                    C   D
+`} />
+
+<Compare left="AVL tree" right="Splay tree" rows={[
+  ["worst case O(log n) per operation", "amortised O(log n); one operation can be O(n)"],
+  ["stores a height per node", "stores nothing extra"],
+  ["shape depends only on the set of keys and order", "shape depends on access pattern"],
+  ["reads do not change the tree", "every read restructures the tree"],
+  ["predictable latency", "fast for skewed, repeated access"],
+]} caption="Two ways to keep a search tree shallow. The right column is better when some keys are hot; the left when every operation must be fast." />
+
+### Common mistake
+
+The mistake is implementing zig-zig as two rotations at X (the simple
+idea), which looks the same on small examples and loses the amortised
+bound. Rotate the parent with the grandparent first. The second mistake is
+using a splay tree where many threads read concurrently: since reads
+modify the tree, every read needs a write lock, which destroys concurrency.
+
+### In real systems
+
+Splay trees appear where access is skewed and single-threaded: the
+Windows NT kernel's memory and file system code, some network packet
+classifiers and caches, and adaptive compression schemes that keep their
+code tree as a splay tree so frequent symbols get short codes. Their "recently used is near the top" property
+is the same intuition as caching, and the amortised accounting is the same
+as the growable array's. In concurrent code, red-black or B-trees are
+preferred because reads do not write.
+
+### Check yourself
+
+1. Why does rotating a node to the root one rotation at a time fail?
+
+<details>
+<summary>Answer</summary>
+
+It can leave the rest of the path as a chain, so a sequence of accesses to
+the deepest nodes costs Θ(n²) in total.
+
+</details>
+
+2. In zig-zig, which rotation happens first?
+
+<details>
+<summary>Answer</summary>
+
+The parent with the grandparent, then the node with its parent.
+
+</details>
+
+## 4.6 Tree traversals (revisited)
+
+### In one sentence
+
+Inorder visits a search tree's keys in sorted order, postorder computes
+anything that depends on the children (like height), preorder anything
+that depends on the parent (like depth), and level order visits by depth
+using a queue.
+
+### The idea
+
+All the recursive traversals do constant work per node and visit each
+node once, so all are O(n). The choice between them is which information
+must be available when a node is processed.
+
+- **Inorder** (left, node, right): for a BST, prints the keys sorted. An
+  O(n) sort of a tree you already have.
+- **Postorder** (left, right, node): computing heights. A node's height is
+  1 plus the larger of its children's heights, which must be computed
+  first. The empty tree has height −1.
+- **Preorder** (node, left, right): labelling each node with its depth.
+  A node's depth is its parent's plus 1, which flows down.
+- **Level order:** all nodes at depth 0, then depth 1, and so on. It is not
+  recursive; it uses a queue (chapter 3): dequeue a node, process it,
+  enqueue its children.
+
+The recursive versions use the call stack, whose depth is the tree's
+height. For a balanced tree that is about log n frames; for a degenerate
+one it is n, and chapter 3 showed what happens at 200,000.
+
+### Worked example
+
+A small BST with keys 8, 4, 12, 2, 6, 14:
+
+```ts
+const levels: number[][] = [];
+let q: T[] = [root];
+while (q.length) {
+  levels.push(q.map(x => x.k));
+  q = q.flatMap(x => [x.left, x.right].filter(Boolean) as T[]);
+}
+const height = (x: T | null): number => (x ? 1 + Math.max(height(x.left), height(x.right)) : -1);
+```
+
+The level-order groups are `[[8],[4,12],[2,6,14]]`, and the height is 2.
+Inorder gives 2, 4, 6, 8, 12, 14; preorder gives 8, 4, 2, 6, 12, 14 (a
+sequence that rebuilds the same BST if inserted in that order, which is
+how BSTs are serialised); postorder gives 2, 6, 4, 14, 12, 8.
+
+Realistic: rendering a comment thread. Preorder with depth gives the
+indentation. Level order gives "show the top-level comments first, then
+replies", which is what a feed that loads lazily wants. Postorder gives
+the reply count under each comment.
+
+### Step by step
+
+<Trace columns={["traversal", "order produced", "use"]} rows={[
+  ["inorder", "2 4 6 8 12 14", "sorted output, range queries"],
+  ["preorder", "8 4 2 6 12 14", "copy or serialise the tree, print with indentation"],
+  ["postorder", "2 6 4 14 12 8", "heights, sizes, freeing nodes, evaluation"],
+  ["level order", "8 | 4 12 | 2 6 14", "by depth: shortest path, UI by level"],
+]} caption="Four traversals of the tree 8(4(2,6),12(-,14)). Same nodes, four orders; the right column is the question that picks one." />
+
+### Common mistake
+
+The mistake is using a stack for level order, which gives a depth-first
+order instead. Level order needs FIFO: the children of the first node must
+wait behind the rest of its level. And with JavaScript arrays, `q.shift()`
+in the loop is the chapter 3 trap; my version builds the next level as a
+new array instead.
+
+### In real systems
+
+Breadth-first search on graphs (chapter 9) is level order generalised.
+Garbage collectors traverse object graphs (Cheney's copying collector
+uses the copied region itself as a queue). Serialisation formats for trees
+(JSON is preorder) and build systems (a postorder over the dependency
+tree: build dependencies before the target) are traversals by another
+name.
+
+### Check yourself
+
+1. Which traversal computes each node's subtree size, and why?
+
+<details>
+<summary>Answer</summary>
+
+Postorder, because a node's size is 1 plus its children's sizes, which
+must be computed first.
+
+</details>
+
+2. What data structure turns a depth-first traversal into level order?
+
+<details>
+<summary>Answer</summary>
+
+A queue instead of a stack.
+
+</details>
+
+## 4.7 B-trees
+
+### In one sentence
+
+A B-tree is a search tree whose nodes are as wide as a disk block, holding
+hundreds of keys each, so that a billion records can be found in three or
+four block reads instead of thirty.
+
+### The idea
+
+Everything so far assumed the data fits in memory. On disk, the cost model
+changes. A disk access (or even an SSD page read) costs roughly as much as
+millions of instructions, so the number of block reads is the only number
+that matters. A balanced binary tree of a billion keys has depth about 30:
+thirty reads per search. Wider nodes give shallower trees: an M-ary tree
+has depth about log_M n.
+
+The B-tree the book describes (the variant usually called a **B+ tree**)
+of order M has these properties:
+
+1. Data items are stored only in leaves.
+2. Internal nodes store up to M − 1 keys that guide the search: key i is
+   the smallest key in subtree i + 1.
+3. The root is a leaf or has between 2 and M children.
+4. Every other internal node has between ⌈M/2⌉ and M children.
+5. All leaves are at the same depth and hold between ⌈L/2⌉ and L items.
+
+M and L are chosen so that a node fills one disk block. The "at least
+half full" rules keep the tree from degenerating; "all leaves at the same
+depth" is the balance.
+
+**Insertion** goes to the right leaf. If the leaf has room, done. If not,
+**split** it into two half-full leaves and add a new key to the parent. If
+the parent overflows, split it too, possibly up to the root; splitting the
+root creates a new root, which is the only way the tree gets taller.
+**Deletion** removes from the leaf; if it falls below half full, it
+borrows an item from a sibling, or merges with it and removes a key from
+the parent, which can cascade upward and shrink the root.
+
+### Worked example
+
+My B+ tree with M = 3 and L = 3 (tiny, so the splits are visible),
+inserting 41, 17, 63, 8, 29, 52, 75, 33, 90, 12. Internal nodes are shown
+`{keys}(children)` and leaves `[items]`:
+
+```text
++41   [41]
++17   [17 41]
++63   [17 41 63]
++8    {41}([8 17] [41 63])                                  leaf split, new root
++29   {41}([8 17 29] [41 63])
++52   {41}([8 17 29] [41 52 63])
++75   {41 63}([8 17 29] [41 52] [63 75])                    leaf split
++33   {41}({29}([8 17] [29 33]) {63}([41 52] [63 75]))      leaf split, root split
++90   {41}({29}([8 17] [29 33]) {63}([41 52] [63 75 90]))
++12   {41}({29}([8 12 17] [29 33]) {63}([41 52] [63 75 90]))
+```
+
+The tree grew taller only twice, both times by splitting the root, and
+every leaf is always at the same depth.
+
+Realistic sizing: a 4 KB block, 8-byte keys and 8-byte child pointers
+gives M = 256; 128-byte records give L = 32. For a billion records:
+
+```text
+leaves: 1e9 / 32 ≈ 31.25 million
+internal levels above them: 4 (best case full nodes, and also when half full)
+binary tree for comparison: log2(1e9) ≈ 29.9 levels
+```
+
+So a lookup reads about 5 blocks (4 internal levels plus the leaf), and
+since the root and the next level total only a few hundred blocks, they
+stay cached in memory, leaving 2 or 3 actual disk reads. For a million
+records, 2 to 3 internal levels.
+
+### Step by step
+
+<Flow caption="Inserting into a B+ tree. Splits propagate upward only as far as they must; the root split is the only step that adds a level." steps={[
+  "search from the root to the leaf where the key belongs",
+  "insert into the leaf in sorted position",
+  "if the leaf now has L + 1 items, split it into two halves",
+  "add the right half's smallest key to the parent",
+  "if the parent now has M + 1 children, split it and push its middle key up",
+  "if the root splits, make a new root with two children",
+]} />
+
+<Figure caption="The tree after inserting 33. The root guides searches with one key; each internal node splits the key range again; all four leaves sit at depth 2." art={`
+                         {41}
+                     /          \\
+                 {29}            {63}
+                /    \\          /    \\
+           [8 17]  [29 33]  [41 52]  [63 75]
+
+   search 52: 52 ≥ 41 → right; 52 < 63 → left; leaf [41 52] → found
+`} />
+
+### Common mistake
+
+The mistake is sizing nodes by key count instead of by block size. The
+point of a B-tree is one node per I/O; a node that spans two blocks
+doubles the reads, and a tiny node wastes the read. A second mistake is
+inserting random keys (such as random UUIDs) into a B-tree index: each
+insert touches a random leaf, so the working set is the whole index and
+leaves split everywhere. Sequential or time-ordered keys keep inserts at
+the right edge.
+
+### In real systems
+
+Nearly every database index is a B+ tree: PostgreSQL's default index,
+MySQL InnoDB's clustered and secondary indexes, SQLite's tables and
+indexes. File systems use them for directories and extents (NTFS, ext4's
+htree, Btrfs, APFS). The random-UUID problem above is why newer ID schemes
+(UUIDv7, ULID) put a timestamp first: it makes inserts sequential in the
+index. Log-structured merge trees (RocksDB, Cassandra) are the main
+alternative, trading read cost for cheaper writes.
+
+### Check yourself
+
+1. With M = 100 and L = 100, roughly how many levels hold 100 million
+   records when nodes are full?
+
+<details>
+<summary>Answer</summary>
+
+A million leaves, then 10,000, 100 and 1 internal nodes: three internal
+levels plus the leaves.
+
+</details>
+
+2. When does a B-tree get taller?
+
+<details>
+<summary>Answer</summary>
+
+Only when the root splits, which creates a new root above it. That keeps
+every leaf at the same depth.
+
+</details>
+
+## 4.8 Sets and maps in the standard library
+
+### In one sentence
+
+The C++ `set` and `map` are ordered containers with O(log n) insert, find
+and erase, built on balanced binary search trees, with iterators that
+walk the keys in sorted order.
+
+### The idea
+
+#### 4.8.1 Sets
+
+A `set` is an ordered container with no duplicates. `insert` returns a
+pair: an iterator and a boolean saying whether insertion happened. `erase`
+takes a value or an iterator. `find` returns an iterator, `end()` if
+absent. Iteration is in sorted order, and the ordering can be supplied as
+a comparison function object (chapter 1's function objects).
+
+#### 4.8.2 Maps
+
+A `map` is an ordered collection of key–value pairs with unique keys. It
+has the set's operations plus `operator[]`, which returns a reference to
+the value for a key, *inserting a default value if the key is absent*.
+That makes counting easy (`count[word]++`) and lookup dangerous (reading
+`m[k]` adds k).
+
+#### 4.8.3 Implementation of set and map
+
+The library uses a balanced search tree, in practice a red-black tree
+(chapter 12), giving O(log n) operations. Iterators need to move to the
+next key in sorted order, which means finding the inorder successor. That
+is done with parent pointers in each node, or (in some designs) threads
+that point from a node's empty right link to its successor.
+
+#### 4.8.4 An example that uses several maps
+
+The book's example builds a word puzzle helper by grouping words with maps
+of maps. My own example in the same spirit groups words into anagram
+families and builds an inverted index, both with maps.
+
+TypeScript's `Map` and `Set` are hash-based (chapter 5), not trees. They
+iterate in insertion order, not sorted order, and have no "next key after
+x" operation. When I need order, I sort the keys on output, or use a
+balanced tree library.
+
+### Worked example
+
+Anagram families: the key is the word's letters sorted.
+
+```ts
+const groups = new Map<string, string[]>();
+for (const w of words) {
+  const k = [...w].sort().join('');
+  (groups.get(k) ?? groups.set(k, []).get(k)!).push(w);
+}
+for (const k of [...groups.keys()].sort()) console.log(k, groups.get(k)!.join(' '));
+```
+
+```text
+aelp    pale leap plea peal
+aelpp   apple
+eilnst  listen silent enlist inlets
+enost   stone notes onset tones
+```
+
+An inverted index, mapping each word to the set of lines it appears on, is
+the core of every search engine:
+
+```text
+lines: 1 "the cat sat"   2 "a cat ran"   3 "the dog sat down"
+a:2  cat:1,2  dog:3  down:3  ran:2  sat:1,3  the:1,3
+```
+
+Queries become set operations: "cat AND sat" is the intersection of
+{1, 2} and {1, 3}, which is line 1.
+
+### Step by step
+
+<Compare left="Ordered map (tree)" right="Hash map (chapter 5)" rows={[
+  ["insert, find, erase: O(log n) worst case", "O(1) average, O(n) worst"],
+  ["iterates in sorted key order", "iterates in arbitrary (JS: insertion) order"],
+  ["range queries, floor and ceiling of a key", "no ordering operations"],
+  ["needs a comparison", "needs a hash and equality"],
+  ["C++ map, Java TreeMap", "C++ unordered_map, Java HashMap, JS Map"],
+]} caption="Which map to use. If the problem says 'smallest', 'next', 'between' or 'sorted', it needs the left column." />
+
+### Common mistake
+
+In C++, the mistake is reading with `m[key]` to test for presence, which
+inserts the key with a default value. Use `find` or `count`. In
+TypeScript, the mistake is expecting `Map` to iterate sorted, or
+expecting object keys to (integer-like keys come first, in numeric order,
+then strings in insertion order, a rule that surprises everyone once).
+
+### In real systems
+
+Ordered maps back leaderboards (top 10, rank of a user), scheduling (next
+timer to fire), time-series lookups (latest value before time t) and
+database indexes. Redis's sorted set is a skip list (chapter 10) plus a
+hash map, giving both O(1) member lookup and O(log n) ranked range
+queries: the two columns of the table above in one structure.
+
+### Check yourself
+
+1. Why can a hash map not answer "smallest key greater than 50" quickly?
+
+<details>
+<summary>Answer</summary>
+
+It stores keys in hash order, unrelated to their values, so it would have
+to scan every key. A search tree follows one path.
+
+</details>
+
+2. What is the risk of `count[word]++` style access when only reading?
+
+<details>
+<summary>Answer</summary>
+
+In C++, `operator[]` inserts missing keys, so reads silently grow the map
+with default values.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Trees">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the chapter teaches that a tree is the shape of
+anything nested: folders, a web page's elements, a company's org chart,
+comments and replies. Each item has one parent and any number of
+children, and the question "what is under this?" is answered by
+recursion.
+
+A worked example: counting all files under a folder. The function counts
+the folder's own files and adds the count of each subfolder, which is the
+same function called on a smaller tree.
+
+```ts
+type Dir = { files: number; subdirs: Dir[] };
+const count = (d: Dir): number => d.files + d.subdirs.reduce((s, c) => s + count(c), 0);
+console.log(count({ files: 2, subdirs: [{ files: 3, subdirs: [] }, { files: 1, subdirs: [] }] })); // 6
+```
+
+The beginner mistake is thinking a search tree is automatically fast. A
+binary search tree built from sorted data is a list. "Tree" alone
+promises nothing about speed; "balanced tree" does.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can implement a BST with all four operations,
+including the two-children removal, and pick a traversal for a task. I
+know that average depth is about 2 ln n for random input and n for sorted
+input, and I can reproduce both numbers.
+
+A worked example: checking whether a tree is a valid BST, with the range
+method rather than the local check.
+
+```ts
+function isBST(t: B | null, lo = -Infinity, hi = Infinity): boolean {
+  if (!t) return true;
+  if (t.key <= lo || t.key >= hi) return false;
+  return isBST(t.left, lo, t.key) && isBST(t.right, t.key, hi);
+}
+```
+
+The intermediate mistake is the local check from section 4.3, which
+accepts 60 inside 50's left subtree. Ranges carry the constraint from
+every ancestor, not just the parent.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+The advanced level is the balance proofs and the amortised view. The AVL
+height bound comes from S(h) = S(h − 1) + S(h − 2) + 1, which grows like
+the Fibonacci numbers, so height is at most about 1.44 log₂ n. Splay trees
+give O(log n) amortised by a potential argument (chapter 11): the sum of
+the logs of the subtree sizes falls enough during a long splay to pay for
+it. B-trees trade comparisons inside a node (cheap, in memory) for depth
+(expensive, on disk).
+
+A precise example: augmenting a balanced BST with subtree sizes makes
+"find the k-th smallest" and "rank of key x" O(log n). At each node, if k
+is at most the left size, go left; if it equals left size + 1, this is
+it; else go right with k reduced. Rotations must update the sizes, just
+as AVL rotations update heights.
+
+The advanced mistake is augmenting a field and forgetting it in one of the
+rotation paths. Every structural change must restore every derived field,
+in bottom-up order.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+The boundary inputs to settle on purpose:
+
+- **Empty tree.** `findMin` on an empty tree has no answer: throw, or
+  return `undefined`. My `findMin(t: B)` takes a non-null node, so the
+  type forbids the empty case.
+- **Removing the root.** Covered by the recursive form, which returns the
+  new root; the caller must assign it.
+- **Removing an absent key.** The recursion falls off the tree and returns
+  null for that subtree: no change. Make sure size counters do not
+  decrement.
+- **Duplicates.** Decide: ignore, count, or keep a list per key. The
+  library's `multiset` keeps them.
+- **Height of an empty tree.** −1 by convention, so a leaf has height 0 and
+  the AVL formula needs no special case.
+- **A single-node B-tree.** The root may be a leaf with fewer than ⌈L/2⌉
+  items; only the root is exempt from the half-full rule.
+
+The mistake is letting these be accidents. Each deserves a test.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases are where the structure meets the language and the input.
+
+- **Recursion on degenerate trees.** The plain BST of 100,000 sorted keys
+  overflows a recursive `insert`. My measurement code inserted
+  iteratively for that reason.
+- **Comparisons on mixed types.** In JavaScript, `'10' < '9'` is true for
+  strings. Keys must have a single type and a consistent comparison.
+- **NaN as a key.** `NaN < x` and `NaN > x` are both false, so a NaN key
+  looks equal to everything and breaks the tree. Reject it.
+- **Mutable keys.** Changing a key's value while it is in the tree breaks
+  the ordering silently. Keys must be immutable while stored.
+- **Splay on read in concurrent code.** A read that rotates is a write;
+  two "readers" can corrupt the tree.
+
+The mistake is assuming the comparison is well behaved. Every ordered
+structure depends on a comparison that is consistent and total.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, nobody writes their own balanced tree unless they
+must. The questions are which library structure, how keys are ordered,
+and what the memory looks like. A tree node in JavaScript is an object
+with a key, a value and two pointers, often 50 to 80 bytes; a million
+entries is tens of megabytes, scattered across the heap.
+
+For databases the question is index design. A B+ tree index on a column
+makes equality and range queries logarithmic and keeps results sorted,
+which can make an `ORDER BY` free. A composite index on (user_id,
+created_at) answers "this user's latest posts" with one descent and a
+short scan, because the leaves are sorted by both.
+
+A worked example: a leaderboard with a million players, needing "rank of
+player p" and "top 100". A sorted array makes updates O(n). A hash map
+cannot rank. A size-augmented balanced tree (or Redis's sorted set) does
+both in O(log n).
+
+The production mistake is indexing with random keys, as described in
+section 4.7, and finding insert latency grows with table size.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that a tree is a decision procedure. Each node asks one
+question and sends you one way; the depth is the number of questions. A
+good tree asks questions that halve the remaining possibilities, and
+balancing is the work of keeping the questions good as data changes.
+
+The second habit is to look for the hidden tree in a problem. Nested
+comments, a menu system, permissions inherited from folders, a JSON
+document, a bracket expression: all trees, and each operation on them is
+one of the four traversals.
+
+A worked example of the mindset: debugging a slow "find permissions"
+function that walked up a folder tree for each request. The tree was
+degenerate (one long chain of nested folders created by a script), so
+every walk was hundreds of steps. The fix was caching the effective
+permissions per folder, computed once in preorder.
+
+The mindset mistake is reaching for a tree because the data is ordered,
+when a sorted array with binary search (chapter 2) would do and is
+smaller and faster for read-only data.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design, trees appear as indexes, hierarchies and partitions. A
+database index is a B+ tree; a distributed database's range partitioning
+is the top level of a tree spread across machines (Bigtable and
+Spanner's tablets, each owning a key range). A file system is a tree of
+directories, and its metadata lookups are path traversals. Merkle trees,
+which store hashes of children in each parent, let two replicas find
+which parts of their data differ by comparing hashes top-down, which is
+how Git, Cassandra's anti-entropy repair and blockchains detect changes.
+
+A worked example: designing "list a user's files sorted by name, 50 per
+page". Store a B+ tree index on (owner, name). Page 1 is one descent and
+a scan of 50 entries. The next page starts from the last name seen
+(keyset pagination), another single descent. Offset pagination
+(`OFFSET 10000`) would scan 10,000 entries first.
+
+The system design mistake is pagination by offset on large tables, which
+turns a logarithmic index into a linear scan.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy for this chapter is to build in layers and measure at each.
+First a plain BST with all four operations and a validator. Then the
+measurement: random versus sorted insertion depth. Then AVL insertion,
+measured on sorted input. Then read splay trees and B-trees closely,
+implementing at least the B+ tree insertion with tiny M and L so the
+splits are visible.
+
+After that, stop building and start recognising. In every codebase I look
+at, I ask where the trees are (DOM, ASTs, folder hierarchies, indexes)
+and which traversal each operation uses. For databases I read the query
+plan and check that the index used matches the query's order and range.
+
+The strategic mistake is spending a month on red-black deletion before
+being fluent with traversals and BST removal. Those come up weekly; the
+fine detail of balancing comes up rarely and is in chapter 12.
+
+Done when my BST and AVL pass randomised tests against a sorted array,
+my depth measurements match 2 ln n and log₂ n, and I can draw both
+rotations and a B-tree split from memory.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Why not always use a balanced tree instead of a hash table?**
+Hash tables are faster on average for exact-match lookups (chapter 5).
+Trees win when order matters: ranges, minimum, next key, sorted output.
+
+**Is a heap a binary search tree?**
+No. A heap (chapter 6) orders parents before children, not left before
+right, so it finds the minimum in O(1) but cannot search for a key.
+
+**Why do databases use B-trees and not AVL trees?**
+Disk and SSD reads are by block. A B-tree node fills a block with hundreds
+of keys, so the tree is 3 or 4 levels deep instead of 30.
+
+**What is the difference between a B-tree and a B+ tree?**
+In a B+ tree, all data lives in the leaves and internal nodes hold only
+guide keys; leaves are often linked for range scans. In the original
+B-tree, internal nodes hold data too. The book's B-tree is the B+ variant.
+
+**Should I use recursion for tree code?**
+For balanced trees, yes: the depth is logarithmic. For trees that can
+degenerate, or that come from untrusted input, use an explicit stack.
+
+**Which is better, AVL or red-black?**
+AVL trees are shallower, so lookups are slightly faster; red-black trees
+rotate less on updates. Libraries mostly chose red-black. The difference
+rarely matters in application code.
+
+**What is the 2 ln n figure, in plain terms?**
+In a BST built from random input, the average key is found after about
+1.39 log₂ n comparisons, about 39% more than a perfect tree.
+
+**Why does JavaScript have no built-in sorted map?**
+The standard library chose hash-based `Map` and `Set`. Sorted maps come
+from libraries, or from sorting keys at output time.
+
+## Key takeaways
+
+- A tree of n nodes has n − 1 edges and one path from the root to each
+  node. Depth is measured down from the root, height up from the leaves.
+- Preorder pushes information down, postorder pulls it up, inorder sorts a
+  BST, level order uses a queue.
+- BST operations cost the depth: about 2 ln n for random input (19.89 at
+  n = 100,000), n − 1 for sorted input.
+- Removal with two children copies the successor and removes it from the
+  right subtree.
+- AVL trees keep height differences at most 1 with single and double
+  rotations; sorted 1..100,000 gave height 16.
+- Splay trees give amortised O(log n) with no balance field; splaying cut
+  sequential access cost from 501,499 to 6,259.
+- B+ trees fit a node per block, so a billion records need about four
+  internal levels.
+- Use an ordered map when the question mentions order; a hash map
+  otherwise.
+
+## Glossary
+
+- **Root, parent, child, leaf, sibling:** the family vocabulary of trees.
+- **Depth:** edges from the root to a node; the root has depth 0.
+- **Height:** edges on the longest downward path to a leaf; a leaf has
+  height 0, an empty tree −1.
+- **First-child/next-sibling:** a representation of any tree with two
+  pointers per node.
+- **Preorder, inorder, postorder:** node before, between, or after its
+  children.
+- **Level order:** visiting by depth, using a queue.
+- **Expression tree:** operators at internal nodes, operands at leaves.
+- **Binary search tree:** left subtree keys smaller, right subtree keys
+  larger, at every node.
+- **Inorder successor:** the next key in sorted order; in a right subtree,
+  its leftmost node.
+- **Internal path length:** the sum of all node depths.
+- **Lazy deletion:** marking a node deleted instead of removing it.
+- **AVL tree:** a BST whose nodes' subtree heights differ by at most 1.
+- **Rotation:** a constant-time pointer rearrangement that preserves
+  inorder order and changes depths.
+- **Splay tree:** a BST that rotates each accessed node to the root with
+  zig, zig-zig and zig-zag steps.
+- **Amortised bound:** a bound on total cost over any sequence of
+  operations.
+- **B-tree (B+ tree):** a wide, shallow search tree with nodes sized to a
+  disk block and all leaves at the same depth.
+- **Split and merge:** B-tree repairs for overfull and underfull nodes.
+
+## Exercises and self-check
+
+### Warm-up
+
+1. Insert 15, 9, 22, 4, 12, 18, 30, 11 into an empty BST and draw it. Give
+   its height and the inorder, preorder and postorder sequences.
+2. Remove 9 from that tree (two children) and redraw it.
+3. Insert 5, 4, 3, 2, 1 into an AVL tree and name each rotation.
+
+### Build
+
+4. Add `size` to each BST node, keep it correct in insert and remove, and
+   implement `kth(k)` and `rank(x)`.
+5. Write an iterative inorder traversal with an explicit stack and test it
+   on a 100,000-node sorted-input BST that crashes the recursive one.
+6. Implement AVL deletion by calling `balance` on the way back up, and
+   test it with random inserts and deletes against a sorted array,
+   checking the AVL condition after each step.
+7. Implement `range(lo, hi)` returning all keys between lo and hi, in
+   O(depth + k).
+
+### Stretch
+
+8. Implement a splay tree with insert, contains and remove, and reproduce
+   the sequential-access measurement.
+9. Extend the B+ tree to support deletion with borrowing and merging, with
+   M = 3 and L = 3, and print the tree after each step.
+10. Serialise a BST in preorder, then rebuild it from the sequence in O(n)
+    using bounds, and check that the rebuilt tree is identical.
+
+### Self-check
+
+<details>
+<summary>Answers to the warm-ups</summary>
+
+1. The tree is 15(9(4,12(11,-)),22(18,30)), height 3. Inorder 4 9 11 12
+   15 18 22 30; preorder 15 9 4 12 11 22 18 30; postorder 4 11 12 9 18 30
+   22 15.
+2. The successor of 9 is 11 (leftmost in 12's subtree). Replace 9 with 11
+   and remove 11: 15(11(4,12),22(18,30)).
+3. After 3: single rotation at 5, giving 4(3,5). After 2: no rotation,
+   4(3(2,-),5). After 1: single rotation at 3, giving 4(2(1,3),5).
+
+</details>
+
+## How I'd study this chapter
+
+I give this chapter four sessions of about ninety minutes.
+
+Session one is sections 4.1 and 4.2. I build the first-child/next-sibling
+folder tree and write the preorder listing and postorder sizes. Then the
+expression tree from postfix, with the three printers and an evaluator,
+checking it against chapter 3's stack evaluator on the same inputs.
+
+Session two is the BST. I write all four operations and the range-based
+validator, then a randomised test: a thousand random inserts and removes
+checked against a sorted array after each step. Then I run the depth
+measurement for random and sorted input and compare with 2 ln n.
+
+Session three is AVL and splay. I draw both rotations on paper before
+coding them, then insert 1 to 7 and compare my output with the trace in
+section 4.4. I read the splay cases closely and reproduce the naive
+versus splay measurement.
+
+Session four is B-trees and maps. I implement the tiny B+ tree insertion,
+print it after every insert, and compute the levels for a database of my
+own size. I finish by writing the anagram groups and inverted index.
+
+This chapter supports
+<a href={withBase('/plans/traditional-software-developer/#strategy-3')}>phase 3 of the traditional roadmap</a>,
+and search trees continue in
+<a href={withBase('/books/introduction-to-algorithms/')}>Introduction to Algorithms</a>
+(binary search trees, red-black trees and B-trees). The next chapter page
+is chapter 5, Hashing.
+
+Done when my BST and AVL pass randomised tests, my measured depths match
+the analysis, and I can draw a rotation, a splay step and a B-tree split
+from memory.
