@@ -305,3 +305,43 @@ one h1, or a missing sitemap entry or share card. Then open
   are combined later.
 - Every chapter of every book. None skipped, none summarised as "see the
   book".
+
+## Reader-friendly structure (fixed for every chapter page)
+
+Every chapter page uses the same skeleton in the same order, so a reader
+always knows where they are. Use these heading names exactly.
+
+1. **Lead paragraph.** Two or three plain sentences: what the chapter is
+   about and why it matters.
+2. `## Before you start`: a short list with what you'll be able to do
+   after this chapter (3–6 items), what you should already know (link the
+   earlier chapter or note), and an honest reading time.
+3. `## Chapter map`: one diagram of the chapter's sections and how they
+   connect.
+4. One `##` per section of the book's chapter, in the book's order. Inside
+   each, the same `###` sub-headings in this order:
+   - `### In one sentence`
+   - `### The idea` (first principles, short paragraphs)
+   - `### Worked example` (simple first, then realistic; more than one is fine)
+   - `### Step by step` (a trace, derivation or proof walked line by line)
+   - `### Common mistake` (the wrong way, why it fails, the fix)
+   - `### In real systems` (where this shows up in production)
+   - `### Check yourself` (1–3 quick questions, answers in a
+     `<details><summary>Answer</summary>…</details>`)
+5. `## From beginner to strategy`: the nine-level block.
+6. `## Questions people ask` (the FAQ).
+7. `## Key takeaways`: 5–10 single-sentence bullets.
+8. `## Glossary`: every term the chapter introduced, one line each.
+9. `## Exercises and self-check`
+10. `## How I'd study this chapter`
+
+Readability rules:
+- Paragraphs of four sentences or fewer. Plain words. Define every term the
+  first time it appears, in the same sentence.
+- One idea per paragraph. Lead with the point, then the detail.
+- Code blocks under about 25 lines. Split longer code and explain each piece.
+- Every diagram has a caption saying what to look at.
+- Use tables for comparisons, lists only for genuinely parallel items, and
+  prose everywhere else.
+- No walls of text. If a section runs past roughly 1,500 words, add a
+  `####` sub-heading.
