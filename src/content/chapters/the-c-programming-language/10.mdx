@@ -1,0 +1,2241 @@
+---
+book: the-c-programming-language
+number: 10
+label: "Appendix B"
+title: "Standard Library"
+description: "K&R appendix B in depth: stdio, ctype, string, math, stdlib, assert, stdarg, setjmp, signal, time and limits headers, each shown with programs that were run."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Appendix B is a summary of the **standard library** that ANSI C
+requires every hosted implementation to provide: fifteen headers, from
+`stdio.h` with its streams and formats to `time.h` with its calendar
+arithmetic. The book calls it a summary rather than a full
+specification, and that is the right way to read it: a map of what
+exists, what each function promises, and where the traps are. This page
+walks through each header group in the appendix's order, with a program
+for each that was compiled and run, so the promises can be seen rather
+than taken on trust.
+
+## Before you start
+
+After this page you will be able to:
+
+- use streams with the right mode, buffering, positioning and error checks, and read the return value of every `printf` and `scanf` family call;
+- classify characters safely with `ctype.h`, including the cast that most code forgets;
+- pick the right `string.h` function, and know which ones do not terminate, do not check bounds, or forbid overlap;
+- call the `math.h` functions and detect domain and range errors through `errno`;
+- convert strings to numbers with full error checking, sort and search with `qsort` and `bsearch`, and control how a program exits;
+- use `assert`, variable argument lists, `setjmp` and `longjmp`, and signals for what each is good for and no more;
+- compute and format dates with `time.h`, and read the limits a platform documents in `limits.h` and `float.h`.
+
+What you should already know:
+<a href={withBase('/books/the-c-programming-language/07-input-and-output/')}>chapter 7</a>,
+which introduced much of this library by example,
+<a href={withBase('/books/the-c-programming-language/05-pointers-and-arrays/')}>chapter 5</a>
+for pointers to functions (needed for `qsort`), and
+<a href={withBase('/books/the-c-programming-language/09-reference-manual/')}>appendix A</a>
+for the conversion rules that explain several of the traps here.
+
+Reading time: the appendix is a reference and reads quickly; working
+through this page with the programs is four or five evenings. All
+programs were built with GCC 14 and the GNU C library on 64-bit Linux,
+with `-std=c11 -Wall -Wextra`; outputs that depend on the platform say
+so.
+
+## Chapter map
+
+<Layers caption="Appendix B's eleven sections, grouped by what they are for. The I/O section is as long as all the others together, which matches how much of real C code it accounts for." layers={[
+  { name: "B1 Input and output: stdio.h", note: "streams, files, formatted and character I/O, positioning, errors" },
+  { name: "B2 and B3: ctype.h and string.h", note: "character tests, string and memory functions" },
+  { name: "B4 Mathematical functions: math.h", note: "trigonometry, exponentials, powers, rounding, errors" },
+  { name: "B5 Utility functions: stdlib.h", note: "number conversion, memory, sorting, searching, exit, environment" },
+  { name: "B6 to B9: assert.h, stdarg.h, setjmp.h, signal.h", note: "checks, variable arguments, non-local jumps, signals" },
+  { name: "B10 Date and time: time.h", note: "calendar time, broken-down time, formatting, processor time" },
+  { name: "B11 Limits: limits.h and float.h", note: "the sizes and ranges an implementation documents" },
+]} />
+
+<Figure art={`
+   ctype.h  string.h  math.h  stdlib.h   assert.h  stdarg.h      (pure C: no OS)
+      |        |        |        |
+   stdio.h ---------------------- malloc, exit, getenv, system  (needs the OS)
+      |                              |
+   time.h   signal.h   setjmp.h      |
+      |        |          |          |
+   ----------- system calls (chapter 8): read, write, open, sbrk, kill ----------
+`} caption="The library sits on the system interface. Some headers are pure computation and work the same on any machine; others are thin wrappers over what the operating system offers, and their behaviour depends on it." />
+
+The headers covered here are the fifteen of ANSI C: `assert.h`,
+`ctype.h`, `errno.h`, `float.h`, `limits.h`, `locale.h`, `math.h`,
+`setjmp.h`, `signal.h`, `stdarg.h`, `stddef.h`, `stdio.h`, `stdlib.h`,
+`string.h` and `time.h`. The appendix covers `errno.h`, `stddef.h` and
+`locale.h` in passing, inside other sections; so does this page. Later
+standards added more (`stdint.h`, `stdbool.h`, `inttypes.h` in C99;
+`threads.h` and `stdatomic.h` in C11), mentioned where they replace
+something here.
+
+## B1 Input and Output: stdio.h
+
+### In one sentence
+
+`stdio.h` provides **streams**: buffered sources and sinks of
+characters, opened on files with `fopen`, read and written with
+character, line, block and formatted functions, positioned with
+`fseek` and friends, and checked with `ferror` and `feof`.
+
+### The idea
+
+A stream is a `FILE *`. Three are open when the program starts:
+`stdin`, `stdout` and `stderr`. Others come from `fopen(name, mode)`,
+whose mode is `"r"`, `"w"` (create or truncate) or `"a"` (append), each
+optionally with `+` for update (read and write) and `b` for binary. On
+Unix, text and binary streams are identical; on systems where line ends
+are two characters, a text stream translates them and a binary stream
+does not. The appendix's subsections, in order:
+
+- **File operations.** `fopen`, `freopen` (reattach an existing stream,
+  as in redirecting `stdin` from inside a program), `fflush`, `fclose`,
+  `remove`, `rename`, `tmpfile` (an anonymous file deleted at close),
+  `tmpnam`, `setvbuf` and `setbuf`.
+- **Formatted output.** `fprintf`, `printf`, `sprintf`, and the
+  `vprintf` family that takes a `va_list` (B7). A conversion is `%`,
+  optional flags (`-`, `+`, space, `0`, `#`), a width, a precision after
+  a dot, a length modifier (`h`, `l`, `L`) and a conversion character.
+  Every one returns the number of characters written, or a negative
+  value on error.
+- **Formatted input.** `fscanf`, `scanf`, `sscanf`, which return the
+  number of items assigned, or `EOF` if input ended before the first
+  conversion.
+- **Character I/O.** `fgetc`, `fgets`, `fputc`, `fputs`, `getc` and
+  `putc` (which may be macros), `getchar`, `putchar`, `gets` (no bounds
+  check at all; removed in C11), `puts`, and `ungetc` for one character
+  of push-back.
+- **Direct I/O.** `fread` and `fwrite` move arrays of objects and return
+  how many whole objects they moved.
+- **File positioning.** `fseek(fp, offset, origin)` with `SEEK_SET`,
+  `SEEK_CUR` or `SEEK_END`; `ftell`; `rewind`; and `fgetpos` and
+  `fsetpos` for files too large for a `long` offset.
+- **Error functions.** `clearerr`, `feof`, `ferror` and `perror`. A
+  stream has an end-of-file indicator and an error indicator; the input
+  functions return `EOF` for both, and these functions tell them apart.
+
+### Worked example
+
+Fixed-size records are the classic use of positioning. Every record is
+the same size, so record k starts at k times that size:
+
+```c
+/* seek.c: fixed-size records with fseek and ftell */
+#include <stdio.h>
+
+struct rec { int id; double price; };
+
+int main(void)
+{
+    FILE *fp = tmpfile();                       /* removed automatically at exit */
+    if (fp == NULL) { perror("tmpfile"); return 1; }
+    for (int i = 0; i < 5; i++) {
+        struct rec r = { i, 1.5 * i };
+        fwrite(&r, sizeof r, 1, fp);
+    }
+    printf("record size %zu, file size %ld\n", sizeof(struct rec), ftell(fp));
+    struct rec r;
+    fseek(fp, 3 * (long)sizeof r, SEEK_SET);    /* jump straight to record 3 */
+    fread(&r, sizeof r, 1, fp);
+    printf("record 3: id %d price %.2f, now at %ld\n", r.id, r.price, ftell(fp));
+    fseek(fp, -(long)sizeof r, SEEK_END);       /* the last record */
+    fread(&r, sizeof r, 1, fp);
+    printf("last: id %d\n", r.id);
+    rewind(fp);
+    printf("after rewind: %ld, read %zu records\n", ftell(fp), fread(&r, sizeof r, 1, fp));
+    fclose(fp);
+    return 0;
+}
+```
+
+```text
+record size 16, file size 80
+record 3: id 3 price 4.50, now at 64
+last: id 4
+after rewind: 16, read 1 records
+```
+
+The `struct` is 16 bytes (an `int`, 4 bytes of padding, a `double`), so
+five records make 80 bytes. Seeking to 3 times 16 and reading one record
+leaves the position at 64. A negative offset from `SEEK_END` finds the
+last record. The final line shows a subtlety: the arguments of `printf`
+are evaluated in an unspecified order, and here GCC called `fread`
+before `ftell`, so the position printed is after the read. Splitting the
+two into separate statements would make the order explicit.
+
+The formatted-output conversions are worth seeing side by side once:
+
+```c
+/* fmt.c: printf conversions and snprintf truncation */
+#include <stdio.h>
+
+int main(void)
+{
+    printf("[%5d] [%-5d] [%05d] [%+d] [% d]\n", 42, 42, 42, 42, 42);
+    printf("[%x] [%X] [%#o] [%#x] [%c]\n", 255, 255, 8, 255, 65);
+    printf("[%8.3f] [%.2e] [%g] [%g]\n", 3.14159, 31415.9, 0.0001, 1e-5);
+    printf("[%.3s] [%10s] [%-10s] [%*d]\n", "abcdef", "right", "left", 6, 7);
+    char small[8];
+    int need = snprintf(small, sizeof small, "value=%d", 123456);
+    printf("wanted %d chars, got \"%s\"\n", need, small);
+    int n;
+    printf("abc%n\n", &n);
+    printf("%%n stored %d\n", n);
+    return 0;
+}
+```
+
+```text
+[   42] [42   ] [00042] [+42] [ 42]
+[ff] [FF] [010] [0xff] [A]
+[   3.142] [3.14e+04] [0.0001] [1e-05]
+[abc] [     right] [left      ] [     7]
+wanted 12 chars, got "value=1"
+abc
+%n stored 3
+```
+
+`snprintf` (C99; the book's `sprintf` has no size argument) wrote 7
+characters and a terminator into the 8-byte buffer and returned 12, the
+length the whole result would have had. Comparing that return with the
+buffer size is how truncation is detected. GCC spotted the truncation at
+compile time and warned (`-Wformat-truncation`). `%g` switches to
+exponent form when the exponent is below -4, which is why 0.0001 and
+1e-05 print differently.
+
+The input side returns a count that must be checked:
+
+```c
+/* scan.c: what scanf-family return values mean */
+#include <stdio.h>
+
+int main(void)
+{
+    const char *inputs[] = { "12 3.5 apple", "12 x", "", "7 2.0e1 pear!" };
+    for (int i = 0; i < 4; i++) {
+        int n = 0; double d = 0; char word[8] = "-";
+        int got = sscanf(inputs[i], "%d %lf %7[a-z]", &n, &d, word);
+        printf("%-16s -> %2d: n=%d d=%g word=%s\n", inputs[i], got, n, d, word);
+    }
+    return 0;
+}
+```
+
+```text
+12 3.5 apple     ->  3: n=12 d=3.5 word=apple
+12 x             ->  1: n=12 d=0 word=-
+                 -> -1: n=0 d=0 word=-
+7 2.0e1 pear!    ->  3: n=7 d=20 word=pear
+```
+
+The count says how far the match got: 1 means only the integer was
+converted, and -1 (`EOF`) means input ended before anything. The width
+in `%7[a-z]` keeps the word inside its 8-byte array; a bare `%s` or
+`%[a-z]` has no limit and is an overflow waiting for long input.
+
+### Step by step
+
+Buffering decides when bytes actually leave the program. The same three
+writes, with `stdout` piped, under the three modes `setvbuf` can set:
+
+```c
+/* buf.c: the same writes under different buffering modes */
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char *argv[])
+{
+    if (argc > 1 && strcmp(argv[1], "line") == 0)
+        setvbuf(stdout, NULL, _IOLBF, BUFSIZ);       /* flush at each newline */
+    else if (argc > 1 && strcmp(argv[1], "none") == 0)
+        setvbuf(stdout, NULL, _IONBF, 0);            /* no buffer at all */
+    printf("out 1\n");
+    fprintf(stderr, "err\n");                         /* stderr is unbuffered */
+    printf("out 2\n");
+    return 0;
+}
+```
+
+```text
+$ ./buf full 2>&1 | cat
+err
+out 1
+out 2
+$ ./buf line 2>&1 | cat
+out 1
+err
+out 2
+$ ./buf none 2>&1 | cat
+out 1
+err
+out 2
+```
+
+<Trace columns={["mode", "stdout flushed when", "order seen", "typical default for"]} rows={[
+  ["_IOFBF (full)", "buffer full, fflush, or exit", "err, out 1, out 2", "files and pipes"],
+  ["_IOLBF (line)", "each newline, or buffer full", "out 1, err, out 2", "terminals"],
+  ["_IONBF (none)", "every call", "out 1, err, out 2", "stderr"],
+]} />
+
+<Flow caption="What happens on a call to putc with a fully buffered stream. Only the last step reaches the kernel, which is why buffered output is fast and why it can be lost if the program dies before flushing." steps={[
+  "putc(c, fp): store c at the buffer pointer, advance it",
+  "Buffer not yet full: return at once; nothing has left the program",
+  "Buffer full, fflush or fclose: call write once with the whole buffer",
+  "exit or return from main: every open stream is flushed and closed",
+  "abort, a fatal signal or _exit: no flush; buffered bytes are lost",
+]} />
+
+### Common mistake
+
+Using `feof` as a loop condition:
+
+```c
+while (!feof(fp)) {             /* wrong: true only after a read has failed */
+    fgets(line, sizeof line, fp);
+    process(line);              /* runs once more with stale data */
+}
+```
+
+The end-of-file indicator is set by a read that **fails**, not by
+reaching the last byte, so the loop body runs one extra time and
+processes the previous line again. Test the return of the read itself,
+`while (fgets(line, sizeof line, fp) != NULL)`, and use `feof` and
+`ferror` only afterwards, to learn why the loop stopped.
+
+### In real systems
+
+Production code checks `fclose` and `fflush` too, because buffered data
+is written then, and a full disk is reported at that moment, not at the
+`fprintf`. Programs that must survive crashes (databases, editors saving
+files) call `fflush` and then the system's `fsync`, and write to a
+temporary file and `rename` it over the old one, since `rename` within
+one file system replaces atomically on POSIX. Logging libraries set
+`stderr` or their log stream to line buffering so that each message
+appears whole.
+
+### Check yourself
+
+**Why can `printf` output vanish when a program is killed, while
+`fprintf(stderr, ...)` output does not?**
+
+<details>
+<summary>Answer</summary>
+
+When `stdout` is fully buffered (a file or pipe) the text waits in the
+program's memory until a flush; a fatal signal or `abort` skips the
+flush. `stderr` is unbuffered, so its text was already written.
+
+</details>
+
+**What does `scanf("%d", &n)` return when the input is "abc"?**
+
+<details>
+<summary>Answer</summary>
+
+0: input was available but the first conversion failed, so no item was
+assigned. "abc" is left unread in the stream, which is why a loop that
+does not consume it spins forever.
+
+</details>
+
+## B2 Character Class Tests: ctype.h
+
+### In one sentence
+
+`ctype.h` declares functions that test a character for a class
+(letter, digit, space, punctuation, and so on) and two that convert
+case, all taking an `int` that must be either `EOF` or a value
+representable as an `unsigned char`.
+
+### The idea
+
+The tests return non-zero (true) or zero; note **non-zero**, not 1, so
+compare results with 0 and never with 1. The classes:
+
+- `isalpha` letters, `isdigit` decimal digits, `isalnum` either,
+  `isxdigit` hex digits;
+- `isupper` and `islower`;
+- `isspace` space, form feed, newline, carriage return, tab and vertical
+  tab;
+- `iscntrl` control characters, `isprint` printing characters including
+  space, `isgraph` printing characters except space, `ispunct` printing
+  characters that are neither letters, digits nor space;
+- `toupper` and `tolower` convert a letter and return anything else
+  unchanged.
+
+The argument rule is the part most programs get wrong. The functions
+are usually implemented as a table lookup indexed by the argument, so
+the argument must be in the range of `unsigned char` or equal to `EOF`.
+On a machine where plain `char` is signed, a byte above 127 (any
+accented letter in UTF-8, for example) is a negative `char`, and
+passing it straight to `isalpha` is undefined behaviour. The cure is a
+cast: `isalpha((unsigned char)c)`.
+
+The results also depend on the **locale**. In the default "C" locale the
+letters are just A to Z and a to z; `setlocale` from `locale.h` can make
+other characters count.
+
+### Worked example
+
+```c
+/* ctype.c: the classification tests and the unsigned char rule */
+#include <ctype.h>
+#include <stdio.h>
+
+int main(void)
+{
+    const char *s = "aZ5 _\t!";
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        printf("%-4d alpha%d digit%d space%d punct%d upper%d -> %c\n",
+               c, !!isalpha(c), !!isdigit(c), !!isspace(c), !!ispunct(c), !!isupper(c),
+               isprint(c) ? toupper(c) : '?');
+    }
+    printf("isxdigit('f') %d, isxdigit('g') %d, tolower('Q') %c\n",
+           !!isxdigit('f'), !!isxdigit('g'), tolower('Q'));
+    return 0;
+}
+```
+
+```text
+97   alpha1 digit0 space0 punct0 upper0 -> A
+90   alpha1 digit0 space0 punct0 upper1 -> Z
+53   alpha0 digit1 space0 punct0 upper0 -> 5
+32   alpha0 digit0 space1 punct0 upper0 ->
+95   alpha0 digit0 space0 punct1 upper0 -> _
+9    alpha0 digit0 space1 punct0 upper0 -> ?
+33   alpha0 digit0 space0 punct1 upper0 -> !
+isxdigit('f') 1, isxdigit('g') 0, tolower('Q') q
+```
+
+The `!!` turns each "non-zero" into exactly 1 for printing; glibc's
+`isalpha` really returns 1024 for a letter. The underscore counts as
+punctuation, not as a letter, which matters when writing a tokeniser:
+C identifiers need `isalnum(c) || c == '_'`. The tab is a space but not
+printable, so the program printed `?` for it.
+
+### Step by step
+
+<Trace columns={["character", "alpha", "digit", "space", "punct", "print", "cntrl"]} rows={[
+  ["'a'", "yes", "", "", "", "yes", ""],
+  ["'5'", "", "yes", "", "", "yes", ""],
+  ["' '", "", "", "yes", "", "yes", ""],
+  ["'_'", "", "", "", "yes", "yes", ""],
+  ["'\\t'", "", "", "yes", "", "", "yes"],
+  ["'\\n'", "", "", "yes", "", "", "yes"],
+]} />
+
+### Common mistake
+
+Writing `if (c >= 'a' && c <= 'z')` instead of `islower(c)`. It works in
+ASCII and fails in EBCDIC, where the lowercase letters are not
+contiguous; more importantly, it hard-codes the "C" locale. The other
+mistake is the missing cast described above: `isspace(*p)` over a
+`char *` that may contain bytes above 127. Address sanitizer builds
+sometimes catch it as a read before a table; often nothing catches it
+and the result is simply wrong.
+
+### In real systems
+
+Parsers for configuration files, HTTP headers and command languages use
+these tests constantly, and the protocol ones usually want the "C"
+locale's behaviour regardless of the user's settings, which is one
+reason serious parsers write their own ASCII-only tests. For text in
+UTF-8, `ctype.h` is the wrong tool for anything beyond ASCII; the
+wide-character `wctype.h` (added in 1995) or a Unicode library is
+needed.
+
+### Check yourself
+
+**Why is `toupper(c) == 'A'` safe but `isalpha(c) == 1` not?**
+
+<details>
+<summary>Answer</summary>
+
+`toupper` returns a character value, so comparing it with a character
+is fine. `isalpha` returns some non-zero value for true, not
+necessarily 1, so the comparison may be false for a letter.
+
+</details>
+
+**What should be passed to `isdigit` when reading with `getchar`?**
+
+<details>
+<summary>Answer</summary>
+
+The `int` that `getchar` returned, unchanged. It is already either `EOF`
+or an `unsigned char` value, which is exactly the allowed range.
+
+</details>
+
+## B3 String Functions: string.h
+
+### In one sentence
+
+`string.h` has two families: `str` functions that work on
+null-terminated strings, and `mem` functions that work on a given
+number of bytes and ignore any terminator.
+
+### The idea
+
+The `str` family:
+
+- **Copying and joining**: `strcpy`, `strncpy`, `strcat`, `strncat`.
+  None of them knows the size of the destination. `strncpy` copies at
+  most n characters and **does not terminate** if the source is that
+  long; if the source is shorter, it pads with zeros up to n.
+  `strncat` always terminates, but its n is the most characters to add,
+  not the size of the buffer.
+- **Comparing**: `strcmp` and `strncmp` return negative, zero or
+  positive by the first differing character, compared as
+  `unsigned char`.
+- **Searching**: `strchr` (first occurrence of a character), `strrchr`
+  (last), `strstr` (first occurrence of a substring), `strpbrk` (first of
+  any of a set of characters), `strspn` (length of the prefix made only
+  of a set), `strcspn` (length of the prefix containing none of a set).
+- **Splitting**: `strtok` finds tokens separated by any of a set of
+  characters, writing `'\0'` over the separators and remembering its
+  place in a hidden static pointer.
+- **Others**: `strlen`, `strerror` (message text for an `errno` value).
+
+The `mem` family: `memcpy` (copy n bytes; source and destination must
+not overlap), `memmove` (the same, but overlap is allowed), `memcmp`,
+`memchr` and `memset`.
+
+### Worked example
+
+```c
+/* str.c: the string.h functions that surprise people */
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    char dst[6];
+    strncpy(dst, "abcdefgh", sizeof dst);             /* fills all 6: no '\0' */
+    printf("strncpy terminated? %s\n", memchr(dst, '\0', sizeof dst) ? "yes" : "no");
+    const char *path = "/usr/local/bin/cc";
+    printf("strchr %s, strrchr %s, strstr %s\n",
+           strchr(path, '/') + 1, strrchr(path, '/') + 1, strstr(path, "local"));
+    printf("strspn(\"  42x\", \" \") = %zu, strcspn(\"key=val\", \"=\") = %zu\n",
+           strspn("  42x", " "), strcspn("key=val", "="));
+    printf("strcmp: %d %d %d\n", strcmp("abc", "abd") < 0, strcmp("b", "abc") > 0,
+           strcmp("abc", "abc") == 0);
+    char buf[] = "0123456789";
+    memmove(buf + 2, buf, 5);                         /* overlapping: memmove is safe */
+    printf("memmove: %s\n", buf);
+    char line[] = "red,,green, blue";
+    for (char *t = strtok(line, ", "); t; t = strtok(NULL, ", ")) printf("[%s]", t);
+    printf("\nline is now \"%s\"\n", line);
+    return 0;
+}
+```
+
+```text
+strncpy terminated? no
+strchr usr/local/bin/cc, strrchr cc, strstr local/bin/cc
+strspn("  42x", " ") = 2, strcspn("key=val", "=") = 3
+strcmp: 1 1 1
+memmove: 0101234789
+[red][green][blue]
+line is now "red"
+```
+
+- `strncpy` filled all six bytes and left no terminator; printing `dst`
+  with `%s` would read past its end. GCC warned at compile time
+  (`-Wstringop-truncation`).
+- `strrchr` plus one is the standard way to get a file name from a
+  path.
+- `strspn` counts the leading blanks; `strcspn` finds where the key
+  ends.
+- `strcmp("b", "abc")` is positive: the first characters differ and
+  `'b'` is greater, whatever the lengths.
+- `memmove` copied "01234" two places to the right over itself
+  correctly. `memcpy` with overlapping regions is undefined.
+- `strtok` treated the run of separators `",,"` as one, and destroyed
+  its input: `line` now ends after "red".
+
+### Step by step
+
+<Trace columns={["call to strtok", "starts scanning at", "skips", "token", "writes \\0 at"]} rows={[
+  ["strtok(line, \", \")", "line[0]", "nothing", "red", "line[3] (the first comma)"],
+  ["strtok(NULL, \", \")", "line[4]", "the second comma", "green", "line[10] (the comma after green)"],
+  ["strtok(NULL, \", \")", "line[11]", "the space", "blue", "nothing; the string ends"],
+  ["strtok(NULL, \", \")", "end of string", "", "NULL", ""],
+]} />
+
+<Compare left="Copying with the book's functions" right="Safer patterns used today" caption="The ANSI string functions trust the caller about sizes. Modern code wraps them, or uses snprintf, which always knows the buffer size." rows={[
+  ["strcpy(d, s): no size at all", "snprintf(d, sizeof d, \"%s\", s): truncates safely"],
+  ["strncpy(d, s, n): may not terminate", "strncpy then d[n - 1] = 0, or snprintf"],
+  ["strcat(d, s): no size at all", "track the length and use memcpy, or snprintf at the end"],
+  ["strtok: hidden state, not reentrant", "strtok_r (POSIX), or strspn and strcspn"],
+  ["memcpy with overlap: undefined", "memmove whenever overlap is possible"],
+]} />
+
+### Common mistake
+
+Using `sizeof` on a pointer as the buffer size:
+
+```c
+void save(char *dst, const char *src)
+{
+    strncpy(dst, src, sizeof dst);     /* sizeof a pointer: 8, not the buffer */
+}
+```
+
+Inside the function `dst` is a pointer, so `sizeof dst` is 8 whatever
+the caller's buffer. Pass the size as a parameter. GCC flags this one
+with `-Wsizeof-pointer-memaccess`, enabled by `-Wall`.
+
+### In real systems
+
+Buffer overflows from `strcpy`, `strcat` and `sprintf` were the single
+largest class of security holes in C programs for decades, which is why
+many projects ban them in code review or with compiler poisoning.
+Optional "bounds-checked" versions (`strcpy_s` and friends, in C11's
+annex K) exist but are barely implemented outside Microsoft's library;
+BSD's `strlcpy` and `strlcat` are widely used and were added to glibc in
+version 2.38. `memcpy` and `memset` are among the most optimised
+functions in any C library, using vector instructions, and calls to them
+with small constant sizes are inlined by the compiler.
+
+### Check yourself
+
+**What does `strncpy(d, "hi", 5)` leave in d?**
+
+<details>
+<summary>Answer</summary>
+
+'h', 'i' and three `'\0'` bytes. When the source is shorter than n, the
+rest is padded with zeros.
+
+</details>
+
+**Why can `strtok` not be used to split two strings in alternation?**
+
+<details>
+<summary>Answer</summary>
+
+It keeps its position in one hidden static pointer, so starting on the
+second string loses the place in the first. `strtok_r` takes the
+position as an argument instead.
+
+</details>
+
+## B4 Mathematical Functions: math.h
+
+### In one sentence
+
+`math.h` declares the trigonometric, hyperbolic, exponential,
+logarithmic, power and rounding functions on `double`, and reports
+errors by setting `errno` to `EDOM` for an argument outside the domain
+and `ERANGE` for a result too large or too small to represent.
+
+### The idea
+
+The functions, grouped:
+
+- **Trigonometric**: `sin`, `cos`, `tan` (radians), `asin`, `acos`,
+  `atan`, and `atan2(y, x)`, which uses the signs of both to find the
+  right quadrant.
+- **Hyperbolic**: `sinh`, `cosh`, `tanh`.
+- **Exponential and logarithmic**: `exp`, `log` (natural), `log10`.
+- **Powers**: `pow(x, y)`, `sqrt`.
+- **Rounding and pieces**: `ceil`, `floor`, `fabs`, `fmod` (remainder
+  with the sign of x), `modf` (split into integer and fractional parts),
+  `frexp` (split into a fraction in [0.5, 1) and a power of 2) and
+  `ldexp` (the reverse).
+
+Error handling is two-sided. A **domain error** (such as `sqrt(-1)` or
+`log(-1)`) sets `errno` to `EDOM` and returns an implementation-defined
+value. A **range error** (overflow) sets `errno` to `ERANGE` and returns
+`HUGE_VAL` with the right sign; on underflow the result is 0 and
+`errno` may or may not be set. Since `errno` is never cleared by a
+successful call, the caller must set it to 0 first.
+
+On Linux, the maths functions live in a separate library, so programs
+using them link with `-lm`.
+
+### Worked example
+
+```c
+/* m.c: math.h results, domain and range errors */
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+
+int main(void)
+{
+    printf("sqrt(2) %.6f, pow(2, 10) %g, fmod(7.5, 2) %g\n", sqrt(2), pow(2, 10), fmod(7.5, 2));
+    printf("floor(-2.5) %g, ceil(-2.5) %g, fabs(-3) %g\n", floor(-2.5), ceil(-2.5), fabs(-3.0));
+    int e;
+    double frac = frexp(48.0, &e);                   /* 48 = 0.75 * 2^6 */
+    double ip, fp = modf(-3.25, &ip);
+    printf("frexp(48) = %g * 2^%d, ldexp(0.75, 6) = %g, modf(-3.25) = %g + %g\n",
+           frac, e, ldexp(0.75, 6), ip, fp);
+    errno = 0;
+    double r = sqrt(-1.0);
+    printf("sqrt(-1) = %f, errno %s\n", r, errno == EDOM ? "EDOM" : "unset");
+    errno = 0;
+    r = exp(1000.0);
+    printf("exp(1000) = %f, errno %s\n", r, errno == ERANGE ? "ERANGE" : "unset");
+    printf("atan2(1, -1) = %.6f (3 pi / 4), log10(1000) = %g\n", atan2(1, -1), log10(1000));
+    return 0;
+}
+```
+
+```text
+sqrt(2) 1.414214, pow(2, 10) 1024, fmod(7.5, 2) 1.5
+floor(-2.5) -3, ceil(-2.5) -2, fabs(-3) 3
+frexp(48) = 0.75 * 2^6, ldexp(0.75, 6) = 48, modf(-3.25) = -3 + -0.25
+sqrt(-1) = -nan, errno EDOM
+exp(1000) = inf, errno ERANGE
+atan2(1, -1) = 2.356194 (3 pi / 4), log10(1000) = 3
+```
+
+`floor` rounds towards minus infinity, so -2.5 becomes -3; a cast to
+`int` would have given -2 (appendix A6). `modf` keeps the sign on both
+parts. `sqrt(-1)` returned a NaN, IEEE 754's "not a number", and set
+`EDOM`; `exp(1000)` returned infinity (which is what `HUGE_VAL` is on
+IEEE machines) and set `ERANGE`. `atan2` placed the point (-1, 1) in the
+second quadrant; `atan(1 / -1)` would have given minus pi over 4.
+
+### Step by step
+
+<Trace columns={["call", "mathematical result", "returned", "errno"]} rows={[
+  ["sqrt(2)", "1.41421356...", "1.414214 (to 6 places)", "unchanged"],
+  ["fmod(7.5, 2)", "7.5 - 3 * 2", "1.5", "unchanged"],
+  ["frexp(48, &e)", "0.75 * 2 to the 6th", "0.75, e = 6", "unchanged"],
+  ["sqrt(-1)", "not a real number", "NaN", "EDOM"],
+  ["exp(1000)", "about 10 to the 434th", "inf (HUGE_VAL)", "ERANGE"],
+]} />
+
+### Common mistake
+
+Using `pow` for integer powers and expecting an exact integer back:
+`(int)pow(10, 2)` is 100 on most systems, but `pow` computes in floating
+point and a result like 99.99999999 truncates to 99. For small integer
+powers multiply directly, and for squares write `x * x`. Related: never
+compare floating results with `==`; see B11 for why `0.1 + 0.2 == 0.3`
+is false.
+
+### In real systems
+
+C99 added `float` and `long double` versions (`sinf`, `sqrtl`), `round`,
+`trunc`, `hypot`, `fma`, `isnan` and `isinf`, and `fenv.h` for
+floating-point exceptions, which is how numerical code detects errors
+today rather than through `errno`. Compilers often replace calls like
+`sqrt` with a single machine instruction; the `-ffast-math` flag goes
+further and assumes no NaNs or infinities, which speeds code up and
+breaks any program that relied on them.
+
+### Check yourself
+
+**Why must `errno` be set to 0 before calling `log(x)` if you want to
+check it afterwards?**
+
+<details>
+<summary>Answer</summary>
+
+Library functions set `errno` only on error and never reset it, so a
+non-zero value may be left over from an earlier failure.
+
+</details>
+
+**What is `fmod(-7, 2)`?**
+
+<details>
+<summary>Answer</summary>
+
+-1: the result has the sign of the first argument, matching C99's `%`
+on integers.
+
+</details>
+
+## B5 Utility Functions: stdlib.h
+
+### In one sentence
+
+`stdlib.h` gathers the library's general utilities: converting strings
+to numbers, pseudo-random numbers, dynamic memory, ending the program,
+talking to the environment, sorting and searching, and integer
+arithmetic helpers.
+
+### The idea
+
+By group:
+
+- **Number conversion.** `atof`, `atoi` and `atol` are simple and have
+  no error reporting: "x" and "0" both give 0. `strtod`, `strtol` and
+  `strtoul` are the real tools. They skip leading white space, convert
+  as much as they can, store a pointer to the first unconverted
+  character through their second argument, and on overflow return the
+  type's largest value and set `errno` to `ERANGE`. `strtol`'s base can
+  be 2 to 36, or 0 to accept C's own prefixes (`0x` for hex, `0` for
+  octal).
+- **Random numbers.** `rand` returns a pseudo-random integer from 0 to
+  `RAND_MAX` (at least 32767); `srand(seed)` starts a new sequence.
+  Chapter 7 covered their limits.
+- **Memory.** `malloc`, `calloc` (zeroed, with a count and a size),
+  `realloc` and `free`, as built by hand in chapter 8.
+- **Program termination.** `exit(status)` flushes and closes streams,
+  calls functions registered with `atexit` in reverse order, and returns
+  status to the environment; `EXIT_SUCCESS` and `EXIT_FAILURE` are the
+  portable values. `abort` ends the program abnormally, as if by the
+  signal `SIGABRT`, with no flushing guaranteed.
+- **Environment.** `getenv(name)` returns the value of an environment
+  variable or a null pointer; `system(command)` runs a command through
+  the shell.
+- **Searching and sorting.** `bsearch` and `qsort`, both generic over
+  any element type through `void *` and a comparison function.
+- **Integer arithmetic.** `abs` and `labs`, and `div` and `ldiv`, which
+  return quotient and remainder together in a structure.
+
+### Worked example
+
+Number conversion with every failure visible:
+
+```c
+/* conv.c: strtol and strtod, with every way they can fail */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void try(const char *s, int base)
+{
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, base);
+    printf("%-22s base %2d -> %ld, rest \"%s\"%s%s\n", s, base, v, end,
+           end == s ? ", no digits" : "", errno == ERANGE ? ", ERANGE" : "");
+}
+
+int main(void)
+{
+    const char *in[] = { "  42", "42abc", "abc", "0x1F", "0755", "ff", "99999999999999999999" };
+    int base[] = { 10, 10, 10, 0, 0, 16, 10 };
+    for (int i = 0; i < 7; i++) try(in[i], base[i]);
+    char *end;
+    double d = strtod("6.02e23 mol", &end);
+    printf("strtod: %g, rest \"%s\"; atoi(\"12x\") = %d, atoi(\"x\") = %d\n",
+           d, end, atoi("12x"), atoi("x"));
+    return 0;
+}
+```
+
+```text
+  42                   base 10 -> 42, rest ""
+42abc                  base 10 -> 42, rest "abc"
+abc                    base 10 -> 0, rest "abc", no digits
+0x1F                   base  0 -> 31, rest ""
+0755                   base  0 -> 493, rest ""
+ff                     base 16 -> 255, rest ""
+99999999999999999999   base 10 -> 9223372036854775807, rest "", ERANGE
+strtod: 6.02e+23, rest " mol"; atoi("12x") = 12, atoi("x") = 0
+```
+
+A strict "the whole string is a number" check needs three tests: the end
+pointer moved (`end != s`), nothing is left (`*end == '\0'`), and
+`errno` is not `ERANGE`. `atoi` cannot report any of these, which is why
+it is fine for quick tools and wrong for input from users or files.
+
+Sorting and searching with comparison functions:
+
+```c
+/* sortf.c: qsort and bsearch with comparison functions */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int by_int(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);                 /* not x - y: that can overflow */
+}
+static int by_str(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+int main(void)
+{
+    int v[] = { 42, -7, 19, 0, 2147483647, -2147483647 - 1, 19 }, key = 19;
+    size_t n = sizeof v / sizeof v[0];
+    qsort(v, n, sizeof v[0], by_int);
+    for (size_t i = 0; i < n; i++) printf("%d ", v[i]);
+    int *hit = bsearch(&key, v, n, sizeof v[0], by_int);
+    printf("\nfound 19 at index %td\n", hit ? hit - v : -1);
+    const char *w[] = { "pear", "apple", "fig", "banana" };
+    qsort(w, 4, sizeof w[0], by_str);
+    printf("%s %s %s %s\n", w[0], w[1], w[2], w[3]);
+    return 0;
+}
+```
+
+```text
+-2147483648 -7 0 19 19 42 2147483647
+found 19 at index 3
+apple banana fig pear
+```
+
+Three details carry the whole interface:
+
+- The comparison receives **pointers to elements**. For an array of
+  `int` they are `int *` in disguise. For an array of strings the
+  elements are `char *`, so the comparison gets pointers to pointers,
+  hence the double cast in `by_str`.
+- The common shortcut `return x - y;` overflows for values like these
+  (the largest minus the smallest `int` does not fit), and the sort then
+  silently misorders. `(x > y) - (x < y)` gives -1, 0 or 1 without
+  arithmetic.
+- `bsearch` on an array with duplicates may return **any** matching
+  element; here it found the first 19, but a different library could
+  return the second.
+
+Exit handling, run and checked from the shell:
+
+```c
+/* util.c: atexit, getenv, div, abs and exit status */
+#include <stdio.h>
+#include <stdlib.h>
+
+static void first(void)  { printf("first registered, runs last\n"); }
+static void second(void) { printf("second registered, runs first\n"); }
+
+int main(void)
+{
+    atexit(first);
+    atexit(second);
+    const char *home = getenv("HOME"), *none = getenv("NO_SUCH_VARIABLE");
+    printf("HOME set? %s, NO_SUCH_VARIABLE %s\n", home ? "yes" : "no", none ? none : "(null)");
+    div_t q = div(-7, 2);
+    printf("div(-7, 2) = %d rem %d, abs(-5) = %d, labs(-5L) = %ld\n", q.quot, q.rem, abs(-5), labs(-5L));
+    printf("exiting with EXIT_FAILURE (%d)\n", EXIT_FAILURE);
+    exit(EXIT_FAILURE);
+}
+```
+
+```text
+$ ./util; echo "status $?"
+HOME set? yes, NO_SUCH_VARIABLE (null)
+div(-7, 2) = -3 rem -1, abs(-5) = 5, labs(-5L) = 5
+exiting with EXIT_FAILURE (1)
+second registered, runs first
+first registered, runs last
+status 1
+```
+
+### Step by step
+
+<Flow caption="What exit does, in order. Returning from main does the same; abort and _exit skip everything except the last step." steps={[
+  "Call atexit functions, last registered first",
+  "Flush and close every open stream (buffered output is written now)",
+  "Remove files made by tmpfile",
+  "Return the status to the parent process, which the shell shows as $?",
+]} />
+
+<Trace columns={["comparison", "x - y", "(x > y) - (x < y)", "correct sign?"]} rows={[
+  ["19 vs 42", "-23", "-1", "both"],
+  ["42 vs 42", "0", "0", "both"],
+  ["2147483647 vs -2147483648", "overflow (undefined; wraps to -1 here)", "1", "only the second"],
+  ["-7 vs 0", "-7", "-1", "both"],
+]} />
+
+### Common mistake
+
+Calling `realloc` like this:
+
+```c
+p = realloc(p, bigger);        /* on failure p becomes NULL and the block leaks */
+```
+
+When `realloc` fails it returns a null pointer and leaves the old block
+alone, but the assignment has already overwritten the only pointer to
+it. Assign to a temporary, check it, then replace `p`.
+
+### In real systems
+
+`qsort` is generic but slow compared with a sort specialised for one
+type, because every comparison is an indirect call; C++'s `std::sort`
+is often noticeably faster for that reason. Production code still
+uses `qsort` widely where clarity matters more. `strtol` with full
+checks is the standard way to parse integers in configuration and
+command-line handling. `getenv` is how containers and twelve-factor
+style services receive configuration, and `system` is avoided in
+anything handling untrusted input, because the command goes through a
+shell (see chapter 7).
+
+### Check yourself
+
+**Why does `strtol("08", NULL, 0)` return 0?**
+
+<details>
+<summary>Answer</summary>
+
+With base 0 a leading 0 means octal, and 8 is not an octal digit, so
+conversion stops after the "0". The end pointer would point at "8".
+
+</details>
+
+**In what order do functions registered with `atexit(a)` then
+`atexit(b)` run?**
+
+<details>
+<summary>Answer</summary>
+
+b, then a: the reverse of registration, so that later setup is undone
+first.
+
+</details>
+
+## B6 Diagnostics: assert.h
+
+### In one sentence
+
+The `assert(expression)` macro checks an assumption at run time: if the
+expression is false it prints the expression, the file and the line to
+`stderr` and calls `abort`; if `NDEBUG` is defined when `assert.h` is
+included, it does nothing at all.
+
+### The idea
+
+An assertion documents and checks something the programmer believes can
+never be false: an invariant, a precondition the caller must meet, a
+state that "cannot happen". It is not error handling. Bad user input,
+missing files and full disks are expected events that the program must
+handle; an assertion failure means the program itself is wrong.
+
+The `NDEBUG` switch is the key design decision. Release builds commonly
+define it, so assertions vanish, along with any side effects inside
+them. That is why an assertion must never do work the program needs:
+`assert(fp = fopen(...))` stops opening the file in a release build.
+
+### Worked example
+
+```c
+/* asrt.c: assert checks a programmer's assumption, not user input */
+#include <assert.h>
+#include <stdio.h>
+
+static double average(const int *v, int n)
+{
+    assert(v != NULL && n > 0);        /* a caller bug if this fails */
+    long sum = 0;
+    for (int i = 0; i < n; i++) sum += v[i];
+    return (double)sum / n;
+}
+
+int main(void)
+{
+    int v[] = { 4, 8, 15 };
+    printf("average %.2f\n", average(v, 3));
+    fflush(stdout);
+    printf("average %.2f\n", average(v, 0));
+    return 0;
+}
+```
+
+```text
+$ ./asrt; echo "status $?"
+average 9.00
+asrt: asrt.c:7: average: Assertion `v != NULL && n > 0' failed.
+Aborted
+status 134
+```
+
+The message names the program, file, line, function and the exact
+expression text (the macro uses the `#` operator from appendix A12);
+the "Aborted" line comes from the shell, reporting how the program died.
+Status 134 is 128 plus 6, the number of `SIGABRT`. The `fflush` before
+the bad call matters: `abort` does not flush streams, and without it the
+first line, sitting in a pipe's buffer, could be lost.
+
+With assertions compiled out the same call carries on and divides by
+zero in floating point:
+
+```text
+$ gcc -DNDEBUG -o asrt-nd asrt.c && ./asrt-nd
+average 9.00
+average -nan
+```
+
+### Step by step
+
+<Compare left="assert" right="if and an error path" caption="Which check fits which problem. The left column is for bugs in the program; the right is for conditions the program must expect." rows={[
+  ["a caller passed a null pointer", "a file does not exist"],
+  ["an index computed internally is out of range", "the user typed a letter where a number was wanted"],
+  ["a switch reached a state that cannot happen", "malloc returned a null pointer"],
+  ["removed when NDEBUG is defined", "always present"],
+  ["ends the program with abort", "reports, recovers or exits cleanly"],
+]} />
+
+### Common mistake
+
+Putting side effects inside the assertion:
+
+```c
+assert(close(fd) == 0);      /* with NDEBUG the descriptor is never closed */
+```
+
+Do the work, keep the result, and assert on the result:
+`int rc = close(fd); assert(rc == 0);`. (Then a release build warns that
+rc is unused; `(void)rc;` silences it.)
+
+### In real systems
+
+Many projects keep assertions on in production for cheap checks, and
+use their own macro (often called `CHECK` or `VERIFY`) that cannot be
+compiled out, reserving `assert` for expensive checks. C11's
+`static_assert` (spelled `_Static_assert` in C11) checks conditions at
+compile time instead, which is better whenever the condition involves
+only constants, such as type sizes or struct layouts.
+
+### Check yourself
+
+**Why is `assert(p != NULL)` after `p = malloc(n)` poor practice?**
+
+<details>
+<summary>Answer</summary>
+
+Running out of memory is a runtime condition, not a bug, and in a
+release build with `NDEBUG` the check disappears and the program
+dereferences a null pointer. Use an `if` and handle the failure.
+
+</details>
+
+**Where must `NDEBUG` be defined to disable assertions?**
+
+<details>
+<summary>Answer</summary>
+
+Before `assert.h` is included, usually with `-DNDEBUG` on the compiler
+command line. The header can be included again to switch the mode for
+the code after it.
+
+</details>
+
+## B7 Variable Argument Lists: stdarg.h
+
+### In one sentence
+
+`stdarg.h` lets a function take a variable number of arguments of
+varying types: declare it with `...` after at least one named
+parameter, then walk the extra arguments with `va_start`, `va_arg` and
+`va_end`.
+
+### The idea
+
+A function such as `printf` is declared
+`int printf(const char *fmt, ...)`. The `...` tells the compiler that more arguments may follow, of
+any types, and that only the **default argument promotions** apply to
+them: `char` and `short` become `int`, and `float` becomes `double`.
+
+Inside, the function:
+
+1. declares a `va_list ap`;
+2. calls `va_start(ap, last)` with the name of the last named parameter;
+3. calls `va_arg(ap, type)` once per argument, naming the type it
+   expects, which must be the promoted type;
+4. calls `va_end(ap)` before returning.
+
+The function cannot ask how many arguments there are or what types they
+have. It must be told, by a count (as in the first example below), by a
+format string (as in `printf`), or by a sentinel such as a final null
+pointer. A wrong guess is undefined behaviour, which is why compilers
+check `printf` formats against their arguments.
+
+The library also provides `vprintf`, `vfprintf` and `vsprintf`, which
+take a `va_list` instead of `...`, so that a variadic function can pass
+its arguments on.
+
+### Worked example
+
+The first half defines two variadic functions:
+
+```c
+/* va.c: a variadic function and a printf wrapper */
+#include <stdarg.h>
+#include <stdio.h>
+
+static int sum(int count, ...)
+{
+    va_list ap;
+    va_start(ap, count);                   /* start after the last named parameter */
+    int total = 0;
+    for (int i = 0; i < count; i++) total += va_arg(ap, int);
+    va_end(ap);
+    return total;
+}
+
+static void logmsg(const char *level, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    printf("[%s] ", level);
+    vprintf(fmt, ap);                       /* the v-version takes a va_list */
+    va_end(ap);
+    putchar('\n');
+}
+```
+
+And a caller:
+
+```c
+/* va.c, continued */
+int main(void)
+{
+    printf("sum(3, 1, 2, 3) = %d, sum(0) = %d\n", sum(3, 1, 2, 3), sum(0));
+    logmsg("warn", "disk %s is %d%% full", "/dev/sda1", 93);
+    return 0;
+}
+```
+
+```text
+sum(3, 1, 2, 3) = 6, sum(0) = 0
+[warn] disk /dev/sda1 is 93% full
+```
+
+`sum` is told the count by its first argument. `logmsg` forwards its
+arguments to `vprintf`, which is the only way to pass "the rest of my
+arguments" along; there is no syntax for calling `printf` with another
+function's `...`.
+
+### Step by step
+
+<Trace columns={["step in sum(3, 1, 2, 3)", "va_list now points at", "value read", "total"]} rows={[
+  ["va_start(ap, count)", "the first unnamed argument", "", "0"],
+  ["va_arg(ap, int), i = 0", "the second", "1", "1"],
+  ["va_arg(ap, int), i = 1", "the third", "2", "3"],
+  ["va_arg(ap, int), i = 2", "past the end", "3", "6"],
+  ["va_end(ap)", "", "", "returns 6"],
+]} />
+
+### Common mistake
+
+Asking `va_arg` for a type that was promoted away:
+
+```c
+char c = va_arg(ap, char);     /* undefined: a char argument arrives as int */
+float f = va_arg(ap, float);   /* undefined: a float arrives as double */
+```
+
+GCC warns that the type is promoted when passed through `...` and that
+the program would abort if the code were reached. Read `int` and
+`double`, then convert. The other classic is passing a plain `0` where
+a variadic function expects a null pointer sentinel, which on 64-bit
+machines may pass a 32-bit int where a 64-bit pointer was read; write
+`(char *)NULL`.
+
+### In real systems
+
+Every logging library in C is built around a `v`-function, and GCC's
+`__attribute__((format(printf, 2, 3)))` on the wrapper's declaration
+makes the compiler check calls to it exactly like calls to `printf`.
+C99 added `va_copy` for walking the same arguments twice, and variadic
+macros (`__VA_ARGS__`), which let logging macros add the file and line
+automatically.
+
+### Check yourself
+
+**Why must a variadic function have at least one named parameter?**
+
+<details>
+<summary>Answer</summary>
+
+`va_start` needs the last named parameter to find where the unnamed
+ones begin. (C23 relaxed this, but ANSI C requires it.)
+
+</details>
+
+**How does `printf` know how many arguments it was given?**
+
+<details>
+<summary>Answer</summary>
+
+It does not; it trusts the format string and reads one argument per
+conversion. Too few arguments is undefined behaviour.
+
+</details>
+
+## B8 Non-local Jumps: setjmp.h
+
+### In one sentence
+
+`setjmp(env)` saves the calling environment and returns 0; a later
+`longjmp(env, val)` from any function called since jumps back to that
+point, which then returns val, abandoning every function call in
+between.
+
+### The idea
+
+Normal control flow can only leave a function by returning to its
+caller. `setjmp` and `longjmp` are the escape hatch: an error found deep
+inside a recursive parser can return straight to the top level in one
+step. The mechanism saves enough machine state (stack pointer, program
+counter, some registers) in a `jmp_buf` to resume from the `setjmp`
+call.
+
+The rules that keep it safe:
+
+- `setjmp` may only be used in simple contexts: as a whole expression
+  statement, or as the controlling expression of an `if`, `switch` or
+  loop, possibly compared with a constant. It must not be stored in an
+  ordinary assignment, although compilers accept `code = setjmp(env)`
+  in practice.
+- The function that called `setjmp` must still be running when
+  `longjmp` is called. Jumping into a function that has returned is
+  undefined.
+- After the jump, automatic variables of the function that called
+  `setjmp` have their values as of the `longjmp` only if they are
+  `volatile`, or were not changed since the `setjmp`. Others may hold
+  stale register copies.
+- `longjmp(env, 0)` makes `setjmp` return 1, so the two paths can always
+  be told apart.
+
+### Worked example
+
+```c
+/* jmp.c: setjmp and longjmp as an error escape from deep recursion */
+#include <setjmp.h>
+#include <stdio.h>
+
+static jmp_buf on_error;
+
+static long walk(int n, int bad)             /* sums n..1, fails on reaching bad */
+{
+    if (n == bad) longjmp(on_error, 42);      /* unwind every frame at once */
+    return n == 0 ? 0 : n + walk(n - 1, bad);
+}
+
+int main(void)
+{
+    volatile int attempts = 0;               /* volatile: changed after setjmp */
+    int code = setjmp(on_error);             /* 0 the first time, 42 after longjmp */
+    attempts++;
+    if (code == 0) {
+        printf("walk(100, -1) = %ld\n", walk(100, -1));
+        walk(1000, 3);
+        printf("never printed\n");
+    } else {
+        printf("came back with %d, attempts %d\n", code, attempts);
+    }
+    return 0;
+}
+```
+
+```text
+walk(100, -1) = 5050
+came back with 42, attempts 2
+```
+
+The first `setjmp` returns 0. `walk(100, -1)` runs to the end normally.
+`walk(1000, 3)` recurses 997 levels and then calls `longjmp`, which
+discards all those frames at once and makes `setjmp` return a second
+time, now with 42. `attempts` is `volatile` and was changed after the
+`setjmp`, so its value, 2, is reliable; without `volatile`, an
+optimising compiler could have kept it in a register and shown 1.
+
+### Step by step
+
+<Timeline caption="One run of jmp.c, in the order things happen. The stack grows and then collapses in a single step at the longjmp." items={[
+  { when: "setjmp", what: "Saves the environment of main and returns 0; attempts becomes 1." },
+  { when: "walk(100, -1)", what: "Recurses 100 levels and returns 5050 normally; nothing special happens." },
+  { when: "walk(1000, 3)", what: "Recurses until n is 3, with 997 frames on the stack." },
+  { when: "longjmp(on_error, 42)", what: "Restores main's saved environment; the 997 frames are abandoned, with no returns." },
+  { when: "setjmp again", what: "Returns 42; attempts becomes 2; the else branch prints the message." },
+]} />
+
+### Common mistake
+
+Using `longjmp` to escape from code that holds resources:
+
+```c
+FILE *fp = fopen(path, "r");
+parse(fp);                      /* may longjmp out on a syntax error */
+fclose(fp);                     /* skipped by the jump: the stream leaks */
+```
+
+`longjmp` runs no cleanup in the abandoned frames: no `fclose`, no
+`free`, no unlocking. Code that uses it must register resources
+somewhere the landing point can release them, or arrange that no
+resources are held across calls that may jump.
+
+### In real systems
+
+`setjmp` and `longjmp` are how C libraries implement exception-like
+error handling: the Lua interpreter's error handling, libpng's error
+recovery and many parsers use them. Using them across a C++ function
+with destructors is undefined. Signal handlers that must leave the
+interrupted code use `sigsetjmp` and `siglongjmp` (POSIX), which also
+restore the signal mask.
+
+### Check yourself
+
+**What does `setjmp` return the first time, and what after
+`longjmp(env, 0)`?**
+
+<details>
+<summary>Answer</summary>
+
+0 the first time. After `longjmp(env, 0)` it returns 1, because a zero
+would be indistinguishable from the first return.
+
+</details>
+
+**Why is it undefined to `longjmp` to a `jmp_buf` saved by a function
+that has returned?**
+
+<details>
+<summary>Answer</summary>
+
+The saved stack frame no longer exists; its memory has been reused by
+other calls, so there is nothing valid to resume.
+
+</details>
+
+## B9 Signals: signal.h
+
+### In one sentence
+
+A signal is an asynchronous event, such as an interrupt from the
+keyboard, an illegal instruction or a request to terminate, and
+`signal(sig, handler)` chooses what happens when it arrives: the
+default action, ignoring it, or calling a function.
+
+### The idea
+
+ANSI C defines six signals: `SIGABRT` (from `abort`), `SIGFPE`
+(arithmetic error, such as integer division by zero), `SIGILL` (illegal
+instruction), `SIGINT` (interactive attention, usually ctrl-C),
+`SIGSEGV` (invalid memory access) and `SIGTERM` (termination request).
+Unix systems define many more.
+
+`signal` takes a signal number and a handler, which is `SIG_DFL` (the
+default, usually to terminate), `SIG_IGN` (ignore) or a pointer to a
+function taking an `int`. It returns the previous handler, or
+`SIG_ERR`. `raise(sig)` sends a signal to the program itself.
+
+A handler can run between any two machine instructions of the main
+program, so it may find data structures half-updated. The standard
+therefore allows a handler to do very little: assign to a variable of
+type `volatile sig_atomic_t`, call `signal` for the same signal, call
+`abort` or `_Exit`, and return. Calling `printf` or `malloc` from a
+handler is undefined, because the main program may have been in the
+middle of the same function.
+
+### Worked example
+
+```c
+/* sig.c: a handler that only sets a flag */
+#include <signal.h>
+#include <stdio.h>
+
+static volatile sig_atomic_t got_int;
+
+static void on_int(int sig) { (void)sig; got_int = 1; }   /* the only safe work */
+
+int main(void)
+{
+    if (signal(SIGINT, on_int) == SIG_ERR) { perror("signal"); return 1; }
+    for (int i = 1; i <= 5; i++) {
+        if (i == 3) raise(SIGINT);          /* as if the user pressed ctrl-C */
+        if (got_int) { printf("interrupted at step %d, cleaning up\n", i); break; }
+        printf("step %d\n", i);
+    }
+    signal(SIGINT, SIG_DFL);
+    fflush(stdout);                         /* the default action skips exit's flush */
+    raise(SIGINT);                          /* default action: terminate */
+    printf("not reached\n");
+    return 0;
+}
+```
+
+```text
+$ ./sig | cat; echo "status ${PIPESTATUS[0]}"
+step 1
+step 2
+interrupted at step 3, cleaning up
+status 130
+```
+
+The handler only sets a flag, and the loop checks the flag at a safe
+point and cleans up there. Then the program restores the default action
+and raises the signal again, which terminates it: status 130 is 128
+plus 2, the number of `SIGINT`. The `fflush` matters: when I first ran
+this without it, with `stdout` piped, the program printed **nothing**,
+because death by signal skips the flushing that `exit` does, and all
+three lines were still in the buffer.
+
+### Step by step
+
+<Flow caption="The safe pattern for handling a signal. All real work happens in the main program at a point it chooses; the handler just records that the signal arrived." steps={[
+  "Install the handler with signal (or sigaction on POSIX)",
+  "Main loop runs normally",
+  "Signal arrives: the handler runs, sets a volatile sig_atomic_t flag, returns",
+  "Main loop checks the flag at its next safe point",
+  "Clean up (flush, remove temporary files) and exit with a status",
+]} />
+
+### Common mistake
+
+Doing real work inside the handler, such as logging with `fprintf`. It
+works in testing because the signal usually arrives while the program is
+waiting for input, and fails rarely and mysteriously in production when
+it arrives inside a `malloc` or another `fprintf` and corrupts their
+state. If a handler must produce output, the POSIX `write` system call
+is on the list of functions safe to call from handlers; `printf` is not.
+
+### In real systems
+
+On POSIX systems `sigaction` replaces `signal`, because its behaviour is
+fully specified (the classic `signal` resets the handler on some
+systems and not on others). Servers handle `SIGTERM` for graceful
+shutdown, `SIGHUP` to reload configuration and ignore `SIGPIPE` so a
+closed connection is reported as an error from `write` instead of
+killing the process. Modern Linux programs often turn signals into
+ordinary file descriptor events with `signalfd`, or use the self-pipe
+trick, so they can be handled in the main event loop.
+
+### Check yourself
+
+**Why is the flag declared `volatile sig_atomic_t` rather than `int`?**
+
+<details>
+<summary>Answer</summary>
+
+`volatile` stops the compiler from caching the flag in a register, so
+the loop sees the handler's change; `sig_atomic_t` is a type that can be
+read and written in one indivisible step, so the loop never sees half
+an update.
+
+</details>
+
+**What does the shell's exit status 134 mean?**
+
+<details>
+<summary>Answer</summary>
+
+The program was killed by signal 6, `SIGABRT` (134 is 128 plus 6),
+usually from `abort` or a failed `assert`.
+
+</details>
+
+## B10 Date and Time Functions: time.h
+
+### In one sentence
+
+`time.h` represents time in three ways, processor time as a `clock_t`,
+calendar time as an arithmetic `time_t`, and broken-down time as a
+`struct tm` of fields, and provides functions to get each, convert
+between them, and format them as text.
+
+### The idea
+
+- `clock()` returns processor time used by the program, in units of
+  `CLOCKS_PER_SEC`. It measures CPU work, not elapsed time.
+- `time(NULL)` returns the current calendar time as a `time_t`. The
+  standard does not say what the number means; on POSIX systems it is
+  seconds since 1970-01-01 00:00 UTC.
+- `difftime(t1, t0)` returns the difference in seconds as a `double`,
+  the portable way to subtract two `time_t` values.
+- `struct tm` has `tm_sec`, `tm_min`, `tm_hour`, `tm_mday` (1 to 31),
+  `tm_mon` (**0 to 11**), `tm_year` (**years since 1900**), `tm_wday`,
+  `tm_yday` and `tm_isdst` (positive, zero, or negative for "unknown").
+- `localtime(&t)` and `gmtime(&t)` convert a `time_t` to a `struct tm`
+  in local time or UTC. Both return a pointer to one static structure
+  that the next call overwrites.
+- `mktime(&tm)` converts local broken-down time to a `time_t`, and
+  **normalises** the structure: out-of-range fields are carried into
+  the next ones and `tm_wday` and `tm_yday` are filled in.
+- `strftime(buf, size, format, &tm)` formats a time with conversions
+  such as `%Y`, `%m`, `%d`, `%H`, `%M`, `%A` (weekday name), `%B` (month
+  name) and `%j` (day of the year). `asctime` and `ctime` give a fixed
+  format.
+
+### Worked example
+
+```c
+/* tm.c: broken-down time, mktime normalisation and strftime */
+#include <stdio.h>
+#include <time.h>
+
+int main(void)
+{
+    struct tm t = { 0 };
+    t.tm_year = 2026 - 1900;                 /* years since 1900 */
+    t.tm_mon = 9;                            /* months from 0: October */
+    t.tm_mday = 23; t.tm_hour = 9; t.tm_min = 30;
+    t.tm_isdst = -1;                         /* let mktime work out DST */
+    time_t when = mktime(&t);
+    char buf[64];
+    strftime(buf, sizeof buf, "%A %d %B %Y, %H:%M (day %j)", &t);
+    printf("%s\n", buf);
+    t.tm_mday += 10;                         /* 33 October is not a date... */
+    mktime(&t);                              /* ...so mktime normalises it */
+    strftime(buf, sizeof buf, "%Y-%m-%d is a %a", &t);
+    printf("plus 10 days: %s\n", buf);
+    printf("difftime: %.0f seconds = %.0f days\n", difftime(mktime(&t), when),
+           difftime(mktime(&t), when) / 86400);
+    printf("epoch %lld for the first date\n", (long long)when);
+    return 0;
+}
+```
+
+```text
+$ TZ=UTC ./tm
+Friday 23 October 2026, 09:30 (day 296)
+plus 10 days: 2026-11-02 is a Mon
+difftime: 864000 seconds = 10 days
+epoch 1792747800 for the first date
+```
+
+- The year is stored as 126 and the month as 9; getting either wrong is
+  the most common `struct tm` bug.
+- `mktime` filled in the weekday (Friday) and the day of the year.
+- Adding 10 to `tm_mday` gave the 33rd of October, which `mktime`
+  carried into the 2nd of November, a Monday. This is the portable way
+  to do date arithmetic: change a field, normalise.
+- Ten days is 864,000 seconds here because UTC has no daylight saving
+  change in between.
+
+`mktime` works in **local** time, so the same fields give a different
+`time_t` in another zone:
+
+```text
+$ TZ=Asia/Kolkata ./tm | tail -1
+epoch 1792728000 for the first date
+```
+
+9:30 in India (UTC plus 5:30) happens 19,800 seconds, five and a half
+hours, earlier than 9:30 in UTC.
+
+### Step by step
+
+<Layers caption="The three representations and the functions between them. time and clock read the system; everything else is conversion." layers={[
+  { name: "time_t (calendar time)", note: "from time(NULL); seconds since 1970 on POSIX; subtract with difftime" },
+  { name: "localtime / gmtime down, mktime up", note: "convert between time_t and fields; mktime also normalises" },
+  { name: "struct tm (broken-down time)", note: "year since 1900, month from 0, day, hour, minute, second, weekday, day of year" },
+  { name: "strftime / asctime", note: "format fields as text" },
+  { name: "text", note: "Friday 23 October 2026, 09:30" },
+]} />
+
+<Trace columns={["field", "set to", "after mktime (first call)", "after += 10 and mktime"]} rows={[
+  ["tm_year", "126", "126", "126"],
+  ["tm_mon", "9 (October)", "9", "10 (November)"],
+  ["tm_mday", "23", "23", "33, normalised to 2"],
+  ["tm_wday", "0 (not set)", "5 (Friday)", "1 (Monday)"],
+  ["tm_yday", "0 (not set)", "295 (prints as day 296)", "305"],
+]} />
+
+### Common mistake
+
+Measuring elapsed time with `clock()`. It counts CPU time, so a program
+that sleeps or waits for the network shows almost none. For wall-clock
+intervals use `time` and `difftime` for seconds, or, on POSIX,
+`clock_gettime(CLOCK_MONOTONIC, ...)`, which is unaffected by changes to
+the system clock. The other classic is keeping the pointer from
+`localtime` and calling it again: both pointers now show the second
+time.
+
+### In real systems
+
+Time zones are the hard part, and the library delegates them to the
+operating system's zone database through the `TZ` environment variable.
+Servers usually store and log times in UTC and convert only for
+display. `localtime_r` and `gmtime_r` (POSIX) are the thread-safe forms.
+A 32-bit `time_t` overflows in January 2038; 64-bit Linux has used a
+64-bit `time_t` for years, and 32-bit systems are moving to it.
+
+### Check yourself
+
+**What date does a `struct tm` describe after `mktime` if
+`tm_year` is 100, `tm_mon` is 0 and `tm_mday` is 0?**
+
+<details>
+<summary>Answer</summary>
+
+Day 0 of January 2000 is normalised to the last day of the previous
+month: 31 December 1999.
+
+</details>
+
+**Why is `difftime` used instead of subtracting two `time_t` values?**
+
+<details>
+<summary>Answer</summary>
+
+The standard does not promise that `time_t` counts seconds, or even
+that it is an integer. `difftime` always returns seconds as a `double`.
+(On POSIX, subtraction happens to work.)
+
+</details>
+
+## B11 Implementation-defined Limits: limits.h and float.h
+
+### In one sentence
+
+`limits.h` defines the ranges of the integer types, and `float.h` the
+range, precision and rounding properties of the floating types, so
+that a program can ask the implementation instead of assuming.
+
+### The idea
+
+`limits.h` gives `CHAR_BIT` (bits in a `char`, at least 8), and for
+each integer type its minimum and maximum: `SCHAR_MIN`, `SCHAR_MAX`,
+`UCHAR_MAX`, `CHAR_MIN`, `CHAR_MAX`, `SHRT_MIN`, `SHRT_MAX`, `USHRT_MAX`,
+`INT_MIN`, `INT_MAX`, `UINT_MAX`, `LONG_MIN`, `LONG_MAX` and
+`ULONG_MAX`. The appendix lists the **minimum** magnitudes every
+implementation must reach: an `int` must hold at least -32767 to 32767,
+a `long` at least about plus or minus 2.1 billion. Real machines exceed
+them; the guarantees are what portable code may rely on.
+
+`float.h` describes each floating type with:
+
+- `FLT_RADIX`, the base of the exponent (2 on almost all hardware);
+- `FLT_MANT_DIG` and `DBL_MANT_DIG`, digits in the significand;
+- `FLT_DIG` and `DBL_DIG`, decimal digits that survive a round trip;
+- `FLT_EPSILON` and `DBL_EPSILON`, the gap between 1.0 and the next
+  larger representable number;
+- `FLT_MIN`, `FLT_MAX`, `DBL_MIN`, `DBL_MAX`, the smallest normalised
+  and the largest finite values;
+- the exponent ranges, and `FLT_ROUNDS`, the rounding mode.
+
+### Worked example
+
+```c
+/* lim.c: the limits this implementation documents */
+#include <float.h>
+#include <limits.h>
+#include <stdio.h>
+
+int main(void)
+{
+    printf("CHAR_BIT %d, CHAR_MIN %d, CHAR_MAX %d, UCHAR_MAX %d\n",
+           CHAR_BIT, CHAR_MIN, CHAR_MAX, UCHAR_MAX);
+    printf("SHRT_MAX %d, INT_MAX %d, INT_MIN %d\n", SHRT_MAX, INT_MAX, INT_MIN);
+    printf("LONG_MAX %ld, ULONG_MAX %lu\n", LONG_MAX, ULONG_MAX);
+    printf("FLT_DIG %d, DBL_DIG %d, FLT_MANT_DIG %d, DBL_MANT_DIG %d\n",
+           FLT_DIG, DBL_DIG, FLT_MANT_DIG, DBL_MANT_DIG);
+    printf("FLT_EPSILON %g, DBL_EPSILON %g, DBL_MAX %g, DBL_MIN %g\n",
+           FLT_EPSILON, DBL_EPSILON, DBL_MAX, DBL_MIN);
+    printf("1.0 + DBL_EPSILON / 2 == 1.0? %d\n", 1.0 + DBL_EPSILON / 2 == 1.0);
+    printf("0.1 + 0.2 == 0.3? %d, difference %g\n", 0.1 + 0.2 == 0.3, 0.1 + 0.2 - 0.3);
+    return 0;
+}
+```
+
+```text
+CHAR_BIT 8, CHAR_MIN -128, CHAR_MAX 127, UCHAR_MAX 255
+SHRT_MAX 32767, INT_MAX 2147483647, INT_MIN -2147483648
+LONG_MAX 9223372036854775807, ULONG_MAX 18446744073709551615
+FLT_DIG 6, DBL_DIG 15, FLT_MANT_DIG 24, DBL_MANT_DIG 53
+FLT_EPSILON 1.19209e-07, DBL_EPSILON 2.22045e-16, DBL_MAX 1.79769e+308, DBL_MIN 2.22507e-308
+1.0 + DBL_EPSILON / 2 == 1.0? 1
+0.1 + 0.2 == 0.3? 0, difference 5.55112e-17
+```
+
+`CHAR_MIN` is -128, confirming that plain `char` is signed here.
+`FLT_MANT_DIG` of 24 is why appendix A6's 16777217 could not be stored
+in a `float`. Adding half an epsilon to 1.0 changes nothing, because
+the result rounds back to 1.0. And 0.1, 0.2 and 0.3 all have infinite
+binary expansions, so each is stored slightly wrong and the sum misses
+0.3 by about one part in 10 to the 16th.
+
+### Step by step
+
+<Figure art={`
+   IEEE 754 double (64 bits), the format behind DBL_* on this machine
+
+   bit  63   62 ........... 52   51 ........................................ 0
+       [sign][  exponent: 11 bits ][          fraction: 52 bits (+1 hidden)     ]
+
+   DBL_MANT_DIG = 53   (52 stored + 1 implicit leading bit)
+   DBL_EPSILON  = 2 to the power -52  = 2.22045e-16
+   DBL_DIG      = 15   (decimal digits that always survive text -> double -> text)
+`} caption="Where the float.h numbers come from. Each constant is a property of the binary format: the fraction width gives the precision and epsilon, the exponent width gives the range." />
+
+<Compare left="limits.h guarantee (ANSI minimum)" right="this machine (x86-64 Linux, GCC)" caption="The guarantees are small on purpose, so that C could run on 16-bit machines. Code that needs more should say so with a check or a fixed-width type." rows={[
+  ["CHAR_BIT at least 8", "8"],
+  ["INT_MAX at least 32767", "2147483647"],
+  ["LONG_MAX at least 2147483647", "9223372036854775807"],
+  ["DBL_DIG at least 10", "15"],
+  ["DBL_EPSILON at most 1E-9", "2.22045e-16"],
+]} />
+
+### Common mistake
+
+Comparing floating results for equality, or using `DBL_EPSILON` as a
+fixed tolerance. Epsilon is the gap **at 1.0**; near 1e6 the gap between
+neighbouring doubles is about a million times bigger, so
+`fabs(a - b) < DBL_EPSILON` is effectively `a == b` for large numbers.
+A tolerance relative to the magnitude, such as
+`fabs(a - b) <= 1e-9 * fmax(fabs(a), fabs(b))`, works across scales.
+For integers, the mistake is assuming `int` is 32 bits in code meant to
+be portable; `limits.h` or C99's `stdint.h` makes the assumption
+visible.
+
+### In real systems
+
+C99's `stdint.h` (`int32_t`, `uint64_t`, `SIZE_MAX`) and `inttypes.h`
+(their `printf` formats) are what modern code uses when sizes matter,
+with `limits.h` still the source of truth for the basic types. Money is
+never stored in binary floating point; financial code uses integers of
+the smallest unit, or decimal libraries. Build systems check limits at
+configure time, and code asserts its assumptions with
+`_Static_assert(CHAR_BIT == 8, "8-bit bytes required")`.
+
+### Check yourself
+
+**Is `INT_MAX + 1` equal to `INT_MIN`?**
+
+<details>
+<summary>Answer</summary>
+
+Not in C: signed overflow is undefined. On most machines the wrapped
+value happens to be `INT_MIN`, but the compiler may assume the overflow
+never happens and optimise accordingly.
+
+</details>
+
+**How many significant decimal digits does a `float` reliably hold?**
+
+<details>
+<summary>Answer</summary>
+
+`FLT_DIG`, which is 6 here: any decimal number with 6 significant
+digits survives conversion to `float` and back.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Appendix B, Standard Library">
+<Level name="Beginner" depth={3}>
+
+The beginner's library is small: `printf` and `scanf`, `fopen`,
+`fgets` and `fclose`, `strlen`, `strcmp` and `strcpy`, `malloc` and
+`free`, and `exit`. The single habit that matters most is **checking
+return values**. Almost every function in this appendix reports failure
+through its return: `NULL` from `fopen` and `malloc`, `EOF` from `getc`,
+a short count from `fread` and `scanf`, a negative number from `printf`.
+Code that ignores them works on the happy path and fails confusingly on
+every other.
+
+A beginner's worked example is reading numbers from a file safely,
+combining B1 and B5:
+
+```c
+/* sumfile.c: add up the integers in a file, one per line */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[])
+{
+    FILE *fp = argc > 1 ? fopen(argv[1], "r") : stdin;
+    if (fp == NULL) { perror(argv[1]); return EXIT_FAILURE; }
+    char line[128], *end;
+    long total = 0;
+    for (int n = 1; fgets(line, sizeof line, fp) != NULL; n++) {
+        errno = 0;
+        long v = strtol(line, &end, 10);
+        if (end == line || errno == ERANGE) { fprintf(stderr, "line %d: bad number\n", n); continue; }
+        total += v;
+    }
+    printf("total %ld\n", total);
+    return ferror(fp) ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+```
+
+```text
+$ printf '10\n20\nx\n12\n' | ./sumfile
+line 3: bad number
+total 42
+```
+
+The beginner's mistake is reaching for `gets` or an unbounded `%s`; both
+read past any buffer given long enough input. `fgets` with `sizeof` is
+the safe line reader.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate step is knowing the library's sharp edges by name:
+`strncpy` does not terminate, `strtok` has hidden state, `feof` reports
+the past, `atoi` cannot fail, `realloc` can leak, `localtime` shares one
+buffer, `memcpy` forbids overlap, `ctype.h` needs `unsigned char`. Each
+was designed for a reason, usually speed or simplicity on 1970s
+machines, and each has a safer modern pattern.
+
+An intermediate exercise is to write small, tested wrappers once and
+reuse them: `xmalloc` that exits on failure with a message, `parse_long`
+that does all three `strtol` checks, `copy_string` built on `snprintf`,
+`read_line` that handles lines longer than the buffer. A personal
+`util.c` of a dozen such functions removes most of the library's traps
+from day-to-day code.
+
+The intermediate mistake is mixing the stdio and system call layers on
+one file without flushing (chapter 8), or mixing `scanf` with `fgets` on
+the same stream, where `scanf` leaves the newline that the next `fgets`
+reads as an empty line.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+Advanced use means understanding what the library does underneath:
+`printf` parses its format at run time, so it is slower than writing
+digits by hand in a hot loop; `qsort`'s indirect calls cost more than
+the comparisons; `malloc` takes a lock in multithreaded programs;
+`getc` is a macro over a buffer but becomes a locked function call when
+threads are in use, which is why POSIX added `getc_unlocked`.
+
+It also means variadic and non-local control flow done right: writing
+`printf`-style wrappers with `vfprintf` and the format attribute, using
+`setjmp` and `longjmp` in a library with a clear rule for which
+resources may be held across a jump, and handling signals with a flag
+and `sigaction`.
+
+The advanced practice is reading a real C library's source for the
+functions you use most. musl's code is short and readable; reading its
+`fgets`, `strtol` and `qsort` takes an evening and makes their
+behaviour, and the standard's wording about it, concrete.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases in the library are usually about sizes and ends:
+
+- `fgets` with a line longer than the buffer returns a partial line with
+  no newline; the rest comes on the next call. Check for the `'\n'`.
+- `fread` returning fewer items than asked may mean end of file or an
+  error; `feof` and `ferror` tell which.
+- `snprintf` with size 0 writes nothing and returns the length needed,
+  the standard way to size a buffer before allocating it.
+- `strtol` on "-" or "+" alone converts nothing; on "0x" with base 16 it
+  converts the "0" and stops at the "x".
+- `malloc(0)` may return a null pointer or a unique pointer; both are
+  correct, and neither may be dereferenced.
+- `qsort` with zero elements is fine, and with a comparison that is not
+  consistent (say, one that returns random results) is undefined and
+  can crash some implementations.
+- `mktime` returns `(time_t)-1` for a time it cannot represent, which is
+  also a valid time (one second before 1970) on POSIX. Check `errno` or
+  the normalised fields to be sure.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases come from the library's interaction with the rest of the
+program:
+
+- A `printf` with `%s` and a null pointer is undefined. glibc prints
+  "(null)" in some forms and crashes in others, because GCC turns
+  `printf("%s\n", s)` into `puts(s)` (chapter 7 showed this).
+- `ungetc` guarantees one character of push-back; a second may fail, and
+  a successful one clears the end-of-file indicator.
+- `exit` called from an `atexit` function is undefined.
+- `rand` and `strtok` are not thread-safe; `errno` is, because it is
+  thread-local in every modern library.
+- `tmpnam` returns a name that another process may claim before you
+  create the file, which is why `tmpfile` or POSIX `mkstemp` should be
+  used instead.
+- The `is` functions are locale-sensitive, so `isalpha` on a byte above
+  127 can give different results for the same program run with a
+  different `LANG`.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production the standard library is used with a short list of house
+rules, enforced by review and tooling:
+
+- banned: `gets`, `strcpy`, `strcat`, `sprintf`, `tmpnam`, `atoi` on
+  external input;
+- required: checked `fclose` on files written, `snprintf` with its
+  result compared with the size, full `strtol` checks;
+- reentrant forms: `strtok_r`, `localtime_r`, `rand_r` or a better
+  generator;
+- signals through `sigaction`, with flag-only handlers;
+- `assert` for invariants, never for input.
+
+Static analysers (clang-tidy, Coverity, the GCC analyzer with
+`-fanalyzer`) know most of these rules and catch violations automatically,
+which is the main reason to run them on C code.
+
+The production mistake is trusting a library function's behaviour on
+one platform. `printf("%ld")` with an `int64_t`, `long` being 4 bytes on
+Windows, `char` being unsigned on ARM: the portable answers are in
+`inttypes.h`, `limits.h` and explicit casts.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset this appendix builds is "small, sharp, documented tools".
+Each function does one thing, says exactly what it promises, and trusts
+the caller for everything else. That trust is the reason the library is
+fast and portable, and the reason its misuse is dangerous. Reading a
+function's description fully, including the sentence about what happens
+on error, is part of calling it.
+
+It also teaches that a standard library is a design, not a given. The
+choices here (return values for errors, a global `errno`, caller-owned
+buffers, null-terminated strings) have costs that later languages
+designed around. Knowing why C chose them makes those later designs
+easier to understand.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, appendix B is a lesson in layering. The pure
+headers (`ctype.h`, `string.h`, `math.h`) depend on nothing; `stdio.h`
+and parts of `stdlib.h` sit on the operating system; `signal.h` and
+`time.h` expose operating system concepts in portable form. A good C
+system keeps the same shape: a core of pure, testable functions, and a
+thin layer that talks to the outside world.
+
+The library's error model is also a design choice to copy or avoid
+deliberately. Returning a status and passing results through pointers
+(`strtol`'s end pointer, `frexp`'s exponent) composes well and needs no
+allocation. A global error variable like `errno` is convenient but
+fragile, since any later call may overwrite it. Most well-designed C
+libraries today return an error code from every function and keep error
+state inside a context object the caller owns.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy for this appendix is to learn it in two passes. First,
+learn by heart the dozen functions used every day and their failure
+signals. Second, skim the whole appendix once so that you know what
+exists, then look things up as needed; nobody remembers every `strftime`
+conversion. Keep the programs from this page: they are a quick way to
+recheck behaviour on a new platform.
+
+After this, the natural next steps are POSIX (the system interface of
+chapter 8, greatly extended), C99 and C11's additions to the library,
+and reading one C library's source. Together with appendix A, this
+appendix finishes the book: chapters 1 to 8 teach the language by use,
+and the two appendices are the reference you return to for the rest of
+your time writing C.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Is appendix B a complete specification of the library?** No. The book
+calls it a summary. The standard gives full details, and the system's
+manual pages (`man 3 printf`) are the practical reference.
+
+**Why does my program need `-lm` but not `-lc`?** The C library is
+linked automatically; on Linux the maths functions live in a separate
+library for historical reasons and must be named. Some systems merge
+them.
+
+**Should I ever use `gets`?** No. It cannot be used safely because it
+does not know the buffer's size, and C11 removed it. Use `fgets`.
+
+**Why are some library functions macros?** For speed: `getc`, `putc`
+and the `ctype.h` tests are often macros so that a common call costs no
+function call. The library must also provide a real function, which
+`#undef` or `(getc)(fp)` reaches.
+
+**Is `rand` good enough for games or simulations?** For small games,
+yes. For simulations use a better generator such as a PCG or xoshiro
+implementation; for anything security-related use the operating
+system's source (`getrandom` on Linux).
+
+**What replaced `signal` and `clock` in modern code?** On POSIX,
+`sigaction` and `clock_gettime`. Both are more precisely specified and
+more capable.
+
+**Where are `stdint.h` and `stdbool.h`?** They arrived in C99, after
+the book. They are now universally available and preferable to guessing
+type sizes or defining a boolean by hand.
+
+## Key takeaways
+
+- Every library function reports failure somehow, usually through its return value; check it.
+- Streams are buffered: full for files and pipes, line for terminals, none for `stderr`; `exit` flushes, `abort` and signals do not.
+- `scanf` returns the number of items assigned, and `fgets` with `sizeof` is the safe line reader.
+- `ctype.h` functions take an `unsigned char` value or `EOF`; cast `char` arguments.
+- `strncpy` may not terminate, `strtok` modifies and remembers, `memcpy` forbids overlap; `snprintf` is the safe formatter.
+- `math.h` reports `EDOM` and `ERANGE` through `errno`, which must be zeroed first; link with `-lm`.
+- `strtol` and `strtod` with an end pointer and `errno` give full error checking; `atoi` gives none.
+- `qsort` and `bsearch` comparisons receive pointers to elements and should not subtract.
+- `assert` checks programmer errors and vanishes with `NDEBUG`; keep side effects out of it.
+- Variadic functions must be told their argument count and types, and see only promoted types.
+- `longjmp` abandons frames without cleanup; signal handlers should only set a `volatile sig_atomic_t` flag.
+- `struct tm` counts months from 0 and years from 1900; `mktime` normalises, and works in local time.
+- `limits.h` and `float.h` document the platform; never compare floating results with `==`.
+
+## Glossary
+
+- **Hosted implementation**: a C implementation with the full standard library, running under an operating system.
+- **Stream**: a buffered source or sink of characters, accessed through a `FILE *`.
+- **Text and binary stream**: streams with and without line-end translation; identical on Unix.
+- **Buffering mode**: full, line or none; decides when buffered output is written.
+- **Conversion specification**: a `%` directive in a format string, with flags, width, precision, length and conversion character.
+- **End-of-file and error indicators**: two flags in each stream, read by `feof` and `ferror`.
+- **Push-back**: returning a character to an input stream with `ungetc`.
+- **Locale**: the cultural settings (character classes, decimal point, formats) chosen with `setlocale`.
+- **Domain error**: a maths function argument outside the function's mathematical domain; `errno` becomes `EDOM`.
+- **Range error**: a result too large to represent; `errno` becomes `ERANGE`.
+- **`errno`**: the variable through which library functions report the reason for a failure.
+- **End pointer**: the second argument of `strtol` and `strtod`, set to the first character not converted.
+- **Comparison function**: a function returning negative, zero or positive to order two elements, used by `qsort` and `bsearch`.
+- **Exit status**: the integer a program returns to its environment; 0 or `EXIT_SUCCESS` means success.
+- **`atexit` function**: a function registered to run when the program exits normally.
+- **Assertion**: a run-time check of something the programmer believes is always true.
+- **Variadic function**: a function declared with `...` that takes a variable number of arguments.
+- **Default argument promotions**: `char` and `short` to `int`, `float` to `double`, for arguments matched by `...`.
+- **Non-local jump**: a transfer of control with `longjmp` to a point saved by `setjmp`, across function calls.
+- **Signal**: an asynchronous event delivered to a program, handled by default, ignored or by a function.
+- **Async-signal-safe**: safe to call from a signal handler; very few library functions are.
+- **Calendar time**: a `time_t` value representing a moment.
+- **Broken-down time**: a `struct tm` holding the fields of a date and time.
+- **Normalisation**: `mktime` carrying out-of-range fields into the next ones.
+- **Machine epsilon**: the gap between 1.0 and the next representable floating value.
+- **NaN**: IEEE 754's "not a number", the result of operations like `sqrt(-1)`.
+
+## Exercises and self-check
+
+These are my own exercises. The appendix has none; chapter 7's
+exercises use many of the same functions.
+
+**Warm-up (by hand)**
+
+1. Write what `printf` prints for `"[%6.2f] [%-6d] [%06.1f] [%.0e]"` with
+   3.14159, 42, -2.5 and 12345.0, then check with a program.
+2. Give the return value of `sscanf` and the values stored for
+   `"%d,%d"` on the inputs "1,2", "1 ,2", "1;2" and "".
+3. Predict `strspn`, `strcspn` and `strpbrk` results for three strings
+   of your choice, then check.
+4. Work out by hand which weekday 1 January 2030 is, then let `mktime`
+   tell you.
+
+**Build (write and test)**
+
+5. Write `parse_long(const char *s, long *out)` returning 0 on success
+   and a distinct error code for "no digits", "trailing junk" and "out of
+   range", with a table-driven test.
+6. Write `read_line` that returns a whole line of any length in a
+   `malloc`'d buffer, growing it with `realloc` correctly.
+7. Write a `qsort` comparison that sorts records by two keys (descending
+   score, then ascending name), and test it on ties.
+8. Write a program that installs `SIGINT` and `SIGTERM` handlers, does
+   work in a loop, and on either signal removes a temporary file and
+   exits with a status that says which signal arrived.
+
+**Stretch (change the problem)**
+
+9. Implement `my_printf` supporting `%d`, `%s`, `%c`, `%x` and `%%`,
+   with width, using `stdarg.h` and `putchar` only, and compare its output
+   with `printf` on a hundred generated cases.
+10. Write a date calculator: given two dates, print the days between
+    them and the weekday of each, using only `mktime`, `difftime` and
+    `strftime`, and check it across a daylight saving change by setting
+    `TZ`.
+
+**Self-check**
+
+<details>
+<summary>What does fopen with mode "w" do to an existing file?</summary>
+
+It truncates it to zero length and opens it for writing.
+
+</details>
+
+<details>
+<summary>How do you detect that snprintf truncated its output?</summary>
+
+Its return value, the length the full output would have had, is at
+least the buffer size.
+
+</details>
+
+<details>
+<summary>Why cast to unsigned char before calling isalpha?</summary>
+
+A negative `char` value other than `EOF` is outside the function's
+allowed range, which is undefined behaviour.
+
+</details>
+
+<details>
+<summary>What three checks make strtol strict?</summary>
+
+The end pointer moved, it points at the terminator (or only allowed
+trailing characters), and `errno` is not `ERANGE`.
+
+</details>
+
+<details>
+<summary>What happens to buffered output when assert fails?</summary>
+
+`assert` calls `abort`, which need not flush streams, so it may be lost.
+
+</details>
+
+<details>
+<summary>Which type should va_arg read for a float argument?</summary>
+
+`double`, because `float` is promoted when passed through `...`.
+
+</details>
+
+<details>
+<summary>What may a signal handler safely do in ANSI C?</summary>
+
+Set a `volatile sig_atomic_t` variable, call `signal` for the same
+signal, call `abort` or `_Exit`, and return.
+
+</details>
+
+<details>
+<summary>What is tm_mon for December?</summary>
+
+11, because months count from 0.
+
+</details>
+
+## How I'd study this chapter
+
+This appendix belongs to
+<a href={withBase('/plans/traditional-software-developer/#phase-5--computer-architecture-and-c')}>phase 5</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, as the reference that goes with every C program in
+that phase, and its I/O, signal and time sections lead straight into
+<a href={withBase('/plans/traditional-software-developer/#phase-6--operating-systems')}>phase 6</a>,
+where the system calls underneath them are studied. I give it four
+sessions, then keep it open while writing C.
+
+<Timeline caption="Four sessions for appendix B, each ending with the programs from this page rebuilt from memory and a couple of the exercises done." items={[
+  { when: "Session 1", what: "B1. Write seek.c, fmt.c, scan.c and buf.c. Then the warm-up exercises 1 and 2, and read_line (exercise 6)." },
+  { when: "Session 2", what: "B2 to B4. Write ctype.c, str.c and m.c. Write copy_string on snprintf and test it against strncpy's behaviour at every length." },
+  { when: "Session 3", what: "B5 and B6. Write conv.c, sortf.c, util.c and asrt.c, then parse_long (exercise 5) and the two-key sort (exercise 7)." },
+  { when: "Session 4", what: "B7 to B11. Write va.c, jmp.c, sig.c, tm.c and lim.c, then the signal exercise (8) and the date calculator (10)." },
+]} />
+
+Everything goes into `kr-appB/`, built with
+`-std=c11 -Wall -Wextra -fsanitize=address,undefined -g`, and the helper
+functions from the exercises go into one `util.c` that I keep using.
+
+Done when I can say, for any function on this page, how it reports
+failure and what its most common misuse is, and when every program
+here runs clean under the sanitizers with the output shown.
