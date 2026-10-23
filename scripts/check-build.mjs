@@ -125,12 +125,56 @@ for (const file of htmlFiles) {
     }
   });
   const isBookPage = /^books\/[^/]+\/index\.html$/.test(rel);
-  if (isBookPage) {
-    if (blocks.length === 0) note(`${rel}: a book page with no level progression`);
+  const isChapterPage = /^books\/[^/]+\/[^/]+\/index\.html$/.test(rel);
+  if (isBookPage || isChapterPage) {
+    // A book page with chapter pages is the overview and the contents: the
+    // levels live on the chapters. Without them, it carries the levels.
+    const hasChapterList = html.includes('data-chapter-list');
+    if (isBookPage && blocks.length === 0 && !hasChapterList) {
+      note(`${rel}: a book page with no level progression and no chapter pages`);
+    }
     const ids = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
     for (const m of html.matchAll(/href="#([^"]+)"/g)) {
       if (!ids.has(decodeURIComponent(m[1]))) note(`${rel}: link "#${m[1]}" has no heading on the page`);
     }
+  }
+  if (isChapterPage) checkChapterPage(rel, html, blocks.length);
+}
+
+// One chapter page (docs/CHAPTER_PAGE_GUIDE.md). A chapter is written like
+// a textbook chapter, so the check holds it to the guide's floor: the nine
+// levels, at least three diagrams, the two closing sections, and at least
+// CHAPTER_MIN_WORDS words of the chapter itself.
+function checkChapterPage(rel, html, levelBlocks) {
+  const CHAPTER_MIN_WORDS = 3000;
+  const CHAPTER_MIN_DIAGRAMS = 3;
+  if (levelBlocks === 0) note(`${rel}: a chapter page with no nine-level progression`);
+  const start = html.indexOf('data-chapter-body');
+  const end = html.indexOf('class="note-end"', start);
+  if (start === -1 || end === -1) {
+    note(`${rel}: the chapter body could not be found`);
+    return;
+  }
+  const body = html.slice(start, end);
+  const diagrams = body.match(/<figure class="dia /g)?.length ?? 0;
+  if (diagrams < CHAPTER_MIN_DIAGRAMS) {
+    note(`${rel}: ${diagrams} diagram(s), a chapter page needs at least ${CHAPTER_MIN_DIAGRAMS}`);
+  }
+  const h2s = [...body.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/g)].map((m) => m[1].replace(/<[^>]+>/g, '').trim().toLowerCase());
+  if (!h2s.some((text) => text.startsWith('exercises'))) {
+    note(`${rel}: no "Exercises and self-check" section`);
+  }
+  if (!h2s.some((text) => text.startsWith('how i') && text.includes('study'))) {
+    note(`${rel}: no "How I'd study this chapter" section`);
+  }
+  const words = body
+    .replace(/<ol class="level-ladder"[\s\S]*?<\/ol>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .split(/\s+/)
+    .filter((word) => /[A-Za-z0-9]/.test(word)).length;
+  if (words < CHAPTER_MIN_WORDS) {
+    note(`${rel}: ${words} words, a chapter page needs at least ${CHAPTER_MIN_WORDS}`);
   }
 }
 
