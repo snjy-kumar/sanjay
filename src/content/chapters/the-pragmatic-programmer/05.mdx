@@ -1,0 +1,1337 @@
+---
+book: the-pragmatic-programmer
+number: 5
+title: "Bend, or Break"
+description: "Decoupling, handling events, transforming data through pipelines, avoiding the inheritance tax and moving configuration out of code: how to keep software flexible enough to change."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Software that cannot bend will break, because requirements, platforms and
+people keep changing. This chapter is about code that bends: pieces that
+know little about each other, logic that reacts to events, programs shaped
+as transformations of data, sharing without inheritance, and behaviour
+that can change without a rebuild.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- spot coupling such as train wrecks and globals, and reduce it with tell, don't ask;
+- model event-driven behaviour with state machines, observers, publish/subscribe and streams;
+- write a program as a pipeline of small transformations, and handle errors inside it;
+- choose interfaces, delegation or mixins over inheritance, and explain why;
+- move configuration out of code and validate it at startup.
+
+What I should already know: objects, functions, arrays and their `map` and
+`filter` methods. The
+<a href={withBase('/books/the-pragmatic-programmer/04-pragmatic-paranoia/')}>previous chapter</a>
+was about detecting wrong state; this one is about keeping code easy to
+change once I have found what to change.
+
+Reading time: about 70 minutes for this page, plus two to three hours for
+the exercises.
+
+## Chapter map
+
+<Flow caption="The chapter's five topics as one argument about change. Read left to right: each topic removes a different reason code is hard to change." steps={[
+  "28. Decouple the pieces",
+  "29. React to events",
+  "30. Transform data",
+  "31. Avoid inheritance tax",
+  "32. Move config out",
+]} />
+
+Decoupling is the core idea; every later topic is a way to get it. Events
+decouple in time, transformations decouple data from the code that
+processes it, interfaces decouple types, and configuration decouples
+behaviour from the build.
+
+## Topic 28. Decoupling
+
+### In one sentence
+
+Coupled code is code where changing one piece forces changes in others,
+so the aim is pieces that know as little about each other as possible.
+
+### The idea
+
+#### What coupling is
+
+Two pieces of code are coupled when a change in one requires a change in
+the other. Some coupling is necessary, since code that cooperates must
+share something. The problem is accidental coupling: knowledge one piece
+has about another's insides that it did not need.
+
+The book uses the image of a bridge. A rigid structure is strong until the
+load changes, then it cracks.
+
+A good bridge has joints that let parts move
+a little. Code with joints, places where one side can change without the
+other noticing, survives change. That links back to the tip in chapter 2
+that good design is easier to change than bad design.
+
+The book lists symptoms of coupling: unrelated modules that must change
+together; a simple change rippling through many files; developers afraid
+to change code because they cannot tell what will break; meetings where
+everyone must attend because everyone is affected.
+
+#### Train wrecks
+
+A train wreck is a chain of calls like
+`order.customer.discounts[0].percent`, each car connected to the next. The
+caller now knows that an order has a customer, that a customer has a list
+of discounts, and what a discount looks like. If any of those change, the
+caller breaks, and so does every other caller written the same way.
+
+The book's fix is a tip: tell, don't ask. Instead of asking an object for
+its internals and making a decision, tell it what I want and let it decide.
+"Apply the best discount to this order" is a request; the knowledge of how
+discounts are stored stays in one place.
+
+The book also mentions the Law of Demeter, an older rule of thumb that a
+method should only call methods on itself, its arguments, objects it
+creates, and its direct fields. The book softens it into "don't chain
+method calls", with an exception for things that are very unlikely to
+change, such as the standard library, and for pipelines of transformations,
+which are chains of a different kind.
+
+#### Globals
+
+Global data is coupling in its purest form: every piece of code that reads
+or writes it is connected to every other. The book counts singletons,
+module-level mutable variables and even shared external resources such as a
+database or a file as globals in this sense. The tip is to avoid global
+data, and if something has to be global, wrap it in an API so the access
+is controlled and changeable.
+
+#### Inheritance as coupling
+
+The book flags inheritance here too: a subclass is coupled to its parent's
+implementation. Topic 31 covers this in depth.
+
+#### Coupling and testing
+
+Coupling shows up first in tests. A function that reads a global clock, a
+global database connection and a global logger cannot be tested without
+setting up all three. A function that receives them as parameters can be
+tested with simple fakes. When a test needs a long setup before it can
+check one line, the setup is a list of the things the code is coupled to.
+
+That gives a practical rule. If something is hard to test, I look at what
+it reaches for, and pass those things in instead. The code gets easier to
+test and easier to change at the same time, because both depend on the
+same property: knowing less about the rest of the system.
+
+#### Coupling in time and in knowledge
+
+There are several kinds of coupling worth naming. Structural coupling is
+knowing another object's shape, as in a train wreck.
+
+Temporal coupling is
+depending on things happening in a particular order, covered in chapter 6.
+Knowledge coupling is two places encoding the same rule, which is the DRY
+problem from chapter 2. Each has the same symptom, a change in one place
+breaking another, and the same cure, giving each piece of knowledge one
+owner.
+
+### Worked example
+
+**Simple.** Computing a discounted total, once as a train wreck and once as
+a request:
+
+```ts
+// Train wreck versus tell-don't-ask.
+type Order = { customer: { discounts: { percent: number }[] }; total: number };
+const order: Order = { customer: { discounts: [{ percent: 10 }, { percent: 5 }] }, total: 200 };
+
+// Caller reaches through three objects and knows the discount rules.
+const best = Math.max(...order.customer.discounts.map(d => d.percent));
+const wreck = order.total - (order.total * best) / 100;
+
+// Caller tells the order what it wants; the rule lives in one place.
+function applyBestDiscount(o: Order): number {
+  const pct = Math.max(0, ...o.customer.discounts.map(d => d.percent));
+  return o.total - (o.total * pct) / 100;
+}
+console.log('train wreck:', wreck, '| tell:', applyBestDiscount(order));
+console.log('no discounts:', applyBestDiscount({ customer: { discounts: [] }, total: 200 }));
+console.log('wreck with no discounts:', Math.max(...[]));
+```
+
+The output:
+
+```text
+train wreck: 180 | tell: 180
+no discounts: 200
+wreck with no discounts: -Infinity
+```
+
+Both give 180 for the normal case. The last line shows the train-wreck
+logic hiding a bug: with no discounts, `Math.max` of nothing is negative
+infinity, and the total becomes infinite. The function version fixed it
+once, by including 0. With the logic copied into ten callers, the fix
+would need ten changes, and one would be missed.
+
+**Realistic.** A checkout page reads `user.subscription.plan.limits.maxItems`
+in four components. The product team renames plans and moves limits to a
+separate service. Every component breaks. With a single function
+`canAddItem(user, cart)` owned by the subscription module, the change is
+made in one file and the components never notice.
+
+### Step by step
+
+<Figure caption="A train wreck and its fix. Look at the arrows: on the left the caller reaches into three objects; on the right it talks to one." art={`
+  TRAIN WRECK                         TELL, DON'T ASK
+
+  caller --> order                    caller --> order.applyBestDiscount()
+         --> order.customer                         |
+         --> customer.discounts                     +--> customer
+         --> discount.percent                            (knows its discounts)
+
+  caller knows 4 shapes               caller knows 1 request
+`} />
+
+<Compare left="Coupled" right="Decoupled" caption="The same knowledge, placed in two ways. Look at the last row: the cost of change is what coupling really measures." rows={[
+  ["Callers walk object chains", "Callers ask for an outcome"],
+  ["Rules copied into every caller", "Rule written once, next to its data"],
+  ["Mutable globals read everywhere", "State passed in or behind an API"],
+  ["One change touches many files", "One change touches one module"],
+]} />
+
+1. **Look for chains of dots** across different kinds of object.
+2. **Ask what decision the caller is making** with the data.
+3. **Move that decision to the object that owns the data**, as a method or
+   function with a request-shaped name.
+4. **Look for global state**, and pass it in or wrap it behind an API.
+5. **Check that a likely change now touches one place.**
+
+### Common mistake
+
+The common mistake is hiding a train wreck behind getters:
+`order.getCustomer().getDiscounts().get(0)` is still a train wreck. The
+fix is not more accessors but a different question: what does the caller
+want, and who should know how to provide it?
+
+The opposite mistake is wrapping everything in pass-through methods, so the
+`Order` class grows dozens of methods that just forward to `Customer`. The
+fix is judgement: wrap decisions, not every field.
+
+### In real systems
+
+At system scale, coupling shows up as services that must deploy together,
+a shared database many services write to, and APIs that expose internal
+tables. Decoupling there means each service owns its data, others ask for
+outcomes through an API or events, and contracts are versioned.
+
+### Check yourself
+
+**What does "tell, don't ask" mean?**
+
+<details>
+<summary>Answer</summary>
+
+Instead of asking an object for its internal data and deciding for it,
+tell it what I want done and let it decide using what it knows.
+
+</details>
+
+**Why does the book count a shared database as global data?**
+
+<details>
+<summary>Answer</summary>
+
+Every piece of code that reads or writes it is coupled to every other one,
+just like a global variable, so a change to its shape can break them all.
+
+</details>
+
+## Topic 29. Juggling the Real World
+
+### In one sentence
+
+Real applications respond to events, so the book offers four ways to
+structure event-driven code: finite state machines, the observer pattern,
+publish/subscribe, and reactive streams.
+
+### The idea
+
+#### Events
+
+An **event** is a piece of information arriving: a click, a timer firing,
+a message from another service, a file appearing, a sensor reading.
+Applications that respond to events, rather than following one fixed path,
+are more responsive and fit the world better. The challenge is organising
+the code so that many events arriving in any order do not turn it into a
+tangle.
+
+#### Strategy 1: finite state machines
+
+A **finite state machine** has a fixed set of states and a table that says,
+for each state and event, which state comes next and what to do. The book
+finds them underused: many pieces of logic full of flags such as
+`isLoading` and `hasError` are really a state machine written badly. With
+an explicit table, impossible combinations cannot happen, and unexpected
+events are visible.
+
+The book extends the idea with actions on transitions, such as starting a
+request when entering "loading", and with machines that run in response to
+a stream of events like characters from a parser.
+
+#### Strategy 2: the observer pattern
+
+In the **observer pattern**, a source of events keeps a list of interested
+functions, called observers, and calls each one when an event happens. It
+decouples the source from what reacts to it. The book notes two problems:
+the source calls observers directly, so a slow observer slows the source,
+and the source holds references to observers, which can keep them alive
+and leak memory if they never unsubscribe.
+
+#### Strategy 3: publish/subscribe
+
+**Publish/subscribe** generalises the observer by putting a channel between
+publishers and subscribers. Publishers send to a named channel; subscribers
+register with the channel. Neither knows the other exists, and the channel
+can be in-process or a separate system such as a message broker. The cost
+is that it can be hard to see the whole flow, since nothing in the
+publisher's code says who listens.
+
+#### Strategy 4: reactive streams
+
+**Reactive streams** treat events as a collection that arrives over time.
+Like an array, a stream can be mapped, filtered and combined, but each
+element arrives when the event happens. Libraries such as RxJS offer this
+in JavaScript. The book shows that the same code can then handle events
+from a user, a timer and a network request in one uniform way, with
+operations such as merging and throttling built in.
+
+#### Choosing a strategy
+
+The four strategies solve different problems, and real applications mix
+them. A state machine fits when the response to an event depends on what
+happened before, such as a checkout flow or a network connection.
+
+An
+observer fits when one object's change should notify a few others in the
+same process, such as a model updating several views. Publish/subscribe
+fits when producers and consumers should not know each other or live in
+different processes. Streams fit when events need combining, filtering,
+throttling or timing logic, such as search-as-you-type.
+
+A useful way to choose is to ask what is hard about the events. If it is
+order and history, use a state machine. If it is who needs to know, use
+observers or pub/sub. If it is timing and combination, use streams.
+
+#### Streams in practice
+
+Search-as-you-type is the classic stream example. Each keystroke is an
+event.
+
+The stream is debounced, so nothing happens until typing pauses for
+a few hundred milliseconds; filtered, so queries shorter than two
+characters are dropped; and switched, so when a new query starts, the
+response to the old one is ignored. Written by hand with timers and flags
+this is a notorious source of bugs, such as results for an old query
+arriving last and overwriting newer ones. Written as a stream, each rule is
+one operator in a chain.
+
+### Worked example
+
+**Simple.** A data-loading component as a state machine, driven by a
+sequence of events that includes one that makes no sense:
+
+```ts
+// A finite state machine as a transition table.
+type State = 'idle' | 'loading' | 'ready' | 'error';
+type Event = 'fetch' | 'ok' | 'fail' | 'reset';
+const table: Record<State, Partial<Record<Event, State>>> = {
+  idle: { fetch: 'loading' },
+  loading: { ok: 'ready', fail: 'error' },
+  ready: { fetch: 'loading', reset: 'idle' },
+  error: { fetch: 'loading', reset: 'idle' },
+};
+let s: State = 'idle';
+for (const e of ['fetch', 'ok', 'ok', 'fetch', 'fail', 'reset'] as Event[]) {
+  const next = table[s][e];
+  console.log(`${s.padEnd(7)} --${e.padEnd(5)}--> ${next ?? s + ' (ignored)'}`);
+  if (next) s = next;
+}
+```
+
+The output:
+
+```text
+idle    --fetch--> loading
+loading --ok   --> ready
+ready   --ok   --> ready (ignored)
+ready   --fetch--> loading
+loading --fail --> error
+error   --reset--> idle
+```
+
+The second "ok" arrives when nothing is loading, perhaps from a stale
+request. With boolean flags it might flip `isLoading` off again or show
+stale data. With the table, it is visibly ignored, and I could choose to
+log it.
+
+**Second simple example.** An observer bus where two parts of the system
+react to an order without the order code knowing about either:
+
+```ts
+// Observer / pub-sub: producers do not know their consumers.
+type Handler<T> = (payload: T) => void;
+class Bus<T> {
+  private subs = new Set<Handler<T>>();
+  on(h: Handler<T>) { this.subs.add(h); return () => this.subs.delete(h); }
+  emit(p: T) { for (const h of this.subs) h(p); }
+}
+const orders = new Bus<{ id: number; total: number }>();
+const offEmail = orders.on(o => console.log(`email: receipt for #${o.id}`));
+orders.on(o => console.log(`stock: reserve items for #${o.id}`));
+orders.emit({ id: 1, total: 250 });
+offEmail();
+orders.emit({ id: 2, total: 90 });
+```
+
+The output:
+
+```text
+email: receipt for #1
+stock: reserve items for #1
+stock: reserve items for #2
+```
+
+`on` returns an unsubscribe function, and calling it stops the email
+handler, so order 2 gets no receipt. Forgetting to unsubscribe is the
+memory leak the book warns about.
+
+**Realistic.** An e-commerce system publishes an "order placed" event to a
+message broker. The email service, the warehouse service and the analytics
+service each subscribe. Adding a fraud-check service later means adding a
+subscriber, with no change to the order service. The trade-off appears in
+debugging: to understand what happens when an order is placed, I need a
+map of subscribers, which the code alone no longer shows.
+
+The state machine also documents the component. A new teammate can read
+the transition table and know every situation the loader can be in and how
+it moves between them, without reading the rendering code. And testing is
+direct: for each state and event pair, assert the next state, which is a
+small table-driven test.
+
+### Step by step
+
+<Figure caption="The loading state machine. Look at the ready state: a stray ok event has no arrow out of it, so the machine stays put." art={`
+             fetch                ok
+   +------+ ------> +---------+ ------> +-------+
+   | idle |         | loading |         | ready |
+   +------+ <-+     +---------+         +-------+
+      ^       |        |    ^              |  |
+      |       | reset  | fail  \\ fetch     |  | reset
+      |       |        v      \\-----------+  |
+      |       |     +-------+                 |
+      |       +---- | error |                 |
+      |             +-------+                 |
+      +---------------------------------------+
+`} />
+
+<Compare left="Observer" right="Publish/subscribe" caption="Two ways to deliver events. Look at the first row: the difference is whether the source knows who is listening." rows={[
+  ["Source holds a list of observers", "Channel sits between publisher and subscriber"],
+  ["Calls observers directly, in process", "Can be in process or across a network"],
+  ["Slow observer slows the source", "Broker can buffer and deliver asynchronously"],
+  ["Easy to trace in code", "Needs a map of subscribers to trace"],
+]} />
+
+1. **List the events** the code must handle.
+2. **If behaviour depends on what happened before, draw the states** and
+   write the transition table.
+3. **If several parts react to one event**, use an observer in process or
+   pub/sub across processes.
+4. **If events form a stream to combine or throttle**, use a stream
+   library.
+5. **Make unsubscribing and unexpected events explicit.**
+
+### Common mistake
+
+The common mistake is a state machine hidden in flags: `isLoading`,
+`hasData` and `hasError` give eight combinations, of which four are
+nonsense, such as loading and error at once. The fix is one `state`
+variable with a fixed set of values and a transition function.
+
+A second mistake is subscribing in a component or object and never
+unsubscribing. The fix is to keep the unsubscribe function and call it in
+teardown, every time.
+
+### In real systems
+
+User interfaces are full of state machines, from forms to video players;
+libraries such as XState make them explicit. Kafka, RabbitMQ and cloud
+queues provide pub/sub across services. Reactive streams underlie many UI
+frameworks' handling of input, and the same ideas power stream processing
+systems for analytics.
+
+### Check yourself
+
+**What is the advantage of a state machine over several boolean flags?**
+
+<details>
+<summary>Answer</summary>
+
+Only valid states exist, transitions are explicit in one table, and an
+event that makes no sense in the current state is visibly ignored or
+reported instead of corrupting the flags.
+
+</details>
+
+**What leak does the observer pattern risk?**
+
+<details>
+<summary>Answer</summary>
+
+The source keeps references to observers, so an observer that never
+unsubscribes stays in memory and keeps receiving events.
+
+</details>
+
+## Topic 30. Transforming Programming
+
+### In one sentence
+
+All programs transform data, so designing a program as a pipeline of
+small transformations from input to output makes it simpler to write,
+test and change.
+
+### The idea
+
+#### Programs as transformations
+
+The book asks me to look at a program the way a Unix user looks at a shell
+pipeline: data comes in, goes through a series of steps, and comes out
+changed. Objects and classes are a way to organise code, but the thing the
+program exists to do is transform data. Its tip: programming is about code,
+but programs are about data.
+
+Thinking this way changes the design question from "what classes do I
+need" to "what does the data look like at each stage, and what small step
+turns one stage into the next". Each step is a function that takes data and
+returns new data, without hidden state.
+
+#### Finding the transformations
+
+The book's method is to start from the requirement as a top-level
+transformation, input to output, and break it into steps until each one is
+obvious. Its example finds words in a set of letters, built as a pipeline:
+take the letters, make all combinations, look each one up in a dictionary,
+group the results. Each step can be written and tested alone.
+
+#### Pipelines in code
+
+Some languages have a pipe operator that passes the result of one function
+into the next, written `|>` in Elixir and F#. JavaScript does not have one
+yet, but array methods chained with dots read the same way, and a small
+`pipe` helper composes plain functions. The book notes that this kind of
+chain is not a train wreck: each step returns new data rather than reaching
+into objects.
+
+#### Errors in a pipeline
+
+A step can fail. The book describes two approaches.
+
+One is to make each
+step return either a value or an error, and have the pipeline skip the
+remaining steps once an error appears; in typed languages this is often a
+`Result` or `Either` type. The other is to keep invalid items out of the
+stream early, filtering them so later steps only see good data. Either way,
+error handling becomes part of the pipeline's design instead of scattered
+`try` blocks.
+
+#### Don't hoard state, pass it around
+
+The book's last point is about state. In an object-oriented design, data is
+hidden inside objects and changed in place.
+
+In a transformation design,
+data flows through functions and each produces a new version. The tip is
+don't hoard state, pass it around. Data that is passed explicitly is easy
+to inspect, log and test at every step.
+
+#### What a result type looks like
+
+A result type is a small union: either a success carrying a value, or a
+failure carrying an error. Each step in the pipeline takes a result. If it
+is a failure, the step passes it on untouched; if it is a success, the step
+does its work and returns a new result. At the end, one place decides what
+to do with a failure, such as logging it or showing a message.
+
+The book shows this with a helper that wraps each step so the "pass
+failures through" logic is written once. In TypeScript the union is a type
+like an object with `ok: true` and a value, or `ok: false` and an error, and
+the compiler forces each consumer to check which one it has. The pipeline
+then reads as the happy path, with the error path handled by the
+structure rather than by `try` blocks in every step.
+
+### Worked example
+
+**Simple.** Turning raw score lines into a sorted list of passing names:
+
+```ts
+// Transforming programming: a pipeline of small functions over data.
+const lines = ['alice,42', 'bob,x', 'carol,17', '', 'dave,99'];
+type Row = { name: string; score: number };
+const parse = (l: string): Row | null => {
+  const [name, raw] = l.split(','); const score = Number(raw);
+  return name && Number.isFinite(score) ? { name, score } : null;
+};
+const result = lines
+  .map(parse)
+  .filter((r): r is Row => r !== null)
+  .filter(r => r.score >= 20)
+  .sort((a, b) => b.score - a.score)
+  .map(r => `${r.name}: ${r.score}`);
+console.log(result);
+```
+
+The output:
+
+```text
+[ 'dave: 99', 'alice: 42' ]
+```
+
+"bob,x" and the empty line fail to parse and are filtered out early, so
+later steps only see valid rows. Carol is dropped by the threshold. Each
+step can be tested alone: `parse('bob,x')` returns null.
+
+**Realistic.** A nightly job builds an invoice for each customer. As a
+pipeline: load usage events for the month, group by customer, price each
+group with the current plan, apply credits, render a PDF, send. Each stage
+writes its output to a file or table. When an invoice is wrong, I can look
+at the data after each stage and find the step that changed it wrongly,
+instead of stepping through one large method.
+
+A second realistic example comes from the front end. A dashboard receives
+raw metrics from an API and must show a chart.
+
+As one function it would
+fetch, parse dates, fill missing days with zero, group by week, compute
+averages and format labels, all mixed together. As a pipeline, each of
+those is a function with an input and output I can print. When the chart
+shows a dip that should not be there, I check the output of "fill missing
+days" and find that a time zone shift moved one day's data into the next,
+without stepping through anything else.
+
+Pipelines also make reuse natural. The same "parse dates" and "fill
+missing days" steps serve a second chart and a CSV export, because each
+step depends only on its input, not on the chart that first needed it.
+
+### Step by step
+
+<Trace columns={["Stage", "Data after the stage"]} rows={[
+  ["input", "alice,42 / bob,x / carol,17 / (empty) / dave,99"],
+  ["map(parse)", "alice 42 / null / carol 17 / null / dave 99"],
+  ["filter(not null)", "alice 42 / carol 17 / dave 99"],
+  ["filter(score at least 20)", "alice 42 / dave 99"],
+  ["sort by score, high first", "dave 99 / alice 42"],
+  ["map(format)", "dave: 99 / alice: 42"],
+]} caption="The score pipeline, one row per stage. Look at the second and third rows: bad input becomes null and is removed before any business rule runs." />
+
+1. **Write the whole job as input to output** in one sentence.
+2. **Describe the data at each intermediate stage.**
+3. **Write one small function per step**, each returning new data.
+4. **Decide how errors flow**: filter early, or carry a result type.
+5. **Test each step alone**, then the whole pipeline on a sample.
+
+### Common mistake
+
+The common mistake is one large loop that parses, validates, filters,
+transforms and formats in one body, with flags to remember what happened.
+It works, but no part can be tested or reused alone. The fix is to split
+the loop into named steps.
+
+A second mistake is a step that mutates its input, such as calling
+`sort` on an array another step still uses. In JavaScript, `sort` sorts in
+place, so in a shared pipeline I copy first or use `toSorted`.
+
+### In real systems
+
+Data engineering is built on this idea: extract, transform, load jobs;
+stream processors; and build tools that run a chain of transforms over
+source files. Web frameworks treat a request as passing through a pipeline
+of middleware. Compilers are pipelines from text to tokens to syntax tree
+to output.
+
+### Check yourself
+
+**Why is a chain of array methods not a train wreck?**
+
+<details>
+<summary>Answer</summary>
+
+Each step returns new data rather than reaching through objects to their
+internals, so the caller does not depend on any object's structure.
+
+</details>
+
+**What are the two ways to handle errors in a pipeline?**
+
+<details>
+<summary>Answer</summary>
+
+Carry a value-or-error result through every step, skipping work after an
+error, or filter invalid items out early so later steps see only good data.
+
+</details>
+
+## Topic 31. Inheritance Tax
+
+### In one sentence
+
+Inheritance couples a subclass to its parent's implementation, so for
+sharing behaviour or expressing types I prefer interfaces, delegation and
+mixins.
+
+### The idea
+
+#### Why people use inheritance
+
+The book traces inheritance to two motives. One is sharing code: put
+common behaviour in a parent class and let children reuse it. The other is
+building types: a `Car` is a kind of `Vehicle`, so it should be usable
+wherever a vehicle is. Both are reasonable goals; the book argues that
+inheritance is a poor tool for both.
+
+#### The tax
+
+When a class inherits for code sharing, it is coupled to the parent's
+implementation, not just its interface. A change in the parent, such as a
+new method or a different internal call order, can break children in ways
+nobody intended. The child also inherits everything, including methods it
+should not expose. If `Account` extends a persistence class to reuse its
+`save`, then `Account` also exposes `delete` and `clear` to every caller.
+
+For types, the trouble is that real categories rarely form a clean tree. A
+class hierarchy that seemed obvious at the start grows exceptions, and
+multiple inheritance, where languages allow it, makes the coupling worse.
+
+#### The alternatives
+
+The book offers three alternatives, with the tip that the inheritance tax
+is rarely worth paying.
+
+**Interfaces and protocols** declare what a type can do without saying how.
+A function that needs something it can save to accepts any value with a
+`save` method. Classes implement the interface independently. The tip:
+prefer interfaces to express polymorphism.
+
+**Delegation** means a class has an instance of another and calls it, rather
+than being one. `Account` has a `Store` and uses its `save`; it exposes only
+the operations that make sense for an account. The tip: delegate to
+services, has-a trumps is-a.
+
+**Mixins and traits** add a set of functions to a class or object without a
+parent-child relationship. The book's example uses them to add validation
+behaviour to several unrelated classes. The tip: use mixins to share
+functionality.
+
+#### Mixins in JavaScript
+
+JavaScript makes mixins easy because objects are open. A mixin can be a
+plain object of functions copied onto a class's prototype, or a function
+that takes a class and returns a subclass with extra methods. The book's
+example adds validation helpers to several model classes this way: each
+model gets the same `validate` behaviour without sharing a parent.
+
+Mixins have their own risks. Two mixins can define the same method name,
+and the last one wins silently. So I keep mixins small and focused, name
+their methods clearly, and prefer plain helper functions when the
+behaviour does not need access to the object's private state.
+
+### Worked example
+
+**Simple.** An account that delegates storage through an interface:
+
+```ts
+// Inheritance tax versus delegation through an interface.
+interface Store { save(key: string, value: string): void; get(key: string): string | undefined }
+class MemoryStore implements Store {
+  private m = new Map<string, string>();
+  save(k: string, v: string) { this.m.set(k, v); }
+  get(k: string) { return this.m.get(k); }
+  clear() { this.m.clear(); } // extra power a subclass would inherit
+}
+class Account {                       // has-a Store, not is-a Store
+  private store: Store;
+  constructor(store: Store) { this.store = store; }
+  rename(id: string, name: string) { if (!name.trim()) throw new Error('name required'); this.store.save(id, name); }
+  name(id: string) { return this.store.get(id); }
+}
+const acct = new Account(new MemoryStore());
+acct.rename('u1', 'Asha');
+console.log(acct.name('u1'), '| has clear()?', 'clear' in acct);
+```
+
+The output:
+
+```text
+Asha | has clear()? false
+```
+
+Had `Account` extended `MemoryStore`, every caller could call
+`acct.clear()` and wipe all accounts. With delegation, `Account` exposes
+only `rename` and `name`, and any `Store`, such as a database-backed one,
+can be swapped in for production or a fake for tests.
+
+**Realistic.** A UI library has a `BaseComponent` class with lifecycle
+hooks, and every component extends it. Over years, the base grows to
+thousands of lines. A change to how it schedules rendering breaks a
+handful of components that overrode one hook in an unusual way. Modern UI
+libraries moved to functions plus composable hooks, which is delegation and
+mixins in another form, partly to escape this tax.
+
+The test benefit is just as concrete. With delegation, a unit test for
+`Account` passes a tiny fake store, a map in memory, and checks that
+`rename` rejects an empty name and saves a valid one. No database, no
+setup, no inherited behaviour to reason about. If `Account` had inherited
+from a database-backed store, the same test would need a database or a
+mocking framework that patches the parent class, both of which make tests
+slower and more fragile.
+
+### Step by step
+
+<Layers caption="A deep inheritance chain. Look at the bottom layer: it depends on the implementation of every layer above it, not just their interfaces." layers={[
+  "BaseModel: save, delete, clear, validate",
+  "TimestampedModel: adds createdAt, overrides save",
+  "UserModel: adds email, overrides validate",
+  "AdminUser: overrides delete, inherits clear it should not have",
+]} />
+
+<Compare left="Inheritance" right="Interface plus delegation" caption="Two ways to give Account storage. Look at the second row: the alternative exposes only what an account should do." rows={[
+  ["Account is a Store", "Account has a Store"],
+  ["Inherits every Store method, including clear", "Exposes only rename and name"],
+  ["Coupled to Store's implementation", "Coupled only to the Store interface"],
+  ["Hard to test without a real store", "Pass a fake Store in tests"],
+]} />
+
+1. **Ask why I want inheritance.** Sharing code, or expressing a type?
+2. **For a type**, define an interface and implement it.
+3. **For sharing code**, hold an instance and delegate, or use a mixin or a
+   plain function.
+4. **Expose only the operations that make sense** for the new class.
+5. **Keep inheritance for small, stable hierarchies**, such as framework
+   extension points designed for it.
+
+### Common mistake
+
+The common mistake is inheriting from a utility class to reuse one method,
+such as a `Report` that extends `CsvWriter`. Now every report is a CSV
+writer, forever. The fix is to have a `CsvWriter` and call it.
+
+Another mistake is believing delegation means writing a forwarding method
+for everything. Expose only what the new class's callers need; the rest of
+the delegate stays hidden, which is the point.
+
+### In real systems
+
+Go has no inheritance at all, only interfaces and embedding; Rust uses
+traits; modern TypeScript code leans on interfaces and composition. Large
+codebases with deep hierarchies, often in older Java or C++ systems, are
+the cautionary examples, where a change to a base class needs a full
+regression test.
+
+### Check yourself
+
+**What does "has-a trumps is-a" mean?**
+
+<details>
+<summary>Answer</summary>
+
+Prefer a class that holds and uses another object (delegation) over one
+that inherits from it, because it couples less and exposes only what it
+chooses.
+
+</details>
+
+**What should I use instead of inheritance to express that several types can be used in the same place?**
+
+<details>
+<summary>Answer</summary>
+
+An interface or protocol that each type implements independently.
+
+</details>
+
+## Topic 32. Configuration
+
+### In one sentence
+
+Values that may change after the code ships, such as credentials, URLs,
+limits and feature switches, belong in configuration outside the code, so
+the application can adapt without a rebuild.
+
+### The idea
+
+#### What belongs in configuration
+
+The book's tip is to parameterise the app using external configuration.
+Candidates include credentials for external services, logging levels and
+destinations, ports and host names, environment-specific settings such as
+database addresses, tax rates and other business values that change, and
+feature flags. If I would need to change it for a different environment or
+a different customer, it should not be a constant in the code.
+
+#### Static configuration
+
+The traditional approach is a file, such as YAML, JSON or environment
+variables, read when the application starts. The book's advice is to wrap
+it behind a small API rather than reading raw values throughout the code.
+Then the rest of the code asks the configuration object for what it needs,
+and the format and source can change without touching that code. This is
+decoupling again.
+
+#### Configuration as a service
+
+The book goes further and suggests keeping configuration behind a service
+API rather than in a file. Several applications can share it, it can have
+access control and an audit trail, and it can change at runtime without a
+restart. Applications can subscribe to changes. Cloud platforms offer this
+as parameter stores and feature-flag services.
+
+#### Don't overdo it
+
+The book warns against the opposite extreme: making everything
+configurable to avoid making decisions. A configuration file with hundreds
+of options, most never changed, is its own maintenance burden, and every
+option multiplies the combinations that need testing. Configure what
+genuinely varies.
+
+#### Configuration per environment
+
+Most applications run in at least three environments: a developer's
+machine, a shared test or staging environment, and production. The code
+should be identical in all three; only configuration differs. That rule
+catches a common smell, code like "if production, do this", which means a
+behaviour difference is hidden in logic instead of named in configuration.
+
+A good setup has a documented list of every configuration key, its type,
+whether it is required and its default. The startup validation enforces
+that list. A sample file with safe development values lets a new developer
+run the app in minutes, while real secrets come from the environment or a
+secret store and never sit in the repository.
+
+### Worked example
+
+**Simple.** Reading configuration once, validating every value at startup,
+reporting all problems at once, and freezing the result:
+
+```ts
+// Configuration read once at startup, validated, and frozen.
+type Config = Readonly<{ port: number; dbUrl: string; featureNewCheckout: boolean }>;
+function loadConfig(env: Record<string, string | undefined>): Config {
+  const errors: string[] = [];
+  const port = Number(env.PORT ?? 3000);
+  if (!Number.isInteger(port)) errors.push(`PORT not an integer: ${env.PORT}`);
+  if (!env.DB_URL) errors.push('DB_URL is required');
+  if (errors.length) throw new Error('config:\n  ' + errors.join('\n  '));
+  return Object.freeze({ port, dbUrl: env.DB_URL!, featureNewCheckout: env.FEATURE_NEW_CHECKOUT === 'true' });
+}
+console.log(loadConfig({ DB_URL: 'postgres://db/app', FEATURE_NEW_CHECKOUT: 'true' }));
+try { loadConfig({ PORT: '80x' }); } catch (e) { console.log((e as Error).message); }
+```
+
+The output:
+
+```text
+{ port: 3000, dbUrl: 'postgres://db/app', featureNewCheckout: true }
+config:
+  PORT not an integer: 80x
+  DB_URL is required
+```
+
+The rest of the code imports this typed object, never `process.env`
+directly. Both problems in the bad config are reported together, so a
+deploy fails once with a full list, instead of once per mistake. That is
+chapter 4's crash early applied to configuration.
+
+**Realistic.** A checkout redesign ships behind a flag read from a
+feature-flag service. It is enabled for staff, then for 5 percent of users,
+then for everyone, with no deploy between steps. When a bug appears at 5
+percent, the flag is switched off in seconds. That is configuration as a
+service giving the reversibility from chapter 2.
+
+### Step by step
+
+<Layers caption="Where configuration can live, from least to most flexible. Look at the top layer: it is the only one that can change without a deploy or restart." layers={[
+  "Config service or feature flags: changes at runtime, audited",
+  "Environment variables or files: change per environment, need a restart",
+  "Build-time constants: change needs a rebuild",
+  "Hard-coded literals in logic: change needs a code edit",
+]} />
+
+<Timeline caption="Rolling out a feature with a flag. Look at the third step: turning the feature off took no deployment." items={[
+  { label: "Deploy", text: "New checkout code ships, flag off for everyone." },
+  { label: "Staff", text: "Flag on for internal users; two bugs fixed." },
+  { label: "5 percent", text: "Error rate rises; flag switched off in seconds." },
+  { label: "Fix and retry", text: "Fix deployed; flag back to 5, then 50 percent." },
+  { label: "Everyone", text: "Flag on for all; old code and flag removed later." },
+]} />
+
+1. **List values that differ by environment, customer or time.**
+2. **Move them out of the code** into files, environment or a service.
+3. **Read them once, through one module**, and validate at startup.
+4. **Expose a typed object** to the rest of the code.
+5. **Remove flags and options** that no longer vary.
+
+### Common mistake
+
+The common mistake is reading `process.env` in fifty places, each with its
+own default and parsing. A typo in one name silently uses the default. The
+fix is one config module that reads, validates and types everything.
+
+Another mistake is committing secrets in configuration files. The fix is a
+secret store or environment injected at deploy time, with the file listing
+only names.
+
+### In real systems
+
+The twelve-factor app guidelines popularised keeping config in the
+environment. Kubernetes ConfigMaps and Secrets, cloud parameter stores and
+feature-flag services such as LaunchDarkly or open-source equivalents are
+the common tools. Stale flags are a known form of debt, so teams track and
+remove them.
+
+### Check yourself
+
+**Why validate configuration at startup rather than when each value is used?**
+
+<details>
+<summary>Answer</summary>
+
+Bad configuration is then found immediately, all at once, with a clear
+message, instead of hours later when a rarely used code path first reads
+the bad value.
+
+</details>
+
+**What does configuration as a service add over a file?**
+
+<details>
+<summary>Answer</summary>
+
+Sharing across applications, access control and audit, and changes at
+runtime without a restart.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 5, Bend, or Break">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, flexibility starts with noticing when one change
+forces many. When I fix a bug and have to edit five files that each
+contain the same logic, that is coupling made visible, and the first fix is
+to move the logic into one function.
+
+Example: three pages each compute "is this user a premium member" from the
+user's plan name. I write one `isPremium(user)` function and replace all
+three.
+
+Mistake: reading global variables from many functions because it is
+convenient. Fix: pass the value in as a parameter, so each function shows
+what it depends on.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level I apply tell, don't ask, and I replace flag soup
+with state machines. I can turn a loop that does five things into a
+pipeline of five functions, and I reach for an interface before a base
+class.
+
+Example: a file-upload widget with `isUploading`, `isDone` and `error`
+flags becomes a state machine with idle, uploading, done and failed, and
+the impossible "uploading and failed" state disappears.
+
+Mistake: building a state machine but still keeping the old flags "just in
+case", so the two disagree. Fix: delete the flags; derive anything needed
+from the single state.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level I design module boundaries. Each module owns its
+data and offers a small API of requests; others never reach inside.
+Events connect modules that should not know about each other, and
+configuration is read through one typed module.
+
+Example: the billing module publishes an "invoice paid" event; the
+accounts module subscribes and upgrades the plan. Neither imports the
+other.
+
+Mistake: an event payload that is just the billing module's internal
+database row, so subscribers become coupled to its schema. Fix: design
+event payloads as a public contract, with only the fields consumers need.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases appear at the boundaries of each technique: an empty list in a
+pipeline, an event that arrives in a state with no transition, a
+configuration value that is present but empty, an interface method that
+one implementation cannot support.
+
+Example: the discount example shows `Math.max` of an empty list returning
+negative infinity; the fix was a 0 floor in the one function that owns the
+rule.
+
+Mistake: an environment variable set to the empty string treated as
+"present", so `DB_URL=""` passes a presence check. Fix: validate the value,
+not just its existence.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine techniques: an observer that unsubscribes itself
+while the source is looping over observers; a pipeline step that throws
+halfway through a batch; two events that arrive in the opposite order to
+the one the state machine expects.
+
+Example: in the `Bus` class, deleting from a `Set` while iterating it is
+safe in JavaScript, but adding to it during iteration means the new
+handler also runs for the current event, which may surprise.
+
+Mistake: assuming events arrive in order across a network. Fix: include a
+sequence number or timestamp and make the state machine handle late or
+duplicate events explicitly.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production, decoupling needs visibility. Events carry correlation ids
+so one order can be traced through every subscriber. Pipelines log counts
+at each stage. Configuration changes are audited and can be rolled back,
+and feature flags have owners and expiry dates.
+
+Example: a dashboard shows, for the nightly invoice pipeline, how many
+records entered and left each stage; a drop at "price" pointed straight at
+a missing plan.
+
+Mistake: flags that are never removed, so the code has hundreds of dead
+branches. Fix: every flag gets an owner and a removal date when it is
+created.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is designing for change I cannot predict. I do not try to
+guess which change will come; I keep each piece small, ignorant of others'
+insides, and easy to replace. When a change arrives, I ask how many places
+it touched, and treat a high number as a design bug.
+
+Example: after each feature, I note which files changed; a file that
+changes with every feature is a candidate for splitting.
+
+Mistake: adding layers of abstraction "for flexibility" with no change in
+sight. Fix: decouple when a real change hurts or is clearly coming; until
+then, keep it simple.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+At system design level, the same ideas become architecture: services that
+own their data, asynchronous messaging between them, pipelines for data
+processing, and centralised configuration and flags.
+
+Example: an order system where the order service writes to its own
+database and publishes events; warehouse, email and analytics consume
+them at their own pace through a broker, so a slow analytics service never
+delays checkout.
+
+Mistake: splitting into services that share one database, which keeps all
+the coupling and adds network calls. Fix: one owner per table, others go
+through APIs or events.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+Strategically, flexibility is what lets a team say yes to change cheaply.
+The investments that pay off are clear module ownership, stable public
+contracts between teams, and the ability to change behaviour by
+configuration and flags.
+
+Example: a team that can switch a payment provider by configuration
+negotiates better rates, because changing providers is a day of work, not
+a quarter.
+
+Mistake: building a platform of configurable everything before knowing
+which variations customers need. Fix: start concrete, then extract the
+configuration that real customers have asked for.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Is the Law of Demeter a strict rule?</summary>
+
+No. The book treats it as a warning sign. Chains through stable things,
+such as the standard library, or pipelines of transformations are fine.
+Chains through my own domain objects are where coupling hurts.
+
+</details>
+
+<details>
+<summary>Should I never use inheritance?</summary>
+
+The book's position is that it is rarely worth the tax. Small, stable
+hierarchies designed for extension, such as a framework's documented base
+class, are reasonable. For sharing code between my own classes, prefer
+delegation or functions.
+
+</details>
+
+<details>
+<summary>When is publish/subscribe overkill?</summary>
+
+When there is only one consumer and both sides are in the same codebase.
+A direct function call is simpler and easier to trace. Pub/sub pays off
+when consumers are many, change often or live in other processes.
+
+</details>
+
+<details>
+<summary>Are pipelines slower than one big loop?</summary>
+
+Chained array methods create intermediate arrays, which costs a little.
+For most data sizes it does not matter. When it does, lazy iterators or
+streaming libraries keep the pipeline shape without the copies.
+
+</details>
+
+<details>
+<summary>What should never go in configuration?</summary>
+
+Logic. A configuration file that encodes conditions and branches has
+become an untested programming language. Keep configuration to values and
+switches, and keep decisions in code.
+
+</details>
+
+<details>
+<summary>Do state machines need a library?</summary>
+
+No. A union type for the states and an object for the transition table, as
+in this chapter, is enough for most cases. Libraries help when states nest,
+when transitions need guards and actions, or when I want a visual diagram
+generated from the code.
+
+</details>
+
+<details>
+<summary>How do I start decoupling a tangled codebase?</summary>
+
+Start where change hurts most. Find the logic that is copied or reached
+into most often, give it one owner and an API, and move callers over one at
+a time, with tests around the behaviour.
+
+</details>
+
+## Key takeaways
+
+- Decoupled code is easier to change; coupling is measured by how many places one change touches.
+- Avoid train wrecks: tell objects what to do instead of reaching through them.
+- Avoid global data, including singletons and shared databases; pass state in or wrap it in an API.
+- Structure event handling with state machines, observers, publish/subscribe or streams.
+- Think of programs as pipelines that transform data, with errors handled in the pipeline.
+- Don't hoard state; pass it from step to step.
+- Inheritance couples to implementation; prefer interfaces, delegation and mixins.
+- Put values that vary in external configuration, read through one validated module.
+
+## Glossary
+
+- **Coupling**: the degree to which a change in one piece of code forces changes in another.
+- **Train wreck**: a chain of calls through several objects' internals.
+- **Tell, don't ask**: request an outcome from an object instead of reading its data to decide for it.
+- **Law of Demeter**: a guideline that a method should call only its own, its arguments' and its fields' methods.
+- **Event**: information that arrives at a time the program does not control.
+- **Finite state machine**: a fixed set of states plus a table of transitions on events.
+- **Observer pattern**: a source calls registered functions when an event happens.
+- **Publish/subscribe**: publishers and subscribers communicate through a named channel without knowing each other.
+- **Reactive stream**: a sequence of events treated like a collection that arrives over time.
+- **Pipeline**: a series of transformations where each step's output is the next step's input.
+- **Delegation**: a class holds another object and forwards specific requests to it.
+- **Mixin**: a set of methods added to classes without inheritance.
+- **Feature flag**: a configuration switch that turns behaviour on or off at runtime.
+
+## Exercises and self-check
+
+**Warm-up.** Search a codebase for chains of three or more property
+accesses across different object types. For two of them, write the
+request-shaped function that would replace the chain.
+
+**Build.** Write a small state machine for a traffic light with a
+pedestrian button, as a transition table. Feed it a list of events,
+including one that makes no sense, and print each transition, as in the
+loading example.
+
+**Stretch.** Take a function over 50 lines that loops over records and
+does several things to each. Rewrite it as a pipeline of named functions,
+each tested alone, and compare the line count and the number of tests
+needed before and after.
+
+<details>
+<summary>Self-check: name the four event strategies in this chapter.</summary>
+
+Finite state machines, the observer pattern, publish/subscribe, and
+reactive streams.
+
+</details>
+
+<details>
+<summary>Self-check: what is the problem if Account extends MemoryStore?</summary>
+
+Account inherits and exposes every store method, including clear, and is
+coupled to that store's implementation, so it cannot easily use a
+different store or a fake in tests.
+
+</details>
+
+<details>
+<summary>Self-check: what happens if configuration is read in many places?</summary>
+
+Each place has its own parsing and default, a typo silently uses the
+default, and changing the source or format means editing all of them.
+
+</details>
+
+## How I'd study this chapter
+
+<Timeline caption="A one-week plan for the chapter. Look at day 4: the pipeline rewrite is where the transforming idea clicks." items={[
+  { label: "Day 1", text: "Read topic 28; find and fix two train wrecks in real code." },
+  { label: "Day 2", text: "Read topic 29; build the traffic-light state machine." },
+  { label: "Day 3", text: "Build the observer bus; add unsubscribe and a test for it." },
+  { label: "Day 4", text: "Read topic 30; rewrite one long loop as a pipeline." },
+  { label: "Day 5", text: "Read topics 31 and 32; replace one inheritance and centralise config." },
+]} />
+
+Done when: my traffic-light machine handles a nonsense event visibly, one
+real loop has become a tested pipeline, and one project reads its
+configuration through a single validated module.
