@@ -1,0 +1,1614 @@
+---
+book: mathematics-for-computer-science
+number: 9
+title: "Directed graphs & Partial Orders"
+description: "Digraphs, degrees, walks and paths, adjacency matrices and walk counting, composition of relations, DAGs and scheduling with critical paths and Dilworth's lemma, strict and weak partial orders, set-containment representations, linear and product orders, and equivalence relations."
+part: "Part II, Structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+A directed graph is a set of points with arrows between them, and once you
+look for them they are everywhere: links between web pages, calls between
+functions, imports between modules, prerequisite chains in a course
+catalogue, steps in a build pipeline. This chapter treats digraphs and
+binary relations as the same thing seen two ways, and uses that to answer
+practical questions: how many routes are there from one vertex to
+another, how fast can a set of dependent tasks finish on parallel
+machines, and what exactly is an "order". It ends with a catalogue of
+relational properties (reflexive, transitive, antisymmetric and the rest)
+that every later chapter uses without comment.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- Use digraph vocabulary (tail, head, in-degree, out-degree, walk, path, cycle, distance) precisely, and relate digraphs to binary relations.
+- Prove that a shortest walk is a path, and count walks of each length with powers of the adjacency matrix.
+- Compose relations, and describe reachability as the positive walk relation G⁺ and the walk relation G*.
+- Topologically sort a DAG, build a minimum-time parallel schedule from depths, and find the critical path.
+- State and apply Dilworth's lemma about chains and antichains.
+- Recognise strict partial orders, weak partial orders, linear orders, product orders and equivalence relations from their properties, and represent any partial order by set containment.
+
+**What you should already know:** relations and their properties from
+chapter 4, well ordering and induction from chapters 2 and 5. In code:
+Maps, arrays of arrays and simple recursion in TypeScript.
+
+**How this page is organised:** one section per book section, 9.1 to 9.11,
+each with the same parts: the idea in one sentence, the explanation (with
+sub-headings where the book has subsections), a worked example, a
+step-by-step trace, a common mistake, where it shows up in real systems,
+and a check. This chapter has no References section. All TypeScript
+snippets were run with Node 22 and the output shown is real.
+
+**Time:** about three sessions of two to three hours each.
+
+## Chapter map
+
+<Flow caption="From arrows to orders. The first half is about moving through a digraph; the second half is about what the reachability relation of an acyclic digraph looks like." steps={[
+  { title: "9.1–9.3 Digraphs", body: "degrees, walks, paths, adjacency matrices" },
+  { title: "9.4 Walk relations", body: "composition, G⁺ and G*" },
+  { title: "9.5 DAGs", body: "topological sort, parallel schedules, Dilworth" },
+  { title: "9.6–9.9 Orders", body: "strict, weak, set containment, linear, product" },
+  { title: "9.10–9.11 Equivalence", body: "classes, partitions, summary of properties" },
+]} />
+
+## 9.1 Vertex Degrees
+
+### In one sentence
+
+Every directed edge leaves one vertex and enters one, so the in-degrees
+and the out-degrees of a digraph both add up to the number of edges.
+
+### The idea
+
+A **directed graph** (digraph) G has a non-empty set of **vertices** V(G),
+also called nodes, and a set of **directed edges** E(G). An edge goes from
+its **tail** u to its **head** v and is written u → v. The book points
+out that a digraph is exactly a binary relation on V whose domain and
+codomain are both V: the edges are the related pairs. Chapter 4 already
+drew relations as arrows; now the arrows are the main object.
+
+The **in-degree** of v is the number of edges with head v, and the
+**out-degree** is the number with tail v. Since each edge has exactly one
+tail and one head, counting edges by their tails and by their heads gives
+the same total:
+
+sum of in-degrees = sum of out-degrees = |E|.
+
+This is the double-counting idea that chapter 14 will develop: count the
+same set two ways and equate the answers.
+
+The book's examples of digraphs include the divisibility relation on a
+range of integers and the link structure of the web, where in-degree
+(how many pages link here) was an early signal of a page's importance in
+search ranking.
+
+<Figure art={`
+   a ---> b ---> d ---> e
+   |      |      ^ |
+   |      v      | |
+   +----> c -----+ |
+   ^               |
+   +---------------+   (the edge d -> a)
+
+   edges: a->b a->c b->c b->d c->d d->a d->e
+   in:  a1 b1 c2 d2 e1      out: a2 b2 c1 d2 e0      both sum to 7
+`} caption="The small digraph used throughout this chapter's code. Each edge contributes one to an out-degree and one to an in-degree." />
+
+### Worked example
+
+**Simple: degrees from an adjacency list.** Represent the digraph as a Map
+from each vertex to its out-neighbours:
+
+```ts
+type Graph = Map<string, string[]>;
+const G: Graph = new Map([['a', ['b', 'c']], ['b', ['c', 'd']], ['c', ['d']], ['d', ['a', 'e']], ['e', []]]);
+const V = [...G.keys()];
+const outDeg = (v: string) => G.get(v)!.length;
+const inDeg = (v: string) => V.filter((u) => G.get(u)!.includes(v)).length;
+console.log(V.map((v) => `${v}: in ${inDeg(v)} out ${outDeg(v)}`).join(' | '),
+  ' sums', V.reduce((s, v) => s + inDeg(v), 0), V.reduce((s, v) => s + outDeg(v), 0));
+```
+
+```text
+a: in 1 out 2 | b: in 1 out 2 | c: in 2 out 1 | d: in 2 out 2 | e: in 1 out 0  sums 7 7
+```
+
+**Realistic: what degrees tell you in a dependency graph.** In a module
+import graph, out-degree is how many modules a file imports, and in-degree
+is how many import it. A module with high in-degree is load-bearing:
+changing its interface ripples widely. A module with in-degree 0 is an
+entry point or dead code. A vertex with out-degree 0, like e above, is a
+sink: in a build graph, a leaf library; in a state machine, a final
+state. Note the asymmetry the adjacency list creates: out-degree is a
+lookup, but in-degree requires scanning every list, which is why graph
+libraries often store reverse edges too.
+
+### Step by step
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "each edge e = u → v has one tail and one head", "definition of a directed edge"],
+  ["2", "out-degree sum counts each edge once, at its tail", "group edges by tail"],
+  ["3", "in-degree sum counts each edge once, at its head", "group edges by head"],
+  ["4", "both sums equal |E|", "same set counted two ways"],
+]} caption="The degree-sum fact as a double count." />
+
+### Common mistake
+
+**The wrong way:** using undirected intuition, "the degree sum is twice
+the number of edges", for a digraph.
+
+**Why it fails:** that is the undirected handshake rule (chapter 11). In a
+digraph each edge contributes once to the in-degree sum and once to the
+out-degree sum, not twice to a single sum.
+
+**The right way:** keep in- and out-degrees separate; their total over
+both is 2|E|, but each alone is |E|.
+
+### In real systems
+
+- **Web ranking:** PageRank refines in-degree by weighting each incoming link by the importance of the page it comes from.
+- **Social networks:** followers (in-degree) and following (out-degree) are tracked separately, and the asymmetry is the point.
+- **Build tools** compute in-degrees to find which targets have no unbuilt dependencies left (Kahn's topological sort algorithm, 9.5).
+
+### Check yourself
+
+1. Can a digraph have a vertex with out-degree 3 and no edges into any vertex?
+2. A digraph has 10 edges. What is the sum of the out-degrees?
+
+<details>
+<summary>Answer</summary>
+
+1. No. Its three edges go into some vertices (possibly itself, as a self-loop), adding to their in-degrees.
+2. 10.
+
+</details>
+
+## 9.2 Walks and Paths
+
+### In one sentence
+
+A walk follows edges and may revisit vertices, a path never repeats a
+vertex, and the shortest walk between two vertices is always a path.
+
+### The idea
+
+A **walk** is an alternating sequence of vertices and edges, starting and
+ending at vertices, where each edge goes from the vertex before it to the
+vertex after it. Its **length** is the number of edges, so a single vertex
+is a walk of length 0. A **path** is a walk that never visits a vertex
+twice. A **closed walk** starts and ends at the same vertex, and a
+**cycle** is a positive-length closed walk whose only repeat is the
+start/end vertex.
+
+Walks can be **merged**: a walk from u to v followed by a walk from v to w
+gives a walk from u to w, of length the sum. (The book notes that it is
+not quite concatenation, since v would appear twice in a row.)
+
+#### Finding a path
+
+**Theorem.** The shortest walk from u to a different vertex v is a path.
+
+**Proof.** If there is any walk from u to v, well ordering gives a
+shortest one, w. Suppose w repeats some vertex x. Then w is: a walk from u
+to x, then a positive-length walk from x back to x, then a walk from x to
+v. Cut out the middle part. What is left is still a walk from u to v,
+and it is strictly shorter, contradicting the choice of w. So w repeats
+nothing: it is a path.
+
+The **distance** dist(u, v) is the length of a shortest path from u to v
+(infinite if none). It satisfies the **triangle inequality**: dist(u, v) ≤
+dist(u, x) + dist(x, v), because merging shortest paths through x gives a
+walk, and the shortest walk is no longer than that. The book warns that
+distance in a digraph is not symmetric: dist(u, v) and dist(v, u) can
+differ, and one can be infinite while the other is finite.
+
+The same cutting argument shows that the shortest positive-length closed
+walk through a vertex is a cycle. So a digraph has a closed walk of
+positive length iff it has a cycle, which 9.5 uses to define DAGs.
+
+### Worked example
+
+**Simple: the proof as a program.** Scan a walk; whenever a vertex
+reappears, cut back to its first occurrence. That is exactly the proof's
+"remove the loop" step, applied repeatedly:
+
+```ts
+function toPath(walk: string[]): string[] {
+  const out: string[] = [];
+  for (const v of walk) { const i = out.indexOf(v); if (i >= 0) out.length = i; out.push(v); }
+  return out;
+}
+console.log('walk a b c d a c d e →', toPath(['a', 'b', 'c', 'd', 'a', 'c', 'd', 'e']).join(' '));
+```
+
+```text
+walk a b c d a c d e → a c d e
+```
+
+**Realistic: why the theorem matters for routing.** A route planner never
+needs to consider walks that revisit a place, so the search space is the
+set of paths, which is finite even when walks are infinitely many. Every
+shortest-path algorithm (breadth-first search for unweighted graphs,
+Dijkstra for non-negative weights) relies on this. With negative edge
+weights the theorem can fail, since going round a negative cycle makes a
+walk "shorter", which is why Bellman–Ford has to detect such cycles.
+
+### Step by step
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "some walk from u to v exists", "assumption"],
+  ["2", "let w be a shortest one", "well ordering on lengths"],
+  ["3", "suppose x occurs twice on w", "w is not a path"],
+  ["4", "w = (u to x) then (x to x, length at least 1) then (x to v)", "split at the two occurrences"],
+  ["5", "drop the middle: (u to x) then (x to v)", "still a walk from u to v"],
+  ["6", "it is shorter than w: contradiction", "step 2"],
+  ["7", "so w is a path", "no vertex repeats"],
+]} caption="The shortest walk is a path. The program above performs step 5 every time it sees a repeat." />
+
+### Common mistake
+
+**The wrong way:** assuming dist(u, v) = dist(v, u) in a digraph, for
+example when caching distances in a symmetric table.
+
+**Why it fails:** edges have direction. In the example graph, e is
+reachable from a in three steps, but a is not reachable from e at all.
+
+**The right way:** store distances as an ordered-pair table, and only
+symmetrise for undirected graphs.
+
+### In real systems
+
+- **Navigation with one-way streets** is a digraph distance problem; the route there and the route back differ.
+- **Network routing protocols** compute shortest paths, and loop-free forwarding is the path property.
+- **Cycle detection in dependency managers** reports a closed walk as an error, using the fact that any closed walk contains a cycle to show the user a minimal one.
+
+### Check yourself
+
+1. Is every path a walk? Is every walk a path?
+2. Give a digraph where dist(u, v) = 1 but dist(v, u) = 5.
+
+<details>
+<summary>Answer</summary>
+
+1. Every path is a walk; walks that repeat a vertex are not paths.
+2. A directed 6-cycle u → v → w → x → y → z → u: from u to v is one edge, from v back to u takes five.
+
+</details>
+
+## 9.3 Adjacency Matrices
+
+### In one sentence
+
+Write a digraph as a 0/1 matrix, and its k-th power counts the walks of
+length k between every pair of vertices.
+
+### The idea
+
+Number the vertices 1 to n. The **adjacency matrix** A has entry A_uv = 1
+if u → v is an edge and 0 otherwise. More generally the book defines the
+**length-k walk counting matrix** C, whose entry C_uv is the number of
+walks of length k from u to v. A itself is the length-1 walk counting
+matrix, and the identity matrix is the length-0 one.
+
+**Theorem.** If C counts walks of length k and D counts walks of length
+m, then the matrix product CD counts walks of length k + m.
+
+**Proof.** Every walk of length k + m from u to v splits uniquely into a
+length-k walk from u to some vertex w followed by a length-m walk from w
+to v. For a fixed w, there are C_uw · D_wv such pairs. Summing over all w
+gives the number of walks, and that sum is exactly the definition of the
+(u, v) entry of CD.
+
+**Corollary.** A^k is the length-k walk counting matrix, by induction on k.
+
+#### Shortest paths
+
+A path never needs more than n − 1 edges (it has at most n vertices).
+So the distance from u to v is the smallest k for which A^k has a
+non-zero (u, v) entry, if any k up to n − 1 works. The book notes this
+is a simple, not efficient, method; refinements lead to the
+shortest-path algorithms of an algorithms course, including weighted
+versions.
+
+<Figure art={`
+          a  b  c  d  e
+     a  [ 0  1  1  0  0 ]
+     b  [ 0  0  1  1  0 ]
+ A = c  [ 0  0  0  1  0 ]
+     d  [ 1  0  0  0  1 ]
+     e  [ 0  0  0  0  0 ]
+
+  (A^2)_ad = A_ab·A_bd + A_ac·A_cd = 1 + 1 = 2   walks a b d, a c d
+`} caption="The adjacency matrix of the running example. Row u, column v is 1 when u → v is an edge. Multiplying sums over the middle vertex of each two-step walk." />
+
+### Worked example
+
+**Simple: walks of length 3, and distances from matrix powers.**
+
+```ts
+const idx = new Map(V.map((v, i) => [v, i]));
+const A = V.map((u) => V.map((v) => (G.get(u)!.includes(v) ? 1 : 0)));
+const mul = (X: number[][], Y: number[][]) => X.map((row) => Y[0].map((_, j) => row.reduce((s, x, k) => s + x * Y[k][j], 0)));
+let P = A; const dist = V.map((_, i) => V.map((_, j) => (i === j ? 0 : A[i][j] ? 1 : Infinity)));
+for (let k = 2; k <= V.length - 1; k++) { P = mul(P, A); P.forEach((row, i) => row.forEach((x, j) => { if (x > 0 && dist[i][j] === Infinity) dist[i][j] = k; })); if (k === 3) console.log('A^3 row a (walks of length 3 from a):', JSON.stringify(P[0])); }
+console.log('dist from a:', V.map((v) => `${v}=${dist[0][idx.get(v)!]}`).join(' '), ' dist from e to a:', dist[idx.get('e')!][0]);
+```
+
+```text
+A^3 row a (walks of length 3 from a): [2,0,0,1,2]
+dist from a: a=0 b=1 c=1 d=2 e=3  dist from e to a: Infinity
+```
+
+Check by hand: the length-3 walks from a are a b c d, a b d a, a b d e, a
+c d a and a c d e, so two end at a, one at d and two at e, matching the
+row [2, 0, 0, 1, 2].
+
+**Realistic: counts grow with cycles.** Count walks from a to d of each
+length from 1 to 8:
+
+```ts
+let Q = A; const counts: number[] = [];
+for (let k = 1; k <= 8; k++) { counts.push(Q[0][3]); Q = mul(Q, A); }
+console.log('walks a→d of length 1..8:', counts.join(' '));
+```
+
+```text
+walks a→d of length 1..8: 0 2 1 0 4 4 1 8
+```
+
+Because the graph has cycles through a (a b d a and a c d a, and a b c d
+a), walks can loop, and the counts keep growing roughly exponentially. In
+a DAG every power beyond the longest path length is the zero matrix,
+since walks cannot loop. That gives a matrix test for acyclicity: G is a
+DAG iff A^n = 0.
+
+### Step by step
+
+Computing (A²)_ad, the number of length-2 walks from a to d.
+
+<Trace columns={["middle vertex w", "A_aw", "A_wd", "product"]} rows={[
+  ["a", "0", "0", "0"],
+  ["b", "1", "1", "1 (walk a b d)"],
+  ["c", "1", "1", "1 (walk a c d)"],
+  ["d", "0", "0", "0"],
+  ["e", "0", "0", "0"],
+  ["sum", "", "", "2"],
+]} caption="Each term of the matrix product is one choice of middle vertex; the sum counts all two-step walks. This is the theorem's proof for k = m = 1." />
+
+### Common mistake
+
+**The wrong way:** reading A^k as "is there a path of length k?" and
+treating entries as paths.
+
+**Why it fails:** A^k counts walks, which may repeat vertices. A non-zero
+entry for k = 5 might come only from walks that loop.
+
+**The right way:** use the first k with a non-zero entry for distances
+(the shortest walk is a path), and remember that later powers count walks,
+not paths. Counting paths is a much harder problem.
+
+### In real systems
+
+- **Graph analytics** compute walk counts and related quantities with sparse matrix products; Katz centrality sums weighted walk counts of all lengths.
+- **Markov chains** (chapter 20's random walks) use powers of a transition matrix, which is a weighted adjacency matrix: entries become probabilities.
+- **Graph databases and GPU graph libraries** often expose graph algorithms as linear algebra over different "semirings", where replacing + and · with min and + turns walk counting into shortest paths.
+
+### Check yourself
+
+1. What does the diagonal entry (A^k)_uu count?
+2. Why does checking powers up to n − 1 suffice for distances?
+
+<details>
+<summary>Answer</summary>
+
+1. The number of closed walks of length k starting and ending at u.
+2. A shortest walk is a path, and a path in an n-vertex graph has at most n − 1 edges.
+
+</details>
+
+## 9.4 Walk Relations
+
+### In one sentence
+
+Reachability is itself a relation: G⁺ relates u to v when a positive-length
+walk goes from u to v, G* also includes length-0 walks, and both are built
+by composing the edge relation with itself.
+
+### The idea
+
+When there is a walk from v to w, w is **reachable** from v, or v is
+**connected** to w. Two walk relations capture this:
+
+- **G⁺**, the positive walk relation: u G⁺ v iff there is a walk of length
+  at least 1 from u to v.
+- **G***, the walk relation: u G* v iff there is a walk of length at least
+  0 from u to v. It is G⁺ plus every vertex related to itself.
+
+#### Composition of relations
+
+For relations S from A to B and R from B to C, the **composition** R ∘ S
+relates a to c iff there is some b with a S b and b R c. This extends
+function composition (chapter 4) to relations; the book keeps the same
+right-to-left order, so R ∘ S means "first S, then R".
+
+For a digraph G viewed as a relation, G ∘ G relates u to v iff there is a
+walk of length exactly 2, and in general G^n (n-fold composition) is
+"walk of length exactly n". So G⁺ is the union of G^n over n ≥ 1, and G*
+is the union over n ≥ 0, where G^0 is the identity relation.
+
+Composition of relations is the Boolean version of matrix multiplication:
+replace "sum of products" with "OR of ANDs". The 0/1 matrix of R ∘ S is
+the Boolean product of their matrices, which is why the walk-counting
+matrix and the walk relation are so closely tied: (A^k)_uv is non-zero
+exactly when u G^k v.
+
+### Worked example
+
+**Simple: the reachability matrix of the running example.** From the
+distances computed in 9.3, every finite entry is a G* pair. From a we
+reach a, b, c, d, e (a itself by length 0, and also by the closed walk a b
+d a, so a G⁺ a holds too). From e we reach only e by a length-0 walk,
+so e G* e but not e G⁺ e. This one example shows the difference: G⁺ has a
+self-pair only for vertices on a cycle.
+
+**Realistic: transitive closure in practice.** Computing G⁺ for all pairs
+is the **transitive closure**. The classic algorithm (Warshall's) builds
+it by allowing intermediate vertices one at a time: after round k,
+reach[i][j] is true if some walk from i to j uses only vertices 1 to k in
+its middle. It takes about n³ simple steps. The Dilworth test in 9.5's
+code uses exactly this triple loop:
+
+```text
+for k, for i, for j: if reach[i][k] and reach[k][j] then reach[i][j] = true
+```
+
+(This line is pseudocode, not a runnable snippet.) Package managers
+compute closures like this to answer "what does installing X pull in?",
+and databases expose recursive queries (SQL's WITH RECURSIVE) to compute
+it on stored edge tables.
+
+### Step by step
+
+Composition on a tiny example: S relates people to the teams they belong
+to, R relates teams to the projects they own.
+
+<Trace columns={["pair in S", "pair in R", "pair in R ∘ S"]} rows={[
+  ["(Ana, infra)", "(infra, CI)", "(Ana, CI)"],
+  ["(Ana, infra)", "(infra, DNS)", "(Ana, DNS)"],
+  ["(Ben, web)", "(web, site)", "(Ben, site)"],
+  ["(Ben, infra)", "(infra, CI)", "(Ben, CI)"],
+]} caption="R ∘ S relates a person to a project when some team links them: a join on the middle element, exactly what a database join of two tables computes." />
+
+### Common mistake
+
+**The wrong way:** reading R ∘ S left to right, as "R first, then S".
+
+**Why it fails:** the book, following function notation, means S first.
+Mixing conventions gives the wrong relation when R and S are not
+symmetric.
+
+**The right way:** read R ∘ S as "R after S", like f(g(x)) for f ∘ g, and
+write the middle element explicitly when in doubt: a S b and b R c.
+
+### In real systems
+
+- **SQL joins** compute relation composition; a recursive common table expression computes the transitive closure.
+- **Access control:** "user can access resource" is often the composition of user-to-role and role-to-permission relations, and nested groups require a closure.
+- **Build systems** compute the closure of the dependency relation to know what must be rebuilt when one file changes.
+
+### Check yourself
+
+1. If G has no cycles, can u G⁺ u hold?
+2. Express "grandparent of" in terms of the relation "parent of".
+
+<details>
+<summary>Answer</summary>
+
+1. No. u G⁺ u means a positive-length closed walk, which would contain a cycle.
+2. Parent ∘ Parent: x is a grandparent of z iff x is a parent of some y who is a parent of z (with the composition order matched to how "parent of" is written).
+
+</details>
+
+## 9.5 Directed Acyclic Graphs & Scheduling
+
+### In one sentence
+
+A digraph with no cycles describes a valid set of "must come before"
+constraints; it can always be put in a single valid order, and the
+longest chain decides how fast the tasks can finish in parallel.
+
+### The idea
+
+The book starts from course prerequisites: if s is a direct prerequisite
+of t, you must complete everything u with u D⁺ t before t. A
+prerequisite cycle would make graduation impossible, so the graph must be
+a **directed acyclic graph (DAG)**: a digraph with no cycles (equivalently,
+no positive-length closed walks).
+
+#### Scheduling
+
+A **topological sort** of a finite DAG is a list of all its vertices in
+which each vertex comes before every vertex reachable from it. The book's
+example is getting dressed: socks before shoes, shirt before tie, and so
+on.
+
+A vertex is **minimal** if no other vertex reaches it (nothing must come
+before it) and **minimum** if it reaches every other vertex. The book
+notes these words are easy to confuse: a DAG can have several minimal
+vertices but at most one minimum.
+
+**Theorem.** Every finite DAG has a topological sort.
+
+**Proof idea.** A finite DAG has a minimal vertex: start anywhere and walk
+backwards along edges; since there are no cycles and finitely many
+vertices, the backward walk must stop, at a vertex with nothing before
+it. Put it first, delete it, and repeat on the remaining DAG (still
+acyclic). Induction on the number of vertices finishes it.
+
+#### Parallel task scheduling
+
+With unlimited processors, tasks that do not depend on each other can run
+at the same time. A **parallel schedule** partitions the vertices into
+blocks A0, A1, ... (step 0, step 1, ...) so that nothing in a later block
+is needed by something in an earlier one. Its **time** is the number of
+blocks, and the **number of processors** it needs is the size of the
+largest block.
+
+A **chain** is a set of vertices any two of which are comparable (one
+reaches the other); think of it as a sequence of tasks that must happen
+one after another. The **depth** of a vertex is the size of the largest
+chain ending at it, minus one in the book's step numbering (so minimal
+vertices have depth 0).
+
+**Theorem.** Scheduling each vertex at step = its depth gives a
+minimum-time schedule.
+
+Every vertex is scheduled after all its predecessors (they have smaller
+depth), so the schedule is valid. And no schedule can be faster: the
+tasks of a largest chain must all go in different steps. So:
+
+**Corollary.** Parallel time = size of the largest chain, the **critical
+path**.
+
+With a bounded number of processors things get harder, and the book
+leaves that to problems; in general it is a hard optimisation problem.
+
+#### Dilworth's lemma
+
+An **antichain** is a set of vertices no two of which are comparable:
+tasks that could all run at once. Each step of the depth schedule is an
+antichain. If the largest chain has size t, the depth schedule
+partitions the vertices into t antichains.
+
+**Dilworth's lemma.** For every t at least 1, a DAG with n vertices has
+either a chain of size greater than t or an antichain of size at least n
+/ t.
+
+**Proof.** If no chain is longer than t, the depth schedule uses at most t
+steps, each an antichain, and together they hold all n vertices. If every
+antichain had fewer than n / t vertices, the total would be less than t ·
+(n / t) = n. So some antichain has at least n / t.
+
+Setting t = √n: every DAG with n vertices has a chain longer than √n or
+an antichain of size at least √n. Either many things must happen in
+sequence, or many things are independent.
+
+<Figure art={`
+   step 0:  write code        provision db
+   step 1:  unit tests        build image       run migrations
+   step 2:  scan image        push image
+   step 3:  merge
+   step 4:  deploy staging
+   step 5:  smoke test
+   step 6:  deploy prod
+   critical path: write code > build image > scan image > merge >
+                  deploy staging > smoke test > deploy prod  (7 tasks)
+`} caption="The depth schedule for the pipeline below. Each row is an antichain; the critical path has one task in each row, so no schedule can take fewer than 7 steps." />
+
+### Worked example
+
+**Simple: topological sort of a deployment pipeline.** Edges say "u must
+happen before v". Repeatedly remove a minimal vertex:
+
+```ts
+const deps: Record<string, string[]> = {
+  'write code': ['unit tests', 'build image'], 'unit tests': ['merge'], 'build image': ['scan image', 'push image'],
+  'scan image': ['merge'], 'merge': ['deploy staging'], 'push image': ['deploy staging'],
+  'provision db': ['run migrations'], 'run migrations': ['deploy staging'], 'deploy staging': ['smoke test'], 'smoke test': ['deploy prod'], 'deploy prod': [],
+};
+const V = Object.keys(deps);
+function topo(): string[] {
+  const left = new Set(V), order: string[] = [];
+  while (left.size) {
+    const m = [...left].find((v) => ![...left].some((u) => deps[u].includes(v)));
+    if (!m) throw new Error('cycle'); order.push(m); left.delete(m);
+  }
+  return order;
+}
+console.log('topological sort:', topo().join(' → '));
+```
+
+```text
+topological sort: write code → unit tests → build image → scan image → merge → push image → provision db → run migrations → deploy staging → smoke test → deploy prod
+```
+
+(This snippet lives in its own file, so `V` here is the pipeline's
+vertex list, not the earlier graph's.)
+
+**Realistic: the minimum-time parallel schedule, and a cycle.** Compute
+each task's depth in topological order, group by depth, then add a bad
+edge:
+
+```ts
+const depth = new Map<string, number>();
+for (const v of topo()) { const preds = V.filter((u) => deps[u].includes(v)); depth.set(v, preds.length ? 1 + Math.max(...preds.map((u) => depth.get(u)!)) : 0); }
+const steps: string[][] = [];
+for (const v of V) (steps[depth.get(v)!] ??= []).push(v);
+steps.forEach((s, k) => console.log(`step ${k}: ${s.join(', ')}`));
+console.log('parallel time', steps.length, ' processors needed', Math.max(...steps.map((s) => s.length)));
+deps['deploy prod'] = ['write code'];
+try { topo(); } catch (e) { console.log('with deploy prod → write code:', (e as Error).message); }
+```
+
+```text
+step 0: write code, provision db
+step 1: unit tests, build image, run migrations
+step 2: scan image, push image
+step 3: merge
+step 4: deploy staging
+step 5: smoke test
+step 6: deploy prod
+parallel time 7  processors needed 3
+with deploy prod → write code: cycle
+```
+
+The pipeline needs 7 steps however many runners you have, because the
+critical path has 7 tasks; three runners suffice to achieve it. Speeding
+up a task off the critical path (unit tests, say) does not shorten the
+pipeline at all; speeding up the image scan might. And once a cycle is
+added, no minimal vertex exists and the sort correctly refuses.
+
+**Dilworth on random DAGs.** For 200 random 12-vertex DAGs, compute the
+largest chain t (by longest-path dynamic programming on the transitive
+closure) and the largest antichain l (by brute force over all 4,096
+subsets), and check l · t ≥ n:
+
+```ts
+let ok = true;
+for (let trial = 0; trial < 200; trial++) {
+  const n = 12; const adj = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => i < j && Math.random() < 0.2));
+  for (let k = 0; k < n; k++) for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (adj[i][k] && adj[k][j]) adj[i][j] = true; // transitive closure
+  const chain = Array(n).fill(1); for (let j = 0; j < n; j++) for (let i = 0; i < j; i++) if (adj[i][j]) chain[j] = Math.max(chain[j], chain[i] + 1);
+  const t = Math.max(...chain); let l = 0;
+  for (let m = 1; m < 1 << n; m++) { const s = [...Array(n).keys()].filter((i) => (m >> i) & 1); if (s.length > l && s.every((i) => s.every((j) => !adj[i][j]))) l = s.length; }
+  if (l * t < n) ok = false;
+}
+console.log('Dilworth bound (largest antichain × largest chain ≥ n) on 200 random 12-vertex DAGs:', ok);
+```
+
+```text
+Dilworth bound (largest antichain × largest chain ≥ n) on 200 random 12-vertex DAGs: true
+```
+
+Edges only go from lower to higher index, so every generated graph is a
+DAG by construction. The graphs are random, but the result is the same
+on every run, because the lemma guarantees it.
+
+### Step by step
+
+The theorem that the depth schedule is optimal.
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "schedule v at step depth(v)", "definition of the schedule"],
+  ["2", "if u reaches v then depth(u) is less than depth(v)", "a chain ending at u extends to v"],
+  ["3", "so every task runs after all its prerequisites", "valid schedule"],
+  ["4", "the number of steps is the largest depth plus 1", "steps 0 to max depth"],
+  ["5", "that equals the size t of the largest chain", "depth counts the chain ending at v"],
+  ["6", "any valid schedule puts a chain's tasks in different steps", "each must wait for the previous"],
+  ["7", "so every schedule needs at least t steps", "the largest chain has t tasks"],
+]} caption="Optimality in both directions: the depth schedule achieves t steps, and no schedule can beat t." />
+
+### Common mistake
+
+**The wrong way:** adding more parallel workers to speed up a pipeline
+whose time is set by its critical path.
+
+**Why it fails:** with enough workers already, time equals the critical
+path length; more workers sit idle.
+
+**The right way:** find the critical path (longest chain) and shorten or
+split the tasks on it, or remove dependencies that are not real.
+
+### In real systems
+
+- **Build systems** (Make, Bazel, Gradle) and **CI pipelines** model targets as a DAG, topologically sort it, and run independent targets in parallel.
+- **Spreadsheets** recalculate cells in topological order of their formula dependencies and report circular references as errors.
+- **Project management** uses the critical path method, named after exactly this corollary.
+- **Data pipelines** (Airflow and similar) are literally called DAGs; the scheduler runs tasks whose predecessors have succeeded.
+- **Package managers** install dependencies in topological order and fail on cycles.
+
+### Check yourself
+
+1. Can a DAG have two minimal vertices? Two minimum vertices?
+2. A DAG has 100 vertices and no chain longer than 4. What does Dilworth guarantee?
+3. Why does every finite DAG have a minimal vertex?
+
+<details>
+<summary>Answer</summary>
+
+1. Yes to two minimal vertices (write code and provision db above). At most one minimum: two minimum vertices would reach each other, giving a cycle.
+2. An antichain of size at least 100 / 4 = 25: at least 25 tasks that can run at once.
+3. Walk backwards from any vertex along incoming edges; without cycles no vertex repeats, and with finitely many vertices the walk stops at a vertex with no incoming edges.
+
+</details>
+
+## 9.6 Partial Orders
+
+### In one sentence
+
+A partial order is a relation that behaves like reachability in a DAG:
+transitive, and either never relating an element to itself (strict) or
+always doing so but never relating two different elements both ways
+(weak).
+
+### The idea
+
+#### The properties of the walk relation in DAGs
+
+The book extracts the properties of walk relations that make them
+"order-like". A relation R on a set A is:
+
+- **transitive** if a R b and b R c imply a R c;
+- **reflexive** if a R a for every a;
+- **irreflexive** if a R a for no a.
+
+For any digraph, G⁺ and G* are transitive (merge the walks), and G* is
+reflexive (length-0 walks). And G is a DAG iff G⁺ is irreflexive, since
+u G⁺ u is exactly a positive-length closed walk.
+
+#### Strict partial orders
+
+A **strict partial order** is a relation that is transitive and
+irreflexive. Examples: less than on numbers, proper subset on sets, "is
+a proper prerequisite of" on courses.
+
+**Theorem.** R is a strict partial order iff R is the positive walk
+relation of some DAG. (Given R, use R itself as the DAG: it is acyclic
+because a cycle plus transitivity would give a R a. Given a DAG, its G⁺
+is transitive and irreflexive.)
+
+A relation is **asymmetric** if a R b implies NOT b R a. For a DAG, G⁺ is
+asymmetric (both directions would make a cycle), and the book derives
+that a strict partial order can equally be defined as transitive and
+asymmetric.
+
+Different DAGs can have the same G⁺. The smallest one, keeping only the
+edges u → v with nothing strictly between u and v, is the **covering
+relation**, drawn as a **Hasse diagram**. For a finite strict partial
+order it is unique.
+
+#### Weak partial orders
+
+A relation is **antisymmetric** if for all a different from b, a R b
+implies NOT b R a: no two distinct elements are related both ways (an
+element may be related to itself). A **weak partial order** is
+transitive, antisymmetric and reflexive. Examples: ≤ on numbers, ⊆ on
+sets, divisibility on the positive integers.
+
+Weak and strict orders come in pairs: given a strict order, add the
+self-pairs to get a weak one; given a weak order, remove them. And a
+relation is a weak partial order iff it is the walk relation G* of some
+DAG.
+
+The book adds a warning about the word "antisymmetric": it is not the
+opposite of symmetric. A relation can be both (equality is) or neither.
+
+<Compare caption="Strict and weak partial orders, side by side. Each is the other with the self-pairs added or removed." left="Strict partial order" right="Weak partial order" rows={[
+  ["transitive and irreflexive", "transitive, antisymmetric and reflexive"],
+  ["equivalently transitive and asymmetric", "a R b and b R a only when a = b"],
+  ["examples: less than, proper subset", "examples: ≤, ⊆, divides"],
+  ["the positive walk relation G⁺ of a DAG", "the walk relation G* of a DAG"],
+  ["no element relates to itself", "every element relates to itself"],
+]} />
+
+### Worked example
+
+**Simple and realistic: checking properties mechanically.** A small
+property checker over a finite set, tried on four relations on 1 to 12:
+
+```ts
+type Rel<T> = (a: T, b: T) => boolean;
+const props = <T>(A: T[], R: Rel<T>) => {
+  const all = (f: (a: T, b: T, c: T) => boolean) => A.every((a) => A.every((b) => A.every((c) => f(a, b, c))));
+  return {
+    refl: A.every((a) => R(a, a)), irrefl: A.every((a) => !R(a, a)),
+    sym: all((a, b) => !R(a, b) || R(b, a)), antisym: all((a, b) => a === b || !(R(a, b) && R(b, a))),
+    asym: all((a, b) => !(R(a, b) && R(b, a))), trans: all((a, b, c) => !(R(a, b) && R(b, c)) || R(a, c)),
+  };
+};
+const show = (o: Record<string, boolean>) => Object.entries(o).filter(([, v]) => v).map(([k]) => k).join(',');
+const N = Array.from({ length: 12 }, (_, i) => i + 1);
+console.log('divides on 1..12:', show(props(N, (a, b) => b % a === 0)));
+console.log('less than:      ', show(props(N, (a, b) => a < b)));
+console.log('same rem mod 3: ', show(props(N, (a, b) => a % 3 === b % 3)));
+console.log('"differ by ≤1": ', show(props(N, (a, b) => Math.abs(a - b) <= 1)));
+```
+
+```text
+divides on 1..12: refl,antisym,trans
+less than:       irrefl,antisym,asym,trans
+same rem mod 3:  refl,sym,trans
+"differ by ≤1": refl,sym
+```
+
+Reading the results:
+
+- Divisibility is reflexive, antisymmetric and transitive: a weak partial order.
+- Less than is irreflexive and transitive: a strict partial order (and, as the output shows, asymmetric and antisymmetric too, as every strict order is).
+- Same remainder mod 3 is reflexive, symmetric and transitive: an equivalence relation (9.10).
+- "Differ by at most 1" fails transitivity (1 relates to 2, 2 to 3, but not 1 to 3), so it is not an order or an equivalence. This "closeness" relation is a classic trap when people try to group values by similarity.
+
+### Step by step
+
+Why a strict partial order R is asymmetric.
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "suppose a R b and b R a", "for contradiction"],
+  ["2", "then a R a", "transitivity with c = a"],
+  ["3", "but R is irreflexive", "definition of strict partial order"],
+  ["4", "contradiction, so a R b implies NOT b R a", "asymmetry"],
+]} caption="Transitive plus irreflexive implies asymmetric. The converse also holds, since asymmetry applied with b = a gives irreflexivity." />
+
+### Common mistake
+
+**The wrong way:** "antisymmetric means not symmetric".
+
+**Why it fails:** equality is both symmetric and antisymmetric, and the
+relation 1 R 2, 2 R 1, 1 R 3 on three elements is neither.
+
+**The right way:** read antisymmetric as "distinct elements are never
+related in both directions", and test it pair by pair.
+
+### In real systems
+
+- **Sorting comparators** must implement a strict weak ordering in most standard libraries; a comparator that is not transitive or not irreflexive can make sort routines return garbage or even crash.
+- **Version constraints** (semantic versioning) define a partial order on releases, with pre-release tags making some versions incomparable in practice.
+- **Happened-before** in distributed systems (Lamport's relation) is a strict partial order on events: two events on different machines with no message between them are incomparable, which is what "concurrent" means.
+
+### Check yourself
+
+1. Is "is an ancestor of" strict or weak?
+2. Is ⊆ on the subsets of `{1, 2}` a linear order?
+
+<details>
+<summary>Answer</summary>
+
+1. Strict: nobody is their own ancestor, and it is transitive.
+2. No: the sets containing only 1 and only 2 are incomparable.
+
+</details>
+
+## 9.7 Representing Partial Orders by Set Containment
+
+### In one sentence
+
+Every partial order has exactly the same shape as some family of sets
+ordered by inclusion: map each element to the set of elements below it.
+
+### The idea
+
+Two relations have the "same shape" when they are **isomorphic**: there is
+a bijection f from A to B with a R a' iff f(a) S f(a'). The book shows
+every weak partial order is isomorphic to ⊆ on a family of sets, using
+the construction: send each a to the set of elements b with b ≤ a (its
+"down-set").
+
+- If a ≤ a', then everything below a is below a' (transitivity), so
+  down(a) ⊆ down(a').
+- If down(a) ⊆ down(a'), then since a is in down(a) (reflexivity), a is
+  in down(a'), so a ≤ a'.
+- The map is injective: if down(a) = down(a'), then a ≤ a' and a' ≤ a, so
+  a = a' (antisymmetry).
+
+Each of the three properties of a weak order is used exactly once. The
+same trick with strict orders gives proper containment.
+
+The value of the theorem is the picture: anything you can prove about
+families of sets under ⊆ that only uses order properties holds for all
+partial orders, and a confusing order can be visualised as nested sets.
+
+### Worked example
+
+**Simple: divisibility as containment.** Each number maps to its set of
+divisors in the range:
+
+```ts
+const down = (a: number) => N.filter((d) => a % d === 0);
+const subset = (X: number[], Y: number[]) => X.every((x) => Y.includes(x));
+console.log('a | b iff down(a) ⊆ down(b) on 1..12:', N.every((a) => N.every((b) => (b % a === 0) === subset(down(a), down(b)))), ' down(12) =', JSON.stringify(down(12)));
+```
+
+```text
+a | b iff down(a) ⊆ down(b) on 1..12: true  down(12) = [1,2,3,4,6,12]
+```
+
+**Realistic: permissions as down-sets.** In a role hierarchy (viewer below
+editor below admin, with billing-admin incomparable to editor), represent
+each role by the set of permissions it grants. "Role r is at most role s"
+becomes "r's permission set is a subset of s's". The theorem guarantees
+this representation is always possible for any hierarchy that is a
+genuine partial order, and the implementation becomes a fast bit-set
+subset test.
+
+### Step by step
+
+<Trace columns={["element", "down-set (divisors among 1, 2, 3, 4, 6, 12)"]} rows={[
+  ["1", "{1}"],
+  ["2", "{1, 2}"],
+  ["3", "{1, 3}"],
+  ["4", "{1, 2, 4}"],
+  ["6", "{1, 2, 3, 6}"],
+  ["12", "{1, 2, 3, 4, 6, 12}"],
+]} caption="Each divisor relation becomes a containment: 2 divides 6 and {1, 2} ⊆ {1, 2, 3, 6}; 4 does not divide 6 and {1, 2, 4} is not a subset of {1, 2, 3, 6}." />
+
+### Common mistake
+
+**The wrong way:** representing elements by up-sets and down-sets
+interchangeably without flipping the order.
+
+**Why it fails:** with up-sets (elements above a), a ≤ a' iff up(a) ⊇
+up(a'): the containment reverses.
+
+**The right way:** pick one and state the direction; down-sets preserve
+the order, up-sets reverse it.
+
+### In real systems
+
+- **Bit-set encodings of orders** (assign each element a bit vector of its down-set) are used to answer "is A a subtype of B?" in constant time in some compilers and type checkers.
+- **Capability and role systems** are often implemented as permission sets with subset checks.
+- **Lattice-based security models** (classification levels plus compartments) are partial orders represented by set containment of labels.
+
+### Check yourself
+
+1. Which property of a weak order makes the down-set map injective?
+2. Represent the order 1 ≤ 2 ≤ 3 as sets.
+
+<details>
+<summary>Answer</summary>
+
+1. Antisymmetry.
+2. 1 maps to `{1}`, 2 to `{1, 2}`, 3 to `{1, 2, 3}`: a chain of nested sets.
+
+</details>
+
+## 9.8 Linear Orders
+
+### In one sentence
+
+A linear (total) order is a partial order in which every two different
+elements are comparable, like the numbers on a line.
+
+### The idea
+
+Elements a and b are **comparable** under R if a R b or b R a. A partial
+order in which every two different elements are comparable is a **linear
+order** (also called total order). ≤ and less than on the reals are
+linear; ⊆ is not, nor is divisibility (2 and 3 are incomparable).
+
+A topological sort of a finite DAG is exactly a linear order that
+**extends** its partial order: whenever a comes before b in the partial
+order, it comes before b in the list. Every finite partial order has such
+a **linear extension**, by 9.5. Usually many: the count measures how much
+freedom the order leaves.
+
+### Worked example
+
+**Simple: counting linear extensions.** How many ways can 1 to 6 be listed
+so that every number comes after all its divisors?
+
+```ts
+const S = [1, 2, 3, 4, 5, 6]; let count = 0;
+const extend = (left: number[]) => { if (!left.length) { count++; return; } for (const v of left) if (!left.some((u) => u !== v && v % u === 0)) extend(left.filter((x) => x !== v)); };
+extend(S); console.log('topological sorts of divisibility on 1..6:', count);
+```
+
+```text
+topological sorts of divisibility on 1..6: 25
+```
+
+Check by hand: 1 must come first. Among 2, 3, 4, 6, the constraints are
+2 before 4, 2 before 6, 3 before 6, which allow five orders (2 3 4 6, 2 3
+6 4, 2 4 3 6, 3 2 4 6, 3 2 6 4). 5 is unconstrained and can go in any of
+five positions among them. 5 · 5 = 25.
+
+**Realistic: why linear extensions matter.** A single-threaded executor
+must pick one linear extension of the dependency order; different picks
+give different but equally valid runs. Bugs that appear only under one
+order (a test that passes when run alone but fails after another) are
+signs of a hidden dependency the declared partial order does not
+capture. Some test runners deliberately randomise the linear extension to
+expose them.
+
+### Step by step
+
+<Trace columns={["position", "choices available", "picked"]} rows={[
+  ["1", "1 (only element with no divisor left)", "1"],
+  ["2", "2, 3, 5", "3"],
+  ["3", "2, 5", "2"],
+  ["4", "4, 5, 6", "6"],
+  ["5", "4, 5", "5"],
+  ["6", "4", "4"],
+]} caption="Building one linear extension by repeatedly choosing any minimal remaining element. Each different sequence of choices gives a different extension; there are 25." />
+
+### Common mistake
+
+**The wrong way:** assuming a sort with a partial-order comparator produces
+"the" order.
+
+**Why it fails:** incomparable elements may land in any relative order,
+and many sorting algorithms assume totality, giving inconsistent results.
+
+**The right way:** sort partial orders with a topological sort, or extend
+the comparator to a total order with a deterministic tie-break.
+
+### In real systems
+
+- **Database ORDER BY** with ties returns rows in an unspecified order unless a unique column breaks the tie, which is exactly choosing a linear extension.
+- **Lamport clocks** extend the happened-before partial order to a total order by breaking ties with process IDs.
+- **Migration tools** apply schema migrations in a total order that extends their dependency order.
+
+### Check yourself
+
+1. Is the lexicographic order on strings linear?
+2. How many linear extensions does an antichain of 4 elements have?
+
+<details>
+<summary>Answer</summary>
+
+1. Yes: any two different strings are comparable.
+2. 4! = 24, since there are no constraints.
+
+</details>
+
+## 9.9 Product Orders
+
+### In one sentence
+
+Two orders combine into an order on pairs by comparing both components,
+and the result is usually only partial even when both parts are linear.
+
+### The idea
+
+Given relations R1 on A1 and R2 on A2, the **product relation** on pairs
+relates (a1, a2) to (b1, b2) iff a1 R1 b1 and a2 R2 b2. The book observes
+that the product of partial orders is a partial order: reflexivity,
+transitivity and antisymmetry each hold component by component. But
+linearity does not carry over: ≤ on ℕ is linear, yet in the product order
+on ℕ × ℕ, (1, 2) and (2, 1) are incomparable.
+
+The book's example compares people by age and height: someone is
+"smaller" only if younger and shorter, and many pairs are incomparable.
+
+### Worked example
+
+**Simple: pairs of version numbers.**
+
+```ts
+const pairs: [number, number][] = [[1, 2], [2, 1], [2, 3], [1, 1]];
+const le = (p: [number, number], q: [number, number]) => p[0] <= q[0] && p[1] <= q[1];
+console.log('(1,2) vs (2,1) comparable?', le(pairs[0], pairs[1]) || le(pairs[1], pairs[0]), ' (1,1) ≤ (2,3)?', le(pairs[3], pairs[2]));
+```
+
+```text
+(1,2) vs (2,1) comparable? false  (1,1) ≤ (2,3)? true
+```
+
+**Realistic: Pareto fronts.** When comparing options on two measures, say
+latency and cost for cloud instance types, the product order says one
+option dominates another only if it is at least as good on both. The
+minimal elements under this order (options not dominated by any other)
+form the **Pareto front**, and the honest answer to "which is best?" is
+usually "any point on the front, depending on what you value". Dilworth's
+lemma even says something here: among n options, either there is a long
+chain of strictly improving options or a large set of mutually
+incomparable trade-offs.
+
+### Step by step
+
+<Trace columns={["property", "why it holds for the product"]} rows={[
+  ["reflexive", "a1 R1 a1 and a2 R2 a2, so (a1, a2) relates to itself"],
+  ["transitive", "chain each component: a1 R1 b1 R1 c1 and a2 R2 b2 R2 c2"],
+  ["antisymmetric", "both directions in each component force a1 = b1 and a2 = b2"],
+  ["linear?", "fails: (1, 2) and (2, 1) under ≤ × ≤"],
+]} caption="The product inherits every property that is checked one component at a time, and loses linearity, which needs a choice between components." />
+
+### Common mistake
+
+**The wrong way:** sorting multi-criteria results by the product order and
+expecting a single ranking.
+
+**Why it fails:** the product order is partial; there may be no single
+best element.
+
+**The right way:** use a lexicographic order (compare the first component,
+break ties with the second), which is linear, or present the Pareto front.
+
+### In real systems
+
+- **Vector clocks** compare event timestamps with the product order on vectors of counters; incomparable vectors mean concurrent events.
+- **Multi-objective optimisation** and benchmark reports present Pareto fronts.
+- **Type systems:** subtyping of function types and tuples is defined component-wise, a product order (with a twist of direction for function arguments).
+
+### Check yourself
+
+1. Is the lexicographic order on pairs the same as the product order?
+2. In the product of ≤ with itself, what are the minimal elements of `{(3,1), (1,3), (2,2), (3,3)}`?
+
+<details>
+<summary>Answer</summary>
+
+1. No. Lexicographic is linear; product is partial. Every product-order relation is also a lexicographic one, but not conversely.
+2. (3,1), (1,3) and (2,2): none is dominated, and (3,3) is above all three.
+
+</details>
+
+## 9.10 Equivalence Relations
+
+### In one sentence
+
+A relation that is reflexive, symmetric and transitive is an equivalence
+relation, and it is the same thing as splitting the set into disjoint
+blocks.
+
+### The idea
+
+A relation is **symmetric** if a R b implies b R a. An **equivalence
+relation** is reflexive, symmetric and transitive. Examples: equality,
+congruence mod n (chapter 8), "has the same length as" on strings, "is
+in the same connected component as" in an undirected graph.
+
+The book's general recipe: for any function f, "f(a) = f(b)" is an
+equivalence relation. In fact every equivalence relation has this form.
+
+#### Equivalence classes
+
+The **equivalence class** of a, written [a], is the set of all elements
+related to a. So [7] under congruence mod 3 is the set of integers with
+remainder 1. The key facts:
+
+- every element is in its own class (reflexivity);
+- if a R b then [a] = [b] (symmetry and transitivity);
+- two classes are either equal or disjoint.
+
+So the classes form a **partition** (9.5's definition: non-empty blocks,
+each element in exactly one). Conversely, any partition defines an
+equivalence relation, "in the same block". And taking f(a) = [a] shows
+every equivalence relation is "same f-value" for some f.
+
+<Layers caption="Three views of the same thing. Moving between them is routine, and each suits different code." layers={[
+  { title: "Equivalence relation", body: "reflexive, symmetric, transitive pairs" },
+  { title: "Partition", body: "disjoint non-empty blocks covering the set" },
+  { title: "Key function", body: "a ~ b iff key(a) = key(b)" },
+]} />
+
+### Worked example
+
+**Simple: classes mod 3.**
+
+```ts
+const classes = new Map<number, number[]>(); for (const n of N) (classes.get(n % 3) ?? classes.set(n % 3, []).get(n % 3)!).push(n);
+console.log('classes mod 3:', JSON.stringify([...classes.values()]));
+```
+
+```text
+classes mod 3: [[1,4,7,10],[2,5,8,11],[3,6,9,12]]
+```
+
+The key function is n % 3; grouping by key is computing the partition.
+
+**Realistic: deduplicating records.** Customer records are "the same
+customer" if they share a normalised email. That is "same f-value", an
+equivalence, and grouping by the normalised email partitions the records
+cleanly. Now suppose the rule is "same email OR same phone". That
+relation is reflexive and symmetric but not transitive: A shares an email
+with B, B shares a phone with C, but A and C share nothing. To get
+clusters you must take the transitive closure (9.4), which is what
+union-find data structures do, and accept that A and C end up merged.
+
+### Step by step
+
+Why two equivalence classes are equal or disjoint.
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "suppose c is in both [a] and [b]", "the classes overlap"],
+  ["2", "a R c and b R c", "definition of class"],
+  ["3", "c R b", "symmetry"],
+  ["4", "a R b", "transitivity with step 2 and 3"],
+  ["5", "any x in [b]: b R x, so a R x, so x in [a]", "transitivity"],
+  ["6", "likewise [a] is inside [b], so [a] = [b]", "symmetric argument"],
+]} caption="Overlapping classes coincide, so the classes partition the set." />
+
+### Common mistake
+
+**The wrong way:** grouping items by a similarity threshold ("within 5% of
+each other") and expecting well-defined groups.
+
+**Why it fails:** thresholds are not transitive; chains of small
+differences link very different items, and the result depends on
+processing order.
+
+**The right way:** group by a key function (rounding to a bucket, a
+canonical form), or explicitly take the transitive closure and accept its
+consequences.
+
+### In real systems
+
+- **Hash maps** rely on an equivalence (the equals method) that must be consistent with the hash function: equal keys must have equal hashes.
+- **Union-find** maintains a partition under merges, used in Kruskal's spanning tree algorithm and in type inference.
+- **Canonicalisation:** URL normalisation, Unicode normalisation and case folding define equivalences by key functions.
+- **Compiler optimisations** (global value numbering) partition expressions into classes known to compute the same value.
+
+### Check yourself
+
+1. Is "has the same birthday as" an equivalence relation?
+2. How many equivalence classes does congruence mod 5 have on the integers?
+
+<details>
+<summary>Answer</summary>
+
+1. Yes: it is "same f-value" for f = birthday.
+2. Five, one per remainder.
+
+</details>
+
+## 9.11 Summary of Relational Properties
+
+### In one sentence
+
+A handful of properties, each checkable pair by pair, classify the
+relations that matter: orders, equivalences and their variants.
+
+### The idea
+
+The book closes with the catalogue. For a relation R on A:
+
+- **reflexive:** every a has a R a. The walk relation of every digraph.
+- **irreflexive:** no a has a R a. G⁺ of a DAG.
+- **symmetric:** a R b implies b R a. Undirected graphs.
+- **asymmetric:** a R b implies NOT b R a. Strict orders.
+- **antisymmetric:** for distinct a, b, a R b implies NOT b R a. Weak orders.
+- **transitive:** a R b and b R c imply a R c. Every walk relation.
+
+And the classes:
+
+- **strict partial order:** transitive and irreflexive (equivalently asymmetric);
+- **weak partial order:** transitive, antisymmetric and reflexive;
+- **linear order:** a partial order in which all distinct pairs are comparable;
+- **equivalence relation:** reflexive, symmetric and transitive.
+
+<Compare caption="The properties that define each class of relation, and how the classes relate to DAGs." left="Class" right="Properties" rows={[
+  ["strict partial order", "transitive, irreflexive, asymmetric, antisymmetric"],
+  ["weak partial order", "transitive, reflexive, antisymmetric"],
+  ["linear order", "a partial order with all distinct pairs comparable"],
+  ["equivalence relation", "transitive, reflexive, symmetric"],
+  ["walk relation of a DAG", "a weak partial order"],
+  ["positive walk relation of a DAG", "a strict partial order"],
+]} />
+
+### Worked example
+
+**Simple:** classify "is a substring of" on strings. Reflexive (every
+string is a substring of itself), transitive, antisymmetric (two strings
+that are substrings of each other have the same length, so are equal).
+A weak partial order, not linear ("ab" and "ba" are incomparable).
+
+**Realistic:** classify a comparator before trusting a sort. Suppose a
+comparator for tasks says a is before b if a's priority is higher, or the
+priorities are equal and a was created earlier. Irreflexive (a task is not
+before itself), transitive (check the cases), and any two different tasks
+are comparable if creation times are distinct. So it is a strict linear
+order, and sorting with it is safe. If creation times can tie, it is only
+a strict partial order (a strict weak ordering in library terms), which
+sort functions also accept, but tied items may come out in either order.
+
+### Step by step
+
+<Trace columns={["question", "substring relation", "verdict"]} rows={[
+  ["a R a for all a?", "every string is a substring of itself", "reflexive"],
+  ["a R b and b R c imply a R c?", "a substring of a substring is a substring", "transitive"],
+  ["a R b and b R a imply a = b?", "equal lengths and one inside the other", "antisymmetric"],
+  ["all distinct pairs comparable?", "ab vs ba: neither", "not linear"],
+  ["conclusion", "", "weak partial order"],
+]} caption="Classifying a relation means answering the property questions one at a time, with a proof for each yes and a counterexample for each no." />
+
+### Common mistake
+
+**The wrong way:** proving "reflexive, symmetric, transitive" by checking
+a few examples.
+
+**Why it fails:** each property is a for-all statement; examples can only
+refute it.
+
+**The right way:** prove each yes in general, find one counterexample for
+each no, and use a brute-force checker like the one in 9.6 on small sets
+to catch mistakes before writing the proof.
+
+### In real systems
+
+- **Property-based tests** for comparators and equality methods check exactly these laws (reflexivity, symmetry, transitivity, antisymmetry) on random inputs.
+- **Language specifications** state these laws as contracts: Java's equals and compareTo documentation, for example, requires them.
+
+### Check yourself
+
+1. Can a relation be both symmetric and antisymmetric?
+2. Which class does "is a subgraph of" belong to?
+
+<details>
+<summary>Answer</summary>
+
+1. Yes: equality, or any subset of the self-pairs.
+2. A weak partial order on graphs (treating identical graphs as equal).
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 9, Directed graphs & Partial Orders">
+<Level name="Beginner" depth={3}>
+
+The smallest working idea: a directed graph is a set of things with
+arrows between them, and the same information is a relation, a set of
+ordered pairs. A walk follows arrows; a path never revisits; a DAG has no
+way to come back to where you started.
+
+Try it: draw the dependency graph of five chores (laundry, dry, fold,
+shop, cook) and list them in an order that respects every arrow. Then add
+an arrow that creates a cycle and see why no order works.
+
+The beginner's mistake is forgetting direction: treating "a reaches b" as
+"b reaches a".
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The working toolkit: adjacency lists for code, adjacency matrices for
+counting (A^k counts length-k walks), composition for building
+reachability, topological sort for ordering, and depth for parallel
+schedules. The critical path is the longest chain and sets the minimum
+parallel time.
+
+Practise classifying relations: for each new relation, decide
+reflexive, irreflexive, symmetric, antisymmetric, asymmetric and
+transitive, with a proof or a counterexample for each.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+The advanced view is that orders and DAGs are the same objects: strict
+partial orders are positive walk relations of DAGs, weak ones are walk
+relations, and any partial order is isomorphic to a family of sets under
+inclusion. Dilworth's lemma gives a size trade-off between chains and
+antichains, which is the theoretical basis of the "sequential versus
+parallel" tension in scheduling.
+
+Linear extensions connect it all: topological sorts are the linear orders
+that extend a partial order, and counting or sampling them is a rich
+problem in its own right.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+- **Self-loops:** an edge u → u is a cycle of length 1, so a graph with a self-loop is not a DAG.
+- **Length-0 walks:** they make G* reflexive and are the reason G* and G⁺ differ.
+- **The empty relation:** it is a strict partial order (vacuously transitive and irreflexive), symmetric and antisymmetric at once.
+- **Infinite DAGs:** may have no minimal element (the integers under greater than), so the topological sort theorem needs finiteness.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+- **Parallel edges:** the book's digraphs have at most one edge per ordered pair; multigraphs need edge identities and walk counts change.
+- **Ties in comparators:** a "strict weak ordering" with ties is a strict partial order whose incomparability is an equivalence; sorting is stable only if the algorithm guarantees it.
+- **Non-transitive similarity:** "within distance d" is reflexive and symmetric but not transitive, so it is neither an equivalence nor an order.
+- **Bounded processors:** with a fixed number of workers, minimum-time scheduling becomes a hard problem, and the depth schedule may not fit.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production code, the graph is usually implicit (imports, service
+calls, build targets, table foreign keys), and the first job is to make
+it explicit and check it is a DAG. Then topological order gives a safe
+execution order, depths give the parallelism, and the critical path tells
+you where optimisation pays. Cycle detection should report a short cycle
+to the user, which is what the "shortest closed walk is a cycle" lemma
+promises can be found.
+
+For comparators and equality methods, test the relational laws: a broken
+comparator or an equals that is not transitive produces bugs that look
+random.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+Two habits. First, when something "must happen before" something else,
+draw the DAG; most scheduling and build problems become obvious once
+drawn. Second, before relying on a relation, ask which of the six
+properties it has. A surprising number of bugs are a relation assumed to
+be transitive or total that is not.
+
+</Level>
+<Level name="System design" depth={3}>
+
+When designing systems with dependencies (microservices, data pipelines,
+module structures), keep the dependency graph acyclic on purpose: layered
+architectures are linear extensions of a module order, and a cycle
+between services makes independent deployment impossible. Use the
+critical path to decide what to parallelise, and partial orders such as
+vector clocks to reason about concurrency honestly instead of pretending
+events are totally ordered.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+Long-term, this chapter feeds graph algorithms (BFS, DFS, shortest paths,
+strongly connected components), concurrency theory (happened-before,
+consistency models), databases (recursive queries, join as composition),
+and type systems (subtyping orders). My plan is to keep the property
+catalogue and the DAG scheduling theorems at hand, and revisit them when
+studying distributed systems and compilers.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Is a digraph really the same thing as a relation?** Yes, for digraphs
+with at most one edge per ordered pair: the edge set is the set of
+related pairs. The book keeps both vocabularies because each is
+convenient in different places.
+
+**What is the difference between minimal and minimum?** Minimal: nothing
+is below it. Minimum: it is below everything else. A DAG can have many
+minimal vertices but at most one minimum.
+
+**Why does the book care about both strict and weak orders?** They carry
+the same information, but some statements are cleaner in one form: "less
+than" for strict, "less than or equal" for weak. Moving between them is
+just adding or removing self-pairs.
+
+**Is topological sort unique?** Only when the order is linear. Otherwise
+there are many, and choosing among them is a design decision.
+
+**Does the depth schedule minimise the number of processors too?** No. It
+minimises time. It may use more processors at some steps than a schedule
+that delays tasks off the critical path; balancing both is harder.
+
+**Why is matrix multiplication related to walks?** Each entry of a matrix
+product sums over a middle index, and a two-part walk is a choice of
+middle vertex. The same structure is relation composition with OR and AND.
+
+## Key takeaways
+
+- A digraph is a binary relation on its vertices; in-degree and out-degree sums both equal the number of edges.
+- The shortest walk between two vertices is a path, and distances satisfy the triangle inequality but are not symmetric.
+- A^k counts walks of length k; the first k with a non-zero entry is the distance.
+- Composition of relations is "first S, then R"; G⁺ and G* are unions of powers of G.
+- Every finite DAG has a topological sort; the depth schedule is a minimum-time parallel schedule, whose time is the size of the largest chain.
+- Dilworth: n vertices force a chain longer than t or an antichain of at least n / t.
+- Strict partial orders are transitive and irreflexive; weak ones are transitive, antisymmetric and reflexive; they are the walk relations of DAGs.
+- Every partial order is isomorphic to a family of sets under inclusion.
+- Linear orders compare every pair; product orders usually do not.
+- Equivalence relations, partitions and key functions are three views of the same thing.
+
+## Glossary
+
+- **Digraph:** a set of vertices with directed edges.
+- **Tail, head:** the start and end vertex of a directed edge.
+- **In-degree, out-degree:** the number of edges entering, leaving a vertex.
+- **Walk:** a sequence of vertices joined by edges in the right direction.
+- **Path:** a walk with no repeated vertex.
+- **Cycle:** a positive-length closed walk with no repeats except the start/end.
+- **Distance:** the length of a shortest path.
+- **Adjacency matrix:** the 0/1 matrix of edges.
+- **Composition R ∘ S:** a relates to c when a S b and b R c for some b.
+- **G⁺, G*:** the positive walk relation and the walk relation.
+- **DAG:** a directed acyclic graph.
+- **Topological sort:** a listing of a DAG's vertices with every edge pointing forward.
+- **Minimal, minimum:** nothing below it; below everything.
+- **Chain, antichain:** pairwise comparable, pairwise incomparable sets of vertices.
+- **Parallel schedule:** a partition of tasks into steps respecting dependencies.
+- **Critical path:** a largest chain; it sets the minimum parallel time.
+- **Dilworth's lemma:** a chain longer than t or an antichain of size at least n / t.
+- **Reflexive, irreflexive, symmetric, asymmetric, antisymmetric, transitive:** the six relational properties.
+- **Strict / weak partial order:** transitive and irreflexive / transitive, antisymmetric and reflexive.
+- **Isomorphic:** related by a bijection that preserves the relation.
+- **Linear order:** a partial order with all distinct pairs comparable.
+- **Linear extension:** a linear order containing a given partial order.
+- **Product order:** comparison of pairs component by component.
+- **Equivalence relation, equivalence class, partition:** reflexive-symmetric-transitive relation; the set related to an element; disjoint blocks covering a set.
+
+## Exercises and self-check
+
+**Warm-up (by hand).**
+
+1. Prove the triangle inequality for digraph distance.
+2. For the running example graph, compute A² and list the walks it counts from b.
+3. Find a minimum-time parallel schedule for the course prerequisites of a degree you know (or invent six courses), and name the critical path.
+4. Classify each relation on the integers: a R b iff a + b is even; a R b iff a − b is positive and odd; a R b iff a divides b.
+
+**Build (code and test).**
+
+5. Implement Kahn's algorithm (topological sort using in-degree counts and a queue) and test it against the remove-a-minimal-vertex version on random DAGs.
+6. Write a function that, given a graph with a cycle, returns a shortest cycle through a given vertex, using breadth-first search.
+7. Write a comparator checker that tests irreflexivity, transitivity and totality on random samples, and use it to find the bug in a comparator that compares floating-point values with a tolerance.
+
+**Stretch (change the problem).**
+
+8. Prove that the covering relation (Hasse diagram) of a finite strict partial order is the unique smallest DAG whose positive walk relation is that order.
+9. Schedule a DAG with only two processors and show an example where the depth schedule is not optimal for two processors.
+
+**Self-check.**
+
+<details>
+<summary>1. Why is the shortest walk a path?</summary>
+
+A repeated vertex lets you cut out a positive-length loop, giving a shorter walk.
+
+</details>
+
+<details>
+<summary>2. What does (A^k)_uv count?</summary>
+
+The number of walks of length exactly k from u to v.
+
+</details>
+
+<details>
+<summary>3. What is the minimum parallel time of a DAG?</summary>
+
+The size of its largest chain, the critical path.
+
+</details>
+
+<details>
+<summary>4. What is the difference between asymmetric and antisymmetric?</summary>
+
+Asymmetric forbids a R b and b R a for all a, b, including a = b. Antisymmetric only forbids it for distinct a and b, so self-pairs are allowed.
+
+</details>
+
+## How I'd study this chapter
+
+I plan three sessions. In the first (two to three hours) I read 9.1 to
+9.4 with the 6.042J lectures on digraphs, implement the adjacency list,
+the walk-to-path function and matrix powers, and check walk counts by
+hand on the small example.
+
+In the second (two to three hours) I read 9.5, model a real CI pipeline
+of my own as a DAG, compute its topological order, depth schedule and
+critical path, and run the Dilworth experiment.
+
+In the third (two to three hours) I read 9.6 to 9.11, build the property
+checker, classify ten relations from code I work with (comparators,
+equality methods, permissions), and write the down-set representation
+proof in my own words.
+
+In my notebook I keep the property catalogue, the strict/weak comparison
+and the critical path theorem.
+
+**Done when** I can do warm-up exercises 1 to 4 without notes, my Kahn
+implementation agrees with the simple sort on random DAGs, and I can
+explain why a pipeline's time is set by its critical path. This chapter
+feeds
+<a href={withBase('/plans/traditional-software-developer/#strategy-2')}>Phase 2 of the traditional core</a>.
