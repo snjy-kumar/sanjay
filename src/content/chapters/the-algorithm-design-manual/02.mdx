@@ -1,0 +1,2033 @@
+---
+book: the-algorithm-design-manual
+number: 2
+title: "Algorithm Analysis"
+description: "The RAM model, Big Oh, growth rates and dominance, analysing loops with summations, and every everyday use of logarithms, with measured TypeScript."
+part: "Part I, Practical Algorithm Design"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+This chapter gives you a way to predict how an algorithm's running time
+grows with its input, without running it. It builds a simple model of a
+computer, a notation (Big Oh) for ignoring the details that do not matter,
+and the two pieces of mathematics that do almost all the work in practice:
+summations for loops and logarithms for anything that halves.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- Count the steps of an algorithm in the RAM model and say what its best,
+  worst and average cases are.
+- Write and read O, Ω and Θ correctly, and order a list of functions by
+  growth rate.
+- Analyse nested loops by turning them into summations, and simplify the
+  result.
+- Recognise a logarithm wherever something is halved, doubled or written in
+  digits, and use that to analyse binary search, trees, bit counts and fast
+  exponentiation.
+- Turn a growth rate into a wall-clock estimate for a given input size.
+
+**What you should already know:** <a href={withBase('/books/the-algorithm-design-manual/01-introduction-to-algorithm-design/')}>chapter 1, Introduction to Algorithm Design</a>,
+especially exhaustive search and estimation; loops and recursion; basic
+algebra with exponents. The mathematics here is reviewed from scratch.
+
+**Reading time:** about seventy minutes straight through, three to four
+hours with the code and self-checks.
+
+All code is my own TypeScript, run in Node 22 with
+`node --experimental-strip-types`. Timings come from my machine and will
+differ on yours; the ratios between them are what matter.
+
+## Chapter map
+
+<Flow caption="The chapter's sections in order. The first four build the tools (a model, a notation, an ordering, rules for combining); the fifth applies them; the rest supply the mathematics and then test it on a real computation." steps={[
+  "2.1 The RAM model: what a 'step' is; best, worst, average case",
+  "2.2 Big Oh: O, Ω, Θ as bounds that ignore constants",
+  "2.3 Growth rates and dominance: the ladder of functions",
+  "2.4 Working with Big Oh: adding and multiplying",
+  "2.5 Reasoning about efficiency: four algorithms analysed",
+  "2.6 Summations: loops into formulas",
+  "2.7–2.8 Logarithms: where they come from, how they behave",
+  "2.9 War story: an analysis that saved a computation",
+  "2.10 Advanced analysis: odd functions, limits",
+]} />
+
+<Layers caption="What each layer of analysis abstracts away. Reading top to bottom you move from a real program to a growth class; each step throws away detail on purpose." layers={[
+  { name: "Growth class", note: "Θ(n²): the only thing that matters for large n" },
+  { name: "Exact step count", note: "n(n − 1)/2 comparisons in the worst case" },
+  { name: "RAM model", note: "each simple operation costs one step, memory access is free" },
+  { name: "Real machine", note: "caches, branch prediction, JIT compilation, garbage collection" },
+]} />
+
+## 2.1 The RAM Model of Computation
+
+### In one sentence
+
+The RAM model is an imaginary computer in which every simple operation and
+every memory access costs exactly one step, which makes algorithms
+countable, and the count can then be taken in the best, worst or average
+case over all inputs of a size.
+
+### The idea
+
+To compare algorithms you need a way to measure them that does not depend
+on whose laptop runs them, which language they are in, or what else the
+machine is doing. Timing a program measures all of those things at once.
+The solution is to analyse on an **abstract machine** that is simple enough
+to count on and close enough to real computers that the counts predict
+reality.
+
+The **RAM model** (random-access machine) has three rules. Each simple
+operation, such as an addition, a comparison, an assignment, a branch or a
+function call, takes one time step. Loops and function calls are not simple
+operations: their cost is the sum of the steps they execute. Each memory
+access takes one step, wherever the memory is, and there is as much memory
+as you need.
+
+All three rules are false on a real computer. Multiplication can cost more
+than addition; a cache miss costs a hundred times a cache hit; memory runs
+out. The model is useful anyway, for the same reason a flat-earth map is
+useful for planning a walk across town: the errors are small compared with
+the thing you care about, which is how cost grows as input grows.
+
+#### 2.1.1 Best-case, worst-case and average-case complexity
+
+For a fixed input size n, different inputs take different numbers of steps.
+Insertion sort on 1,000 already-sorted numbers does 999 comparisons; on
+1,000 reversed numbers it does about half a million. So "the running time on
+n items" is not one number but a spread of numbers.
+
+Three summaries of that spread are used. The **worst-case complexity** is the
+maximum number of steps over all inputs of size n. The **best-case
+complexity** is the minimum. The **average-case complexity** is the expected
+number over some probability distribution of inputs, usually "every input
+equally likely". Each is a function of n.
+
+Worst case is the one used most, for three reasons. It is a guarantee: no
+input of that size can do worse. It is usually easier to compute than the
+average, which needs a distribution and a probability argument. And real
+inputs often hit the worst case more than you would expect (sorted data
+handed to an algorithm that hates sorted data). Best case is mostly useful as
+a warning sign: an algorithm whose best case is great and worst case
+terrible needs a reason to believe your inputs are the good ones.
+
+<Figure art={`
+   steps
+     ^
+     |                                   * worst case
+     |                              *  .
+     |                        *  .  .  average
+     |                   *  . .  .
+     |             *  .  .  .  -  -  -   best case
+     |        * . . - - -
+     |   *. .- -
+     +-------------------------------------> n
+       each column: the spread of step counts
+       over all inputs of that size
+`} caption="Three functions of n drawn from one spread. For each input size, the top of the spread is the worst case, the bottom the best, and the average sits between; the analysis picks one curve to talk about." />
+
+### Worked example
+
+**Simple: counting a loop.** Finding the largest of n numbers:
+
+```ts
+function max(a: number[]): number {
+  let best = a[0];                         // 1 step
+  for (let i = 1; i < a.length; i++)       // n − 1 iterations
+    if (a[i] > best) best = a[i];          // 1 comparison, sometimes 1 assignment
+  return best;                             // 1 step
+}
+```
+
+Every input of size n does exactly n − 1 comparisons. The assignments vary:
+none if the first element is the largest (best case), n − 1 if the input is
+increasing (worst case). Counting comparisons only, best, worst and average
+are all n − 1; counting assignments too, they differ. What you count is a
+choice, and it must be stated.
+
+**Realistic: two sorts on three kinds of input.** I instrumented selection
+sort and insertion sort to count comparisons and data moves, then ran them
+on 1,000 sorted, reversed and random numbers.
+
+```ts
+function insertionSort(a: number[]) {
+  let cmp = 0, moves = 0;
+  for (let j = 1; j < a.length; j++) {
+    const key = a[j]; let i = j - 1;
+    while (i >= 0) {
+      cmp++;
+      if (a[i] > key) { a[i + 1] = a[i]; moves++; i--; } else break;
+    }
+    a[i + 1] = key;
+  }
+  return { cmp, moves };
+}
+```
+
+```text
+sorted   selection { cmp: 499500, swaps: 0 }  insertion { cmp: 999, moves: 0 }
+reversed selection { cmp: 499500, swaps: 500 }  insertion { cmp: 499500, moves: 499500 }
+random   selection { cmp: 499500, swaps: 991 }  insertion { cmp: 254159, moves: 253165 }
+n(n-1)/2 = 499500
+```
+
+Selection sort does exactly n(n − 1)/2 = 499,500 comparisons on every input:
+its best, worst and average cases coincide. Insertion sort ranges from 999
+(sorted, best) to 499,500 (reversed, worst), with random input at about
+half the worst, which matches the average-case analysis: a random
+permutation has n(n − 1)/4 inversions on average, about 249,750 here.
+
+### Step by step
+
+Insertion sort's comparison count, derived for the worst case. Each row is
+one pass of the outer loop on reversed input of size 5 (`5 4 3 2 1`):
+
+<Trace
+  columns={["pass j", "key", "comparisons this pass", "running total", "array after"]}
+  rows={[
+    ["1", "4", "1", "1", "4 5 3 2 1"],
+    ["2", "3", "2", "3", "3 4 5 2 1"],
+    ["3", "2", "3", "6", "2 3 4 5 1"],
+    ["4", "1", "4", "10", "1 2 3 4 5"],
+  ]}
+  caption="Worst-case insertion sort on 5 items. The comparisons column is 1, 2, 3, 4: pass j compares against all j earlier items. The total, 10, is 5 × 4 / 2, the formula n(n − 1)/2."
+/>
+
+The general argument: on reversed input, the key at pass j is smaller than
+all j items before it, so the inner loop runs all the way, j comparisons.
+Summing j from 1 to n − 1 gives n(n − 1)/2 (section 2.6 proves the formula).
+On sorted input, each pass does one comparison and stops: n − 1 total.
+
+### Common mistake
+
+**The mistake:** treating a library call or a built-in as one step. A line
+like `if (list.includes(x))` looks like one operation but scans the whole
+list. Inside a loop over the list, the "linear" function is quadratic.
+
+**Why it fails:** the RAM model's "one step" applies to simple operations
+only. Anything that loops internally (`includes`, `indexOf`, `slice`,
+spread, `JSON.stringify`, string concatenation in some engines) costs as many
+steps as its own loop.
+
+**The fix:** for every library call inside a loop, write its own cost next
+to it. Replace linear lookups in loops with a `Set` or `Map`, whose lookups
+take constant expected time (chapter 3).
+
+### In real systems
+
+Worst-case thinking is what latency targets are about. A service's p99
+latency (the time under which 99 percent of requests finish) is a measured
+worst-ish case, and it is usually set by inputs that hit an algorithm's bad
+case: the customer with 40,000 orders, the search with a one-letter query.
+Designing for the average and being surprised by the tail is the most common
+performance failure in production.
+
+The RAM model's biggest lie, that memory access is uniform, matters most in
+practice. Two algorithms with the same step count can differ tenfold
+because one walks memory in order (cache-friendly) and the other jumps
+around. Analysis tells you which designs are worth considering; measurement
+on real hardware chooses between the survivors.
+
+### Check yourself
+
+<details>
+<summary>Why is worst case usually preferred over average case?</summary>
+
+It is a guarantee for every input, it is easier to compute, and it does not
+depend on assuming a distribution of inputs that real data may not follow.
+
+</details>
+
+<details>
+<summary>What are the best and worst cases of selection sort, counted in comparisons?</summary>
+
+Both are n(n − 1)/2. Selection sort always scans the whole unsorted part to
+find the minimum, regardless of the input order.
+
+</details>
+
+## 2.2 The Big Oh Notation
+
+### In one sentence
+
+Big Oh notation describes a function by an upper bound on its growth,
+ignoring constant factors and small inputs, with Ω for lower bounds and Θ
+for both at once.
+
+### The idea
+
+Exact step counts are messy. Insertion sort's worst case is n(n − 1)/2
+comparisons plus some number of moves plus loop overhead, and the exact
+expression depends on what you choose to count. What you usually need to
+know is simpler: **does the cost grow like n, like n², or like 2ⁿ?** Big Oh
+is the notation that keeps that and throws the rest away.
+
+The definitions, in words first. We say **f(n) = O(g(n))** when, beyond some
+input size, f is never more than a constant times g. We say **f(n) = Ω(g(n))**
+when, beyond some size, f is never less than a constant times g. We say
+**f(n) = Θ(g(n))** when both hold: f is sandwiched between two constant
+multiples of g.
+
+In symbols: f(n) = O(g(n)) means there exist a constant c greater than 0 and
+a size n₀ such that f(n) is at most c·g(n) for every n of at least n₀. Ω
+flips "at most" to "at least". Θ needs two constants, one for each side.
+
+Two features are deliberate. **Constants are ignored**, because they depend
+on the machine, the language and what you counted, and they change less than
+the growth rate does. **Small n is ignored** (the n₀), because every
+algorithm is fast on small inputs; the question is what happens as n grows.
+Both are also limitations, and the chapter is honest about that: a 1,000n
+algorithm is O(n) and an n² algorithm is O(n²), yet the n² one is faster for
+every n under 1,000.
+
+<Figure art={`
+  cost
+    ^                                  c2·g(n)
+    |                               .-'
+    |                           .-'     f(n)
+    |                       .-'   ___.--'
+    |                   .-' __.--'       c1·g(n)
+    |               .-'_.-'        __.--'
+    |           .-'.-'      __.--'
+    |   f wiggles .  __.--'
+    |   here   __.--'
+    +-------|------------------------------> n
+           n0
+  beyond n0, f stays between c1·g and c2·g: f = Θ(g)
+`} caption="Θ as a sandwich. Ignore everything left of n₀; to the right, f must stay below the upper constant multiple (that is O) and above the lower one (that is Ω)." />
+
+### Worked example
+
+**Simple: proving a bound from the definition.** Claim: 3n² − 100n + 6 is
+O(n²). Choose c = 3. For every n of at least 1, −100n + 6 is negative (it is
+at most −94), so 3n² − 100n + 6 is at most 3n². So c = 3 and n₀ = 1 work.
+
+Is it Ω(n²)? We need a constant c with 3n² − 100n + 6 at least c·n² for
+large n. Take c = 2: we need n² − 100n + 6 to be at least 0, which holds once
+n is at least 100. So c = 2, n₀ = 100 work, and the function is Θ(n²).
+
+Is it O(n)? No: for any constant c, 3n² − 100n + 6 exceeds c·n once n is
+larger than about (c + 100)/3. No constant can hold it under a line.
+
+**Realistic: reading a library's documentation.** A data structure library
+documents `insert: O(log n)`, `findMin: O(1)`, `deleteMin: O(log n)`. A
+binary heap (chapter 3) matches. What the notation does not say is the
+constant: a heap stored in an array is fast in practice; a pointer-based
+heap with the same O can be several times slower because of memory access.
+O is the first filter, not the final answer.
+
+### Step by step
+
+Finding the constants for 3n² − 100n + 6 = Θ(n²) as a table, checking the
+sandwich at a few sizes with c₁ = 2 and c₂ = 3:
+
+<Trace
+  columns={["n", "f(n) = 3n² − 100n + 6", "c₁·n² = 2n²", "c₂·n² = 3n²", "sandwiched?"]}
+  rows={[
+    ["10", "−694", "200", "300", "no: below the lower bound (n is under n₀)"],
+    ["50", "2,506", "5,000", "7,500", "no: still below 2n²"],
+    ["100", "20,006", "20,000", "30,000", "yes, just"],
+    ["1,000", "2,900,006", "2,000,000", "3,000,000", "yes"],
+    ["10⁶", "≈ 2.9999 × 10¹²", "2 × 10¹²", "3 × 10¹²", "yes, and closing in on 3n²"],
+  ]}
+  caption="The sandwich, checked numerically. Below n₀ = 100 the function escapes the lower bound, which the definition allows; from 100 on it stays inside, and for large n it hugs 3n², because the 100n term becomes negligible."
+/>
+
+### Common mistake
+
+**The mistake:** reading "O" as "exactly". Saying "this algorithm is O(n²)"
+when you mean it takes quadratic time. Strictly, O is only an upper bound, so
+binary search is also O(n²), truthfully and uselessly.
+
+**Why it fails:** an upper bound says nothing about whether the algorithm is
+actually that slow. Comparing two algorithms by loose upper bounds can rank
+them wrongly.
+
+**The fix:** use Θ when you know the tight growth, and O only when you mean
+"at most". In conversation people say O for Θ all the time; in writing that
+compares algorithms, be precise.
+
+### In real systems
+
+Big Oh is the lingua franca of API documentation (Redis documents the cost of
+every command this way), database query planning ("this is a full scan,
+O(n)"), and code review ("this nested loop is quadratic in the number of
+users"). It works because it survives changes of hardware and language.
+
+The ignored constants come back in production. Two O(n log n) sorts can
+differ by a factor of three; an O(1) hash lookup can be slower than an
+O(log n) search in a small sorted array that fits in cache. Teams that
+benchmark the final candidates on real data avoid being misled by notation
+that was never meant to decide close calls.
+
+### Check yourself
+
+<details>
+<summary>Is n² = O(n³)? Is n³ = O(n²)?</summary>
+
+Yes to the first: n² is at most n³ for every n of at least 1. No to the
+second: n³/n² = n grows without bound, so no constant multiple of n² stays
+above n³.
+
+</details>
+
+<details>
+<summary>Why does Big Oh ignore constant factors?</summary>
+
+Constants depend on the machine, the language and what is counted, and for
+large n the growth rate dominates them. Ignoring them makes the comparison
+portable, at the cost of misleading for small n.
+
+</details>
+
+## 2.3 Growth Rates and Dominance Relations
+
+### In one sentence
+
+A handful of growth rates (constant, logarithmic, linear, n log n,
+quadratic, cubic, exponential, factorial) cover almost every algorithm, and
+the gaps between them are so large that knowing which class you are in
+predicts feasibility better than any constant.
+
+### The idea
+
+Big Oh lets you drop constants. The payoff is that you can then put every
+algorithm on a short ladder of growth rates and read off what input sizes it
+can handle. The surprise for most people is how steep the ladder is. A step
+up in the class is not "a bit slower"; it is the difference between
+milliseconds and the age of the universe.
+
+The common classes, slowest-growing first, with what typically produces each:
+
+- **Constant**, Θ(1): adding two numbers, reading an array element. Cost does
+  not depend on n.
+- **Logarithmic**, Θ(log n): binary search, walking down a balanced tree.
+  Grows so slowly that it is almost constant: a billion items is about 30
+  steps.
+- **Linear**, Θ(n): one pass over the data, such as finding the maximum or
+  summing.
+- **Superlinear**, Θ(n log n): good sorting algorithms (chapter 4), and many
+  divide-and-conquer methods (chapter 5).
+- **Quadratic**, Θ(n²): looking at all pairs, as insertion sort does in the
+  worst case.
+- **Cubic**, Θ(n³): all triples, or simple matrix multiplication, or several
+  dynamic programs (chapter 10).
+- **Exponential**, Θ(cⁿ) for a constant c above 1: all subsets of n items.
+- **Factorial**, Θ(n!): all orderings of n items, as in the brute-force tour
+  of chapter 1.
+
+### Worked example
+
+**Simple: what one second buys.** Assuming a billion simple steps per
+second, I tabulated the time each class takes at a range of sizes:
+
+```ts
+const rate = 1e9; // steps per second
+const f: [string, (n: number) => number][] = [
+  ['lg n', n => Math.log2(n)], ['n', n => n], ['n lg n', n => n * Math.log2(n)],
+  ['n^2', n => n * n], ['2^n', n => 2 ** n],
+  ['n!', n => { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }],
+];
+// for each n, print fmt(g(n) / rate) for each function g
+```
+
+```text
+n         lg n       n          n lg n     n^2        2^n        n!
+10        <1 us      <1 us      <1 us      <1 us      1 us       4 ms
+20        <1 us      <1 us      <1 us      <1 us      1 ms       7.7e+1 yr
+30        <1 us      <1 us      <1 us      <1 us      1 s        8.4e+15 yr
+40        <1 us      <1 us      <1 us      2 us       1100 s     forever
+50        <1 us      <1 us      <1 us      3 us       313 h      forever
+100       <1 us      <1 us      <1 us      10 us      4.0e+13 yr forever
+1000      <1 us      1 us       10 us      1 ms       forever    forever
+1000000   <1 us      1 ms       20 ms      1000 s     forever    forever
+1000000000<1 us      1 s        30 s       3.2e+1 yr  forever    forever
+```
+
+Read it by column. Factorial dies at about 20 items. Exponential dies
+somewhere between 40 and 50. Quadratic is fine up to about a hundred
+thousand and painful at a million (seventeen minutes) and hopeless at a
+billion (decades). Linear and n log n handle a billion in seconds. Log n is
+never the bottleneck.
+
+**Realistic: picking the class from the input size.** Reversing the table
+gives a rule of thumb I use constantly. If n is about 10, anything works,
+even n!. If n is about 20 to 25, 2ⁿ is feasible. If n is a few hundred, n³
+is fine. If n is a few tens of thousands, n² is fine. If n is in the
+millions or more, you need n log n or better. Competitive programmers use
+exactly this table to guess the intended algorithm from the stated limits.
+
+<Compare
+  left="Input size"
+  right="Largest class that fits in about a second"
+  rows={[
+    ["n ≤ 12", "Θ(n!): try every ordering"],
+    ["n ≤ 25", "Θ(2ⁿ): try every subset"],
+    ["n ≤ 500", "Θ(n³): all triples, simple dynamic programs"],
+    ["n ≤ 30,000", "Θ(n²): all pairs"],
+    ["n ≤ 10⁷", "Θ(n log n): sort, divide and conquer"],
+    ["n ≤ 10⁹", "Θ(n): one pass, if it fits in memory"],
+    ["larger", "Θ(log n) or sublinear: you cannot even read it all"],
+  ]}
+  caption="The growth table read backwards: from the input size, the class of algorithm you can afford. These assume roughly a billion simple steps per second; the boundaries move by a small factor on other machines, never by a class."
+/>
+
+#### 2.3.1 Dominance relations
+
+We say g **dominates** f when f(n)/g(n) tends to 0 as n grows: g eventually
+leaves f behind by any factor you like. Writing f ≪ g for "g dominates f",
+the ladder above is a chain of dominance:
+
+1 ≪ log n ≪ n ≪ n log n ≪ n² ≪ n³ ≪ 2ⁿ ≪ n!
+
+Some useful facts about dominance. Any power of log n is dominated by any
+positive power of n: (log n)¹⁰⁰ ≪ n^0.01, although the crossover point is
+astronomically large. Any polynomial is dominated by any exponential with
+base above 1: n¹⁰⁰ ≪ 1.01ⁿ. And bigger bases dominate: 2ⁿ ≪ 3ⁿ, because
+(2/3)ⁿ tends to 0. Note that this means 2ⁿ and 3ⁿ are **not** the same Θ
+class, unlike n² and 3n².
+
+<Figure art={`
+   constant   log     linear  n log n  quadratic  cubic  exponential  factorial
+      1   <<  log n << n   << n log n << n^2   <<  n^3 << 2^n      <<  n!
+      |        |        |        |         |        |       |           |
+    O(1)    binary   one      good      all     matrix   all         all
+    lookup  search   pass     sort      pairs   multiply subsets     orders
+   <---------- usually practical ---------->  <--- small n only --------->
+`} caption="The dominance ladder with a typical algorithm under each rung. The practical boundary sits between polynomial and exponential growth; that boundary is the subject of chapter 11." />
+
+### Step by step
+
+Deciding whether f = n log n dominates g = n^1.5 or the other way, by
+computing the ratio g/f = n^0.5 / log n at growing n:
+
+<Trace
+  columns={["n", "n log₂ n", "n^1.5", "ratio n^1.5 / (n log n)"]}
+  rows={[
+    ["16", "64", "64", "1.0"],
+    ["1,024", "10,240", "32,768", "3.2"],
+    ["10⁶", "about 2.0 × 10⁷", "10⁹", "about 50"],
+    ["10⁹", "about 3.0 × 10¹⁰", "about 3.2 × 10¹³", "about 1,000"],
+  ]}
+  caption="The ratio √n / log n grows without bound, so n^1.5 dominates n log n. At n = 16 they are equal; after that the gap widens forever."
+/>
+
+### Common mistake
+
+**The mistake:** assuming 2ⁿ and 3ⁿ, or 2ⁿ and 2^(2n), are "both exponential,
+so the same".
+
+**Why it fails:** 3ⁿ/2ⁿ = 1.5ⁿ grows without bound, and 2^(2n) is 4ⁿ. These
+are different Θ classes. At n = 40, 2ⁿ is about 18 minutes at a billion steps
+per second while 3ⁿ is about 390 years.
+
+**The fix:** constants in front of a function can be dropped; constants in an
+exponent or base cannot. Only multiplicative constants disappear in Big Oh.
+
+### In real systems
+
+The growth ladder is why "it was fast in testing" fails in production. Test
+data is small, where every class looks the same. A quadratic deduplication
+step that handles 1,000 test records in a millisecond takes seventeen
+minutes on a million real ones. Many incident reviews contain a version of
+this sentence: "this code path was O(n²) and n grew."
+
+It is also why some problems are solved with exponential algorithms on
+purpose. Exact solvers for scheduling or circuit verification run in
+exponential worst-case time, and they work because the inputs that matter are
+small or structured. Knowing that you are in exponential territory tells you
+to look for that structure rather than wait for faster hardware.
+
+### Check yourself
+
+<details>
+<summary>Order these by growth: n², 2ⁿ, n log n, √n, 100n, n!.</summary>
+
+√n, 100n, n log n, n², 2ⁿ, n!. The constant 100 does not change 100n's
+class: it is Θ(n).
+
+</details>
+
+<details>
+<summary>Your input is about 5,000 items and the limit is one second. Is a quadratic algorithm acceptable?</summary>
+
+Yes. 5,000² is 25 million steps, a few hundredths of a second at a billion
+steps per second. A cubic algorithm (125 billion steps) would not be.
+
+</details>
+
+## 2.4 Working with the Big Oh
+
+### In one sentence
+
+Adding functions keeps the larger one, and multiplying functions multiplies
+their growth rates, which is how you build the cost of a whole program from
+the costs of its parts.
+
+### The idea
+
+Programs are made of pieces in sequence and pieces nested inside loops.
+Big Oh has a rule for each.
+
+#### 2.4.1 Adding functions
+
+Running one piece of code and then another costs the sum of their costs, and
+in Big Oh a sum is dominated by its larger term: O(f(n)) + O(g(n)) =
+O(max(f(n), g(n))). The reason is that f + g is at most twice the larger of
+the two, and the 2 is a constant we drop. So n³ + n² + n + 1 = Θ(n³). A
+program that sorts (n log n) and then makes one pass (n) is Θ(n log n)
+overall.
+
+#### 2.4.2 Multiplying functions
+
+Running a piece of code once per iteration of a loop multiplies: a loop of
+f(n) iterations whose body costs g(n) costs O(f(n) · g(n)). Constants still
+drop: O(c · f(n)) = O(f(n)) for any constant c above 0. But a factor that
+depends on n does not drop: n times n is n², not n.
+
+<Figure art={`
+   sequence                         nesting
+   +-----------+                    for i in 1..n          <- n times
+   |  A: n^2   |                      +---------------+
+   +-----------+                      | body: log n   |
+   |  B: n     |                      +---------------+
+   +-----------+
+   total = n^2 + n = Θ(n^2)         total = n · log n = Θ(n log n)
+   (the bigger piece wins)          (the factors multiply)
+`} caption="The two composition rules. Code in sequence adds, and the largest term absorbs the rest; code inside a loop multiplies by the iteration count." />
+
+### Worked example
+
+**Simple: a three-part function.**
+
+```ts
+function summary(a: number[]) {
+  const s = a.slice().sort((x, y) => x - y);      // Θ(n log n)
+  let pairs = 0;
+  for (let i = 0; i < s.length; i++)               // n iterations
+    for (let j = i + 1; j < s.length; j++)         //   up to n iterations
+      if (s[j] - s[i] < 10) pairs++;               //     Θ(1)
+  return { median: s[s.length >> 1], pairs };       // Θ(1)
+}
+```
+
+The sort is n log n. The double loop is a multiplication: about n · n/2
+iterations of constant work, Θ(n²). The return is constant. Adding: n log n
++ n² + 1 = Θ(n²). The sort, which looks like the expensive part, does not
+matter at all.
+
+**Realistic: spotting the hidden factor.** Here is a common pattern in data
+processing, written two ways:
+
+```ts
+// version 1: Θ(n·m), a linear search per order
+const withCustomer1 = orders.map(o => ({ ...o, c: customers.find(c => c.id === o.cid) }));
+// version 2: Θ(n + m), one pass to index, one pass to join
+const byId = new Map(customers.map(c => [c.id, c]));
+const withCustomer2 = orders.map(o => ({ ...o, c: byId.get(o.cid) }));
+```
+
+With n orders and m customers, version 1 multiplies: each of n orders does a
+search of up to m customers. Version 2 adds: one pass over customers to build
+the index, one pass over orders. For 100,000 of each that is 10 billion
+steps versus 200,000.
+
+### Step by step
+
+Building the cost of `summary` line by line, applying the rules in order:
+
+<Trace
+  columns={["piece", "cost", "rule", "running total"]}
+  rows={[
+    ["slice + sort", "Θ(n log n)", "start", "Θ(n log n)"],
+    ["inner loop body", "Θ(1)", "—", "—"],
+    ["inner loop", "up to n − i iterations × Θ(1)", "multiply", "Θ(n − i)"],
+    ["outer loop", "sum over i of Θ(n − i)", "sum (section 2.6)", "Θ(n²) for this piece"],
+    ["add to the sort", "Θ(n log n) + Θ(n²)", "add: keep the max", "Θ(n²)"],
+    ["return", "Θ(1)", "add", "Θ(n²)"],
+  ]}
+  caption="Composing a cost. The inner loop's length depends on i, so 'multiply' turns into a sum; that sum is the subject of section 2.6, and it comes to about n²/2."
+/>
+
+### Common mistake
+
+**The mistake:** multiplying where you should add. Two loops one after the
+other, each of n steps, are Θ(n), not Θ(n²).
+
+**Why it fails:** sequence adds, nesting multiplies. Getting this backwards
+overestimates the cost and can lead you to "optimise" code that was already
+linear.
+
+**The fix:** look at indentation. Statements at the same depth add; a
+statement inside a loop is multiplied by the loop's iteration count.
+
+### In real systems
+
+The hidden multiplication in the orders-and-customers example is so common
+in database work that it has a name: the **N+1 query problem**. Code fetches
+N rows and then runs one more query per row, so a page that shows 50 items
+makes 51 database round trips. Object-relational mappers make it easy to
+write without noticing. The fix is the same as version 2 above: fetch all
+the related rows in one query and join in memory.
+
+In front-end code the same pattern shows up as rendering a list in which
+each item looks something up in another list. It is invisible with 20 items
+in development and freezes the page with 5,000 in production.
+
+### Check yourself
+
+<details>
+<summary>What is the Big Oh of n² + 1000n + 10⁶?</summary>
+
+Θ(n²). The sum is dominated by the largest term; the constants and smaller
+terms drop out (although for n under about 1,000 the other terms dominate in
+practice).
+
+</details>
+
+<details>
+<summary>A loop runs log n times and its body calls a function that is Θ(n). What is the total?</summary>
+
+Θ(n log n): the iteration count times the cost of the body.
+
+</details>
+
+## 2.5 Reasoning about Efficiency
+
+### In one sentence
+
+To analyse a real algorithm, find its loops, count how many times the
+innermost work runs as a function of the input size, and simplify with the
+rules of Big Oh; four classic algorithms show the method.
+
+### The idea
+
+Rough analysis is quick: count nesting depth. One loop over the input is
+usually linear, two nested loops quadratic, three cubic. Precise analysis
+replaces "usually" with a count, which matters when inner loops are shorter
+than the outer ones or stop early. The four examples below are chosen so
+that each teaches a different trap.
+
+#### 2.5.1 Selection sort
+
+Selection sort repeatedly finds the smallest remaining item and swaps it to
+the front.
+
+```ts
+function selectionSort(a: number[]): void {
+  for (let i = 0; i < a.length; i++) {
+    let m = i;
+    for (let j = i + 1; j < a.length; j++) if (a[j] < a[m]) m = j;
+    [a[i], a[m]] = [a[m], a[i]];
+  }
+}
+```
+
+The analysis: the inner loop runs n − 1 − i times on pass i. Summing over i
+gives (n − 1) + (n − 2) + … + 1 + 0 = n(n − 1)/2. That is Θ(n²) exactly, in
+every case, which the measured 499,500 comparisons for n = 1,000 confirmed.
+
+There is also a quick upper-and-lower-bound argument that avoids the sum.
+Upper: two loops, each at most n, so at most n². Lower: for the first n/2
+passes the inner loop runs at least n/2 times, so at least n²/4. Both are
+constants times n², so Θ(n²).
+
+#### 2.5.2 Insertion sort
+
+Insertion sort's inner loop can stop early, so its cost depends on the
+input. The worst case (reversed input) runs the inner loop fully every time:
+Θ(n²). The best case (sorted input) stops after one comparison: Θ(n). In
+general its cost is n plus the number of **inversions**, pairs of items that
+are out of order, which is why it is the method of choice for nearly sorted
+data. The measured counts in section 2.1 showed all three cases.
+
+#### 2.5.3 String pattern matching
+
+The task is to find where a pattern p of length m first occurs in a text t
+of length n. The straightforward method tries each starting position and
+compares character by character until a mismatch.
+
+```ts
+function findMatch(text: string, pat: string): number {
+  for (let i = 0; i + pat.length <= text.length; i++) {
+    let j = 0;
+    while (j < pat.length && text[i + j] === pat[j]) j++;
+    if (j === pat.length) return i;
+  }
+  return -1;
+}
+```
+
+Analysis: the outer loop runs at most n − m + 1 times; the inner at most m.
+So the worst case is at most (n − m + 1)·m comparisons, which is O(nm). Is it
+that bad on some input? Yes: text `aaaa…a` and pattern `aa…ab` makes every
+start position match m − 1 characters before failing.
+
+```text
+{ at: 19, cmp: 22 }                       // 'mat' in 'the cat sat on the mat'
+worst { at: -1, cmp: 990100 }  (n-m+1)*m = 990100
+```
+
+On ordinary English text the search for `mat` took 22 comparisons for 20
+start positions: almost every attempt fails on the first character. On the
+adversarial input with n = 10,000 and m = 100, the count hit the bound
+exactly. Chapter 6 shows a randomized method that is linear in expectation.
+
+#### 2.5.4 Matrix multiplication
+
+Multiplying an x-by-y matrix A by a y-by-z matrix B gives an x-by-z matrix C,
+each of whose entries is a sum of y products.
+
+```ts
+function matmul(A: number[][], B: number[][]): number[][] {
+  const x = A.length, y = B.length, z = B[0].length;
+  const C = Array.from({ length: x }, () => new Array(z).fill(0));
+  for (let i = 0; i < x; i++)
+    for (let j = 0; j < z; j++)
+      for (let k = 0; k < y; k++) C[i][j] += A[i][k] * B[k][j];
+  return C;
+}
+```
+
+Three nested loops, with lengths x, z and y, none stopping early: exactly
+xyz multiplications. For square n-by-n matrices that is n³. I measured it at
+three sizes:
+
+```text
+{"C":[[19,22],[43,50]],"mults":8}
+n=100 mults=1,000,000 time=19ms
+n=200 mults=8,000,000 time=24ms
+n=400 mults=64,000,000 time=203ms
+```
+
+Doubling n multiplies the work by 8, and from 200 to 400 the time went up by
+about 8.5. The first row (19 ms for a million multiplications) is dominated
+by JIT warm-up, the engine compiling the function; a small-n timing is not a
+reliable measurement, which is one more reason to analyse rather than only
+time.
+
+<Compare
+  left="Algorithm"
+  right="Analysis"
+  rows={[
+    ["Selection sort", "inner loop always full: Θ(n²) every case"],
+    ["Insertion sort", "inner loop stops early: Θ(n) best, Θ(n²) worst, Θ(n + inversions) in general"],
+    ["Naive string matching", "two parameters: O(nm) worst, often near n in practice"],
+    ["Matrix multiplication", "three full loops: exactly xyz multiplications, n³ for square"],
+  ]}
+  caption="Four algorithms, four lessons. A full inner loop gives a clean answer; an early exit separates best from worst; two input parameters must both appear; three full loops multiply three sizes."
+/>
+
+### Worked example
+
+**Simple: predicting time from a measurement.** If an n³ algorithm takes 0.2
+seconds at n = 400, how long at n = 1,600? The size grows by 4, so the time
+grows by 4³ = 64: about 13 seconds. At n = 4,000, the factor is 10³ =
+1,000: about 200 seconds. This is the cheapest useful thing analysis
+gives you: one measurement plus a growth rate predicts every other size.
+
+**Realistic: the doubling experiment.** When you cannot analyse code (a
+library, a service, a query), run it at n and 2n and compare times. A ratio
+near 2 means linear, a bit over 2 means n log n, near 4 means quadratic, near
+8 means cubic. Do it at sizes large enough that warm-up and fixed costs are
+negligible, and repeat to average out noise.
+
+### Step by step
+
+The doubling experiment applied to the matrix multiply, reading the class
+off the ratios:
+
+<Trace
+  columns={["n", "multiplications", "time", "ratio to previous", "implied exponent (log₂ of ratio)"]}
+  rows={[
+    ["100", "10⁶", "19 ms", "—", "—"],
+    ["200", "8 × 10⁶", "24 ms", "1.3", "0.4 (warm-up noise)"],
+    ["400", "6.4 × 10⁷", "203 ms", "8.5", "3.1"],
+  ]}
+  caption="The exponent of a power law is log₂ of the time ratio when n doubles. The first pair is ruined by JIT warm-up; the second pair gives 3.1, matching Θ(n³)."
+/>
+
+### Common mistake
+
+**The mistake:** collapsing a two-parameter cost to one parameter, and
+saying string matching is O(n) or O(n²).
+
+**Why it fails:** the cost really depends on both n and m. Writing O(n)
+hides the worst case; writing O(n²) assumes m is about n, which it usually
+is not (patterns are short).
+
+**The fix:** keep every independent size in the bound until you have a
+reason to relate them: O(nm), O(V + E) for graphs, O(xyz) for matrices.
+
+### In real systems
+
+Doubling experiments are how performance regressions are caught in
+continuous integration: benchmark at two sizes, and alarm if the ratio
+changes. They are also how you find out the real complexity of a database
+query or a third-party API whose documentation says nothing.
+
+Matrix multiplication is the workload of machine learning, and its n³ is why
+hardware is specialised for it. Libraries do not use a different algorithm
+(the asymptotically faster ones in chapter 5 are rarely worth it); they make
+the same n³ operations run faster through blocking for cache, vector
+instructions and parallelism. That is the RAM model's ignored constant being
+attacked directly.
+
+### Check yourself
+
+<details>
+<summary>Selection sort and insertion sort are both Θ(n²) in the worst case. When would you choose insertion sort?</summary>
+
+When the input is nearly sorted (few inversions), because insertion sort is
+then close to linear, or for very small arrays, where its simple inner loop
+is fast. Many library sorts switch to insertion sort for small subarrays.
+
+</details>
+
+<details>
+<summary>Time doubles when n doubles from 10⁶ to 2 × 10⁶, then goes up by about 2.1 from 2 × 10⁶ to 4 × 10⁶. What is the likely class?</summary>
+
+Θ(n log n): a ratio slightly above 2, because the log factor grows a little
+with each doubling.
+
+</details>
+
+## 2.6 Summations
+
+### In one sentence
+
+A loop whose work varies per iteration costs the sum of that work, and a few
+closed forms (arithmetic series, geometric series, harmonic series) turn
+almost every such sum into a growth rate.
+
+### The idea
+
+A **summation** adds a term for each value of an index: Σ from i = 1 to n of
+f(i) means f(1) + f(2) + … + f(n). Loops are summations in disguise: the
+total work is the sum, over iterations, of the work each iteration does.
+When every iteration costs the same, the sum is just a multiplication. When
+the cost depends on i (as in selection sort), you need a formula.
+
+Three families cover most cases.
+
+**Arithmetic progressions.** The sum 1 + 2 + … + n is n(n + 1)/2. The proof
+is pairing: write the sum forwards and backwards, add column by column, and
+each of the n columns sums to n + 1. More generally, the sum of i^p for i up
+to n is Θ(n^(p+1)): sum of squares is Θ(n³), and so on. Rule of thumb:
+summing a polynomial raises its degree by one.
+
+**Geometric series.** The sum 1 + a + a² + … + aⁿ equals (a^(n+1) − 1)/(a − 1)
+for a ≠ 1. What matters is which way the ratio a points. If a is below 1,
+the sum is bounded by a constant, 1/(1 − a), however many terms there are:
+1 + 1/2 + 1/4 + … never reaches 2. If a is above 1, the sum is dominated by
+its last term: Θ(aⁿ). So a geometric sum is always within a constant of its
+largest term.
+
+**The harmonic series.** H(n) = 1 + 1/2 + 1/3 + … + 1/n grows like the natural
+log of n: H(n) is about ln n + 0.5772. It appears whenever work is
+proportional to n/i for each i (section 2.7.6 and quicksort's analysis in
+chapter 4).
+
+<Figure art={`
+   1 + 2 + 3 + ... + n       (forwards)
+   n + n-1 + ... + 2 + 1     (backwards)
+   ---------------------
+  (n+1)+(n+1)+ ... +(n+1)    n columns, each n+1
+
+   2S = n(n+1)   =>   S = n(n+1)/2
+
+      #                      the staircase 1..n
+      ##                     fills about half of
+      ###                    an n-by-n square:
+      ####                   that is the n^2/2
+      #####
+`} caption="Why 1 + 2 + … + n = n(n + 1)/2. Pairing the sum with its reverse gives n equal columns; the staircase picture shows the same thing as half a square." />
+
+### Worked example
+
+**Simple: the harmonic sum, checked.**
+
+```ts
+let H = 0;
+for (let i = 1; i <= 1_000_000; i++) H += 1 / i;
+console.log(H.toFixed(4), Math.log(1e6).toFixed(4), (H - Math.log(1e6)).toFixed(4));
+```
+
+```text
+H(1e6) = 14.3927, ln(1e6) = 13.8155, diff = 0.5772
+```
+
+A million terms add to only about 14.4, and the difference from ln n is the
+constant 0.5772, known as the Euler–Mascheroni constant. That is what
+"H(n) = Θ(log n)" looks like in numbers.
+
+**Realistic: growing an array by doubling.** A dynamic array (JavaScript's
+arrays, Java's ArrayList, Python's list) starts small and, when full, copies
+everything into a new array twice as large. How much copying do n pushes
+cost in total? The copies happen at sizes 1, 2, 4, …, up to n: a geometric
+series with ratio 2, dominated by its last term. The total is under 2n
+copies, so each push costs O(1) on average. This is the standard example of
+**amortised** cost, the average cost per operation over a worst-case
+sequence of operations (chapter 3 returns to it).
+
+### Step by step
+
+Summing the copy costs for 17 pushes into a doubling array that starts with
+capacity 1:
+
+<Trace
+  columns={["push that overflows", "old capacity", "copies made", "new capacity", "total copies so far"]}
+  rows={[
+    ["2nd", "1", "1", "2", "1"],
+    ["3rd", "2", "2", "4", "3"],
+    ["5th", "4", "4", "8", "7"],
+    ["9th", "8", "8", "16", "15"],
+    ["17th", "16", "16", "32", "31"],
+  ]}
+  caption="The copy counts double each time, so the running total is always one less than the next power of two: 31 copies for 17 pushes, under 2n. A geometric series is a constant times its largest term."
+/>
+
+### Common mistake
+
+**The mistake:** treating a loop whose inner bound depends on i as "n times
+n", and being surprised the constant is off by two, or worse, treating a loop
+whose work shrinks geometrically as "n times log n".
+
+**Why it fails:** the shape of the sum decides. A loop doing n, n/2, n/4, …
+work per round sums to 2n, which is linear, not n log n. Getting the sum
+wrong gets the class wrong.
+
+**The fix:** write the sum explicitly, then decide which family it belongs
+to: arithmetic (raise the degree by one), geometric (largest term), harmonic
+(log).
+
+### In real systems
+
+The doubling growth policy, and its geometric-sum analysis, is in every
+standard library's dynamic array, hash table resizing (chapter 3) and buffer
+growth. Some use a factor of 1.5 instead of 2 to waste less memory; the
+series is still geometric and the amortised cost still constant.
+
+Geometric sums also explain exponential backoff in networking and retries.
+A client that waits 1, 2, 4, 8 seconds between attempts has waited in total
+about twice its last wait, so the total delay is controlled by the cap on
+the last interval, not by the number of retries.
+
+### Check yourself
+
+<details>
+<summary>What is Σ from i = 1 to n of i², in Θ notation?</summary>
+
+Θ(n³). Summing a polynomial of degree 2 gives degree 3; the exact formula
+is n(n + 1)(2n + 1)/6.
+
+</details>
+
+<details>
+<summary>An algorithm does n work, then n/2, then n/4, and so on, until the size reaches 1. What is the total?</summary>
+
+Under 2n, so Θ(n). It is a geometric series with ratio 1/2, bounded by a
+constant times its first (largest) term.
+
+</details>
+
+## 2.7 Logarithms and Their Applications
+
+### In one sentence
+
+A logarithm is the inverse of an exponential, so it counts how many times
+you can halve (or double) before reaching 1, which is why it appears in
+every algorithm that repeatedly splits its problem.
+
+### The idea
+
+The **logarithm** of x to base b, written log_b(x), is the power you must
+raise b to in order to get x: log₂(1,024) = 10 because 2¹⁰ = 1,024. Read the
+other way, log₂ n is the number of times you can halve n before you reach
+1, and the number of times you must double 1 to reach n. In this book and
+this page, "lg n" means log₂ n and "ln n" means the natural log, base e.
+
+Exponentials grow fast, so their inverses grow slowly. That is the whole
+reason log n is so desirable: lg of a thousand is about 10, of a million
+about 20, of a billion about 30. Each factor of a thousand in the input adds
+only about 10 to the logarithm.
+
+#### 2.7.1 Binary search
+
+**Binary search** finds a key in a sorted array by comparing with the middle
+element and discarding the half that cannot contain the key. Each comparison
+halves the remaining range, so after lg n comparisons the range is one item.
+
+```ts
+function bsearch(a: number[], x: number): number {
+  let lo = 0, hi = a.length - 1;
+  while (lo <= hi) {
+    const mid = lo + ((hi - lo) >> 1);
+    if (a[mid] === x) return mid;
+    if (a[mid] < x) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
+}
+```
+
+```text
+n=1,000 search for missing 7: steps=10, lg n = 9.97
+n=1,000,000 search for missing 7: steps=20, lg n = 19.93
+```
+
+A thousand times more data costs ten more comparisons. The index
+computation `lo + ((hi - lo) >> 1)` avoids the overflow that `(lo + hi) / 2`
+can cause in languages with fixed-size integers, a bug that survived in a
+widely used standard library for years.
+
+#### 2.7.2 Trees
+
+A **binary tree** of height h (the number of edges on the longest path from
+the root to a leaf) has at most 2^h leaves, because each level can at most
+double the count. Turned around, a binary tree with n leaves has height at
+least lg n. More generally, a tree in which each node has d children has
+height at least log_d n. So any structure that organises n items as leaves of
+a balanced tree reaches any one of them in a logarithmic number of steps:
+that is the basis of balanced search trees (chapter 3) and heaps (chapter 4).
+
+<Figure art={`
+  level 0              o                       1 node
+                    /     \\
+  level 1         o         o                  2 nodes
+                /   \\     /   \\
+  level 2      o     o   o     o               4 nodes
+              / \\   / \\ / \\   / \\
+  level 3    o  o  o  o o  o  o  o             8 nodes
+
+   leaves = 2^h, so height h = lg(leaves)
+   1,000,000 leaves need height of only 20
+`} caption="Why trees give logarithms. Each level doubles the number of nodes, so the height needed to hold n leaves is lg n; walking from the root to any leaf takes that many steps." />
+
+#### 2.7.3 Bits
+
+How many bits does it take to write the number n in binary? With w bits you
+can write 2^w different values, so you need w with 2^w at least n + 1, which
+is ⌊lg n⌋ + 1 bits.
+
+```text
+255 needs 8 bits; floor(lg n)+1 = 8
+256 needs 9 bits; floor(lg n)+1 = 9
+1000000 needs 20 bits; floor(lg n)+1 = 20
+2147483647 needs 31 bits; floor(lg n)+1 = 31
+```
+
+The same logic in any base: a number n has about log₁₀ n decimal digits. So
+an algorithm whose cost is linear in the **number of digits** of its input is
+logarithmic in the input's **value**. This distinction becomes important in
+chapter 11, where an algorithm that looks polynomial in a number's value is
+exponential in its length.
+
+#### 2.7.4 Multiplication
+
+Logarithms turn multiplication into addition: log(xy) = log x + log y. That
+is how slide rules worked, and it is still useful for computing: to compare
+products of many probabilities without underflow, add their logs instead of
+multiplying the probabilities. A product of 1,000 numbers each around 0.01
+is 10^(−2000), far below the smallest double; the sum of their log₁₀ values
+is −2,000, perfectly representable.
+
+#### 2.7.5 Fast exponentiation
+
+Computing aⁿ by multiplying a by itself n − 1 times takes n − 1
+multiplications. A much faster method uses the observation that aⁿ is
+(a^(n/2))² when n is even and a · (a^⌊n/2⌋)² when n is odd. Each step halves
+n, so the number of multiplications is at most 2 lg n.
+
+```ts
+function power(a: bigint, n: number): bigint {
+  if (n === 0) return 1n;
+  const half = power(a, Math.floor(n / 2));
+  return n % 2 === 0 ? half * half : a * half * half;
+}
+```
+
+```text
+3^10: 6 multiplications (naive 9), 5 digits, ok=true
+3^64: 8 multiplications (naive 63), 31 digits, ok=true
+3^100: 10 multiplications (naive 99), 48 digits, ok=true
+3^1000: 16 multiplications (naive 999), 478 digits, ok=true
+```
+
+Sixteen multiplications instead of 999. With numbers this large, each
+multiplication is no longer one step (the numbers have hundreds of digits),
+but the count of multiplications drops from linear to logarithmic. This is
+the method used in public-key cryptography, where exponents have hundreds of
+digits and the naive method would not finish before the sun burns out.
+
+#### 2.7.6 Logarithms and summations
+
+The harmonic number H(n) = Σ 1/i is about ln n (section 2.6). It explains
+results where the work for item i is about n/i. A classic is the expected
+time to collect all n kinds of coupon by random draws (chapter 6): when i
+kinds remain, the expected wait for a new one is n/i draws, and summing gives
+n·H(n), about n ln n.
+
+#### 2.7.7 Logarithms and criminal justice
+
+The book makes the point that logarithms show up even in law. In the
+United States federal sentencing guidelines, the penalty for fraud goes up
+in steps of offense levels, and the money thresholds between steps grow
+roughly geometrically. So the punishment grows roughly with the logarithm of
+the money, not in proportion to it. The lesson the book draws is about how
+logarithmic scales behave: each extra unit on the scale costs exponentially
+more of the underlying quantity, so stealing ten times as much adds only a
+few levels.
+
+<Flow caption="Where logarithms come from: any process that repeatedly divides by a constant. Recognising the halving is the whole analysis." steps={[
+  "Halving a search range: binary search, lg n",
+  "Doubling node counts per level: tree height, lg n",
+  "Digits of a number: ⌊lg n⌋ + 1 bits",
+  "Halving an exponent: fast power, about 2 lg n multiplications",
+  "Summing 1/i: harmonic numbers, about ln n",
+]} />
+
+### Worked example
+
+**Simple: how many guesses?** In a guessing game where you are told "higher"
+or "lower", how many guesses do you need for a number from 1 to a million?
+Each guess halves the range, so 20 guesses always suffice (2²⁰ is 1,048,576).
+That is binary search on an implicit array.
+
+**Realistic: git bisect.** Finding the commit that introduced a bug among
+1,000 commits by testing each would take up to 1,000 builds. `git bisect`
+does binary search over the history: test the middle, discard the half that
+is consistently good or bad. It needs at most 10 tests. The same logic finds
+the first bad build, the version where a dependency broke, or the config
+change that caused an incident, whenever the property is monotone (once bad,
+it stays bad).
+
+### Step by step
+
+Fast exponentiation computing 3¹³, following the recursion down and back up.
+13 in binary is 1101.
+
+<Trace
+  columns={["n", "n even or odd", "result computed", "multiplications at this level"]}
+  rows={[
+    ["0", "base case", "1", "0"],
+    ["1", "odd: 3 × 1²", "3", "2"],
+    ["3", "odd: 3 × 3²", "27", "2"],
+    ["6", "even: 27²", "729", "1"],
+    ["13", "odd: 3 × 729²", "1,594,323", "2"],
+  ]}
+  caption="Rows read bottom-up in time: the recursion halves 13 → 6 → 3 → 1 → 0, then squares its way back. The odd levels are the 1 bits of 1101. Seven multiplications here (counting the trivial ones at n = 1); naive needs 12."
+/>
+
+### Common mistake
+
+**The mistake:** worrying about the base of a logarithm in Big Oh, or
+writing O(log₁₀ n) as if it were better than O(lg n).
+
+**Why it fails:** logs in different bases differ by a constant factor
+(section 2.8), and Big Oh drops constants. O(log n) is the same class
+whatever the base.
+
+**The fix:** write O(log n) with no base. Care about the base only for
+exact counts (bits versus decimal digits).
+
+### In real systems
+
+Logarithmic depth is why databases can find one row among billions in a few
+disk reads. A **B-tree**, the index structure in almost every relational
+database, has a very large number of children per node (often hundreds), so
+its height is log base a few hundred of n: three or four levels for a
+billion rows. Each level is one page read, and the top levels sit in memory.
+
+Logarithmic scales are also how you should read most monitoring dashboards.
+Latency and request volume span orders of magnitude, so plotting them on a
+log axis makes a doubling look the same size whether it happens at 1 ms or
+1 second. Sound is measured in decibels and earthquakes on a log scale for
+the same reason.
+
+### Check yourself
+
+<details>
+<summary>How many comparisons does binary search need, at most, on a sorted array of 4 billion items?</summary>
+
+About 32. 2³² is about 4.3 billion, so 32 halvings reduce the range to one.
+
+</details>
+
+<details>
+<summary>How many multiplications does fast exponentiation need for a^1024?</summary>
+
+Ten squarings: 1024 = 2¹⁰ and every level is even, so each level is one
+squaring (plus the trivial base case).
+
+</details>
+
+## 2.8 Properties of Logarithms
+
+### In one sentence
+
+Logarithms of products are sums, logarithms of powers are multiples, and
+changing the base only multiplies by a constant, so the base never matters
+in Big Oh but the argument's exponent can.
+
+### The idea
+
+The rules you need, each with the reason in plain words:
+
+- **Product rule:** log(xy) = log x + log y. Exponents add when powers
+  multiply.
+- **Power rule:** log(x^k) = k · log x. A power is repeated multiplication,
+  so its log is repeated addition.
+- **Change of base:** log_a(x) = log_b(x) / log_b(a). Converting between bases
+  divides by a constant, log_b(a).
+- **Inverse:** b^(log_b x) = x. Exponentiating and logging undo each other.
+
+The consequences for analysis are short and important. The base of a
+logarithm does not affect its Big Oh class, because changing base is a
+constant factor: lg n = ln n / ln 2, about 1.44 ln n. A polynomial inside a
+log does not matter either: log(n³) = 3 log n = Θ(log n). But a log inside
+an exponent matters a lot: 2^(lg n) = n, while 2^(2 lg n) = n².
+
+<Compare
+  left="Expression"
+  right="Simplifies to"
+  rows={[
+    ["log₁₀ n vs lg n", "same class: they differ by the constant lg 10, about 3.32"],
+    ["log(n¹⁰⁰)", "100 log n = Θ(log n)"],
+    ["log(n!)", "Θ(n log n): n! has about n log n bits"],
+    ["2^(lg n)", "n"],
+    ["n^(lg 3)", "about n^1.585, a real polynomial power (chapter 5)"],
+    ["lg lg n", "grows even slower: about 5 for n = 10⁹"],
+  ]}
+  caption="Logarithm identities as they appear in analysis. Constants inside or in front of a log vanish; anything that moves a log into an exponent changes the class."
+/>
+
+### Worked example
+
+**Simple: log of a factorial.** log(n!) = log 1 + log 2 + … + log n. Each of
+the n terms is at most log n, so the sum is at most n log n. The top half of
+the terms are each at least log(n/2), so the sum is at least (n/2) log(n/2).
+Both bounds are Θ(n log n). This identity is why sorting by comparisons
+needs Ω(n log n) comparisons (chapter 4): there are n! orderings to
+distinguish, and each comparison gives one bit.
+
+**Realistic: why tree fan-out matters.** A balanced tree with fan-out d has
+height log_d n = lg n / lg d. Going from binary (d = 2) to fan-out 256
+divides the height by lg 256 = 8. The Big Oh class is the same, but when each
+level costs a disk read, eight times fewer reads is the difference between
+usable and unusable. Constants matter when they sit on the most expensive
+operation.
+
+### Step by step
+
+Converting log₁₀ to lg for a few values, showing the constant ratio:
+
+<Trace
+  columns={["n", "log₁₀ n", "lg n", "lg n ÷ log₁₀ n"]}
+  rows={[
+    ["10", "1", "3.32", "3.32"],
+    ["1,000", "3", "9.97", "3.32"],
+    ["10⁶", "6", "19.93", "3.32"],
+    ["10⁹", "9", "29.90", "3.32"],
+  ]}
+  caption="The ratio is the same at every size: lg 10, about 3.32. A constant ratio is exactly what Big Oh ignores, so the base of a logarithm never changes its class."
+/>
+
+### Common mistake
+
+**The mistake:** simplifying 2^(2 lg n) or 4^(lg n) to n because "logs and
+exponents cancel".
+
+**Why it fails:** they cancel only when the bases match and there is nothing
+else in the exponent. 4^(lg n) = (2²)^(lg n) = 2^(2 lg n) = n². The base
+inside a log is a constant factor; outside, in an exponent, it changes the
+polynomial's degree.
+
+**The fix:** rewrite everything in one base before cancelling.
+
+### In real systems
+
+Working in log space is standard in machine learning and statistics.
+Language models score text by summing log probabilities, since multiplying
+thousands of small probabilities underflows. Log-sum-exp tricks keep this
+stable. Any time a system multiplies many small numbers, check whether it
+should be adding logs.
+
+The change-of-base rule also explains why "number of digits" estimates
+carry across bases. A 128-bit key is about 38.5 decimal digits (128 times
+log₁₀ 2), and a 2,048-bit RSA modulus is about 617 digits.
+
+### Check yourself
+
+<details>
+<summary>Is n^(log₂ 3) the same class as n^(log₁₀ 3)?</summary>
+
+No. The first is about n^1.585 and the second about n^0.477. The base of a log
+is a constant factor, but here that constant sits in an exponent, where it
+changes the class.
+
+</details>
+
+<details>
+<summary>Why is log(n!) = Θ(n log n)?</summary>
+
+It is a sum of n terms each at most log n (giving the upper bound), and the
+top half are each at least log(n/2) (giving a lower bound of a constant times
+n log n).
+
+</details>
+
+## 2.9 War Story: Mystery of the Pyramids
+
+### In one sentence
+
+A number-theory computation that looked like it needed a supercomputer
+became feasible on ordinary machines once someone analysed its cost and
+changed the algorithm, which is the chapter's whole argument in one story.
+
+### The idea
+
+The story, in outline and in my words. The book recounts a project testing a
+conjecture about **pyramidal numbers**, the numbers of balls in a triangular
+pyramid stacked in layers: 1, 4, 10, 20, 35, …, the k-th being
+k(k + 1)(k + 2)/6. The conjecture (an old one, attributed to Pollock) is that
+every positive integer can be written as the sum of at most five such
+numbers. Testing it by computer up to a very large bound was the goal.
+
+The first program did the obvious thing and, for each number, searched for a
+way to write it as a sum of pyramidal numbers. It worked on small cases and
+then needed vastly more time than anyone had as the bound grew. The turning
+point was an analysis of how the cost grew, which showed that the original
+plan could not finish, followed by a redesign: build the sums of small
+numbers of pyramidal numbers once, store them so membership tests are fast,
+and combine them rather than searching from scratch for each target.
+
+The lessons the book draws are the chapter's: estimate before you run, the
+growth rate decides feasibility, and the fix for an infeasible computation
+is usually a better algorithm, not a faster machine.
+
+### Worked example
+
+**Simple: the pyramidal numbers themselves.** Up to 100,000 there are only
+83 pyramidal numbers, because the k-th is about k³/6: k is about the cube
+root of 6n. That small count is what makes clever combination possible.
+
+**Realistic: my own version of the check, done as a dynamic program.** For
+each n up to a bound, compute the fewest pyramidal numbers that sum to n,
+using the best answer for n − t for each pyramidal t (the coin-change
+recurrence of chapter 10).
+
+```ts
+const N = 100000, T: number[] = [];
+for (let k = 1; ; k++) { const t = k * (k + 1) * (k + 2) / 6; if (t > N) break; T.push(t); }
+const fewest = new Uint8Array(N + 1).fill(255); fewest[0] = 0;
+for (let n = 1; n <= N; n++)
+  for (const t of T) {
+    if (t > n) break;
+    fewest[n] = Math.min(fewest[n], fewest[n - t] + 1);
+  }
+```
+
+```text
+83 tetrahedral numbers up to 100000; worst case needs 5; counts by size: 83 2991 44456 52234 236 0 time 31 ms
+need exactly 5: 17 27 33 52 73 82 83 103 107 137 153 162 217 ...
+```
+
+Every number up to 100,000 needs at most five, consistent with the
+conjecture. Only 236 need exactly five (17 is the smallest: no combination of
+four of 1, 4, 10 reaches it), and the vast majority need three or four. The
+cost is N times the number of pyramidal numbers, about N^(4/3), which is why
+this runs in 31 ms here, while pushing the bound to the billions needs the
+more careful, memory-conscious approach the story describes.
+
+<Figure art={`
+   layer 1      layer 2       layer 3          totals
+     o           o o           o o o
+                  o             o o            1  = 1
+                               o               4  = 1 + 3
+                                               10 = 1 + 3 + 6
+                                               20 = 1 + 3 + 6 + 10
+   the k-th pyramidal number stacks the first k triangles:
+   k(k+1)(k+2)/6, so there are only about (6n)^(1/3) below n
+`} caption="Pyramidal (tetrahedral) numbers are stacks of triangular layers. They grow as the cube of k, so very few lie below any bound, which is what makes precomputing combinations of them practical." />
+
+### Step by step
+
+The cost reasoning that separates the plans, at a bound N, with P (about
+the cube root of 6N) pyramidal numbers below it:
+
+<Trace
+  columns={["plan", "work, roughly", "N = 10⁶ (P ≈ 180)", "N = 10⁹ (P ≈ 1,800)"]}
+  rows={[
+    ["try all 5-tuples per target", "N · P⁵ (as a crude bound)", "about 2 × 10¹⁷", "about 2 × 10²⁵"],
+    ["DP over all n (my version)", "N · P", "about 2 × 10⁸", "about 2 × 10¹²"],
+    ["precompute sums of two, combine", "P² to build, then fast lookups per target", "small table", "about 3 million pairs to store"],
+  ]}
+  caption="Estimates, not measurements, for the three approaches. The naive search is hopeless at either size; better algorithms move the problem from impossible to a workstation job. The exact numbers matter less than the gaps between rows."
+/>
+
+### Common mistake
+
+**The mistake:** starting a long computation without estimating its running
+time, and discovering after days that it will need years.
+
+**Why it fails:** growth rates are unforgiving. A program that took a minute
+at size 10⁶ can need decades at 10⁹ if it is quadratic, and nothing in the
+first run warns you unless you measure at two sizes.
+
+**The fix:** before any long run, time it at two or three sizes, fit the
+growth, and extrapolate to the target. If the answer is too large, redesign
+before buying hardware.
+
+### In real systems
+
+This is the backfill or data migration story told in every engineering
+team: a script that rewrites every row looks fine on staging and, at
+production size, would take three weeks. The fix is the same: estimate from
+a sample, then change the algorithm (batch, index, process in sorted order,
+precompute a lookup table) before scheduling the run.
+
+Large mathematical verifications follow the pattern too. Distributed
+projects that check conjectures to huge bounds succeed because someone spent
+the effort to make the per-number cost tiny before spreading it over many
+machines.
+
+### Check yourself
+
+<details>
+<summary>What single habit does the story argue for?</summary>
+
+Estimating how a computation's cost grows, from analysis or from timing at
+a few sizes, before committing to a long run.
+
+</details>
+
+<details>
+<summary>Why are there so few pyramidal numbers below a bound N?</summary>
+
+The k-th is about k³/6, so k is about the cube root of 6N. Below a million
+there are fewer than 200.
+
+</details>
+
+## 2.10 Advanced Analysis
+
+### In one sentence
+
+A few unusual functions (inverse Ackermann, log log n, log* n, n^ε) appear in
+the analyses of advanced algorithms, and limits give a clean test for which
+of two functions dominates.
+
+### The idea
+
+#### 2.10.1 Esoteric functions
+
+Most algorithms land on the standard ladder, but some analyses produce
+functions in between its rungs. The ones worth recognising:
+
+- **Inverse Ackermann, α(n):** grows so slowly that it is at most 4 for any
+  input that could fit in the universe. It appears in the analysis of the
+  union-find data structure (chapter 8), which is "almost constant" time per
+  operation.
+- **log log n:** the log of the log. For n = 10⁹, lg n is about 30 and lg lg n
+  about 5. It appears in some search structures over integers.
+- **log* n (iterated log):** how many times you must take lg before the value
+  drops to 1 or below. It is 5 for any n up to 2^65,536. It shows up in some
+  parallel and distributed algorithms.
+- **n^ε for small ε:** a tiny positive power, which still eventually beats any
+  power of log n.
+- **n log log n, n/log n, √n:** fill in gaps near linear time.
+
+#### 2.10.2 Limits and dominance relations
+
+The cleanest test of dominance uses a limit: g dominates f exactly when the
+limit of f(n)/g(n) as n goes to infinity is 0. If the limit is a positive
+constant, they are in the same Θ class. If the limit is infinite, f dominates
+g. When the ratio is hard to evaluate directly, **L'Hôpital's rule** (replace
+the ratio of two functions that both grow without bound by the ratio of their
+derivatives) usually settles it.
+
+<Compare
+  left="limit of f(n) / g(n)"
+  right="conclusion"
+  rows={[
+    ["0", "g dominates f: f = O(g) but not Θ(g)"],
+    ["a positive constant", "f = Θ(g): same class"],
+    ["infinity", "f dominates g: f = Ω(g) but not Θ(g)"],
+    ["does not exist (oscillates)", "use the definitions directly"],
+  ]}
+  caption="Reading a limit as a dominance relation. Most comparisons in practice end in one of the first three rows."
+/>
+
+### Worked example
+
+**Simple: ln n versus √n.** The ratio ln n / √n has both parts growing without
+bound. Derivatives: 1/n on top and 1/(2√n) below, giving 2√n / n = 2/√n,
+which tends to 0. So √n dominates ln n, as the ladder claims.
+
+**Realistic: is n log n "basically linear"?** The ratio (n log n)/n is
+log n, which tends to infinity, so n log n is strictly larger than linear.
+But it grows so slowly that in practice an n log n algorithm behaves like a
+linear one with a constant of 20 to 30. This is why engineers often treat
+sorting as "almost free" next to anything quadratic, and why the
+distinction between n and n log n matters only at the largest scales.
+
+### Step by step
+
+Computing log* n for n = 2^65,536, by repeatedly taking lg:
+
+<Trace
+  columns={["application of lg", "value"]}
+  rows={[
+    ["start", "2^65,536"],
+    ["1", "65,536 = 2¹⁶"],
+    ["2", "16"],
+    ["3", "4"],
+    ["4", "2"],
+    ["5", "1"],
+  ]}
+  caption="Five applications of lg reduce 2^65,536 (a number with nearly 20,000 decimal digits) to 1, so log* of it is 5. Functions this slow are constants for every practical purpose."
+/>
+
+### Common mistake
+
+**The mistake:** concluding that because two functions are close at the sizes
+you tested, they are in the same class.
+
+**Why it fails:** dominance is about the limit. n^0.1 eventually dominates
+(lg n)³, but they cross only when n is around 10⁷². Tested at a million,
+n^0.1 is about 4 while (lg n)³ is about 7,900, so the function that grows
+faster in the limit looks far smaller.
+
+**The fix:** use the limit test, or the known ladder, for the class; use
+measurement for the sizes you actually run.
+
+### In real systems
+
+The inverse Ackermann function is the reason union-find is used without
+hesitation in production graph code: Kruskal's minimum spanning tree,
+connected components in image processing, and clustering. Its analysis says
+"constant" for any real input.
+
+The broader lesson for engineering is the gap between asymptotic and
+practical. Algorithms with the best known growth rates sometimes have
+constants so large that they are never used (the fastest known matrix
+multiplication algorithms are an example). Knowing the esoteric bounds helps
+you read papers; knowing the constants decides what you ship.
+
+### Check yourself
+
+<details>
+<summary>Which dominates: (lg n)² or n^0.1?</summary>
+
+n^0.1. Any positive power of n eventually dominates any power of log n,
+although here the crossover is enormous (n somewhere above 10⁴⁰ or so).
+
+</details>
+
+<details>
+<summary>If the limit of f/g is 7, what can you say?</summary>
+
+f = Θ(g). A positive finite limit means each is within a constant factor of
+the other for large n.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 2, Algorithm Analysis">
+
+<Level name="Beginner" depth={3}>
+
+At the smallest level, this chapter teaches one skill: look at a loop and say
+how its work grows when the input grows. One loop over n items is linear.
+A loop inside a loop over the same items is quadratic. Halving until one
+item remains is logarithmic. Constants do not change the answer.
+
+The smallest worked version: a function that checks whether an array has
+two equal elements by comparing every pair. Two nested loops, the inner
+starting after the outer, give n(n − 1)/2 comparisons. For 10 items that is
+45; for 1,000 it is 499,500; for a million it is about half a trillion. You
+can say "quadratic" without running anything, and the numbers show why it
+matters.
+
+The beginner's mistake is to think that a smaller constant rescues a worse
+class. Making the inner comparison twice as fast halves the half-trillion,
+which is still hours of work. Sorting first and comparing neighbours, an
+n log n method, does the million-item check in well under a second. If you
+can explain that trade to someone with the two counts, you have the
+beginner level.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you separate the cases and the notation. You say
+"insertion sort is Θ(n) in the best case and Θ(n²) in the worst", not
+"insertion sort is n²". You say what you are counting (comparisons, moves,
+memory accesses), because the answer can depend on it. You write O when you
+mean an upper bound and Θ when you know the growth exactly.
+
+The tool that carries you through most real code is the summation. When the
+inner loop's length depends on the outer index, write the sum and recognise
+its family. A triangle of work (1 + 2 + … + n) is n²/2. Work that halves
+each round (n + n/2 + n/4 + …) is 2n. Work of n/i for each i is n ln n.
+
+A worked case: a function that, for each i, scans the multiples of i up to
+n (a sieve-like pattern). The inner loop runs n/i times, so the total is
+n(1 + 1/2 + … + 1/n) = n·H(n), about n ln n. Without the harmonic series you
+might guess n², which is wrong by a factor of n/ln n, about 72,000 at a
+million.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level you prove what you claim. For an upper bound you
+exhibit the constant and the threshold; for a lower bound you exhibit an
+input family that forces the cost (all-a text for naive matching, reversed
+input for insertion sort). For dominance you take the limit of the ratio,
+using L'Hôpital when both parts grow without bound.
+
+You also keep the bound honest about its parameters. Graph algorithms are
+O(V + E), not O(n); string algorithms are O(n + m) or O(nm); matrix code is
+O(xyz). Collapsing parameters too early hides the case that matters, such
+as a dense graph where E is about V².
+
+A worked case: the doubling array's amortised bound. The claim "push is O(1)
+amortised" is proved by summing the copy costs over n pushes: 1 + 2 + 4 + …
+up to n, a geometric series under 2n. Dividing by n gives under 2 copies per
+push. The same proof technique, total cost of a worst-case sequence divided
+by its length, analyses hash table resizing and many structures in chapter
+3.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Small inputs are the first edge case. For n under a few dozen, constants and
+overheads dominate, and a quadratic algorithm can beat an n log n one. This
+is why library sorts switch to insertion sort for small pieces. Analysis
+says which method wins eventually; only measurement says where the
+crossover is.
+
+Already-sorted, reversed and all-equal inputs are the second. They are
+common in practice (data arriving in time order, a list sorted twice) and
+they hit the best or worst case of many algorithms. A naive quicksort that
+picks the first element as the pivot is quadratic on sorted input, which is
+the input it sees most often in some systems.
+
+Very large numbers are the third. The RAM model assumes a multiplication is
+one step, true for 64-bit integers and false for 2,000-bit ones. My
+fast-exponentiation run computed 3 to the 1,000 with 16 multiplications, but
+each multiplication of 478-digit numbers is itself a loop. When numbers grow
+with the input, count digit operations, not arithmetic operations.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+The formulas need checking at n = 0 and n = 1. n(n − 1)/2 gives 0 for both,
+which is right for a pair-comparison loop. A binary search on an empty array
+must return "not found" without reading index 0. A loop like
+`for (i = 1; i < n; i *= 2)` runs ⌊lg(n − 1)⌋ + 1 times for n of at least 2 and zero times
+for n = 1, and an off-by-one in that count is harmless in Big Oh and harmful
+in an exact budget.
+
+Integer overflow is the classic corner case of the chapter. Computing the
+midpoint as (lo + hi)/2 overflows when lo and hi are both above half the
+largest integer, which happens only on arrays with over a billion elements.
+The fix, lo + (hi − lo)/2, is one line; the bug lived for years in widely
+used code because nobody tested at that size.
+
+Functions that oscillate are the mathematical corner case. n^(1 + sin n)
+has no limit ratio against n, so the limit test fails, and you fall back to
+the definitions of O and Ω. Such functions are rare in algorithms, but
+knowing the limit test can fail stops you trusting it blindly.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production code the most common analysis job is finding the hidden
+multiplication. A list lookup inside a loop, a database query inside a loop
+(the N+1 pattern), a string built by repeated concatenation in a loop, or a
+sort inside a loop: each turns a linear-looking function into a quadratic
+one. In review I read every loop body and write the cost of each call next
+to it.
+
+The second job is measuring what you cannot read. For a third-party library,
+a database query or a remote service, the doubling experiment gives the
+class: time at n, 2n, 4n after warm-up, take log₂ of each ratio. My matrix
+run showed why warm-up matters: the first pair of sizes gave an exponent of
+0.4, the second gave 3.1, and only the second was real.
+
+The third is estimating long jobs. Before a migration, backfill or
+reindexing run, time it on 1 percent and 2 percent of the data, fit the
+growth and extrapolate. A job that is linear and takes 10 minutes on 1
+percent takes about 17 hours in full; if it is quadratic it takes 70 days,
+and you want to know that before you start.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is to treat every performance claim as a prediction with a
+growth rate attached. "It is fast" means nothing; "it is linear and handles
+a million records in 40 ms" can be checked, extrapolated and defended. Ask
+of any code that touches user data: what happens when this grows by a factor
+of a thousand?
+
+Analysis and measurement are partners. Analysis without measurement misses
+constants, cache effects and warm-up; measurement without analysis cannot
+extrapolate beyond the sizes you tried. The habit that ties them together is
+predicting before you measure, then explaining any gap.
+
+A worked example of the mindset: a colleague reports that a report page got
+slow "recently". Rather than profiling at random, ask what grew. If the
+number of customers doubled and the page time quadrupled, the page is
+quadratic in customers, and the hunt narrows to loops over customers.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+Growth rates decide architecture. A component whose cost is linear in total
+data can be scaled by adding machines; a component that is quadratic in the
+number of users (comparing every user with every other for recommendations,
+say) cannot, and forces a different design such as approximate methods or
+precomputed neighbourhoods.
+
+Logarithmic structures are chosen in system design because their cost
+barely moves as data grows. A B-tree index of a billion rows is three or
+four levels deep, so a lookup is a few page reads whether the table has a
+million rows or a billion. That flat curve is why databases can promise
+consistent point-query latency.
+
+Amortised costs need care in latency-sensitive systems. A hash table or
+dynamic array that doubles is O(1) per operation on average, but the resize
+itself is O(n) and happens during some unlucky request. Systems with strict
+tail-latency targets grow incrementally (moving a few items per operation)
+or preallocate, trading memory for a flat worst case.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategic use of this chapter is to cost designs before building them.
+Start from the input size: the table in section 2.3 says which classes are
+affordable. For a million items you need n log n or better; for a few
+thousand, quadratic is fine; for thirty, exponential might be. This prunes
+the design space in a minute.
+
+Keep a short list of standard costs memorised so the costing is quick:
+sorting n log n, binary search log n, hash lookup constant expected, heap
+insert and delete-min log n, BFS and DFS V + E. With those, most designs can
+be priced on a whiteboard, and the expensive step identified before any code
+exists.
+
+Then confirm with a doubling experiment once the code exists, and write the
+measured class next to the predicted one. When they differ, the
+difference is a bug or a misunderstanding worth finding. Done when you can
+look at an unfamiliar function, write its Θ bound with the reasoning,
+predict its time at ten times the input, and confirm the prediction with a
+doubling experiment.
+
+</Level>
+
+</Levels>
+
+<Timeline caption="How analysis typically matures in practice. Each stage adds a habit rather than replacing the last." items={[
+  { when: "First", what: "count nested loops and name the class" },
+  { when: "Then", what: "separate best, worst and average; state what is counted" },
+  { when: "Then", what: "write summations for varying loops; spot logs in halving" },
+  { when: "Then", what: "run doubling experiments to check predictions" },
+  { when: "Finally", what: "cost every design from the input size before coding" },
+]} />
+
+## Questions people ask
+
+**Does Big Oh matter if computers keep getting faster?** More than ever.
+A faster computer multiplies the size you can handle in a fixed time by a
+constant for linear algorithms, by the square root of that constant for
+quadratic ones, and adds only a little for exponential ones. Doubling the
+speed lets an exponential 2ⁿ algorithm handle n + 1.
+
+**When is an O(n²) algorithm better than an O(n log n) one?** When n is small
+and the quadratic one has a much smaller constant, or when it has better
+memory behaviour. Library sorts use insertion sort below a few dozen items
+for this reason. For large n, the class always wins.
+
+**Should I analyse average case or worst case?** Worst case by default. Use
+average case when you control the randomness (randomized quicksort, hashing
+with a random function, chapter 6), because then the average is over your
+own coin flips and no input can defeat it.
+
+**Why does everyone write O when they mean Θ?** Habit. In conversation, "this
+is O(n log n)" almost always means "this is Θ(n log n)". In writing that
+compares algorithms, using Θ removes ambiguity.
+
+**What is amortised analysis, briefly?** The average cost per operation over
+any sequence of operations, in the worst case. A dynamic array's push is
+occasionally Θ(n) (when it resizes) but Θ(1) amortised, because resizes are
+rare enough that their total is linear.
+
+**How precise do my analyses need to be?** Precise enough to make the
+decision. Usually that is the Θ class; sometimes, when two designs are in
+the same class, it is the constant, and then you measure.
+
+## Key takeaways
+
+- The RAM model counts simple operations as one step each; it is wrong in
+  detail and right about growth, which is what it is for.
+- Best, worst and average case are three functions of n; worst case is the
+  default because it is a guarantee.
+- O is an upper bound, Ω a lower bound, Θ both; constants and small n are
+  ignored on purpose.
+- The growth ladder is steep: the input size tells you which class you can
+  afford, and no constant factor crosses a class boundary.
+- In sequence, costs add and the largest wins; in nested loops, they
+  multiply.
+- Loops with varying bounds are summations: arithmetic series raise the
+  degree by one, geometric series equal their largest term, harmonic series
+  are logarithmic.
+- Logarithms appear wherever something halves or doubles: binary search,
+  tree height, bit counts, fast exponentiation.
+- The base of a logarithm never changes its class; a log inside an exponent
+  does.
+- Estimate before any long computation; a better algorithm beats a faster
+  machine.
+
+## Glossary
+
+- **RAM model:** an abstract computer in which each simple operation and
+  memory access costs one step.
+- **Worst-case complexity:** the maximum number of steps over all inputs of
+  size n.
+- **Best-case complexity:** the minimum over all inputs of size n.
+- **Average-case complexity:** the expected number of steps over a
+  distribution of inputs of size n.
+- **Big Oh, O(g):** a function bounded above by a constant times g for large n.
+- **Big Omega, Ω(g):** bounded below by a constant times g for large n.
+- **Big Theta, Θ(g):** bounded both above and below by constants times g.
+- **Dominance:** g dominates f when f(n)/g(n) tends to 0.
+- **Inversion:** a pair of items in the wrong order relative to each other.
+- **Summation:** a sum of terms over an index, written with Σ.
+- **Geometric series:** a sum whose terms grow or shrink by a constant ratio.
+- **Harmonic number, H(n):** 1 + 1/2 + … + 1/n, about ln n.
+- **Logarithm:** the exponent to which a base must be raised to get a number.
+- **Amortised cost:** the average cost per operation over a worst-case
+  sequence of operations.
+- **Doubling experiment:** timing a program at n and 2n to infer its growth
+  rate from the ratio.
+- **Inverse Ackermann, α(n):** an extremely slow-growing function, at most 4
+  in practice.
+- **log* n:** the number of times lg must be applied to bring n to 1 or below.
+
+## Exercises and self-check
+
+**Warm-up.** Write the exact number of times the innermost statement runs
+in a triple loop where i goes from 1 to n, j from 1 to i, and k from 1 to j.
+Give its Θ class, then confirm by counting in code for n = 10, 20, 40.
+
+**Build.** Write a small benchmarking helper that runs a function at sizes
+n, 2n, 4n, 8n (after a warm-up run), prints the times and the log₂ of each
+ratio, and guesses the class. Try it on a sort, a linear scan, a nested-loop
+pair count and a matrix multiply.
+
+**Stretch.** Implement a dynamic array that grows by a factor of 1.5 instead
+of 2. Count total copies over a million pushes and compare with the
+geometric-series prediction. Then measure the maximum single-push time and
+explain what it means for latency.
+
+<details>
+<summary>1. Give the best and worst case of insertion sort in comparisons.</summary>
+
+Best n − 1 (sorted input); worst n(n − 1)/2 (reversed input).
+
+</details>
+
+<details>
+<summary>2. Prove that 5n + 20 = O(n) with explicit constants.</summary>
+
+For n of at least 20, 20 is at most n, so 5n + 20 is at most 6n. Take c = 6,
+n₀ = 20 (other choices also work, such as c = 25, n₀ = 1).
+
+</details>
+
+<details>
+<summary>3. What is the Θ class of n³ + 2ⁿ?</summary>
+
+Θ(2ⁿ). The exponential dominates the polynomial, and in a sum the largest
+term wins.
+
+</details>
+
+<details>
+<summary>4. A loop halves n until it reaches 1, doing constant work per step. What is its cost?</summary>
+
+Θ(log n): the number of halvings from n to 1.
+
+</details>
+
+<details>
+<summary>5. Why is the naive string matcher's bound O(nm) and not O(n)?</summary>
+
+Each of up to n − m + 1 start positions can compare up to m characters
+before failing, and inputs such as all-a text with a pattern ending in b
+make that happen at every position.
+
+</details>
+
+<details>
+<summary>6. Is 2ⁿ⁺¹ = Θ(2ⁿ)? Is 2²ⁿ = Θ(2ⁿ)?</summary>
+
+Yes to the first: 2ⁿ⁺¹ is exactly 2 · 2ⁿ, a constant factor. No to the
+second: 2²ⁿ = 4ⁿ, and 4ⁿ/2ⁿ = 2ⁿ grows without bound.
+
+</details>
+
+<details>
+<summary>7. An n log n program takes 2 seconds at n = 10⁶. Roughly how long at n = 10⁷?</summary>
+
+About 23 seconds: n grows tenfold and lg n from about 20 to about 23.3, so
+the time grows by about 10 × 1.17.
+
+</details>
+
+<details>
+<summary>8. What does a doubling ratio of about 4 suggest?</summary>
+
+Quadratic growth, Θ(n²), since (2n)² / n² = 4.
+
+</details>
+
+## How I'd study this chapter
+
+I would read sections 2.1 to 2.4 in one sitting and then stop to do the
+growth table myself, by hand for a few cells and by code for the rest,
+because the steepness of the ladder is the one fact everything else depends
+on. Then I would work through 2.5 with the code running: instrument each of
+the four algorithms, count, and check the counts against the formulas.
+
+Next, I would do the summations and logarithm sections with pencil first,
+deriving n(n + 1)/2 and the geometric sum before looking, then checking with
+small programs. For the war story, I would write my own version of the
+pyramidal-number check and time it at two bounds to feel the growth. This
+chapter is the analysis toolkit for <a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of my learning plan</a>,
+and the rest of the <a href={withBase('/books/the-algorithm-design-manual/')}>book</a>
+assumes it.
+
+Done when I can take any loop nest from my own code, write its Θ bound and
+the summation behind it, predict its time at ten times the input, and
+confirm the prediction with a doubling experiment within a factor of two.
