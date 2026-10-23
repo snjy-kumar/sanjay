@@ -139,6 +139,57 @@ for (const file of htmlFiles) {
     }
   }
   if (isChapterPage) checkChapterPage(rel, html, blocks.length);
+  // An undated note (a dedicated series) is held to its own floor.
+  const isUndatedNote = /^posts\/[^/]+\/[^/]+\/index\.html$/.test(rel) && html.includes('data-undated-body');
+  if (isUndatedNote) {
+    const ids = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
+    for (const m of html.matchAll(/href="#([^"]+)"/g)) {
+      if (!ids.has(decodeURIComponent(m[1]))) note(`${rel}: link "#${m[1]}" has no heading on the page`);
+    }
+    checkUndatedNote(rel, html, blocks.length);
+  }
+}
+
+// One undated note (docs/UNDATED_NOTE_GUIDE.md). The dedicated series are
+// written at chapter-page depth in the notes' shell, so the check holds each
+// one to the guide's floor: the nine levels, at least five diagrams, worked
+// code, a Check yourself after the sections, Key takeaways, a Glossary, and
+// at least UNDATED_MIN_WORDS words. The dated daily notes are not affected.
+function checkUndatedNote(rel, html, levelBlocks) {
+  const UNDATED_MIN_WORDS = 5000;
+  const UNDATED_MIN_DIAGRAMS = 5;
+  if (levelBlocks === 0) note(`${rel}: an undated note with no nine-level progression`);
+  const start = html.indexOf('data-undated-body');
+  const end = html.indexOf('class="note-end"', start);
+  if (start === -1 || end === -1) {
+    note(`${rel}: the undated note body could not be found`);
+    return;
+  }
+  const body = html.slice(start, end);
+  const diagrams = body.match(/<figure class="dia /g)?.length ?? 0;
+  if (diagrams < UNDATED_MIN_DIAGRAMS) {
+    note(`${rel}: ${diagrams} diagram(s), an undated note needs at least ${UNDATED_MIN_DIAGRAMS}`);
+  }
+  if (!/<pre[\s>]/.test(body)) note(`${rel}: an undated note with no worked code`);
+  const headingText = (level) =>
+    [...body.matchAll(new RegExp(`<h${level}[^>]*>([\\s\\S]*?)<\\/h${level}>`, 'g'))]
+      .map((m) => m[1].replace(/<[^>]+>/g, '').trim().toLowerCase());
+  const h2s = headingText(2);
+  const h3s = headingText(3);
+  if (![...h2s, ...h3s].some((text) => text.startsWith('check yourself'))) {
+    note(`${rel}: no "Check yourself" section`);
+  }
+  if (!h2s.some((text) => text.startsWith('key takeaways'))) note(`${rel}: no "Key takeaways" section`);
+  if (!h2s.some((text) => text.startsWith('glossary'))) note(`${rel}: no "Glossary" section`);
+  const words = body
+    .replace(/<ol class="level-ladder"[\s\S]*?<\/ol>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .split(/\s+/)
+    .filter((word) => /[A-Za-z0-9]/.test(word)).length;
+  if (words < UNDATED_MIN_WORDS) {
+    note(`${rel}: ${words} words, an undated note needs at least ${UNDATED_MIN_WORDS}`);
+  }
 }
 
 // One chapter page (docs/CHAPTER_PAGE_GUIDE.md). A chapter is written like
@@ -268,7 +319,7 @@ if (await exists(contentDir)) {
 
     const tagLine = frontmatter.match(/^tags:\s*\[(.*)\]/m)?.[1];
     const tags = tagLine
-      ? [...tagLine.matchAll(/'([^']+)'/g)].map((m) => m[1])
+      ? [...tagLine.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1])
       : [];
     if (tags.length === 0) {
       warn(`${rel}: the note has no topics, so it will not appear on a topic page`);
@@ -281,7 +332,7 @@ if (await exists(contentDir)) {
 
     const relatedLine = frontmatter.match(/^related:\s*\[(.*)\]/m)?.[1];
     const related = relatedLine
-      ? [...relatedLine.matchAll(/'([^']+)'/g)].map((m) => m[1])
+      ? [...relatedLine.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1])
       : [];
     for (const id of related) {
       if (!noteIds.has(id)) note(`${rel}: the related note "${id}" does not exist`);
