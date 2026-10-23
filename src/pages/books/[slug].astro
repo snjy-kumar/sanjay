@@ -1,0 +1,148 @@
+---
+// One book, chapter by chapter. The body is the MDX in src/content/books/;
+// this page adds the parts every book page shares: where the book sits on
+// the roadmaps, how its chapter list was checked, the contents, and the way
+// back. See docs/BOOK_PAGE_GUIDE.md.
+import { getCollection, getEntry, render } from 'astro:content';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { bookBySlug, shelves } from '../../data/books';
+import { checkBooks, citingPlans, planHref, roadmapsCiting } from '../../utils/books';
+import { planById } from '../../data/plans';
+import { withBase } from '../../utils/base';
+import { noteHref } from '../../utils/notes';
+
+export async function getStaticPaths() {
+  const pages = await getCollection('books');
+  checkBooks(pages.map((page) => page.id));
+  return pages.map((page) => ({ params: { slug: page.id } }));
+}
+
+const entry = await getEntry('books', Astro.params.slug!);
+const { Content, headings } = await render(entry!);
+const book = bookBySlug(entry!.id)!;
+const shelf = shelves.find((s) => s.id === book.shelf)!;
+const cites = citingPlans(book);
+const roadmaps = roadmapsCiting(book);
+
+const posts = await getCollection('blog');
+const notes = entry!.data.notes
+  .map((id) => posts.find((post) => post.id === id))
+  .filter((note): note is (typeof posts)[number] => Boolean(note));
+
+// The contents: each h2, with the chapters (h3) under it.
+const contents: { slug: string; text: string; children: { slug: string; text: string }[] }[] = [];
+for (const heading of headings) {
+  if (heading.depth === 2) contents.push({ slug: heading.slug, text: heading.text, children: [] });
+  else if (heading.depth === 3 && contents.length > 0) {
+    contents[contents.length - 1].children.push({ slug: heading.slug, text: heading.text });
+  }
+}
+
+const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
+const pageUrl = new URL(withBase(`/books/${book.slug}/`), siteOrigin).href;
+
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'Article',
+  headline: entry!.data.title,
+  description: entry!.data.description,
+  url: pageUrl,
+  inLanguage: 'en',
+  datePublished: entry!.data.date.toISOString(),
+  about: {
+    '@type': 'Book',
+    name: book.title,
+    author: book.author,
+    bookEdition: entry!.data.edition,
+  },
+  isPartOf: {
+    '@type': 'CollectionPage',
+    name: 'The books',
+    url: new URL(withBase('/books/'), siteOrigin).href,
+  },
+  author: {
+    '@type': 'Person',
+    name: 'Sanjay Kumar Thakur',
+    url: new URL(withBase('/'), siteOrigin).href,
+  },
+};
+---
+
+<SiteLayout
+  title={entry!.data.title}
+  description={entry!.data.description}
+  ogImage={new URL(withBase(`/og/books/${book.slug}.png`), siteOrigin).href}
+  ogImageAlt={`${book.title}, chapter by chapter`}
+  jsonLd={jsonLd}
+>
+  <p class="crumb">
+    <a href={withBase('/')}>Home</a> /
+    <a href={withBase('/books/')}>Books</a> /
+    <span>{book.title}</span>
+  </p>
+  <h1>{entry!.data.title}</h1>
+  <p class="lead">{entry!.data.description}</p>
+  <p class="span">{book.author} · {entry!.data.edition} · {shelf.name}</p>
+
+  <section class="book-where" aria-labelledby="where-it-sits">
+    <h2 id="where-it-sits">Where it sits</h2>
+    <ul class="book-cites">
+      {cites.map((cite) => (
+        <li>
+          <a href={planHref(cite.plan)}>{cite.label}</a>
+          {cite.phases.length > 0 && <span class="meta"> · {cite.phases.join(', ')}</span>}
+        </li>
+      ))}
+    </ul>
+    {roadmaps.length > 1 && (
+      <p class="series-note">Shared by {roadmaps.length} roadmaps: {roadmaps.map((id) => planById(id)!.label).join(', ')}.</p>
+    )}
+    <p class="series-note book-toc-note">
+      {entry!.data.tocVerified ? (
+        <>The chapter list follows the {entry!.data.edition}, checked against </>
+      ) : (
+        <>The chapter list could not be checked against an official table of contents, so this page follows the book's known parts instead. Sources looked at: </>
+      )}
+      {entry!.data.tocSources.map((src, i) => (
+        <>{i > 0 && ', '}<a href={src}>{new URL(src).hostname.replace(/^www\./, '')}</a></>
+      ))}.
+      Everything below is my own paraphrase and my own examples; read the book for the author's words.
+    </p>
+  </section>
+
+  {contents.length > 0 && (
+    <nav class="book-contents" aria-labelledby="book-contents">
+      <h2 id="book-contents">Contents</h2>
+      <ol>
+        {contents.map((item) => (
+          <li>
+            <a href={`#${item.slug}`}>{item.text}</a>
+            {item.children.length > 0 && (
+              <ol>
+                {item.children.map((child) => <li><a href={`#${child.slug}`}>{child.text}</a></li>)}
+              </ol>
+            )}
+          </li>
+        ))}
+      </ol>
+    </nav>
+  )}
+
+  <div class="entry book">
+    <Content />
+  </div>
+
+  {notes.length > 0 && (
+    <section aria-labelledby="book-notes">
+      <h2 id="book-notes">Notes on this site that go with it</h2>
+      <ul class="book-cites">
+        {notes.map((note) => <li><a href={noteHref(note)}>{note.data.title}</a></li>)}
+      </ul>
+    </section>
+  )}
+
+  <p class="series-pager">
+    <a href={withBase('/books/')}>All the books</a>
+    {cites.map((cite) => <a href={planHref(cite.plan)}>{cite.label}</a>)}
+  </p>
+</SiteLayout>
