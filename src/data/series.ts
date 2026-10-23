@@ -196,7 +196,7 @@ export const series: Series[] = [
     description:
       'The interface layer: design tokens, component APIs, loading, error and empty states, forms, accessibility, and the line between a component library and a design system.',
     blurb:
-      'The React series is about how components work. This one is about what makes them usable: the tokens, states and accessibility rules that decide whether a screen survives a real user. It starts once the React series has enough components to extract.',
+      'The React series is about how components work. This one is about what makes them usable: the tokens, states and accessibility rules that decide whether a screen survives a real user. It builds on the React series, and each note goes live as soon as it is written.',
     topics: ['accessibility', 'design-systems', 'composition', 'forms', 'performance', 'testing'],
     posts: [],
     planned: [
