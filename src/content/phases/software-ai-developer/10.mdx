@@ -1,0 +1,990 @@
+---
+plan: software-ai-developer
+phase: 10
+title: "Architecture and system design: making expensive decisions on purpose"
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Four weeks, weeks 57 to 60. Architecture is the set of decisions that are expensive to reverse. By
+now I have built every layer of an AI-native app; this phase is about choosing the shape of the
+capstone deliberately and writing those choices down so a skeptical reviewer can challenge them.
+The primary book is *Fundamentals of Software Architecture*, with *Software Architecture: The Hard
+Parts* for depth, Martin Fowler's site and the System Design Primer. Explanations are my own
+paraphrase and examples.
+
+#### Phase 10: how I would learn it
+
+Each week produces part of the capstone's design doc, not exercises about imaginary systems. I
+draw before I write, write before I build, and load-test before I believe a scaling claim.
+
+<Timeline
+  caption="Phase 10's four weeks"
+  items={[
+    { when: 'week 57', what: 'Monolith versus services, boundaries and data ownership. Draw the capstone as modules. First ADRs.' },
+    { when: 'week 58', what: 'Events, commands, queues, idempotency; CQRS and read models; consistency and its UX.' },
+    { when: 'week 59', what: 'Multi-tenancy, scaling, resilience patterns. Load test to find the first bottleneck.' },
+    { when: 'week 60', what: 'Design doc, ADR set, failure matrix, cost at 10x and 100x, migration plan. Then the gate.' },
+  ]}
+/>
+
+<Layers
+  caption="The capstone's architecture as I would draw it on day one"
+  layers={[
+    { name: 'web app', note: 'Astro or React front end, server routes' },
+    { name: 'modules in one deployable', note: 'accounts, documents, ai-qa, billing, admin' },
+    { name: 'workers', note: 'ingest, embeddings, agent runs, emails' },
+    { name: 'Postgres', note: 'rows, full-text, vectors, queue tables' },
+    { name: 'external', note: 'model providers, payments, email, object storage' },
+  ]}
+/>
+
+#### Phase 10: Modular monolith versus microservices
+
+<Compare
+  caption="The default is a modular monolith until a specific pressure proves otherwise"
+  left="Modular monolith"
+  right="Microservices"
+  rows={[
+    ['One deploy, one database, in-process calls', 'Many deploys, many databases, network calls'],
+    ['Refactoring a boundary is a code change', 'Refactoring a boundary is a migration'],
+    ['Transactions across modules are easy', 'Cross-service consistency needs sagas or events'],
+    ['Scaling is all-or-nothing', 'Scale each service independently'],
+    ['One team, one codebase', 'Many teams with independent release cycles'],
+  ]}
+/>
+
+<Levels label="Phase 10, modular monolith versus microservices">
+
+<Level name="Beginner">
+
+A monolith is one deployable application. A modular monolith is a monolith with strict internal
+boundaries: modules that own their data and talk through defined interfaces. Microservices split
+those modules into separately deployed services that communicate over the network. Every network
+call can fail, be slow or arrive twice, which in-process calls cannot.
+
+Mistake: choosing microservices to look serious. Fix: start modular, split for a named reason.
+
+</Level>
+
+<Level name="Intermediate">
+
+Module boundaries in a TypeScript monolith: each module has a folder, a public `index.ts`, and its
+own tables. Other modules import only the index. A lint rule enforces it.
+
+```ts
+// eslint: no imports from another module's internals
+'no-restricted-imports': ['error', { patterns: ['@/modules/*/internal/*'] }]
+// documents/index.ts exposes: getDocument, listDocuments, onDocumentChanged
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Reasons that justify a split: a part with very different scaling (embedding workers needing GPUs or
+bursty CPU), a part with different reliability or security requirements (payments), independent
+teams blocked on each other's releases, or a different runtime. Each reason is measurable. If none
+applies, the split is cost without benefit.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **One module that is CPU heavy:** run it as a separate worker process from the same codebase; that
+  is not a microservice, just a different entry point.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A "distributed monolith":** services that must deploy together and share a database. All the
+  costs of both, none of the benefits.
+
+</Level>
+
+<Level name="Production level">
+
+The monolith gets the same operational care: health checks, graceful shutdown, horizontal scaling
+behind a load balancer, separate worker processes.
+
+</Level>
+
+<Level name="Mindset">
+
+The default should be the cheapest thing that keeps the option to change later. Clean module
+boundaries keep that option.
+
+</Level>
+
+<Level name="System design">
+
+A modular monolith is the shape from which services can later be extracted along existing seams.
+
+</Level>
+
+<Level name="Strategy">
+
+I draw the capstone as modules, list for each the reasons it might become a service, and write an
+ADR choosing the monolith. Done when the lint rule enforces boundaries in CI.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Boundaries: domain, data ownership, deployment
+
+<Figure art={`
+  accounts        documents        ai-qa           billing
+  [users]         [docs]           [answers]       [usage]
+  [tenants]       [chunks]         [feedback]      [invoices]
+     ^               ^   |            |  ^             ^
+     |               |   +--event---->|  |             |
+     +---- reads via accounts API ----+  +-- usage ----+
+  rule: only the owner writes its tables
+`} caption="Each module owns its tables. Others ask through an interface or listen to events." />
+
+<Levels label="Phase 10, boundaries">
+
+<Level name="Beginner">
+
+A boundary separates parts of a system that change for different reasons. Three kinds matter:
+**domain** (what concept it is about: documents, billing), **data ownership** (which part may write
+which tables), and **deployment** (what ships together).
+
+Mistake: a shared `utils` module that every module edits. Fix: shared code is small and stable;
+business logic belongs to an owner.
+
+</Level>
+
+<Level name="Intermediate">
+
+The data rule: only the owning module writes its tables. Other modules read through its API or keep
+their own copy updated by events. In the capstone, `ai-qa` needs document text; it calls
+`documents.getChunks()` rather than querying `chunks` directly.
+
+</Level>
+
+<Level name="Advanced">
+
+Boundaries are found by looking at change: files that always change together belong together. Git
+history shows it.
+
+```bash
+git log --name-only --pretty=format: | sort | uniq -c | sort -rn | head
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A report that needs data from every module:** a read model (topic 4) built from events, not
+  joins across owners.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A foreign key across modules:** allowed in one database for integrity, but the referencing module
+  must not write the referenced table.
+
+</Level>
+
+<Level name="Production level">
+
+Ownership is written in a CODEOWNERS file and the architecture doc, so reviews go to the owner.
+
+</Level>
+
+<Level name="Mindset">
+
+A boundary is a promise about who may change what.
+
+</Level>
+
+<Level name="System design">
+
+Boundaries determine the failure blast radius and future service seams.
+
+</Level>
+
+<Level name="Strategy">
+
+I map every table to one owning module. Done when none has two writers.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Event-driven design: events, commands, queues, idempotency
+
+<Flow
+  caption="A document upload, event-driven"
+  steps={['command: UploadDocument', 'documents module saves row + outbox event DocumentUploaded (one transaction)', 'outbox relay publishes to queue', 'ingest worker consumes: chunk + embed', 'event DocumentIndexed', 'ai-qa marks the document answerable']}
+/>
+
+<Levels label="Phase 10, event-driven design">
+
+<Level name="Beginner">
+
+A **command** asks for something to happen (`UploadDocument`) and can be refused. An **event** says
+something happened (`DocumentUploaded`) and cannot be refused, only reacted to. A **queue** holds
+messages until a consumer processes them, so producer and consumer do not need to be up at the same
+time.
+
+Mistake: naming events like commands. Fix: past tense for events.
+
+</Level>
+
+<Level name="Intermediate">
+
+Delivery is usually at-least-once: a consumer may see the same event twice. Consumers are idempotent,
+usually by recording processed event ids.
+
+```sql
+INSERT INTO processed_events (consumer, event_id) VALUES ('ingest', $1)
+ON CONFLICT DO NOTHING RETURNING event_id;  -- no row returned: already processed, skip
+```
+
+The **outbox** pattern solves "saved the row but failed to publish": write the event into an outbox
+table in the same transaction as the row, then a relay publishes it.
+
+</Level>
+
+<Level name="Advanced">
+
+Ordering is guaranteed only within a partition or key, if at all. If `DocumentDeleted` can arrive
+before `DocumentUploaded` is processed, the consumer must handle it: store a tombstone and ignore a
+later upload event with an older version.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A poison message** that always fails: after N attempts, move to a dead-letter queue and alert.
+- **An event with an unknown schema version:** reject to dead-letter, do not guess.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Retry plus a non-idempotent side effect** (sending an email): idempotency key per event id at the
+  email provider.
+
+</Level>
+
+<Level name="Production level">
+
+Queue depth, consumer lag, dead-letter count and processing time are monitored; replay from the
+outbox is a documented procedure.
+
+</Level>
+
+<Level name="Mindset">
+
+Events trade immediate consistency for decoupling. I make that trade knowingly, per flow.
+
+</Level>
+
+<Level name="System design">
+
+For the capstone, a Postgres-backed queue table is enough; a separate broker is an ADR away when
+throughput demands it.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement outbox plus idempotent consumer, then kill the worker mid-processing and replay. Done when
+no document is indexed twice or lost.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: CQRS and read models
+
+<Figure art={`
+  writes (commands)            reads (queries)
+  -----------------            ---------------
+  normalized tables   --events-->  read model table
+  constraints, txns                 denormalized for one screen
+                                    eventually consistent
+`} caption="Separate the shape that keeps data correct from the shape that makes a screen fast." />
+
+<Levels label="Phase 10, CQRS and read models">
+
+<Level name="Beginner">
+
+CQRS (command query responsibility segregation) separates the model used to change data from the
+model used to read it. A read model is a table shaped for one screen, kept up to date from the write
+side.
+
+Mistake: applying CQRS everywhere. Fix: use it where a read is slow or complex and a little staleness
+is acceptable.
+
+</Level>
+
+<Level name="Intermediate">
+
+The capstone's admin dashboard (documents, answer counts, feedback rates per tenant) joins five
+tables. A `tenant_stats` read model updated by events makes it a single-row read. A materialized view
+refreshed every few minutes is the simplest version.
+
+```sql
+CREATE MATERIALIZED VIEW tenant_stats AS
+SELECT t.id, count(DISTINCT d.id) docs, count(a.id) answers,
+       avg((a.feedback = 1)::int) helpful_rate
+FROM tenants t LEFT JOIN documents d ON d.tenant_id = t.id
+LEFT JOIN answers a ON a.tenant_id = t.id GROUP BY t.id;
+-- REFRESH MATERIALIZED VIEW CONCURRENTLY tenant_stats;  (needs a unique index)
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Read models can be rebuilt from scratch from the source tables or the event log; that rebuild must be
+tested, because it is the recovery path when the read model is wrong.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A user writes then immediately reads a read model:** sees stale data. Read your own writes from
+  the write side, or show "updating".
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A rebuild running while new events arrive:** build into a new table, catch up, then swap.
+
+</Level>
+
+<Level name="Production level">
+
+Lag between write and read model is a metric with an alert.
+
+</Level>
+
+<Level name="Mindset">
+
+CQRS simplifies reads by complicating consistency. I only buy it when reads hurt.
+
+</Level>
+
+<Level name="System design">
+
+Read models are owned by the module that serves the screen and fed by events from owners.
+
+</Level>
+
+<Level name="Strategy">
+
+I build one read model and its rebuild script. Done when the dashboard query time and the lag are
+measured before and after.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Consistency: strong, eventual, and the user experience of each
+
+<Compare
+  caption="Consistency is felt in the interface"
+  left="Strong"
+  right="Eventual"
+  rows={[
+    ['After save, every read shows it', 'After save, reads may lag'],
+    ['Simpler to reason about', 'Needs UX for "processing" and conflicts'],
+    ['Required for money, permissions, quotas', 'Fine for counts, search, recommendations'],
+  ]}
+/>
+
+<Levels label="Phase 10, consistency">
+
+<Level name="Beginner">
+
+Strong consistency means every read sees the latest write. Eventual consistency means reads may be
+stale for a while but converge. Users experience the difference: upload a document and immediately
+ask about it; under eventual consistency (indexing takes time) the answer may be "not found".
+
+Mistake: hiding eventual consistency. Fix: show state: "Indexing, ready in about a minute".
+
+</Level>
+
+<Level name="Intermediate">
+
+I classify each piece of data. Permissions, billing, quotas: strong, in Postgres transactions.
+Search index, vectors, stats: eventual, with visible status.
+
+</Level>
+
+<Level name="Advanced">
+
+Read replicas introduce staleness even for "strong" data; reads that must be fresh go to the primary.
+Session-level read-your-writes can be achieved by routing a user to the primary for a short window
+after they write.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A permission revoked but the cached permission is still valid** for a minute: for revocation,
+  cache TTL must be short or invalidated on change.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Document deleted while an answer citing it is being generated:** the citation check at display
+  time hides the deleted source.
+
+</Level>
+
+<Level name="Production level">
+
+Staleness is measured (index lag, replica lag) and shown on dashboards.
+
+</Level>
+
+<Level name="Mindset">
+
+Consistency is a product decision about what users may see, not only a database setting.
+
+</Level>
+
+<Level name="System design">
+
+A table in the design doc lists each data type, its consistency level, its source of truth, and its
+UX for staleness.
+
+</Level>
+
+<Level name="Strategy">
+
+I write that table for the capstone. Done when every row has a reason and a UX state.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Multi-tenancy: shared schema, separate schemas, separate databases
+
+<Compare
+  caption="Three isolation models"
+  left="Model"
+  right="Tradeoff"
+  rows={[
+    ['Shared schema, tenant_id column', 'Cheapest, simplest ops; isolation depends on every query (use RLS)'],
+    ['Schema per tenant', 'Stronger separation; migrations run N times'],
+    ['Database per tenant', 'Strongest isolation, per-tenant backup; most ops cost'],
+  ]}
+/>
+
+<Levels label="Phase 10, multi-tenancy">
+
+<Level name="Beginner">
+
+Multi-tenancy means one system serves many customers whose data must stay separate. The usual start
+is a `tenant_id` column on every tenant-owned table and a filter on every query.
+
+Mistake: trusting each developer to add the filter. Fix: Postgres row-level security as a backstop.
+
+</Level>
+
+<Level name="Intermediate">
+
+```sql
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON documents
+  USING (tenant_id = current_setting('app.tenant_id')::bigint);
+-- per request, inside the transaction: SET LOCAL app.tenant_id = '42';
+```
+
+The app connects as a role without `BYPASSRLS`; a query that forgets the filter returns only the
+current tenant's rows.
+
+</Level>
+
+<Level name="Advanced">
+
+Noisy neighbours: one tenant's heavy ingest slows everyone. Per-tenant queues or concurrency limits
+fix it. Large customers may require dedicated databases; the design keeps that option by routing
+connections through a tenant-aware resolver.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Unset `app.tenant_id`:** `current_setting` raises an error, which is the fail-closed behaviour I
+  want. Using the missing-ok form would silently return no rows; I choose the error.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Connection pooling plus a session-level setting:** a pooled connection carries the previous
+  tenant's setting. Use `SET LOCAL` inside a transaction so it resets.
+
+</Level>
+
+<Level name="Production level">
+
+Cross-tenant tests in CI for every tenant-owned table and every retrieval path.
+
+</Level>
+
+<Level name="Mindset">
+
+Isolation failures are the incident customers never forgive.
+
+</Level>
+
+<Level name="System design">
+
+Tenant id flows from session to database setting to vector filter to cache key to queue message.
+
+</Level>
+
+<Level name="Strategy">
+
+I enable RLS on every tenant table and write a test that runs every query as a second tenant. Done
+when it passes and a deliberately missing filter is caught.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Scaling: stateless services, sticky sessions, caching, read replicas, the database bottleneck
+
+<Figure art={`
+  users -> load balancer -> app x N (stateless) --> cache
+                                  |                   |
+                                  v                   v
+                            Postgres primary <-- replicas (reads)
+                                  ^
+                         the usual first bottleneck
+`} caption="App servers scale out easily when stateless. The database is where scaling gets hard." />
+
+<Levels label="Phase 10, scaling">
+
+<Level name="Beginner">
+
+Stateless app servers keep no user state in memory between requests (sessions in the database or a
+store), so I can run several behind a load balancer. Sticky sessions (pinning a user to one server)
+are a workaround for stateful servers and make scaling and deploys harder.
+
+Mistake: storing uploads or sessions on the app server's disk. Fix: object storage and a session
+store.
+
+</Level>
+
+<Level name="Intermediate">
+
+Caching reduces load for repeated reads; read replicas offload read queries; connection pooling
+protects Postgres from too many connections. For an AI app, the model provider's rate limits are
+often a bottleneck before the database.
+
+</Level>
+
+<Level name="Advanced">
+
+I find bottlenecks by load testing, not guessing:
+
+```js
+// k6 script: ramp to 50 virtual users asking questions
+import http from 'k6/http';
+export const options = { stages: [{ duration: '2m', target: 50 }], thresholds: { http_req_duration: ['p(95)<4000'] } };
+export default () => http.post(`${__ENV.BASE}/api/answer`, JSON.stringify({ q: 'refund policy?' }),
+  { headers: { 'content-type': 'application/json', cookie: __ENV.COOKIE } });
+```
+
+The first bottleneck is the first resource to saturate: database connections, CPU, provider rate
+limit, or queue throughput. The trace tells me which.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Load test against production providers:** burns real money and rate limits; use a mock provider
+  with realistic latency for most tests.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Cache stampede:** a popular key expires and many requests rebuild it at once. Request coalescing
+  or early refresh.
+
+</Level>
+
+<Level name="Production level">
+
+Capacity is planned from load-test numbers with headroom; autoscaling rules use measured signals.
+
+</Level>
+
+<Level name="Mindset">
+
+Measure first. Most scaling work done before measurement scales the wrong thing.
+
+</Level>
+
+<Level name="System design">
+
+Estimate cost at 10x and 100x: requests per day times tokens per request times price, plus database
+and hosting. Write the numbers and the assumption behind each.
+
+</Level>
+
+<Level name="Strategy">
+
+I run the load test, find the first bottleneck, fix it, find the second. Done when both are written
+up with before-and-after numbers.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Resilience: timeouts, retries, circuit breakers, bulkheads, backpressure
+
+<Flow
+  caption="Circuit breaker states"
+  steps={['closed: calls pass, failures counted', 'too many failures: open, calls fail fast', 'after a cool-down: half-open, one trial call', 'trial succeeds: closed; fails: open again']}
+/>
+
+<Levels label="Phase 10, resilience">
+
+<Level name="Beginner">
+
+Every call to something outside my process needs a **timeout**. **Retries** handle brief failures,
+with backoff and jitter so retries do not arrive all at once. A **circuit breaker** stops calling a
+failing dependency for a while. **Bulkheads** isolate resources so one failing part cannot exhaust
+everything. **Backpressure** slows or rejects input when the system is full.
+
+Mistake: retrying immediately and indefinitely. Fix: few retries, exponential backoff, jitter, and
+only for idempotent operations.
+
+</Level>
+
+<Level name="Intermediate">
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries = 3) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i + 1 >= tries || !isRetryable(e)) throw e;
+      const delay = Math.random() * 200 * 2 ** i;   // full jitter
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Retries multiply load at every layer: three layers each retrying three times can turn one request
+into 27. Retry at one layer only. Bulkheads in practice: separate connection pools or concurrency
+limits for AI calls versus database calls, so a slow provider does not consume every worker.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **429 with a Retry-After header:** honour it rather than my backoff.
+- **Timeout longer than the caller's timeout:** pointless; budgets must shrink inward.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Circuit open plus a fallback that also depends on the same failing service:** fallbacks need
+  different dependencies.
+
+</Level>
+
+<Level name="Production level">
+
+Breaker state, retry counts and rejected requests are metrics; a breaker opening pages someone if it
+stays open.
+
+</Level>
+
+<Level name="Mindset">
+
+Failure is normal. Resilience is deciding in advance how each failure looks to the user.
+
+</Level>
+
+<Level name="System design">
+
+Resilience patterns wrap each dependency in one adapter, configured from the failure matrix.
+
+</Level>
+
+<Level name="Strategy">
+
+I inject latency and errors into each dependency in staging. Done when each one degrades as the
+failure matrix says.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Design docs and ADRs
+
+<Figure art={`
+  # ADR 004: Store vectors in Postgres (pgvector)
+  Status: accepted   Date: ...
+  Context:   corpus under 1M chunks; one team; Postgres already run
+  Decision:  pgvector with HNSW index, tenant filter via RLS
+  Alternatives: managed vector DB; Elasticsearch
+  Consequences: one store to back up; re-evaluate above 5M chunks
+`} caption="An ADR: short, dated, with the alternatives and the conditions that would change it." />
+
+<Levels label="Phase 10, design docs and ADRs">
+
+<Level name="Beginner">
+
+A design doc explains what will be built and why: context, goals, non-goals, the design, alternatives
+and risks. An architecture decision record (ADR) captures one decision: context, decision,
+alternatives considered, consequences.
+
+Mistake: writing docs after building. Fix: write before, update after.
+
+</Level>
+
+<Level name="Intermediate">
+
+The capstone's five ADRs that matter: monolith versus services; Postgres for vectors versus a vector
+database; tenancy model; model provider and fallback; queue technology. Each lists what would make me
+revisit it.
+
+</Level>
+
+<Level name="Advanced">
+
+ADRs are immutable once accepted; a change is a new ADR that supersedes the old one, so the history
+of reasoning survives.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A decision too small for an ADR:** a code comment. ADRs are for expensive-to-reverse choices.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Two ADRs that conflict:** the later one must name the superseded one.
+
+</Level>
+
+<Level name="Production level">
+
+ADRs live in the repo (`docs/adr/`), reviewed in PRs, linked from the architecture doc.
+
+</Level>
+
+<Level name="Mindset">
+
+Writing forces the decision to be explicit, which is the whole point.
+
+</Level>
+
+<Level name="System design">
+
+The design doc is the map; ADRs are the signposts at each fork.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the five ADRs and have someone argue against each. Done when each survives or is revised.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Failure matrices: dependency, failure mode, detection, mitigation, recovery
+
+<Figure art={`
+  dependency    failure          detection           mitigation          recovery
+  ------------  ---------------  ------------------  ------------------  -------------
+  model API     outage / slow    5xx, p95 alert      breaker, fallback   auto, canary
+  Postgres      primary down     health check        read-only mode      failover
+  payments      webhook delay    queue age alert     grace period        replay
+  email         bounces          bounce webhook      retry, suppress     manual
+  object store  403 after rotate error rate          retry w/ new creds  rotate back
+`} caption="One row per external dependency. Empty cells are the risks I have not handled." />
+
+<Levels label="Phase 10, failure matrices">
+
+<Level name="Beginner">
+
+A failure matrix lists every dependency and, for each way it can fail, how I detect it, how I limit
+the damage, and how I recover. It turns vague worry into a checklist.
+
+</Level>
+
+<Level name="Intermediate">
+
+I fill it from the architecture diagram: every arrow to an external box is a row. Then I rank rows
+by likelihood times impact; the top three are the ones the gate asks me to name.
+
+</Level>
+
+<Level name="Advanced">
+
+Each mitigation must be tested; untested mitigations are wishes. Game days (phase 5) exercise the
+top rows.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Internal dependencies** (my own worker) belong in the matrix too.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Correlated failures:** one cloud region down takes several rows at once.
+
+</Level>
+
+<Level name="Production level">
+
+The matrix links to runbook entries and alerts.
+
+</Level>
+
+<Level name="Mindset">
+
+Every dependency is a promise someone else might break.
+
+</Level>
+
+<Level name="System design">
+
+The matrix drives resilience config, alerts and runbooks.
+
+</Level>
+
+<Level name="Strategy">
+
+I fill the matrix and test the top three. Done when each of the three has a recorded test result.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Cost and operability as architecture concerns
+
+<Layers
+  caption="A monthly cost model at 1x, 10x and 100x, line by line"
+  layers={[
+    { name: 'model tokens', note: 'requests x tokens x price; usually grows fastest' },
+    { name: 'embeddings', note: 'documents x chunks x price; mostly at ingest' },
+    { name: 'database', note: 'size, connections, replicas' },
+    { name: 'compute', note: 'app and worker instances' },
+    { name: 'people time', note: 'on-call and maintenance hours' },
+  ]}
+/>
+
+<Levels label="Phase 10, cost and operability">
+
+<Level name="Beginner">
+
+Two systems that do the same thing can differ hugely in cost and in how hard they are to run.
+Operability means: can I deploy, observe, debug and recover it without heroics? Both are
+architecture properties, decided early.
+
+</Level>
+
+<Level name="Intermediate">
+
+The cost model is a spreadsheet with assumptions per line. At 10x and 100x, I note which line
+dominates and which design choice would change it (caching, a smaller model, batching).
+
+</Level>
+
+<Level name="Advanced">
+
+Operability is measured in runbook length, alert noise and time to restore in game days. A component
+that needs a specialist to operate costs more than its bill.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Free tiers:** costs jump when exceeded; the model includes the jump.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Usage that grows with data, not users** (re-embedding everything after a model change): a one-off
+  cost spike to plan for.
+
+</Level>
+
+<Level name="Production level">
+
+Cost dashboards per feature and tenant; a monthly review against the model.
+
+</Level>
+
+<Level name="Mindset">
+
+A design I cannot afford or cannot operate is a wrong design, however elegant.
+
+</Level>
+
+<Level name="System design">
+
+Cost and operability appear in every ADR's consequences section.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the cost model at three scales. Done when I can say which line dominates at 100x and what I
+would change.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: the build and the gate
+
+<Flow
+  caption="The phase 10 deliverables"
+  steps={['design doc', 'five ADRs', 'failure matrix', 'load test and first bottleneck', 'cost at 10x and 100x', 'migration plan to the next design']}
+/>
+
+The migration plan describes how the capstone would move to its next shape (for example, extracting
+the ingest worker into a separately scaled service) in reversible steps: dual-write or a feature flag,
+a backfill, a cutover, a rollback point.
+
+The gate:
+
+- Defend the architecture to a skeptical reviewer, using the ADRs.
+- Name the top three failure modes and the tested mitigation for each.
+- Estimate cost at 10x and 100x load with stated assumptions.
+- Explain what I would not build and why: every non-goal in the design doc has a reason.
+
+Done when the design doc, ADRs, matrix, load-test report and cost model are in the repo and someone
+has reviewed them.
