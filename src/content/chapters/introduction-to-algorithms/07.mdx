@@ -1,0 +1,1323 @@
+---
+book: introduction-to-algorithms
+number: 7
+title: "Quicksort"
+description: "Partitioning in place, why quicksort is quadratic on bad splits and n lg n on almost any constant split, the random pivot, and the expected-comparisons proof with indicator variables, all with tested TypeScript and measured counts."
+part: "Part II, Sorting and Order Statistics"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Quicksort is the sort most people mean when they say "a fast sort". Its
+worst case is Θ(n²), worse than heapsort and merge sort, and yet for
+decades it has been the default choice in libraries and textbooks alike.
+The reason is in this chapter. Its inner loop is tiny, it sorts in place,
+it reads memory in straight lines, and with a random pivot its expected
+running time is Θ(n lg n) on every input, with a small constant. The
+chapter shows the algorithm, explains where the quadratic case comes
+from and why it is rare, adds randomness to make "rare" a provable
+statement, and then proves it.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- write the Lomuto partition procedure from memory, state its loop invariant and prove it correct;
+- write quicksort on top of it and trace both by hand on a small array;
+- explain why a sorted input with a last-element pivot costs Θ(n²), and why any split of constant proportion, even 1 to 9, still gives Θ(n lg n);
+- add a random pivot and say exactly what the randomness buys and what it does not;
+- prove that randomized quicksort makes about 2n ln n comparisons in expectation, using indicator variables and the probability 2/(j − i + 1);
+- handle the cases that break textbook quicksort in practice: many equal keys and deep recursion.
+
+**You should already know:** <a href={withBase('/books/introduction-to-algorithms/02-getting-started/')}>chapter 2</a>
+(loop invariants, divide and conquer, merge sort),
+<a href={withBase('/books/introduction-to-algorithms/04-divide-and-conquer/')}>chapter 4</a>
+(recurrences and recursion trees) and
+<a href={withBase('/books/introduction-to-algorithms/05-probabilistic-analysis-and-randomized-algorithms/')}>chapter 5</a>
+(indicator random variables and linearity of expectation). The analysis
+in 7.4 is chapter 5's technique applied once more, so it pays to have it
+fresh.
+
+**Reading time:** about 70 minutes to read, and four sessions of one to
+two hours to trace partitions by hand, write the code and work through
+the proof.
+
+## Chapter map
+
+The chapter has four sections, and they follow one question: how fast is
+quicksort, really? First the algorithm, then the informal answer, then a
+change to the algorithm that makes the answer independent of the input,
+then the formal answer.
+
+<Layers caption="Chapter 7 as a stack. The partition procedure in 7.1 is the only real code; everything after it is about how well the pivot splits the array and how to guarantee it splits well on average." layers={[
+  { name: "7.1 Description of quicksort", note: "divide by partitioning around a pivot, conquer by recursion, no combine step; Lomuto partition and its four-region invariant" },
+  { name: "7.2 Performance of quicksort", note: "worst case Θ(n²) on maximally unbalanced splits; best case Θ(n lg n); any constant-proportion split is still Θ(n lg n)" },
+  { name: "7.3 A randomized version", note: "swap a uniformly random element into the pivot slot; the bad case now depends on luck, not on the input" },
+  { name: "7.4 Analysis of quicksort", note: "worst case by substitution; expected comparisons by indicators: keys i and j meet with probability 2/(j − i + 1)" },
+]} />
+
+<Flow steps={["Array a[p..r]", "Pick a pivot (last element, or a random one swapped there)", "Partition: smaller-or-equal keys left, larger keys right, pivot between them", "Pivot is now in its final position q", "Recursively sort a[p..q−1]", "Recursively sort a[q+1..r]", "Nothing to combine: the array is sorted"]} caption="Quicksort end to end. All the work happens before the recursive calls, in partition, which is the opposite of merge sort, where all the work happens after them, in merge." />
+
+A comparison worth keeping in mind through the whole chapter: merge sort
+splits trivially and works hard to combine; quicksort works hard to
+split and has nothing to combine. Merge sort's split is always perfect,
+so its time is always Θ(n lg n). Quicksort's split depends on the pivot,
+so its time depends on the pivot too, and that dependence is what the
+chapter is about.
+
+## 7.1 Description of quicksort
+
+### In one sentence
+
+Quicksort picks a pivot, rearranges the subarray in place so that every
+key at most the pivot comes before it and every larger key comes after
+it, and then sorts the two sides recursively.
+
+### The idea
+
+Quicksort is divide and conquer, like merge sort, with the three steps
+in different places.
+
+- **Divide.** Partition the subarray a[p..r] around a pivot key x. When
+  partition finishes, x sits at some index q, every key in a[p..q−1] is
+  at most x, and every key in a[q+1..r] is greater than x. The pivot is
+  now exactly where it will be in the sorted output, and it never moves
+  again.
+- **Conquer.** Sort a[p..q−1] and a[q+1..r] by recursive calls.
+- **Combine.** Nothing. Both sides are sorted in place and already in
+  the right order relative to each other, so the whole subarray is
+  sorted.
+
+The book's partition procedure, usually named after Nico Lomuto, takes
+the last element a[r] as the pivot and sweeps one index j from left to
+right. A second index i marks the end of the "small" region. Whenever
+a[j] is at most the pivot, i moves right by one and a[i] and a[j] swap,
+which grows the small region by one and pushes a large key to the end of
+the large region. At the end, the pivot swaps into the slot just after
+the small region.
+
+Here is the TypeScript I use throughout the chapter. It is zero-based
+and the bounds are inclusive, like the book's.
+
+```ts
+// qs.ts (excerpt): Lomuto partition and quicksort. The full file adds an optional log and counters.
+export function partition(a: number[], p: number, r: number): number {
+  const x = a[r];                       // the pivot is the last element
+  let i = p - 1;                        // a[p..i] holds keys at most x
+  for (let j = p; j < r; j++) {         // a[i+1..j-1] holds keys greater than x
+    if (a[j] <= x) { i++; [a[i], a[j]] = [a[j], a[i]]; }
+  }
+  [a[i + 1], a[r]] = [a[r], a[i + 1]];  // put the pivot between the two regions
+  return i + 1;
+}
+
+export function quicksort(a: number[], p = 0, r = a.length - 1) {
+  if (p < r) {
+    const q = partition(a, p, r);
+    quicksort(a, p, q - 1);
+    quicksort(a, q + 1, r);
+  }
+}
+```
+
+#### The loop invariant
+
+At the start of each iteration of the loop, the subarray is divided into
+four regions, and the invariant says what each one holds.
+
+<Figure art={`
+   index:   p        i   i+1      j-1   j          r-1   r
+           +----------+-------------+------------------+-----+
+           |  at most |   greater   |    not yet       |  x  |
+           |    x     |   than x    |    examined      |     |
+           +----------+-------------+------------------+-----+
+              small        large         unknown        pivot
+
+   each step looks at a[j]:
+     a[j] greater than x  ->  j moves right; the large region grows
+     a[j] at most x       ->  i moves right, swap a[i] and a[j];
+                              the small region grows, a large key
+                              moves to the end of the large region
+`} caption="The four regions of Lomuto partition. Regions one and two are the invariant; region three shrinks by one key per iteration; the pivot waits at the end until the final swap places it between the small and large regions." />
+
+1. Every key in a[p..i] is at most x.
+2. Every key in a[i+1..j−1] is greater than x.
+3. a[r] is x.
+
+The keys in a[j..r−1] can be anything; the invariant says nothing about
+them.
+
+- **Initialization.** Before the first iteration, i = p − 1 and j = p,
+  so both a[p..i] and a[i+1..j−1] are empty, and the conditions hold
+  trivially. The first line set x to a[r].
+- **Maintenance.** If a[j] is greater than x, the only change is that j
+  increases, which adds a[j] to the large region, and condition 2 still
+  holds. If a[j] is at most x, i increases, and a[i] (which was the first
+  key of the large region, or a[j] itself if the large region was empty)
+  swaps with a[j]. Now a[i] is at most x, so condition 1 holds, and the
+  key that was at a[i] is greater than x and now sits at a[j], at the end
+  of the large region, so condition 2 holds after j increases.
+- **Termination.** The loop ends with j = r. Every key except the pivot
+  is now in one of the two regions. The final swap moves the pivot to
+  index i + 1, the first slot of the large region, and moves the large
+  key that was there to a[r], still in the large region. So a[p..i] is at
+  most x, a[i+1] is x, and a[i+2..r] is greater than x.
+
+The loop does r − p iterations, each O(1), so partition costs Θ(n) on an
+n-element subarray, and it makes exactly n − 1 key comparisons.
+
+### Worked example
+
+#### A simple example: one partition, logged
+
+The array 7 2 9 4 1 8 3 5, with pivot 5 (the last key). My program logs
+the subarray after each iteration, with the values of j and i.
+
+```ts
+// lomuto.ts
+import { partition } from "./qs.ts";
+const a = [7, 2, 9, 4, 1, 8, 3, 5];
+const log: string[] = []; const m = partition(a, 0, a.length - 1, log);
+log.forEach(l => console.log(l));
+console.log(`pivot 5 lands at index ${m}: ${a.join(" ")}`);
+```
+
+```text
+j=0 i=-1: 7 2 9 4 1 8 3 5
+j=1 i=0: 2 7 9 4 1 8 3 5
+j=2 i=0: 2 7 9 4 1 8 3 5
+j=3 i=1: 2 4 9 7 1 8 3 5
+j=4 i=2: 2 4 1 7 9 8 3 5
+j=5 i=2: 2 4 1 7 9 8 3 5
+j=6 i=3: 2 4 1 3 9 8 7 5
+pivot 5 lands at index 4: 2 4 1 3 5 8 7 9
+```
+
+Read it with the four regions in mind. At j = 0 the key 7 is larger than
+5, so nothing moves and the large region is just 7. At j = 1 the key 2 is
+small: i becomes 0 and 2 swaps with the 7, so the small region is 2 and
+the large region is 7. At j = 3 the key 4 swaps with the 7, the first
+large key, and the 7 moves to the end of the large region. And so on.
+After the loop, the pivot swaps with the 9 at index 4.
+
+The result is 2 4 1 3, then 5, then 8 7 9. Neither side is sorted, but 5
+is in its final place, and the two sides can be sorted independently.
+
+### Step by step
+
+<Trace
+  columns={["j", "a[j]", "compare with 5", "action", "array after", "i"]}
+  rows={[
+    ["0", "7", "greater", "large region grows", "7 2 9 4 1 8 3 5", "−1"],
+    ["1", "2", "at most", "i to 0, swap a[0] and a[1]", "2 7 9 4 1 8 3 5", "0"],
+    ["2", "9", "greater", "large region grows", "2 7 9 4 1 8 3 5", "0"],
+    ["3", "4", "at most", "i to 1, swap a[1] and a[3]", "2 4 9 7 1 8 3 5", "1"],
+    ["4", "1", "at most", "i to 2, swap a[2] and a[4]", "2 4 1 7 9 8 3 5", "2"],
+    ["5", "8", "greater", "large region grows", "2 4 1 7 9 8 3 5", "2"],
+    ["6", "3", "at most", "i to 3, swap a[3] and a[6]", "2 4 1 3 9 8 7 5", "3"],
+    ["end", "", "", "swap pivot a[7] with a[i+1] = a[4]", "2 4 1 3 5 8 7 9", "q = 4"],
+  ]}
+  caption="Lomuto partition of 7 2 9 4 1 8 3 5 around 5, matching the program's log. Seven comparisons for eight keys, four swaps inside the loop and one at the end."
+/>
+
+Then quicksort recurses. On the left, 2 4 1 3 with pivot 3 partitions to
+2 1 3 4, and so on down. On the right, 8 7 9 with pivot 9 partitions to
+8 7 9, with an empty right side, which is a taste of 7.2's bad case: a
+pivot that is the maximum leaves one side empty.
+
+I checked the full quicksort the boring way: on every array length from
+0 to 60, fifty random arrays each with many repeated small values,
+against the built-in sort.
+
+```text
+3050 arrays checked, 0 mismatches
+```
+
+### Common mistake
+
+The common mistake is getting the boundaries of the recursive calls
+wrong. The pivot is at q and is in its final place, so the calls are on
+p..q−1 and q+1..r. Writing quicksort(a, p, q) instead looks harmless and
+is not: if the pivot happens to be the maximum, q = r, the call is on the
+whole subarray again, and the recursion never ends. Including the pivot
+in a call is only correct with a different partition (Hoare's, which
+does not place the pivot; see the corner cases further down).
+
+A second mistake is changing `a[j] <= x` to `a[j] < x` without thinking.
+Lomuto stays correct either way, but with the strict test, keys equal to
+the pivot go to the large side, which changes where the duplicates end
+up and does not fix the equal-keys problem from 7.2. The fix for that
+problem is a different partition, not a different comparison.
+
+### In real systems
+
+Partition is useful on its own, far beyond sorting. It is the core of
+quickselect (chapter 9), which finds the k-th smallest element in
+expected linear time by partitioning and recursing on one side only. It
+is how a database or a distributed job splits rows around a key to send
+them to different workers. It is how a k-d tree is built: partition the
+points around the median on one coordinate, then the next. And the
+two-region idea, "keep a growing prefix that satisfies a predicate", is
+exactly what a `filter` done in place looks like, for example removing
+deleted items from an array without allocating a new one.
+
+### Check yourself
+
+1. In Lomuto partition, which element is the pivot, and where does it
+   end up?
+2. After partition returns q, what can you say about a[q]?
+3. How many key comparisons does partition make on an n-element subarray?
+
+<details>
+<summary>Answer</summary>
+
+1. The last element, a[r]. The final swap moves it to index i + 1, just
+   after the region of keys at most the pivot.
+2. It is in its final sorted position: everything before it is at most
+   a[q] and everything after it is greater.
+3. Exactly n − 1, one for each key other than the pivot.
+
+</details>
+
+## 7.2 Performance of quicksort
+
+### In one sentence
+
+Quicksort's running time depends on how evenly the pivots split the
+subarrays: maximally uneven splits at every level give Θ(n²), and any
+split of constant proportion, even 1 to 99, gives Θ(n lg n).
+
+### The idea
+
+Partition costs Θ(n) on n keys no matter what. What changes is the shape
+of the recursion, and the shape is set by where the pivots land.
+
+**The worst case.** Suppose every partition puts all n − 1 other keys on
+one side and none on the other. That happens, with the last-element
+pivot, when the input is already sorted: the pivot is always the
+maximum. The recurrence is
+
+T(n) = T(n − 1) + T(0) + Θ(n) = T(n − 1) + Θ(n),
+
+which sums to Θ(n²): the partitions cost about n, n − 1, n − 2 and so
+on down to 1. The recursion is a path of depth n, not a tree. This is
+the same arithmetic series as insertion sort's worst case, and it is
+painful precisely because the worst case is not exotic. Sorted and
+nearly sorted data is everywhere in practice.
+
+**The best case.** If every pivot is the median, both sides have at most
+n/2 keys, and
+
+T(n) = 2T(n/2) + Θ(n) = Θ(n lg n),
+
+by case 2 of the master theorem from chapter 4. That is merge sort's
+recurrence.
+
+**Balanced partitioning.** The surprising part is how little balance is
+needed. Suppose every partition splits 9 to 1, which sounds terrible:
+
+T(n) = T(9n/10) + T(n/10) + cn.
+
+Draw the recursion tree. Every full level costs at most cn, because the
+subproblems on a level together hold at most n keys. The shortest path
+to a leaf, always taking the 1/10 side, has depth log base 10 of n. The
+longest, always taking the 9/10 side, has depth log base 10/9 of n,
+which is Θ(lg n) because the base is a constant greater than 1. So the
+total is O(n lg n). The same argument works for any fixed ratio, 99 to 1
+included. Only the constant changes.
+
+<Figure art={`
+  level cost                         recursion tree for a 1 : 9 split
+
+     cn                                       n
+                                       /             \\
+     cn                           n/10               9n/10
+                                 /     \\            /       \\
+     cn                     n/100    9n/100     9n/100      81n/100
+                             ...       ...        ...          ...
+     cn       (left edge reaches size 1 at depth log10 n)
+   at most cn                                              ...
+   at most cn                (right edge reaches size 1 at depth log10/9 n)
+                                                           1
+   ----------------------------------------------------------------------
+   total: at most cn per level, about log10/9 n levels  =  O(n lg n)
+`} caption="The recursion tree for a split that always sends a tenth of the keys one way and nine tenths the other. Full levels cost cn; below the shortest branch the levels cost less. The depth is a constant times lg n, so the total is O(n lg n)." />
+
+I computed the exact comparison count of the 1:9 recurrence (with n − 1
+comparisons per partition, as Lomuto makes) and of the even split, and
+set both against the n(n − 1)/2 of the worst case.
+
+```text
+n=1000  1:9 split=16731  even split=7987  ratio=2.09  worst n(n-1)/2=499500
+n=10000  1:9 split=238326  even split=113631  ratio=2.10  worst n(n-1)/2=49995000
+n=100000  1:9 split=3092968  even split=1468946  ratio=2.11  worst n(n-1)/2=4999950000
+n=1000000  1:9 split=38011396  even split=17951445  ratio=2.12  worst n(n-1)/2=499999500000
+depth of 1:9 tree at n=1e6: log base 10/9 of n = 131.1; even split: lg n = 19.9
+```
+
+A 1:9 split everywhere costs about twice the perfect split. The worst
+case at a million keys costs more than ten thousand times the 1:9 case.
+The gap between "unlucky but constant ratio" and "maximally unlucky" is
+the gap between n lg n and n².
+
+**Intuition for the average case.** On a random input, splits are a mix
+of good and bad. The book's intuition: suppose good and bad splits
+alternate down the tree. A bad split of n keys into 0 and n − 1, followed
+by a good split of the n − 1 into two halves, costs Θ(n) + Θ(n − 1) =
+Θ(n) and produces the same two halves that one good split would have
+produced at cost Θ(n). The bad split is absorbed into the good one's
+cost. So a constant fraction of bad splits only multiplies the running
+time by a constant. Section 7.4 turns this intuition into a proof.
+
+<Compare left="Worst-case splits (0 and n − 1)" right="Constant-proportion splits (even 1 and 9)" caption="The two regimes of quicksort. The amount of work per level is the same; what differs is the number of levels, n against a constant times lg n." rows={[
+  ["Recursion is a path of depth n", "Recursion tree of depth Θ(lg n)"],
+  ["Partition costs n, n − 1, ... , 1", "Each full level costs at most cn"],
+  ["Θ(n²) time; about n²/2 comparisons", "Θ(n lg n) time; about twice the best case at 1:9"],
+  ["Stack depth n: overflows for large n", "Stack depth Θ(lg n)"],
+  ["Triggered by sorted input with a fixed end pivot", "Typical for random input or a random pivot"],
+]} />
+
+### Worked example
+
+#### A simple example: sorted input of eight keys
+
+Take 1 2 3 4 5 6 7 8 with the last-element pivot. Partition around 8:
+every key is smaller, so i runs all the way, and 8 stays at index 7. Left
+side 1..7, right side empty. Partition around 7: same again. The sizes
+go 8, 7, 6, 5, 4, 3, 2, and the comparisons 7 + 6 + 5 + 4 + 3 + 2 + 1 =
+28, which is 8 × 7 / 2. The recursion is eight calls deep, plus the empty
+calls hanging off each level.
+
+Reverse sorted, 8 7 6 5 4 3 2 1, is just as bad: the pivot 1 is the
+minimum, every other key is larger, and the left side is empty. And an
+array of eight equal keys is bad too, which surprises people: every key
+is at most the pivot, so the small region swallows everything.
+
+#### A realistic example: four input shapes, two pivot rules
+
+I ran quicksort on 5,000 keys in four shapes: random, sorted, reversed
+and all equal. For each shape I used the last-element pivot and the
+random pivot from 7.3, and counted comparisons and the maximum recursion
+depth. The "n lg n" column divides the comparisons by n lg n.
+
+```ts
+// inputs.ts (excerpt)
+for (const [name, make] of Object.entries(shapes)) for (const randomized of [false, true]) {
+  st.cmp = 0; st.maxDepth = 0; const a = make(); quicksort(a, 0, n - 1, randomized);
+  console.log(`${name} ${randomized ? "random pivot" : "last pivot"} comparisons=${st.cmp} ...`);
+}
+```
+
+```text
+random    last pivot    comparisons=   70515  (1.15 n lg n)  max depth=29
+random    random pivot  comparisons=   69465  (1.13 n lg n)  max depth=27
+sorted    last pivot    comparisons=12497500  (203.41 n lg n)  max depth=5000
+sorted    random pivot  comparisons=   70346  (1.14 n lg n)  max depth=26
+reversed  last pivot    comparisons=12497500  (203.41 n lg n)  max depth=5000
+reversed  random pivot  comparisons=   68238  (1.11 n lg n)  max depth=29
+all equal last pivot    comparisons=12497500  (203.41 n lg n)  max depth=5000
+all equal random pivot  comparisons=12497500  (203.41 n lg n)  max depth=5000
+```
+
+Three things stand out. Sorted and reversed input with a fixed pivot hit
+exactly n(n − 1)/2 = 12,497,500 comparisons, the worst case, with a
+recursion 5,000 deep (I had to raise Node's stack size to run it at
+all). A random pivot fixes both completely: about 1.1 to 1.15 n lg n
+comparisons and a depth under 30. And all-equal input is quadratic with
+either pivot, because the problem there is not which key is chosen but
+that every key equals it. Randomness cannot help when all choices are
+the same. That case needs a different partition, which the edge cases
+in the levels section below cover, with measurements.
+
+### Step by step
+
+<Trace
+  columns={["input shape", "last-element pivot", "random pivot", "why"]}
+  rows={[
+    ["random", "about 1.15 n lg n", "about 1.13 n lg n", "splits are random either way"],
+    ["sorted", "n(n − 1)/2, depth n", "about 1.14 n lg n", "fixed pivot is always the maximum"],
+    ["reversed", "n(n − 1)/2, depth n", "about 1.11 n lg n", "fixed pivot is always the minimum"],
+    ["all equal", "n(n − 1)/2, depth n", "n(n − 1)/2, depth n", "every key is at most the pivot; all go left"],
+  ]}
+  caption="The measured counts for n = 5,000, condensed. The random pivot removes the dependence on input order but not on duplicate keys."
+/>
+
+### Common mistake
+
+The common mistake is to believe the worst case needs a malicious input.
+With a first- or last-element pivot, the worst case is sorted data,
+which is what you get when someone sorts a list that was already sorted,
+appends a few items to a sorted log, or re-sorts by the same key. Code
+that is fine in tests on random arrays then falls over in production on
+the most ordinary data there is.
+
+The second mistake is to believe that "balanced" means "close to half".
+A split of 1 to 9, or 1 to 99, is still Θ(n lg n). What kills quicksort
+is not imbalance but a constant number of keys going to one side, so
+that the problem shrinks by a constant rather than by a constant factor.
+
+### In real systems
+
+This section is why no serious library uses a fixed end pivot. The
+common choices are a random pivot, the median of three (first, middle,
+last), or for large arrays a median of medians of a small sample (often
+called "ninther"). The median of three already fixes sorted and reversed
+input, because the middle key of a sorted array is its median.
+Deterministic rules can still be beaten by a crafted input; a well-known
+paper by McIlroy showed how to build such an input adaptively against
+almost any deterministic quicksort. That is why the robust libraries add
+a guarantee on top, which the production level below describes.
+
+### Check yourself
+
+1. What is the recurrence for quicksort when every split is 0 to n − 1,
+   and what does it solve to?
+2. Why is a 1 to 9 split everywhere still O(n lg n)?
+3. Why does a random pivot not help on an array of equal keys?
+
+<details>
+<summary>Answer</summary>
+
+1. T(n) = T(n − 1) + Θ(n), which is Θ(n²).
+2. Every level of the recursion tree costs at most cn, and the deepest
+   path shrinks by a factor 9/10 per level, so there are log base 10/9 of
+   n = Θ(lg n) levels.
+3. Every choice of pivot is the same key, and Lomuto puts every key equal
+   to the pivot on the left, so every split is n − 1 to 0 whatever the
+   random choice.
+
+</details>
+
+## 7.3 A randomized version of quicksort
+
+### In one sentence
+
+Before partitioning, swap a uniformly random element of the subarray into
+the pivot position, so that no fixed input can force bad splits and the
+expected running time is Θ(n lg n) on every input of distinct keys.
+
+### The idea
+
+Chapter 5 offered two ways to get average-case behaviour without assuming
+anything about the input: shuffle the input first, or make random
+choices inside the algorithm. For quicksort the book takes the second
+route, which is simpler to analyse: **random sampling**. Instead of
+always using a[r] as the pivot, pick an index k uniformly from p..r, swap
+a[k] with a[r], and partition as before.
+
+```ts
+// qs.ts (excerpt)
+export function randomizedPartition(a: number[], p: number, r: number): number {
+  const k = randInt(rand, p, r);        // uniform over p..r
+  [a[k], a[r]] = [a[r], a[k]];
+  return partition(a, p, r);
+}
+```
+
+Quicksort itself only changes in which partition it calls. Two lines of
+code turn a sort with an input-dependent bad case into one whose bad case
+depends only on the coin flips.
+
+<Flow steps={["Subarray a[p..r]", "Draw k uniformly from p..r", "Swap a[k] with a[r]", "Partition around a[r] as in 7.1", "Recurse on both sides, each with its own fresh random choice"]} caption="Randomized quicksort. The only new step is the random swap; the partition and the recursion are unchanged, which is why the analysis in 7.4 can reuse everything from 7.1." />
+
+What this buys, precisely:
+
+- **No bad inputs.** For every input of distinct keys the expected
+  running time is the same, Θ(n lg n). There is no sorted array, no
+  reversed array, no crafted array that does worse in expectation. The
+  measured table in 7.2 shows this on sorted and reversed data.
+- **The bad case still exists, but in the coins.** If the random choices
+  happen to pick the maximum every time, the run is quadratic. The
+  probability of anything close to that is vanishingly small, and it is
+  the same small probability for every input, so an adversary who knows
+  the code but not the random numbers cannot make it likely.
+- **Repeatability is lost unless you seed.** Two runs on the same input
+  can take different times. For tests, I seed the generator (all the
+  programs on this page use a seeded mulberry32 generator), so the
+  numbers on the page are reproducible.
+
+What it does not buy:
+
+- It does not fix duplicate keys, as the all-equal row showed. The proof
+  in 7.4 assumes distinct keys.
+- It does not stop an adversary who can see or predict the random
+  numbers. If the generator is seeded with a constant, an attacker can
+  replay it and craft a quadratic input, which is exactly a fixed pivot
+  rule with extra steps. Where inputs are hostile, seed from a source the
+  attacker does not see.
+
+### Worked example
+
+#### A simple example: why the sorted input is now fine
+
+On 1 2 3 4 5 6 7 8 the fixed pivot always picks the maximum. With a
+random pivot, the first pivot is each of the eight keys with probability
+1/8. The chance that it is the maximum or the minimum, the two choices
+that produce an empty side, is 2/8. The chance that it lands in the
+middle half (3, 4, 5 or 6), giving a split no worse than 3 to 4 here and
+no worse than 1 to 3 in general, is 4/8 = 1/2. So half the time the split
+is good in the strong sense from 7.2, independently at every node of the
+recursion. On average, every other level shrinks the problem by a
+constant factor, which is enough for O(lg n) depth.
+
+#### A realistic example: a sorted log file
+
+Suppose a service writes timestamped events to a file, and a nightly job
+loads them and sorts by timestamp. The file is almost always already in
+order, because events arrive in time order. A fixed-pivot quicksort
+takes Θ(n²) on exactly this input: for a million events that is half a
+trillion comparisons, against a few tens of millions for an n lg n run. The
+random pivot makes the order of the file irrelevant. This is not a
+hypothetical risk; it is the most common way a hand-written quicksort
+goes wrong.
+
+### Step by step
+
+How a random pivot plays out on the eight sorted keys, one possible run
+(choices fixed for illustration, not a program output):
+
+<Trace
+  columns={["subarray", "random index picked", "pivot", "split sizes", "comparisons"]}
+  rows={[
+    ["1 2 3 4 5 6 7 8", "3", "4", "3 and 4", "7"],
+    ["1 2 3", "1", "2", "1 and 1", "2"],
+    ["5 6 7 8", "3 (last)", "8", "3 and 0", "3"],
+    ["5 6 7", "1 (middle)", "6", "1 and 1", "2"],
+  ]}
+  caption="One run of randomized quicksort on sorted input. Fourteen comparisons in all, against 28 with the fixed last-element pivot. A bad pick (8, the maximum of its subarray) happens, but it costs only one level."
+/>
+
+### Common mistake
+
+The common mistake is to pick the random index from the wrong range.
+`randInt(rand, 0, n - 1)` instead of `randInt(rand, p, r)` picks a key
+outside the subarray, and swapping it in corrupts the array: a key from
+another part moves into this one. Tests with small arrays sometimes miss
+it because the bad index happens to land inside the range. The second
+version of the same bug is an off-by-one, drawing from p..r−1, which
+silently never chooses the last element and slightly biases the pivot.
+
+### In real systems
+
+Randomized pivots are used in practice, but more often libraries use a
+cheap deterministic rule (median of three or the ninther) plus a fallback
+that guarantees O(n lg n) regardless, because a fallback also protects
+against bad random luck and does not need a good random source. Go's
+standard library uses pattern-defeating quicksort, which notices bad
+partitions and shuffles a few elements to break the pattern, and falls
+back to heapsort if things stay bad. The ideas in this chapter, random
+choice to defeat input patterns, and a guaranteed algorithm when the
+splits go wrong, are both there.
+
+### Check yourself
+
+1. Which two lines turn quicksort into randomized quicksort?
+2. On an input of n distinct keys, is there an input on which randomized
+   quicksort's expected running time is Θ(n²)?
+3. What is the probability that a uniformly random pivot lies in the
+   middle half of the keys?
+
+<details>
+<summary>Answer</summary>
+
+1. Drawing k uniformly from p..r and swapping a[k] with a[r] before
+   calling the ordinary partition.
+2. No. The expected time is Θ(n lg n) for every input of distinct keys;
+   only the random choices, not the input, can cause a slow run.
+3. About 1/2: half of the n positions are in the middle half.
+
+</details>
+
+## 7.4 Analysis of quicksort
+
+### In one sentence
+
+Quicksort's worst case is Θ(n²), proved with the substitution method,
+and randomized quicksort's expected running time is Θ(n lg n), proved by
+counting comparisons: the i-th and j-th smallest keys are compared
+exactly when one of them is the first pivot chosen from the keys
+between them, which happens with probability 2/(j − i + 1).
+
+### The idea
+
+#### Worst-case analysis
+
+Section 7.2 showed one input that costs Θ(n²). To show that nothing
+costs more, write the recurrence with the worst split at every step:
+
+T(n) = max over q from 0 to n − 1 of ( T(q) + T(n − 1 − q) ) + Θ(n).
+
+Guess T(n) ≤ cn² and substitute:
+
+T(n) ≤ max over q of ( cq² + c(n − 1 − q)² ) + Θ(n).
+
+The expression q² + (n − 1 − q)² is a parabola opening upward in q, so on
+the interval 0..n − 1 its maximum is at an endpoint, where it equals
+(n − 1)². So
+
+T(n) ≤ c(n − 1)² + Θ(n) = cn² − c(2n − 1) + Θ(n) ≤ cn²,
+
+once c is large enough that c(2n − 1) covers the Θ(n) term. With the
+sorted-input example as the matching lower bound, the worst case is
+Θ(n²). The same argument with "min" instead of "max" gives the best case,
+Ω(n lg n).
+
+#### Expected running time: count comparisons, not calls
+
+The cleanest route to the expected time does not solve a recurrence at
+all. It counts comparisons.
+
+**Step 1: time is comparisons plus n.** Each call to partition does O(1)
+work plus O(1) per comparison in its loop. There are at most n calls to
+partition, because each one places a pivot that is never part of a later
+call. So the running time is O(n + X), where X is the total number of
+comparisons over the whole run. It remains to bound E[X].
+
+**Step 2: name the keys by rank.** Assume the keys are distinct and call
+them z_1, z_2, ..., z_n in increasing order, so z_i is the i-th smallest,
+wherever it sits in the array. Let Z_ij be the set of keys from z_i to
+z_j inclusive, which has j − i + 1 keys.
+
+**Step 3: each pair is compared at most once.** Comparisons happen only
+between a pivot and another key in its partition, and after that
+partition the pivot is in its final place and never takes part in
+another call. So two keys meet at most once. Define the indicator
+X_ij = I(z_i is compared with z_j). Then X is the sum of X_ij over all
+pairs with i less than j, and by linearity of expectation (chapter 5),
+
+E[X] = sum over pairs of Pr(z_i is compared with z_j).
+
+**Step 4: when do z_i and z_j meet?** Watch the set Z_ij. As long as no
+key of Z_ij has been chosen as a pivot, every pivot is either below z_i
+or above z_j, so it sends all of Z_ij to the same side, and the set stays
+together in one subarray. Consider the first time a key of Z_ij is
+chosen as a pivot.
+
+- If that pivot is z_i or z_j, it is compared with every other key in
+  its subarray, including the other one. They meet.
+- If it is some key strictly between them, it sends z_i to the left and
+  z_j to the right. They are never in the same subarray again, so they
+  never meet.
+
+<Figure art={`
+  sorted ranks:    z_1  ...  z_i  z_i+1  ...  z_j-1  z_j  ...  z_n
+                              \\_________ Z_ij _________/
+                               j - i + 1 keys, stay together
+                               until one of them is a pivot
+
+  first pivot chosen from Z_ij is ...
+
+     z_i  or  z_j     ->  compared with every key in its subarray,
+                          including the other end: X_ij = 1
+     strictly inside  ->  z_i goes left, z_j goes right, separated
+                          forever: X_ij = 0
+
+  each of the j - i + 1 keys is equally likely to be first, so
+           Pr(X_ij = 1)  =  2 / (j - i + 1)
+`} caption="The key step of the proof. Pivots outside the range leave the range together; the first pivot inside it decides the pair's fate. Only two of the j − i + 1 equally likely choices make the ends meet." />
+
+**Step 5: the probability.** Each pivot is chosen uniformly from its
+subarray, and Z_ij is inside that subarray, so when the first pivot from
+Z_ij is chosen, each of its j − i + 1 keys is equally likely. Two of them
+make the pair meet. So
+
+Pr(z_i is compared with z_j) = 2/(j − i + 1).
+
+Adjacent ranks (j = i + 1) are always compared, which makes sense: no
+other key can separate them. The minimum and the maximum are compared
+with probability 2/n.
+
+**Step 6: sum.** Substitute k = j − i. For each i, the inner sum is the
+sum over k from 1 to n − i of 2/(k + 1), which is less than 2 H_n, where
+H_n is the harmonic number, about ln n. There are n − 1 values of i, so
+
+E[X] is less than 2n H_n = O(n lg n).
+
+So randomized quicksort runs in O(n lg n) expected time, and since every
+comparison sort needs Ω(n lg n) comparisons (chapter 8), the expectation
+is Θ(n lg n).
+
+Done exactly, the sum gives 2(n + 1)H_n − 4n, which is 2n ln n minus
+about 2.85n plus lower-order terms. Since 2 ln n is about 1.39 lg n,
+randomized quicksort makes about 1.39 n lg n comparisons on average,
+roughly 39 percent more than the information-theoretic minimum of about
+n lg n. Its speed in practice comes from what each comparison costs, not
+from how few it makes.
+
+### Worked example
+
+#### A simple example: check the probability by simulation
+
+The formula 2/(j − i + 1) is easy to test. I shuffled the keys 1 to 10,
+ran randomized quicksort fifty thousand times, recorded which pairs were
+compared, and set the observed frequency against the prediction.
+
+```ts
+// pairs.ts (excerpt): inside the partition loop, record every comparison by rank.
+for (let j = p; j < q; j++) {
+  const lo = Math.min(a[j], x), hi = Math.max(a[j], x); seen[lo][hi]++;
+  if (a[j] <= x) { i++; [a[i], a[j]] = [a[j], a[i]]; }
+}
+```
+
+```text
+keys 1 and 2: compared in 1.000 of runs, predicted 1.000
+keys 4 and 5: compared in 1.000 of runs, predicted 1.000
+keys 1 and 3: compared in 0.664 of runs, predicted 0.667
+keys 3 and 7: compared in 0.395 of runs, predicted 0.400
+keys 1 and 10: compared in 0.200 of runs, predicted 0.200
+```
+
+Adjacent keys always meet. Keys 1 and 10, the minimum and maximum, meet
+only when one of them is the very first pivot, 2 times in 10. The middle
+pairs agree to two or three decimal places.
+
+#### A realistic example: the expected count against measurement
+
+Next, the total. I ran randomized quicksort on random arrays, averaged
+the comparisons, and set them against the exact formula and against the
+leading term 2n ln n.
+
+```ts
+// expected.ts (excerpt)
+const exact = 2 * (n + 1) * H(n) - 4 * n;
+console.log(`n=${n}  measured=${(total / trials).toFixed(1)}  formula=${exact.toFixed(1)}  2n ln n=...`);
+```
+
+```text
+n=10  measured=24.3  formula=24.4  2n ln n=46.1
+n=100  measured=644.1  formula=647.9  2n ln n=921.0
+n=1000  measured=10941.8  formula=10985.9  2n ln n=13815.5
+n=10000  measured=154748.0  formula=155771.7  2n ln n=184206.8
+```
+
+The measured averages are within one percent of the exact formula at
+every size (400 trials up to n = 1,000 and 40 at n = 10,000, so some
+noise is expected). The leading term 2n ln n is far off at small n,
+because the −2.85n correction is large there; the ratio between them
+approaches 1 only slowly. That is a useful reminder that "about 2n ln n"
+is an asymptotic statement, and the exact formula is what to compare
+against when you measure.
+
+### Step by step
+
+<Trace
+  columns={["step", "statement", "why it holds"]}
+  rows={[
+    ["1", "time is O(n + X)", "at most n partition calls; each does O(1) plus O(1) per comparison"],
+    ["2", "X is the sum of X_ij over pairs", "each pair is compared at most once, always pivot against non-pivot"],
+    ["3", "E[X] is the sum of Pr(z_i meets z_j)", "linearity of expectation; no independence needed"],
+    ["4", "Z_ij stays together until a pivot is chosen from it", "pivots outside the range send the whole range one way"],
+    ["5", "Pr(z_i meets z_j) = 2/(j − i + 1)", "the first pivot from Z_ij is uniform over its j − i + 1 keys"],
+    ["6", "E[X] is less than 2n H_n = O(n lg n)", "each inner sum is a partial harmonic sum, less than 2 H_n"],
+  ]}
+  caption="The expected-time proof in six steps. Steps 2 to 5 are the indicator method of chapter 5, applied to pairs of keys instead of candidates."
+/>
+
+### Common mistake
+
+The common mistake in the proof is to assume the pairs are independent,
+or to try to compute the distribution of X. Neither is needed. Linearity
+of expectation adds the probabilities of dependent events without any
+correction, and that is the whole power of the indicator method. If you
+find yourself conditioning on what happened at the root, you are solving
+a recurrence instead, which works (the book's exercises do it) but is
+much more work.
+
+The common mistake in reading the result is to forget its assumption:
+distinct keys. With duplicates, the pair argument breaks, and the
+all-equal measurement in 7.2 shows the cost: every partition puts all
+the equal keys on one side.
+
+### In real systems
+
+The pair-comparison argument is a pattern that comes back. The expected
+depth of a key in a randomly built binary search tree (chapter 12) and
+the expected cost of quickselect (chapter 9) are proved the same way,
+with "the first chosen key in a range decides". In practice, the 1.39 n
+lg n figure matters when comparisons are expensive, such as comparing
+long strings or calling a user-supplied comparator. There, merge-based
+sorts that make closer to n lg n comparisons (TimSort, which V8 uses for
+`Array.prototype.sort`) can beat quicksort even though quicksort wins on
+plain numbers.
+
+### Check yourself
+
+1. Why can two keys be compared at most once in quicksort?
+2. What is the probability that the smallest and largest keys are
+   compared?
+3. Why does the proof need the keys to be distinct?
+
+<details>
+<summary>Answer</summary>
+
+1. Comparisons are always against the current pivot, and once a
+   partition finishes, its pivot is in its final place and is excluded
+   from every later call.
+2. 2/n: they meet only if one of them is the first pivot chosen from the
+   whole array.
+3. The ranks z_1 to z_n and the sets Z_ij need a strict order, and with
+   ties the claim that the first pivot strictly inside the range
+   separates the ends no longer describes what partition does: equal keys
+   all go to the same side.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 7, Quicksort">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, quicksort picks one key, the pivot, and moves
+every smaller key to its left and every larger key to its right. The
+pivot is then exactly where it belongs. The two sides are sorted the same
+way, and there is nothing left to do afterwards: no merging, no extra
+array.
+
+A smallest worked example: 3 1 2 with pivot 2 (the last key). The 3 is
+larger, so it stays to the right; the 1 is smaller, so it moves to the
+front: 1 3 2. Then the pivot swaps into the slot after the small region:
+1 2 3. The left side (1) and the right side (3) have one key each and are
+already sorted. Two comparisons, and the whole array is done.
+
+The beginner's mistake is to think the partition sorts the two sides. It
+does not: after partitioning 7 2 9 4 1 8 3 5 around 5, the left side is 2
+4 1 3, in no particular order. Only the pivot is final. The fix is to
+remember that partition makes one promise, about one key, and recursion
+does the rest.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, you can write Lomuto partition and quicksort
+from memory, with the right recursive bounds (p..q−1 and q+1..r), and you
+know the costs: Θ(n) per partition, Θ(n²) in the worst case, Θ(n lg n)
+expected with a random pivot, and in place apart from the recursion
+stack.
+
+The book uses Lomuto partition: one index sweeps the array and swaps
+smaller items to the front. Picking a random pivot makes the expected
+time n lg n on every input. A worked example of why that matters: my
+measurements at n = 5,000 show sorted input taking 12,497,500
+comparisons with the last-element pivot and 70,346 with a random pivot,
+a factor of nearly 180, from changing two lines.
+
+The intermediate mistake is to test a quicksort only on random arrays.
+Every pivot rule looks good on random data. The fix is a test matrix with
+at least four shapes (random, sorted, reversed, all equal) and a check of
+both the output and the comparison count or running time.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, you can prove what the code does. Partition is
+correct by its four-region invariant. The worst case is Θ(n²) by the
+substitution argument, where the parabola q² + (n − 1 − q)² peaks at the
+endpoints. The expected number of comparisons is the sum over pairs of
+2/(j − i + 1), because items i and j are compared only if one of them is
+the first pivot chosen from the range between them. Summing gives about
+2n ln n, and exactly 2(n + 1)H_n − 4n.
+
+A worked derivation beyond the chapter: the expected recursion depth is
+also O(lg n). Any one key's subarray shrinks to at most three quarters of
+its size whenever the pivot falls in the middle half, which happens with
+probability 1/2 at each level, so the key needs O(lg n) levels in
+expectation and, with a Chernoff bound, with high probability. My
+measured depths, 26 to 29 at n = 5,000, are a small multiple of lg n,
+which is about 12.3.
+
+The advanced mistake is to read "expected Θ(n lg n)" as a bound on every
+run. It is an average over the coin flips. The fix is to state the
+guarantee with its quantifier: for every input, the expectation over the
+random choices is Θ(n lg n), and the probability of a much slower run is
+tiny but not zero.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases are single boundaries. Empty subarrays: the test p less than r
+handles both the empty case (p = r + 1) and the single-key case (p = r),
+and both are reached constantly, since every pivot at an end of its
+subarray creates an empty call. Already sorted input with a last-element
+pivot is the worst case, n squared, as measured.
+
+Many equal keys are the edge that randomization cannot fix. Lomuto sends
+every key equal to the pivot to the left, so a run of equal keys
+partitions as n − 1 to 0 every time. I compared three partitions on
+5,000 keys drawn from 5,000, 50 and just 1 distinct values, all with
+random pivots, counting comparisons and recursion depth.
+
+```text
+5000 distinct  Lomuto    comparisons=    68920  max depth=  26  sorted=true
+5000 distinct  Hoare     comparisons=    97286  max depth=  33  sorted=true
+5000 distinct  three-way comparisons=   110605  max depth=  27  sorted=true
+  50 distinct  Lomuto    comparisons=   282875  max depth= 127  sorted=true
+  50 distinct  Hoare     comparisons=    75676  max depth=  21  sorted=true
+  50 distinct  three-way comparisons=    52091  max depth=  15  sorted=true
+   1 distinct  Lomuto    comparisons= 12497500  max depth=5000  sorted=true
+   1 distinct  Hoare     comparisons=    69606  max depth=  14  sorted=true
+   1 distinct  three-way comparisons=    10000  max depth=   2  sorted=true
+```
+
+<Trace
+  columns={["partition", "how equal keys are handled", "all keys equal", "distinct keys"]}
+  rows={[
+    ["Lomuto (book)", "all go left with the small keys", "n(n − 1)/2 comparisons, depth n", "fewest comparisons of the three"],
+    ["Hoare (book problem)", "both scans stop on equal keys and swap them, splitting them evenly", "n lg n-like, depth about lg n", "more comparisons as counted here, but fewer swaps"],
+    ["Three-way (Dutch national flag)", "equal keys gathered in the middle, never recursed on", "linear: about 2n comparisons, depth 2", "most comparisons: two tests per key"],
+  ]}
+  caption="Three partition schemes and the equal-keys edge case, summarising the measured table. Three-way partition turns duplicates from the worst case into the best case."
+/>
+
+Two-way partition degenerates with duplicates. Three-way partition,
+often called the Dutch national flag problem, fixes it: it splits the
+subarray into less than, equal to, and greater than the pivot, and
+recurses only on the outer two. On an all-equal array it finishes in one
+pass. The cost is a second comparison per key on distinct data, visible
+in the first three rows.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two boundaries. Sorted input of equal keys has both
+problems at once. Recursion depth becomes n, and an unbounded recursion
+overflows the stack: at 5,000 equal keys my plain version needed Node's
+stack size raised just to finish. A sort that crashes on a list of
+identical values is a real production bug, not a puzzle.
+
+Recursing on the smaller side and looping on the larger bounds the depth
+at log n, because each recursive call gets at most half the keys of its
+caller. I measured the maximum depth for the plain version and the
+smaller-side version on sorted input (the worst case for the fixed
+pivot) and on random input.
+
+```ts
+// tail.ts (excerpt): recurse on the smaller side, loop on the larger.
+function smallFirst(a: number[], p: number, q: number) {
+  while (p < q) {
+    const m = part(a, p, q);
+    if (m - p < q - m) { smallFirst(a, p, m - 1); p = m + 1; }
+    else { smallFirst(a, m + 1, q); q = m - 1; }
+  }
+}
+```
+
+```text
+n=1000  sorted input: plain depth=1000, smaller-side depth=2   random input: plain=20, smaller-side=7   lg n=10.0
+n=4000  sorted input: plain depth=4000, smaller-side depth=2   random input: plain=25, smaller-side=9   lg n=12.0
+```
+
+On sorted input, the plain version is n deep; the smaller-side version is
+2 deep, because the smaller side is always empty. Note what this does
+not fix: the sorted case still takes Θ(n²) time. It fixes the crash, not
+the slowness. The time needs a better pivot; the stack needs the
+smaller-side rule. A robust quicksort has both.
+
+A second corner: Hoare's partition, from the book's problems, does not
+put the pivot in its final place. It returns an index j such that every
+key in a[p..j] is at most every key in a[j+1..r], and the recursion is on
+p..j and j+1..r, pivot included. Mixing the two conventions, Hoare's
+partition with Lomuto's q−1 and q+1 bounds or the reverse, either loses
+keys or recurses forever.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, nobody ships the textbook version. V8 uses TimSort for
+`Array.prototype.sort`, a stable merge-based sort that exploits runs
+already present in the data. C++ standard libraries typically use
+introsort: quicksort with median-of-three pivots that switches to
+heapsort when the recursion gets deeper than about 2 lg n, and to
+insertion sort for small subarrays. Go uses pattern-defeating
+quicksort (Rust's current unstable sort descends from it), a relative of
+introsort with extra tricks for sorted and
+duplicate-heavy input.
+
+Each of those design choices maps to this chapter. The heapsort fallback
+is chapter 6 guaranteeing O(n lg n) when the splits go bad. The
+insertion sort cutoff (often around 16 to 32 keys) is chapter 2's
+observation that insertion sort's small constant wins on tiny inputs.
+The median of three is 7.2's fix for sorted input. Three-way or
+equal-aware partitioning is the edge case above.
+
+Adversarial inputs exist for deterministic pivot rules. If a service
+sorts user-supplied data with a predictable pivot, a crafted request can
+force Θ(n²) work, a denial-of-service vector. The fixes are a random
+pivot seeded from a secret, a worst-case fallback, or a sort with no bad
+case at all.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+An expected bound is only as good as the randomness behind it. Who
+controls the input? If it is random data from a simulation, a fixed
+pivot is fine. If it is user data, it is often sorted. If it is an
+attacker, any predictable rule can be beaten. The question to ask before
+choosing a pivot rule is who decides what the input looks like.
+
+The second habit is to separate the two kinds of failure. Slowness
+(Θ(n²) time) and crashing (Θ(n) stack depth) have different causes and
+different fixes, and a version that fixes one can still have the other,
+as the corner-case measurement shows. When a bound is stated, I ask which
+resource it bounds: time, comparisons, swaps, or stack.
+
+The mindset mistake is to compare algorithms on their worst case alone.
+By worst case, quicksort loses to heapsort and merge sort, and yet it is
+often the fastest in practice. The fix is to keep three numbers in view:
+worst case, expected case, and the constant hidden in each.
+
+</Level>
+<Level name="System design" depth={3}>
+
+Partition is the core of quickselect, of database partitioning around a
+split key, and of building balanced k-d trees. A concrete system design
+example: a distributed sort of a dataset too large for one machine. Take
+a random sample, sort the sample, and choose k − 1 split keys from it.
+Every machine then partitions its share of the data by those keys and
+sends each part to the machine responsible for it. Each machine sorts
+its part locally, and the concatenation of the parts is sorted. That is
+quicksort's partition step with k − 1 pivots chosen by random sampling,
+spread over k machines; it is often called sample sort.
+
+The design concerns are exactly this chapter's. A bad set of split keys
+sends most data to one machine, the distributed version of a bad split,
+and the whole job waits for that machine. Random sampling makes that
+unlikely, the way a random pivot does. And duplicate-heavy keys (one
+customer with most of the orders) defeat sampling, the way equal keys
+defeat Lomuto, so such keys need special handling, such as splitting a
+hot key across several machines.
+
+The design mistake is to pick split keys from the first part of the
+data, which is the distributed version of the last-element pivot on
+sorted input.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+Write Lomuto, Hoare and three-way partition, and benchmark all three on
+random, sorted and all-equal input. Then add the random pivot, the
+smaller-side recursion and an insertion sort cutoff, and measure each
+change separately, so that I know what each one buys.
+
+I keep the test matrix as a permanent fixture: four input shapes, sizes
+from 0 to 60 checked against the built-in sort, and a large-n run that
+reports comparisons and maximum depth. The equal-keys row and the depth
+column are the two that catch real bugs.
+
+Done when no input in the benchmark makes my final version quadratic or
+overflow the stack, and when I can prove, on paper and without notes,
+that keys i and j are compared with probability 2/(j − i + 1) and that
+this sums to O(n lg n).
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>If quicksort's worst case is Θ(n²), why is it called quick?</summary>
+
+Because its typical case is fast in practice: the inner loop is a single
+comparison and an occasional swap, it reads memory sequentially, and it
+needs no extra array. With a random or median-of-three pivot the
+quadratic case is very unlikely, and with an introsort fallback it is
+impossible.
+
+</details>
+
+<details>
+<summary>Is quicksort stable?</summary>
+
+No. Partition swaps keys over long distances, so equal keys can change
+their relative order. If stability matters, use merge sort or TimSort,
+or sort by a composite key that includes the original index.
+
+</details>
+
+<details>
+<summary>Lomuto or Hoare?</summary>
+
+Lomuto is easier to get right and is what the book teaches first. Hoare
+does about a third as many swaps on random data and handles equal keys
+much better, but its invariant is subtler and it does not put the pivot
+in its final place. For learning, Lomuto; for a serious implementation,
+Hoare or three-way.
+
+</details>
+
+<details>
+<summary>Should I shuffle the array first or pick a random pivot?</summary>
+
+Both give the same expected bound. Shuffling once costs Θ(n) up front and
+lets you keep the plain partition; a random pivot costs one random
+number per partition. The book picks random sampling because its
+analysis is slightly cleaner.
+
+</details>
+
+<details>
+<summary>Why does quicksort beat heapsort in practice when both are n lg n?</summary>
+
+Quicksort's partition scans memory in straight lines, which caches and
+prefetchers love, and each comparison is followed by cheap work.
+Heapsort jumps between index i and 2i + 1, missing the cache on large
+arrays, and does about 2n lg n comparisons against quicksort's 1.39 n lg
+n.
+
+</details>
+
+<details>
+<summary>What does "in place" mean for quicksort, given the recursion?</summary>
+
+It needs no extra array, only the recursion stack. With the smaller-side
+rule, the stack is O(lg n) in the worst case; without it, it can reach
+Θ(n). Most definitions count O(lg n) extra space as in place.
+
+</details>
+
+## Key takeaways
+
+- Quicksort partitions around a pivot, recurses on both sides and has no combine step; partition costs Θ(n) and places the pivot in its final position.
+- Lomuto partition keeps four regions: at most the pivot, greater than the pivot, unexamined, and the pivot itself.
+- Splits of 0 and n − 1 at every level give Θ(n²), which a fixed end pivot hits on sorted or reversed input.
+- Any constant-proportion split, even 1 to 99, gives Θ(n lg n); a 1 to 9 split costs about twice the perfect one.
+- A random pivot makes the expected running time Θ(n lg n) on every input of distinct keys.
+- Keys z_i and z_j are compared with probability 2/(j − i + 1), and summing gives about 2n ln n, or 1.39 n lg n, comparisons.
+- Equal keys break two-way partition even with a random pivot; three-way partition fixes them.
+- Recursing on the smaller side bounds the stack at O(lg n) but does not fix quadratic time.
+
+## Glossary
+
+- **Pivot**: the key a partition step splits the subarray around.
+- **Partition**: rearranging a subarray in place so keys at most the pivot come before it and larger keys after it.
+- **Lomuto partition**: the book's partition, with the last element as pivot and a single left-to-right scan.
+- **Hoare partition**: the original partition, with two indices scanning toward each other; it does not fix the pivot's position.
+- **Three-way partition**: splitting into less than, equal to and greater than the pivot; also called the Dutch national flag problem.
+- **Balanced split**: a split whose sides are both at least a constant fraction of the subarray.
+- **Random sampling**: choosing the pivot uniformly at random from the subarray.
+- **Median of three**: choosing as pivot the median of the first, middle and last keys.
+- **Introsort**: quicksort that switches to heapsort when the recursion is too deep.
+- **Tail recursion elimination**: replacing the last recursive call with a loop; done on the larger side, it bounds the stack depth.
+- **Harmonic number H_n**: the sum 1 + 1/2 + ... + 1/n, about ln n.
+- **Sample sort**: a distributed sort that partitions data by split keys chosen from a random sample.
+
+## Exercises and self-check
+
+My own exercises. Do a selection of the book's exercises after each
+section, and the chapter-end problems (Hoare partition, equal keys, stack depth,
+median-of-3 and fuzzy sorting) on a second pass.
+
+**Warm-up (by hand)**
+
+1. Trace Lomuto partition on 12 18 9 5 13 8 7 4 20 2 6 11, writing the
+   four regions after every iteration.
+2. Count the comparisons quicksort makes on 1 2 3 4 5 6 with the last
+   pivot, and on the same keys if every pivot were the median.
+3. For n = 8 distinct keys, compute the probability that the second and
+   sixth smallest are compared, and check it against the formula.
+
+**Build (write and test code)**
+
+4. Write Lomuto, Hoare and three-way quicksort, and run the four-shape
+   test matrix with comparison counts and maximum depth.
+5. Add an insertion sort cutoff for subarrays of size at most k, and
+   measure running time for k from 1 to 64 on a million random numbers.
+   Where is the minimum on your machine?
+6. Write an introsort: quicksort with a depth limit of 2 lg n that
+   switches to your chapter 6 heapsort. Show that it stays O(n lg n) on
+   an input you construct to defeat median-of-three.
+
+**Stretch (change the problem)**
+
+7. Prove that the expected maximum recursion depth of randomized
+   quicksort is O(lg n).
+8. Write quickselect (find the k-th smallest) with Lomuto partition, and
+   adapt the pair-comparison proof to bound its expected comparisons.
+9. Design a sample sort for 100 machines. How large a sample do you need
+   so that no machine gets more than twice its fair share, and what do
+   you do with a key that is a tenth of all the data?
+
+**Self-check**
+
+<details>
+<summary>1. What are the four regions of Lomuto partition?</summary>
+
+Keys at most the pivot (a[p..i]), keys greater than the pivot
+(a[i+1..j−1]), keys not yet examined (a[j..r−1]), and the pivot (a[r]).
+
+</details>
+
+<details>
+<summary>2. What input makes last-element-pivot quicksort quadratic?</summary>
+
+Sorted or reversed input, and any array of equal keys: every split is
+n − 1 to 0.
+
+</details>
+
+<details>
+<summary>3. Why is a 1 to 9 split still O(n lg n)?</summary>
+
+Each level costs at most cn and the depth is log base 10/9 of n, which is
+Θ(lg n).
+
+</details>
+
+<details>
+<summary>4. What does randomization guarantee, and for whom?</summary>
+
+For every input of distinct keys, the expected running time over the
+random choices is Θ(n lg n). It guarantees nothing about one particular
+run, and nothing against someone who can predict the random numbers.
+
+</details>
+
+<details>
+<summary>5. When are z_i and z_j compared?</summary>
+
+Exactly when the first pivot chosen from z_i..z_j is z_i or z_j, which
+has probability 2/(j − i + 1).
+
+</details>
+
+<details>
+<summary>6. What fixes the stack depth, and what fixes the time?</summary>
+
+Recursing on the smaller side and looping on the larger fixes the stack
+(O(lg n)). A random or median-of-three pivot, plus three-way partition
+for duplicates, fixes the expected time; a heapsort fallback fixes the
+worst case.
+
+</details>
+
+## How I'd study this chapter
+
+I would give this chapter four sessions in
+<a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of the traditional core roadmap</a>,
+right after heapsort, so that the comparison between the two is fresh.
+
+<Timeline caption="Four sessions for chapter 7." items={[
+  { when: "Session 1", what: "Read 7.1. Trace Lomuto partition on two arrays with the four regions drawn. Write partition and quicksort, and run the length 0 to 60 check against the built-in sort." },
+  { when: "Session 2", what: "Read 7.2. Run the four-shape test matrix with the last-element pivot. Draw the 1 to 9 recursion tree and compute its depth for n = 10⁶." },
+  { when: "Session 3", what: "Read 7.3 and 7.4. Add the random pivot and rerun the matrix. Work through the pair-comparison proof on paper, then check 2/(j − i + 1) by simulation." },
+  { when: "Session 4", what: "Write Hoare and three-way partition, the smaller-side recursion and an introsort fallback. Do the self-check without notes." },
+]} />
+
+I keep `chapter-07.ts` with the three partitions, randomized quicksort,
+the smaller-side version and the test matrix. Partition comes straight
+back in chapter 9 as quickselect, and the pair-comparison proof comes
+back in chapter 12 for random binary search trees, so I keep both close
+at hand.
+
+Done when I can write randomized quicksort with three-way partition and
+bounded stack depth from a blank file, pass the test matrix first time,
+and prove the 2n ln n bound on paper.
