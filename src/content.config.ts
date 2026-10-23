@@ -1,5 +1,6 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
+import { bookBySlug } from './data/books';
 
 const blog = defineCollection({
   loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/blog' }),
@@ -88,4 +89,34 @@ const phases = defineCollection({
   }),
 });
 
-export const collections = { blog, log, plans, books, phases };
+// One chapter of a book, on its own page, written like a textbook chapter.
+// File: src/content/chapters/<book slug>/<nn>.mdx, where <nn> is the
+// chapter number padded to two digits. The book's own page
+// (src/content/books/<slug>.mdx) is then the overview, the learning strategy
+// and the contents; the chapters carry the teaching. See
+// docs/CHAPTER_PAGE_GUIDE.md before writing one.
+const chapters = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/chapters' }),
+  schema: z.object({
+    /** The book's slug in src/data/books.ts. Must match the folder name. */
+    book: z.string().refine((slug) => Boolean(bookBySlug(slug)), {
+      message: 'is not a book slug in src/data/books.ts',
+    }),
+    /** The chapter number as the book numbers it. Must match the file name.
+     *  Appendices continue after the last chapter and set `label`. */
+    number: z.number().int().min(0),
+    /** The chapter's title as the book has it, or a plain descriptive one
+     *  when the exact title cannot be checked. Becomes the h1 and the URL. */
+    title: z.string().min(1),
+    /** The meta description, unique to this page, about 120 to 160
+     *  characters. */
+    description: z.string().min(50),
+    /** The book's part the chapter sits in, e.g. "Part I, Foundations". */
+    part: z.string().optional(),
+    /** Shown instead of "Chapter <n>", e.g. "Appendix A". */
+    label: z.string().optional(),
+    date: z.coerce.date(),
+  }),
+});
+
+export const collections = { blog, log, plans, books, phases, chapters };
