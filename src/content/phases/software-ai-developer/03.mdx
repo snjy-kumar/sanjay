@@ -10,140 +10,190 @@ import Layers from '../../../components/book/Layers.astro';
 import Compare from '../../../components/book/Compare.astro';
 import Timeline from '../../../components/book/Timeline.astro';
 import Figure from '../../../components/book/Figure.astro';
+import { withBase } from '../../../utils/base';
 
-Six weeks on the layer where trust is enforced. The frontend can hide a problem; the backend cannot. The
-primary book is *Node.js Design Patterns*, with the Node docs and Full Stack Open as free references and
-*API Design Patterns* for depth. Every topic here ends up in one API: auth, roles, a protected resource,
-a job, a limit, an upload and OpenAPI docs, tested against a real database.
+Six weeks on the layer where trust is enforced. The frontend can hide a problem; the backend cannot. Every
+rule the product makes (who may see this note, how many requests per minute, whether this job ran
+exactly once) is either enforced here or not enforced at all. The primary book is *Node.js Design
+Patterns*, with the Node docs and Full Stack Open as free references and *API Design Patterns* as
+optional depth. The traditional core covers the theory under several of these topics in its
+<a href={withBase('/plans/traditional-software-developer/')}>networks and security phases</a>; this phase
+is the applied version, built and broken in my own API.
 
 #### Phase 3: how I would learn it
 
-Thirteen topics in six weeks. I group them by the request's journey: what arrives (HTTP, API design,
-validation), who sent it (authentication, authorization), what happens later (jobs, schedules, email),
-what makes it fast and safe (caching, limits, uploads), and how I know it worked (logging, tests).
+I build one API through the whole phase and add one capability a few days at a time. For each topic I
+write the failing test first (a second user reads the first user's note; a retried POST creates two rows;
+a killed worker loses a job), then make it pass. The failure is the lesson; the passing test is the proof I
+keep.
 
 <Timeline
-  caption="Phase 3's six weeks"
+  caption="Phase 3's six weeks. Each week adds one capability to the same API, with a test that proves its rule."
   items={[
-    { when: 'week 13', what: 'HTTP and REST resources; API design, error shapes and OpenAPI.' },
-    { when: 'week 14', what: 'Authentication: passwords, sessions, cookies, JWTs, OAuth, magic links.' },
-    { when: 'week 15', what: 'Authorization and tenant isolation; validation and output encoding.' },
-    { when: 'week 16', what: 'Background jobs, retries and dead letters; cron and time zones; email.' },
-    { when: 'week 17', what: 'Caching; rate limits and quotas; uploads and signed URLs.' },
-    { when: 'week 18', what: 'Logging, correlation IDs, graceful shutdown; API, contract and load tests. Then the gate.' },
+    { when: "week 13", what: "REST resources, status codes, idempotency, pagination; error shape and OpenAPI. Test: an idempotent retry." },
+    { when: "week 14", what: "Authentication: password hashing, sessions, cookies; JWT and OAuth compared. Test: session fixation is impossible." },
+    { when: "week 15", what: "Authorization and validation: roles, ownership, tenant isolation, output encoding. Test: cross-tenant read returns 404." },
+    { when: "week 16", what: "Jobs, schedules and time zones: queue, worker, retries, dead letters, cron. Test: kill a worker mid-job." },
+    { when: "week 17", what: "Caching, rate limits, uploads, email. Test: limit holds across two instances; upload of a fake image is rejected." },
+    { when: "week 18", what: "Logging, graceful shutdown, API, contract and load tests. Report p50, p95, p99. Then the gate." },
+  ]}
+/>
+
+<Layers
+  caption="One request through the API, outside to inside. Each layer can refuse the request before the next one runs."
+  layers={[
+    { name: "Edge", note: "TLS, body size limit, rate limit by IP" },
+    { name: "Request context", note: "request ID, logger, timeout" },
+    { name: "Authentication", note: "who is this? session or token" },
+    { name: "Validation", note: "is the input well-formed? schema at the boundary" },
+    { name: "Authorization", note: "may this user do this to this resource?" },
+    { name: "Handler", note: "business rule, in a transaction" },
+    { name: "Data", note: "Postgres with constraints, Redis for derived state" },
   ]}
 />
 
 <Flow
-  caption="The path of every request through the API"
-  steps={['Request ID assigned', 'Rate limit', 'Authenticate', 'Validate input', 'Authorize on the resource', 'Do the work or enqueue it', 'Encode output', 'Log one line']}
+  caption="The loop for every topic in this phase"
+  steps={["Write the attack or failure as a test", "Watch it fail", "Implement the rule", "Watch it pass", "Log the rule and why", "Add it to the threat model"]}
 />
 
 #### Phase 3: HTTP and REST: resources, methods, status codes, idempotency and pagination
 
 <Figure art={`
-  GET    /notes?cursor=abc&limit=20   list      200  safe, idempotent
-  POST   /notes                       create    201  Location: /notes/42
-  GET    /notes/42                    read      200 or 404
-  PATCH  /notes/42                    change    200 or 409 on version clash
-  PUT    /notes/42                    replace   200  idempotent
-  DELETE /notes/42                    remove    204  idempotent (again: 204 or 404)
-`} caption="A resource and its methods: what each does, what it returns and whether repeating it is safe." />
+  resource            GET        POST       PUT/PATCH     DELETE
+  /notes              list       create     -             -
+  /notes/42           read       -          replace/edit  remove
+  /notes/42/share     read       create     -             revoke
 
-<Levels label="Phase 3, REST resources, methods, status codes, idempotency and pagination">
+  safe:        GET, HEAD                (no state change)
+  idempotent:  GET, HEAD, PUT, DELETE   (repeat = same effect)
+  neither:     POST, PATCH              (needs an idempotency key to be retry-safe)
+`} caption="Nouns in the path, verbs in the method. The idempotency column decides what a client may safely retry." />
+
+<Levels label="Phase 3, HTTP and REST: resources, methods, status codes, idempotency and pagination">
 
 <Level name="Beginner">
 
-REST models the API as resources (nouns) with URLs, acted on by HTTP methods. Status codes report the
-outcome: 200 ok, 201 created, 204 no content, 400 bad input, 401 not authenticated, 403 not allowed, 404
-not found, 409 conflict, 422 semantically invalid, 429 too many requests, 500 bug, 503 unavailable.
+REST organises an API around resources (things, named by nouns in the URL) and uses HTTP methods as the
+verbs. `GET /notes` lists notes, `POST /notes` creates one, `GET /notes/42` reads one, `PATCH /notes/42`
+changes it, `DELETE /notes/42` removes it. Status codes say what happened: 200 OK, 201 Created, 204 No
+Content, 400 Bad Request, 401 Unauthorized (not signed in), 403 Forbidden (signed in, not allowed), 404
+Not Found, 409 Conflict, 422 Unprocessable (valid JSON, invalid data), 429 Too Many Requests, 500 Internal
+Server Error.
 
 ```http
 POST /notes HTTP/1.1
 Content-Type: application/json
 
-{"title":"First"}
+{"title":"Standup","body":"Shipped the login fix."}
 
 HTTP/1.1 201 Created
 Location: /notes/42
+Content-Type: application/json
+
+{"id":"42","title":"Standup","body":"Shipped the login fix.","createdAt":"2026-10-23T09:12:00Z"}
 ```
 
-Common mistake: verbs in URLs (`/createNote`). Fix: the method is the verb; the URL is the noun.
+The common mistake is verbs in the path (`POST /createNote`, `GET /deleteNote?id=42`). A GET that deletes
+will be triggered by a link prefetcher or a crawler. The method is the verb.
 
 </Level>
 
 <Level name="Intermediate">
 
-Pagination: offset (`?page=3`) is simple but slow on deep pages and skips or repeats items when rows are
-inserted. Cursor pagination returns an opaque cursor encoding the last item's sort key, and the next
-query continues from there.
+In a real API the pieces combine into consistent rules. Create returns 201 with a `Location` header.
+Update returns 200 with the new representation or 204 with none. A list is always paginated, because an
+unbounded list is a time bomb. Cursor pagination (an opaque token pointing after the last item) is stable
+when rows are inserted; offset pagination (`?page=3`) skips or repeats items when the data changes and gets
+slower as the offset grows.
 
-```sql
-select id, title, created_at from notes
-where user_id = $1 and (created_at, id) < ($2, $3)
-order by created_at desc, id desc limit 21;  -- one extra to know if there is a next page
+```ts
+// GET /notes?limit=20&cursor=eyJjIjoiMjAyNi0xMC0yM1QwOToxMiIsImlkIjo0Mn0
+const limit = Math.min(Number(req.query.limit ?? 20), 100);
+const after = req.query.cursor ? decodeCursor(String(req.query.cursor)) : null;
+const rows = await db.query(
+  `select * from notes where user_id = $1
+     and ($2::timestamptz is null or (created_at, id) < ($2, $3))
+   order by created_at desc, id desc limit $4`,
+  [userId, after?.c ?? null, after?.id ?? null, limit + 1]);
+const page = rows.slice(0, limit);
+res.json({ data: page, nextCursor: rows.length > limit ? encodeCursor(page.at(-1)!) : null });
 ```
+
+Fetching `limit + 1` rows tells me whether there is a next page without a separate count query.
 
 </Level>
 
 <Level name="Advanced">
 
-Idempotency means repeating a request has the same effect as doing it once. GET, PUT and DELETE are
-idempotent by definition; POST is not. Clients and proxies retry on timeouts, so a non-idempotent POST
-can create duplicates. The standard fix is an `Idempotency-Key` header: the server stores the key with
-the response and replays the stored response for a repeat.
+The exact rules: a method is safe if it does not change state, and idempotent if doing it twice has the
+same effect as doing it once. DELETE of an already-deleted note is still idempotent even though the second
+call returns 404, because the server state is the same. POST is neither, so a network timeout during a
+create leaves the client unsure whether the note exists. The fix is an idempotency key: the client sends a
+unique `Idempotency-Key` header, the server stores the key with the response, and a repeat with the same key
+returns the stored response instead of creating again.
 
 ```ts
-const key = req.headers['idempotency-key'];
-const prior = await db.oneOrNone('select status, body from idem where key = $1 and user_id = $2', [key, user.id]);
-if (prior) return reply(prior.status, prior.body);
-// do the work and insert into idem in the same transaction
+const key = req.header('Idempotency-Key');
+if (key) {
+  const prior = await db.query('select status, body from idem where user_id=$1 and key=$2', [userId, key]);
+  if (prior.rows[0]) return res.status(prior.rows[0].status).json(prior.rows[0].body);
+}
+// ... create the note and insert into idem(user_id, key, status, body) in the same transaction
 ```
 
 </Level>
 
 <Level name="Edge cases">
 
-- `limit=0`, `limit=-1`, `limit=100000`: clamp to a range.
-- A cursor from an old version of the API or a tampered cursor: validate and return 400.
-- DELETE of an already deleted resource: 204 or 404, documented either way.
+A `limit` of 0, a negative `limit`, a `limit` of a million, a cursor that is not valid base64, a cursor
+from a different user's list: each must give a 400 or be clamped, never a 500 or another user's data. A
+`DELETE` with a body is allowed by the spec but dropped by some proxies. A `PUT` that omits a field sets
+it to null (a full replacement), which surprises clients who meant `PATCH`. A trailing slash (`/notes/`
+versus `/notes`) should redirect or be treated identically.
 
 </Level>
 
 <Level name="Corner cases">
 
-Two requests with the same idempotency key arrive at the same moment: both see no prior row and both do
-the work. Idempotency plus concurrency. A unique constraint on the key, inserted first with a "pending"
-status, makes the second request wait or get 409. Another: the same key with a different body should be
-rejected, not replayed.
+Two requests with the same idempotency key arriving at the same moment: both check the table, both see
+nothing, both create. The fix is to insert the key first with a unique constraint and a "processing" state;
+the second insert fails, and that request waits or returns 409. Cursor pagination plus a sort on a
+non-unique column (`created_at` alone): two notes with the same timestamp straddle a page boundary and one
+is skipped. The tiebreaker (`id`) in the cursor fixes it.
 
 </Level>
 
 <Level name="Production level">
 
-Status codes drive client retries, monitoring (5xx rate is an SLI) and caching. Pagination limits protect
-the database. Idempotency keys are kept for a bounded time (24 hours is common) and cleaned up.
+In production these rules are what let clients, proxies and my own retry logic behave safely. Mobile
+clients on bad networks retry; load balancers retry idempotent requests on a failed upstream; the
+frontend's form may resend. I make every create accept an idempotency key, keep keys for 24 hours, cap
+every list's page size, and document the status codes per endpoint in OpenAPI.
 
 </Level>
 
 <Level name="Mindset">
 
-Assume every request can arrive twice, late, or out of order.
+The habit is to ask "what if this request arrives twice, or never gets an answer?" for every endpoint.
+Networks duplicate and drop messages; an API that assumes exactly-once delivery is wrong in a way that only
+shows up in production.
 
 </Level>
 
 <Level name="System design">
 
-Idempotency at the API edge makes retries safe everywhere behind it: queues, webhooks, payment calls.
-It is the same idea that phase 10's event-driven design depends on.
+Idempotency is the foundation of every reliable distributed operation in later phases: job retries,
+webhooks, payment calls, agent tool calls. The same key-and-stored-result pattern appears in all of them.
+Cursor pagination is also how background jobs walk large tables in batches without missing rows.
 
 </Level>
 
 <Level name="Strategy">
 
-Design the notes API on paper first (resources, methods, codes), then implement cursor pagination and
-idempotency keys with tests that send duplicate and concurrent requests. Done when a script sending the
-same POST ten times in parallel creates exactly one note.
+I write a test that sends the same POST twice with one key and asserts one row, and a test that fires both
+concurrently. I paginate a table of ten thousand notes while inserting new ones and assert no duplicates or
+gaps. Done when the gate's "prove an endpoint is idempotent" is a passing test I can explain line by line.
 
 </Level>
 
@@ -152,1098 +202,1297 @@ same POST ten times in parallel creates exactly one note.
 #### Phase 3: API design: versioning, error shapes, validation and OpenAPI
 
 <Compare
-  caption="An error response clients can act on, against one they cannot"
-  left="Unhelpful"
-  right="Actionable"
+  left="Unhelpful error"
+  right="Useful error"
+  caption="The error shape is part of the contract. A client should be able to act on it without reading my logs."
   rows={[
-    ["500 with an HTML stack trace", "400 with application/problem+json"],
-    ["error: something went wrong", "type, title, status, detail, instance"],
-    ["No field information", "errors: list of field path and message"],
-    ["No request ID", "requestId the user can quote to support"],
+    ["500 with an HTML stack trace", "422 with a JSON body in one stable shape"],
+    ["message: Invalid input", "code: validation_failed, fields: { email: [\"Enter a valid email\"] }"],
+    ["no way to find it in the logs", "requestId: 01JB8... echoed in the X-Request-Id header"],
+    ["different shape per endpoint", "the same envelope everywhere, documented in OpenAPI"],
   ]}
 />
 
-<Levels label="Phase 3, versioning, error shapes, validation and OpenAPI">
+<Levels label="Phase 3, API design: versioning, error shapes, validation and OpenAPI">
 
 <Level name="Beginner">
 
-One error shape for the whole API. RFC 9457 problem details is a good standard.
+API design is deciding what clients will depend on: URLs, fields, status codes and error formats. Once a
+client depends on something, changing it breaks them. Three decisions matter first: one error shape for
+every endpoint, validation of every input, and documentation that matches the code.
 
 ```json
-{ "type": "https://api.example/errors/validation", "title": "Invalid input", "status": 400,
-  "detail": "title must not be empty", "errors": [{ "path": "title", "message": "Required" }],
-  "requestId": "4f2c..." }
+{ "error": { "code": "validation_failed", "message": "Some fields are invalid", "fields": { "email": ["Enter a valid email"] }, "requestId": "01JB8Q4Z6M" } }
 ```
 
-Common mistake: every handler inventing its own error JSON. Fix: one error middleware that maps error
-classes to problem responses.
+The common mistake is returning whatever the framework produced, so one endpoint returns `{ "message" }`,
+another `{ "error" }` and a third an HTML page. Clients end up writing three parsers.
 
 </Level>
 
 <Level name="Intermediate">
 
-OpenAPI describes endpoints, parameters, bodies and responses in a machine-readable file. Generating it
-from the same schemas used for validation keeps docs true; generating client types from it keeps the
-frontend true.
+In a real API I define each endpoint with a schema for the request and the response, validate the request
+before the handler runs, and generate the OpenAPI document from the same schemas so docs cannot drift.
 
 ```ts
+import { z } from 'zod';
+import { extendZodWithOpenApi, OpenAPIRegistry } from '@asteasolutions/zod-to-openapi';
+extendZodWithOpenApi(z);
+const CreateNote = z.object({ title: z.string().min(1).max(200), body: z.string().max(20_000) }).openapi('CreateNote');
 registry.registerPath({ method: 'post', path: '/notes', request: { body: { content: { 'application/json': { schema: CreateNote } } } },
-  responses: { 201: { description: 'Created', content: { 'application/json': { schema: Note } } }, 400: { description: 'Invalid' } } });
+  responses: { 201: { description: 'Created' }, 422: { description: 'Validation failed' } } });
 ```
+
+A middleware turns a Zod failure into the standard 422 envelope. The mistake is validating inside each
+handler with hand-written `if` checks; one gets forgotten.
 
 </Level>
 
 <Level name="Advanced">
 
-Versioning: additive changes (new optional fields, new endpoints) are not breaking; removing or renaming
-fields, changing types or tightening validation is. Options are a version in the path (`/v2`), in a
-header, or evolve one version with deprecation. Clients must ignore unknown fields (tolerant reader) for
-additive change to be safe.
+The rules for change: adding an optional field to a response or an optional parameter to a request is
+backward compatible; removing or renaming a field, making an optional field required, or changing a type is
+breaking. Versioning (a `/v2` prefix or a header) is how breaking changes ship without breaking old
+clients, and every version is a second API to maintain, so the goal is to need it rarely. Clients should
+ignore unknown fields (tolerant reader) so that additions never break them. Enums are a trap: adding a
+value is breaking for a client that switches exhaustively.
 
 </Level>
 
 <Level name="Edge cases">
 
-- `null` versus absent field: does PATCH with `title: null` clear it or is it invalid?
-- Enum values added later break clients that switch exhaustively.
-- Very large error lists: cap them.
+A request body of `null`, an empty object, a string where an object was expected, a JSON body sent with
+`text/plain`, a field with extra whitespace, a body over the size limit (which should be a 413 before
+parsing, not a crash during it). An error message that echoes the user's input back unescaped is an XSS
+vector if a client renders it as HTML.
+
+```text
+PayloadTooLargeError: request entity too large   -> map to 413, not 500
+```
 
 </Level>
 
 <Level name="Corner cases">
 
-A field deprecated in v1 and removed in v2 while a mobile app version still on v1 sends it, and the
-server's shared validator for both versions rejects it. Versioning plus shared code. Version-specific
-schemas at the edge, mapping into one internal model.
+A validation library that coerces types (the string "false" becomes `true` under JavaScript truthiness, or
+"" becomes 0) plus a field that is optional: an explicitly sent empty value is silently turned into a real
+one. I use strict schemas at the API boundary and coerce only where I mean to. A new required request field
+plus an old mobile client that cannot be updated: the new field must have a server-side default for a
+deprecation period.
 
 </Level>
 
 <Level name="Production level">
 
-Error responses never include stack traces, SQL or internal IDs. The OpenAPI file is linted and checked in
-CI for breaking changes against the last release.
+In production I publish the OpenAPI document, run a check in CI that fails on breaking changes against the
+last released version (tools like `oasdiff` compare two specs), log every 4xx with its code so I can see
+which clients struggle, and mark deprecated fields with a `Deprecation` header and a date before removing
+them.
 
 </Level>
 
 <Level name="Mindset">
 
-The API is a product with users who cannot read my code. Design it for them.
+The habit is "the API is a promise to someone I cannot see." Every field I expose is a field I may have to
+keep. Expose less, name it carefully, and make errors something a client can act on.
 
 </Level>
 
 <Level name="System design">
 
-The API contract is the boundary between teams and between deploys. Contract tests (later in this phase)
-and OpenAPI diff checks make that boundary enforceable.
+The API contract is the seam between teams and deployables: frontend and backend, my service and another,
+my app and an AI agent calling it as a tool in Phase 9. A machine-readable spec lets each side generate
+clients, mocks and tests. *API Design Patterns* is the reference for the larger patterns (long-running
+operations, batch endpoints, field masks).
 
 </Level>
 
 <Level name="Strategy">
 
-Write the error middleware and the OpenAPI generation, then try three changes (add a field, rename a
-field, tighten a limit) and see which ones the diff check flags. Done when renaming is flagged and adding
-is not.
+I design the notes API on paper first (resources, fields, errors), generate the OpenAPI document, then
+implement against it and add a CI breaking-change check. Done when the docs are generated from the code,
+every error in the system uses the one envelope, and a deliberately breaking change fails CI.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: authentication: passwords, sessions, cookies, JWTs, OAuth and magic links
+#### Phase 3: Authentication: passwords, sessions, cookies, JWTs, OAuth and magic links
 
 <Figure art={`
-  password sign-in with a server session
-  browser                    API                        database
-    | POST /login email+pw    |                             |
-    |------------------------>| select hash where email     |
-    |                         |---------------------------->|
-    |                         | argon2.verify(hash, pw)     |
-    |                         | insert session(id, user,    |
-    |                         |   expires) ---------------->|
-    | Set-Cookie: sid=random; HttpOnly; Secure; SameSite    |
-    |<------------------------|                             |
-    | GET /notes  Cookie: sid |  lookup session, load user  |
-`} caption="Session authentication: the cookie holds only a random ID; the server looks it up, so revoking a session is deleting a row." />
+  sign in                                   later requests
+  POST /login {email, pw}                   GET /notes  Cookie: sid=R4nd0m
+     |                                          |
+  look up user, verify argon2id hash        look up sid in sessions table
+     |                                          |
+  new random session id (rotate!)           found, not expired, not revoked?
+  insert sessions(id_hash, user_id, exp)        |            \\
+     |                                        yes -> user    no -> 401
+  Set-Cookie: sid=R4nd0m; HttpOnly;
+              Secure; SameSite=Lax
+`} caption="Server-side sessions. The cookie is a random key; the truth lives on the server, so revoking is a delete." />
 
-<Levels label="Phase 3, passwords, sessions, cookies, JWTs, OAuth and magic links">
+<Levels label="Phase 3, authentication: passwords, sessions, cookies, JWTs, OAuth and magic links">
 
 <Level name="Beginner">
 
-Authentication answers "who is this?". Passwords are never stored; a slow, salted hash is (Argon2id or
-bcrypt). A session is a random ID in an `HttpOnly` cookie mapped to a user on the server.
+Authentication answers "who is this?" The user proves an identity (a password, a link sent to their email,
+an account at another provider), and the server gives the browser something to send on later requests so
+it does not have to prove it again. Passwords are never stored; a slow, salted hash of them is. A session
+is a random ID in a cookie that maps to the user on the server.
 
 ```ts
 import argon2 from 'argon2';
-const hash = await argon2.hash(password);              // on sign-up
-const ok = await argon2.verify(user.password_hash, input); // on sign-in
-const sid = crypto.randomBytes(32).toString('base64url');
-await db.query('insert into sessions (id, user_id, expires_at) values ($1, $2, now() + interval \'14 days\')', [sha256(sid), user.id]);
-res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=1209600`);
+const hash = await argon2.hash(password);                 // $argon2id$v=19$m=65536,t=3,p=4$...
+const ok = await argon2.verify(user.password_hash, input); // true or false
 ```
 
-Storing a hash of the session ID means a database leak does not leak live sessions. Common mistake:
-saying "wrong password" versus "no such user". Fix: one message for both, to avoid account enumeration.
+The common mistake is a fast hash like SHA-256 for passwords. A GPU can try billions per second; argon2id
+and bcrypt are designed to be slow and memory-hard.
 
 </Level>
 
 <Level name="Intermediate">
 
-JWTs are signed tokens carrying claims. They are verified without a database lookup, which is their
-appeal and their problem: a JWT cannot be revoked before it expires unless I add a denylist, at which
-point I have a session store again. OAuth delegates sign-in to a provider (authorization code flow with
-PKCE); magic links email a single-use, short-lived token.
+A real sign-in flow: validate input, look up the user, verify the hash, create a new session with a random
+ID, store a hash of that ID with the user and an expiry, and set the cookie with `HttpOnly` (JavaScript
+cannot read it), `Secure` (HTTPS only), `SameSite=Lax` (not sent on most cross-site requests) and an
+expiry. Sign-out deletes the session row. Password reset sends a single-use, short-lived token.
 
-The gate asks why a JWT in local storage is a different risk from an `HttpOnly` cookie. Local storage is
-readable by any JavaScript on the page, so one XSS bug exfiltrates the token and the attacker uses it from
-anywhere until it expires. An `HttpOnly` cookie cannot be read by script; XSS can still make requests as
-the user while the page is open, but cannot steal the credential. The cookie, in exchange, is sent
-automatically, so it needs CSRF protection (`SameSite`, plus a token or origin check for unsafe methods).
+```ts
+import { randomBytes, createHash } from 'node:crypto';
+const sid = randomBytes(32).toString('base64url');
+await db.query('insert into sessions(id_hash, user_id, expires_at) values ($1, $2, now() + interval \'30 days\')',
+  [createHash('sha256').update(sid).digest('hex'), user.id]);
+res.cookie('sid', sid, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 30 * 864e5, path: '/' });
+```
+
+Storing a hash of the session ID means a leaked database dump does not hand out live sessions. The same
+error message for "no such user" and "wrong password" avoids telling an attacker which emails exist.
 
 </Level>
 
 <Level name="Advanced">
 
-Session fixation: always issue a new session ID on sign-in. Password reset tokens are random, single-use,
-hashed in the database and expire in under an hour. Login rate limits by account and by IP slow
-credential stuffing. Argon2id parameters are tuned so a hash takes tens of milliseconds on the server.
-For OAuth, the `state` parameter prevents CSRF on the callback and PKCE prevents code interception.
+The options and their exact trade-offs. A JWT is a signed token holding claims (user ID, expiry); the server
+verifies the signature without a database lookup, which is fast but means a JWT cannot be revoked before it
+expires unless I add a denylist, which brings the lookup back. OAuth 2.0 with OpenID Connect delegates
+sign-in to a provider: the browser is redirected there, comes back with a code, and my server exchanges the
+code (with PKCE and a `state` parameter against CSRF) for tokens. A magic link is a single-use token emailed
+to the user, which makes email account security my security. Passkeys (WebAuthn) use a key pair on the
+device and resist phishing.
+
+```text
+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiIsImV4cCI6MTc2MTIyNTYwMH0.k3Y...
+header (alg)        . claims (sub, exp)                       . signature
+```
+
+The gate asks why a JWT in local storage differs from an HttpOnly cookie: any script on the page (one XSS
+bug, one compromised dependency) can read local storage and send the token anywhere; it cannot read an
+HttpOnly cookie. The cookie has its own risk, CSRF, which `SameSite` and an origin check address.
 
 </Level>
 
 <Level name="Edge cases">
 
-- An email with different case (`A@x.com` versus `a@x.com`): normalise before lookup and in a unique
-  index on `lower(email)`.
-- A password of 10,000 characters: cap length, because hashing it is a denial-of-service vector (bcrypt
-  silently truncates at 72 bytes).
-- An expired session on an open tab: return 401 and let the client redirect.
+An email with different case at sign-up and sign-in; a password longer than bcrypt's 72-byte limit (bcrypt
+silently ignores the rest, so two long passwords with the same first 72 bytes match); a password reset token
+used twice; a session expired one second ago; a user deleted while signed in; a `SameSite=Lax` cookie on the
+return from an OAuth provider's POST, which is not sent.
 
 </Level>
 
 <Level name="Corner cases">
 
-A user changes their password; their other sessions should end, but a JWT issued earlier still works
-until expiry. Revocation plus stateless tokens. Sessions handle it by deleting rows; JWTs need a
-per-user token version checked on each request. Another: a magic link opened in a different browser
-than the one that requested it, so the session lands in the wrong place.
+Session fixation: an attacker sets a known session ID in the victim's browser before they sign in, and if
+the server keeps the same ID after sign-in, the attacker is now signed in as the victim. The fix is to issue
+a new session ID on every privilege change (sign-in, role change). Password change plus other active
+sessions: changing the password should revoke the other sessions, or a thief keeps access. A JWT with
+`alg: none` plus a library that trusts the header: the signature check is skipped. Always pin the expected
+algorithm when verifying.
 
 </Level>
 
 <Level name="Production level">
 
-Auth is the last place to improvise. I use a well-reviewed library or provider for the primitives,
-keep the flows small, log sign-in events (success, failure, reset) as an audit trail, and alert on spikes
-of failures.
+In production authentication needs rate limits on sign-in and reset (by account and by IP), a lockout or
+increasing delay after failures, logging of sign-in events without passwords, breach-password checks on
+sign-up, session lists so users can sign out other devices, and alerts on bursts of failed logins. I use a
+well-reviewed library for the crypto and the OAuth flow, and own the session model and the tests.
 
 </Level>
 
 <Level name="Mindset">
 
-Every credential will leak eventually. Design so a leak is detectable, limited and revocable.
+The habit is "never invent crypto, always understand the flow." The libraries do the maths; I must still
+know what each token is, where it is stored, who can read it, how long it lives and how to revoke it.
 
 </Level>
 
 <Level name="System design">
 
-Authentication is a service boundary: one place issues sessions, every other part trusts its result.
-In a multi-service system that becomes an auth gateway; in a monolith it is one middleware.
+The choice between server sessions and stateless tokens is a system decision: sessions need a shared store
+(Postgres or Redis) across instances but revoke instantly; JWTs scale without a store but revoke slowly. For
+a single product with one API, server sessions are the simpler and safer default. Service-to-service calls
+and agent tools later use short-lived tokens with narrow scopes.
 
 </Level>
 
 <Level name="Strategy">
 
-Implement email and password with sessions, password reset and logout-everywhere, then write the threat
-model for the flow (assets, entry points, attacks, mitigations). Done when I can explain the JWT and
-cookie difference from the gate in two minutes and every attack in my threat model has a test or a
-named mitigation.
+I implement email and password with sessions from scratch once, then write attack tests: fixation, reuse of
+a reset token, a stolen cookie after sign-out, brute force against the limit. Then I read an OAuth flow
+step by step in the Network tab. Done when I can threat-model the auth flow, as the gate asks, with every
+token named and its storage and lifetime explained.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: authorization: roles, permissions, ownership checks and tenant isolation
+#### Phase 3: Authorization: roles, permissions, ownership checks and tenant isolation
 
 <Flow
-  caption="Authorization on every request that touches a resource"
-  steps={['Authenticated user', 'Load the resource scoped by tenant', 'Is the user in that tenant?', 'Does their role allow the action?', 'Do they own it, if ownership matters?', 'Allow or 404']}
+  caption="Every protected request asks three questions, in this order"
+  steps={["Who is it? (authentication)", "Which tenant is this in? (scope every query)", "Does their role allow the action?", "Do they own or share this resource?", "Then run the handler"]}
 />
 
-<Levels label="Phase 3, roles, permissions, ownership and tenant isolation">
+<Levels label="Phase 3, authorization: roles, permissions, ownership checks and tenant isolation">
 
 <Level name="Beginner">
 
-Authorization answers "is this user allowed to do this to this thing?". Roles group permissions (owner,
-admin, member, viewer). Ownership checks that a resource belongs to the user. Tenant isolation means one
-team never sees another's data.
+Authorization answers "may this user do this to this thing?" Authentication tells me who; authorization
+decides what. The most important check is ownership: a user may only read or change their own resources,
+or those shared with them. Broken access control is first on the OWASP Top 10 because it is easy to forget.
 
 ```ts
-const note = await db.oneOrNone('select * from notes where id = $1 and team_id = $2', [id, user.teamId]);
-if (!note) return reply(404);   // not 403: do not reveal that it exists
+// wrong: any signed-in user can read any note by changing the number
+const note = await db.query('select * from notes where id = $1', [req.params.id]);
+// right: the query itself enforces ownership
+const note = await db.query('select * from notes where id = $1 and user_id = $2', [req.params.id, req.user.id]);
 ```
 
-Common mistake: `select * from notes where id = $1` and checking ownership afterwards, or not at all.
-That is IDOR, insecure direct object reference. Fix: scope every query by tenant.
+The common mistake is checking ownership in the frontend (hiding the button) and not in the API.
 
 </Level>
 
 <Level name="Intermediate">
 
-Permissions belong in one policy module, not scattered `if` statements.
+Real apps have teams. A tenant (an organisation) contains users with roles (owner, admin, member, viewer),
+and roles map to permissions (`note:read`, `note:write`, `member:invite`). Every query is scoped to the
+tenant from the session, and every action checks the permission. I keep the mapping in one place.
 
 ```ts
-const can = {
-  'note:read':   (u, n) => u.teamId === n.teamId,
-  'note:edit':   (u, n) => u.teamId === n.teamId && (u.role !== 'viewer'),
-  'note:delete': (u, n) => u.teamId === n.teamId && (u.role === 'admin' || n.authorId === u.id),
-} satisfies Record<string, (u: User, n: Note) => boolean>;
+const can = { owner: ['*'], admin: ['note:*', 'member:invite'], member: ['note:read', 'note:write'], viewer: ['note:read'] } as const;
+function allowed(role: keyof typeof can, perm: string) {
+  return can[role].some((p) => p === '*' || p === perm || (p.endsWith(':*') && perm.startsWith(p.slice(0, -1))));
+}
 ```
+
+For a resource that belongs to another tenant, I return 404, not 403, so I do not confirm that it exists.
 
 </Level>
 
 <Level name="Advanced">
 
-Defence in depth: Postgres row-level security enforces tenant isolation in the database even if a query
-forgets the filter.
+The models underneath: RBAC (permissions through roles) is simple and coarse; ABAC (rules over attributes:
+the user's department, the resource's status, the time) is flexible and harder to audit; relationship-based
+access (a user can edit a doc if they are an editor of its folder) generalises sharing. Postgres row-level
+security can enforce tenant isolation in the database itself, so a forgotten `where` clause returns no rows
+instead of everyone's.
 
 ```sql
 alter table notes enable row level security;
-create policy tenant on notes using (team_id = current_setting('app.team_id')::uuid);
--- per request: set local app.team_id = '...';
+create policy tenant_isolation on notes using (tenant_id = current_setting('app.tenant_id')::bigint);
+-- per request, inside the transaction: set local app.tenant_id = '7';
 ```
-
-RBAC (roles) is simple; ABAC (attributes such as department or document status) is flexible; relationship
-based (Zanzibar-style) handles sharing graphs. Start with RBAC plus ownership.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A user removed from a team with an open session: the next request must fail, so load membership per
-  request or invalidate on removal.
-- An admin endpoint reachable without the admin check because the route was added later.
-- List endpoints that filter correctly but count endpoints that do not, leaking totals.
+A user removed from a team while their session is active; the last owner trying to leave a tenant (leaving
+it ownerless); an admin demoting themselves; a resource ID in the body that differs from the ID in the URL;
+a list endpoint with a filter parameter `tenantId` that a client can change. Each needs a test.
 
 </Level>
 
 <Level name="Corner cases">
 
-A background job runs without a user context and uses a superuser connection, bypassing RLS, and writes
-one tenant's data into another's export. Jobs plus isolation. Jobs carry the tenant ID and set it like
-requests do. Another: a search index or cache keyed without the tenant ID returns another team's results;
-phase 4's vector search has the same trap.
+A user who belongs to two tenants plus a request that names tenant A in the URL while the session's current
+tenant is B: the handler must check membership in the tenant named, not trust either source alone. A
+background job enqueued by a user who has since lost access: the job runs later with the original user's
+rights unless it re-checks at run time. A search index or cache shared across tenants: the database query is
+scoped but the cache key is not, so tenant B sees tenant A's cached result.
 
 </Level>
 
 <Level name="Production level">
 
-Authorization tests are the most valuable tests in a multi-tenant app: for every endpoint, a request as
-a user from another tenant must fail. I generate those tests from the route list so new routes cannot
-skip them.
+In production authorization failures are data breaches. I write one isolation test per resource type (two
+tenants, two users, every endpoint), run them in CI, log every 403 and 404 on protected resources, and
+audit-log admin actions (who changed whose role, when). Row-level security is a second net under the
+application checks, not a replacement for them.
 
 </Level>
 
 <Level name="Mindset">
 
-Deny by default. Every new endpoint starts closed and is opened on purpose.
+The habit is "deny by default, scope by construction." Every query starts from the tenant and the user,
+so the safe version is the easy version, and forgetting is hard.
 
 </Level>
 
 <Level name="System design">
 
-Isolation choices (shared schema with a tenant column, schema per tenant, database per tenant) trade cost
-for blast radius; phase 10 revisits them. AI features inherit these rules: retrieval must filter by tenant
-before the model ever sees a document.
+Tenant isolation is a system-wide property: database rows, caches, search indexes, object storage paths,
+logs, background jobs, and in Phase 7 the vector index used for retrieval. An AI feature that retrieves
+across tenants is a breach with a chat interface. Phase 10 compares shared-schema, schema-per-tenant and
+database-per-tenant isolation.
 
 </Level>
 
 <Level name="Strategy">
 
-Write a test matrix: every route times every role times own versus other tenant. Done when the matrix
-runs in CI and a deliberately removed tenant filter turns it red.
+I write the cross-tenant test suite before adding the second role, then add roles one at a time. Done when
+the gate's "a tenant cannot read another tenant's data" is a suite that tries every endpoint and every
+store, and passes.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: input validation and output encoding at every boundary
+#### Phase 3: Input validation and output encoding at every boundary
 
 <Figure art={`
-  in:  HTTP body, query, headers, webhook, file, env, DB row, model output
-          |  validate: type, size, range, format, allowlist
-          v
-       [ trusted internal values ]
-          |  encode for the destination
-          v
-  out: HTML (escape), SQL (parameters), shell (argv array), URL (encode),
-       JSON (serialize), log (redact), model prompt (delimit)
-`} caption="Validate on the way in, encode on the way out, and the encoding depends on where the value is going." />
+  untrusted in                    my code                    untrusted out
+  ------------                    -------                    -------------
+  HTTP body, query, headers  -->  validate (schema)  -->  typed values
+  file upload                -->  check type, size   -->
+  webhook                    -->  verify signature   -->
+  model output               -->  parse + validate   -->
+                                  typed values  -->  encode for the sink:
+                                                     HTML  -> escape < > & " '
+                                                     SQL   -> parameters
+                                                     shell -> argument array
+                                                     URL   -> encodeURIComponent
+`} caption="Validate on the way in, encode on the way out, and encode for the specific place the data lands." />
 
-<Levels label="Phase 3, input validation and output encoding">
+<Levels label="Phase 3, input validation and output encoding at every boundary">
 
 <Level name="Beginner">
 
-Validation checks input against rules before using it. Encoding makes output safe for its destination.
-They are different: validated input can still be dangerous in the wrong context.
+Every piece of data that comes from outside my code is untrusted: request bodies, query strings, headers,
+cookies, uploaded files, webhooks, third-party API responses and model output. Validation checks the shape
+and limits on the way in. Encoding makes data safe for the place it goes out to: HTML, SQL, a shell, a URL.
 
 ```ts
-// SQL: never concatenate
-await db.query('select * from notes where title = $1', [title]);
-// HTML: escape, or let the framework do it
-const safe = title.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+// SQL: never build queries with string concatenation
+db.query(`select * from users where email = '${email}'`);            // injectable
+db.query('select * from users where email = $1', [email]);           // parameterised
 ```
 
-Common mistake: "sanitising" input by stripping characters, then concatenating it into SQL. Fix:
-parameters for SQL, escaping for HTML; validation is for business rules.
+The common mistake is "sanitising" input by stripping characters, which breaks legitimate names and still
+misses attacks. Validate structure; encode for the output context.
 
 </Level>
 
 <Level name="Intermediate">
 
-Allowlists beat denylists: accept `sort` only if it is one of `created_at` or `title`, rather than trying
-to reject bad values. Identifiers such as column names cannot be SQL parameters, so they must come from an
-allowlist.
+In a real API validation is a middleware with a schema per route, applied to body, params and query, with
+limits on every string and array. Encoding is mostly done by tools when I use them correctly: parameterised
+queries for SQL, a templating engine or React for HTML (both escape by default), `execFile` with an argument
+array instead of `exec` with a string for processes.
 
 ```ts
-const SORT = { created: 'created_at', title: 'title' } as const;
-const col = SORT[req.query.sort as keyof typeof SORT] ?? 'created_at';
+import { execFile } from 'node:child_process';
+execFile('convert', [inputPath, '-resize', '800x', outputPath]);  // no shell: a filename cannot inject
+// exec(`convert ${inputPath} -resize 800x ${outputPath}`)         // a filename of "x; rm -rf ~" runs
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-Each output context has its own encoding: HTML body, HTML attribute, JavaScript string, URL, CSS. React
-escapes text by default; `dangerouslySetInnerHTML` and `href={userValue}` (a `javascript:` URL) are the
-holes. Shell commands take an argument array (`execFile`), never a string through a shell. Unicode
-normalisation before comparing usernames prevents look-alike duplicates.
+The exact rules: encoding is context-specific. Text inside an HTML element needs `<`, `>` and `&`
+escaped; inside an attribute, quotes too; inside a `script` block or an `href`, different rules apply, and a
+`javascript:` URL in an `href` executes even when escaped. React escapes text but `dangerouslySetInnerHTML`
+and `href={userUrl}` bypass that. Markdown rendered to HTML (an AI answer) must be sanitised with an
+allowlist (DOMPurify) after rendering. Unicode normalisation (NFC) matters when comparing usernames: "é" can
+be one code point or two.
+
+```ts
+const safeHref = (u: string) => (/^https?:\/\//i.test(u) ? u : '#');
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- A filename with `../` in an upload: path traversal.
-- A number field receiving `1e309`: parses as `Infinity`.
-- A header with a CRLF: response splitting.
+A string field with a null byte; a number field with `1e309` (Infinity) or `-0`; an array of a million
+items; a deeply nested object; a field named `__proto__` in JSON that some merge utilities turn into
+prototype pollution; an email of 300 characters; a header value with a newline (header injection). Each
+belongs in the schema's limits or a test.
 
 </Level>
 
 <Level name="Corner cases">
 
-Model output treated as trusted: an AI summary containing markdown with a `javascript:` link, rendered as
-HTML. Two boundaries meet: model output is untrusted input, and rendering is an output context. Validate
-and encode model output exactly like user input. This is the root of phase 6's insecure output handling.
+Validated data stored safely, then rendered unsafely later in a different context (stored XSS): the note
+body was fine in the API and becomes script in an admin dashboard that uses `innerHTML`. Validation does not
+protect output; encoding at every sink does. A model's output used as a SQL fragment, a shell argument or a
+URL (an AI feature that "writes the query"): model output is user input with extra steps, and gets the same
+parameterisation and allowlists.
 
 </Level>
 
 <Level name="Production level">
 
-Validation failures are logged as metrics (a spike means a broken client or an attack). Encoding is
-automatic through the framework and query builder, so humans only think about it at the escape hatches.
+In production I enforce body size limits at the edge (for example 100 KB for JSON, larger only on the
+upload route), log validation failures by route and field, run a linter rule against string-built SQL and
+`dangerouslySetInnerHTML`, and set a Content-Security-Policy (Phase 6) as a backstop for the encoding bug I
+have not found yet.
 
 </Level>
 
 <Level name="Mindset">
 
-Ask two questions of every value: where did it come from, and where is it going?
+The habit is to see every boundary as a border crossing: check papers on entry, and translate for the
+destination on exit. "It came from our own frontend" is not a reason to trust it, because anyone can send
+the same request.
 
 </Level>
 
 <Level name="System design">
 
-Trust boundaries are drawn on the architecture diagram; each crossing names its validator and its
-encoder. That diagram becomes the threat model in phase 6.
+Boundaries multiply in an AI system: user to API, API to model, model back to API, API to tools. Each one
+gets validation in and encoding out. A single shared validation package and a small set of safe output
+helpers make the right thing the default for every service.
 
 </Level>
 
 <Level name="Strategy">
 
-List every input and every output of the API, and write the validator or encoder next to each. Done when
-the list has no blanks and a payload of classic injection strings in every field causes no change in
-behaviour.
+I write a fuzz-style test that sends a list of nasty inputs (from a payload list such as the "big list of
+naughty strings") to every endpoint and asserts no 500 and no reflected script. Done when every route has a
+schema with limits and no string-built SQL or shell command remains.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: background jobs: queues, workers, retries, backoff and dead-letter queues
+#### Phase 3: Background jobs: queues, workers, retries, backoff and dead-letter queues
 
 <Figure art={`
-  API --enqueue--> [ queue ] --claim--> worker --ok--> ack, delete
-                       ^                   |
-                       |                 fail
-                       |                   v
-                       +--- retry after 2^n s + jitter (n < max)
-                                           |
-                                      n == max
-                                           v
-                                   [ dead-letter queue ] --> alert, inspect, replay
-`} caption="A job's life: claimed by a worker, acknowledged on success, retried with backoff on failure, and parked in a dead-letter queue after too many attempts." />
+  API ---enqueue {job id, payload}---> queue ---> worker 1  -- ok --> ack (done)
+                                         ^   \\-> worker 2  -- fail -> retry later
+                                         |                            (backoff 1s, 4s, 16s...)
+                                         |                                  |
+                                         +----------- re-queued ------------+
+                                                     after N tries
+                                                          |
+                                                          v
+                                                  dead-letter queue -> alert, inspect, replay
+`} caption="A job's life. The queue promises at-least-once delivery, so the worker must be safe to run twice." />
 
-<Levels label="Phase 3, queues, workers, retries, backoff and dead letters">
+<Levels label="Phase 3, background jobs: queues, workers, retries, backoff and dead-letter queues">
 
 <Level name="Beginner">
 
-Slow or unreliable work (sending email, processing an upload, calling a model) moves out of the request
-into a job. The API enqueues and returns; a worker processes later.
+A background job is work done outside the request: sending an email, resizing an image, embedding a
+document, calling a slow API. The request puts a job on a queue and returns quickly; a worker process takes
+jobs off the queue and runs them. If a job fails, it is retried later.
 
 ```ts
-await queue.add('send-welcome', { userId }, { attempts: 5, backoff: { type: 'exponential', delay: 2000 } });
+// in the request handler
+await queue.add('send-welcome', { userId }, { jobId: `welcome:${userId}`, attempts: 5, backoff: { type: 'exponential', delay: 1000 } });
+res.status(202).json({ status: 'queued' });
+// in the worker process
+new Worker('default', async (job) => { if (job.name === 'send-welcome') await sendWelcome(job.data.userId); });
 ```
 
-Common mistake: doing slow work inside the request and timing out. Fix: enqueue and return 202 Accepted
-with a status URL if the client needs to follow progress.
+The common mistake is doing slow work inside the request with `await`, so the user waits and a timeout
+loses the work halfway.
 
 </Level>
 
 <Level name="Intermediate">
 
-Retries with exponential backoff and jitter spread out retries so a recovering dependency is not flooded.
-After the maximum attempts, the job goes to a dead-letter queue for inspection. Jobs must be idempotent,
-because at-least-once delivery means a job can run twice.
+A real job system needs four behaviours: retries with exponential backoff and jitter (so a hundred failing
+jobs do not retry in the same second), a maximum attempt count, a dead-letter queue for jobs that exhausted
+their attempts, and visibility (how many jobs are waiting, running, failed). Libraries like BullMQ (on Redis)
+or pg-boss and Graphile Worker (on Postgres) provide these.
 
 ```ts
 const delay = (attempt: number) => Math.min(60_000, 1000 * 2 ** attempt) * (0.5 + Math.random() / 2);
+// attempt 1 ~ 1-2 s, 2 ~ 2-4 s, 3 ~ 4-8 s ... capped at a minute
 ```
+
+A Postgres-backed queue has a strong advantage: the job can be inserted in the same transaction as the data
+it relates to, so a note is never saved without its "embed this note" job, or the reverse.
 
 </Level>
 
 <Level name="Advanced">
 
-A Postgres-backed queue claims jobs with `select ... for update skip locked`, so workers never take the
-same job and a crashed worker's job becomes visible again when its lock or lease expires.
+The exact guarantee of almost every queue is at-least-once delivery: a worker takes a job, and if it crashes
+before acknowledging, the job becomes visible again after a lock timeout and another worker runs it. So the
+job will sometimes run twice, and must be idempotent. In Postgres the queue is a table read with `FOR UPDATE
+SKIP LOCKED`, which lets many workers take different rows without blocking each other.
 
 ```sql
-update jobs set locked_until = now() + interval '5 minutes', attempts = attempts + 1
-where id = (select id from jobs where run_at <= now() and (locked_until is null or locked_until < now())
+update jobs set status = 'running', locked_until = now() + interval '5 minutes', attempts = attempts + 1
+where id = (select id from jobs where status = 'queued' and run_at <= now()
             order by run_at for update skip locked limit 1)
 returning *;
 ```
 
-The transactional outbox pattern inserts the job in the same transaction as the business write, so a
-rollback never leaves an orphan job and a commit never loses one.
+Exactly-once processing is not something the queue gives; I build it from at-least-once plus an idempotent
+handler (check a "sent" flag, use an idempotency key with the email provider).
 
 </Level>
 
 <Level name="Edge cases">
 
-- A job payload referencing a row deleted before the job runs.
-- A job that always fails (a poison message) blocks a FIFO queue unless it is moved aside.
-- A lease shorter than the job's runtime: a second worker picks it up while the first is still working.
+A job whose payload refers to a row that was deleted before the worker ran; a job that takes longer than its
+lock timeout, so a second worker starts it while the first is still running; a job payload too large for
+Redis comfortably (store an ID, not the document); a permanent error (invalid email address) that should not
+be retried at all; a queue with zero workers running, where jobs pile up silently.
 
 </Level>
 
 <Level name="Corner cases">
 
-The plan's build: kill a worker mid-job and prove the job is retried safely. The worker sent the email and
-crashed before acknowledging, so the retry sends it again. Crash plus side effect. The fix is an
-idempotency record per job (`sent_emails(job_id unique)`) checked before the side effect, or a provider
-idempotency key. Another: retries during a provider outage all fire at once when it recovers, without
-jitter.
+A worker killed mid-job after it sent the email but before it acknowledged: the job runs again and sends the
+email twice, unless the handler records "sent" before acknowledging or the provider dedupes by key. The plan's
+build asks me to prove this case. A retry storm plus a downstream outage: every job fails, retries with
+backoff, and when the downstream recovers, the whole backlog hits it at once. Rate-limit the worker's
+concurrency and add jitter.
 
 </Level>
 
 <Level name="Production level">
 
-Metrics: queue depth, age of oldest job, failure rate, dead-letter count. Alerts on oldest-job age catch
-stuck workers. Workers shut down gracefully: stop claiming, finish or release in-flight jobs.
+In production I alert on queue depth and age of the oldest job (not just failures), on the dead-letter queue
+growing, and on worker heartbeats stopping. Workers shut down gracefully on `SIGTERM`: stop taking new jobs,
+finish or release current ones, then exit. Every job logs with a job ID and the request ID that enqueued it,
+so a user's action can be traced through to the worker.
 
 </Level>
 
 <Level name="Mindset">
 
-Anything asynchronous will run zero times, once, or twice. Design for all three.
+The habit is "assume it runs twice, or not at all." Every job handler is written as if a crash could happen
+on any line, and the question for each line is what a second run would do.
 
 </Level>
 
 <Level name="System design">
 
-Queues decouple producers from consumers and absorb load spikes. Phase 7's document ingestion and
-embedding, and phase 9's agent runs, are jobs on this same machinery.
+Queues decouple the request path from slow and unreliable work, absorb bursts and let workers scale
+separately. They also add eventual consistency: the user saved a document and the search index is a few
+seconds behind. In Phase 7 ingestion (chunk, embed, index) runs as jobs; in Phase 9 an agent's long task is
+a job with a budget and a kill switch.
 
 </Level>
 
 <Level name="Strategy">
 
-Build the queue on Postgres, then run a chaos script: kill workers at random during a thousand jobs. Done
-when every job completes exactly once in effect, and the dead-letter queue holds only the deliberately
-poisoned ones.
+I build the queue twice: once on a Postgres table with `SKIP LOCKED` to understand it, then with a library.
+Then I run the plan's drill: kill the worker with `kill -9` mid-job and prove the job is retried and the side
+effect happens once. Done when that drill is an automated test and the dashboard shows queue depth and age.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: scheduled jobs, cron and time zones
+#### Phase 3: Scheduled jobs, cron and time zones
 
 <Figure art={`
-  "every day at 09:00 for each user, in their time zone"
-  user tz          local 09:00     as UTC
-  Asia/Calcutta    09:00 IST       03:30 UTC
-  Europe/London    09:00 GMT/BST   09:00 or 08:00 UTC (DST)
-  America/New_York 09:00 EST/EDT   14:00 or 13:00 UTC (DST)
-  store: tz name + local time.   compute: next UTC instant each run.
-`} caption="A daily schedule per user: store the zone name and local time, and compute the next UTC instant, because offsets move with daylight saving." />
+  user in Asia/Calcutta asks: "remind me at 9:00 every day"
+  store:   rule = 'every day 09:00', tz = 'Asia/Calcutta'      (intent)
+  compute: next run = 2026-10-24 09:00 +05:30 = 03:30 UTC       (instant)
+  scheduler tick (UTC) -> run due jobs -> compute the next one
+  user in America/New_York, same rule: 09:00 local
+     before DST change: 13:00 UTC    after DST change: 14:00 UTC
+`} caption="Store the intent with its time zone; compute instants from it. A fixed UTC time drifts by an hour twice a year." />
 
 <Levels label="Phase 3, scheduled jobs, cron and time zones">
 
 <Level name="Beginner">
 
-Cron runs a job on a schedule written as five fields: minute, hour, day of month, month, day of week.
-`0 9 * * *` is every day at 09:00 in the scheduler's time zone. Store timestamps in UTC (`timestamptz` in
-Postgres).
+A scheduled job runs at a time or on a repeating schedule: a nightly cleanup, a weekly digest, a reminder.
+Cron syntax describes the schedule in five fields: minute, hour, day of month, month, day of week.
 
-```txt
-*/15 * * * *   every 15 minutes
-0 3 * * 1      03:00 every Monday
+```text
+*/15 * * * *    every 15 minutes
+0 3 * * *       every day at 03:00
+30 9 * * 1-5    09:30 on weekdays
 ```
 
-Common mistake: storing local times without a zone. Fix: `timestamptz` for instants; a zone name such as
-`Asia/Calcutta` for "the user's local time".
+Store timestamps as `timestamptz` in Postgres (an instant) and show them in the user's time zone. The common
+mistake is storing local times without a zone, so "09:00" means different instants on different servers.
 
 </Level>
 
 <Level name="Intermediate">
 
-A user-facing schedule ("remind me at 9 am") is a local time plus a zone, not a UTC time, because the
-offset changes with daylight saving. Compute the next run in that zone each time.
+In a real app there are two kinds of schedule. System jobs (cleanup, backups) run in UTC from a single
+scheduler. User schedules (a daily digest at 9 in their morning) store the rule and the IANA time zone name
+(`Asia/Calcutta`, not `+05:30`), and the next run instant is computed from them after each run.
 
 ```ts
 import { Temporal } from '@js-temporal/polyfill';
-const next = Temporal.Now.zonedDateTimeISO('America/New_York').with({ hour: 9, minute: 0, second: 0 }).add({ days: 1 });
-console.log(next.toInstant().toString());
+function nextNineAm(tz: string, now = Temporal.Now.instant()) {
+  const local = now.toZonedDateTimeISO(tz);
+  let next = local.with({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+  if (Temporal.ZonedDateTime.compare(next, local) <= 0) next = next.add({ days: 1 });
+  return next.toInstant(); // store this as run_at
+}
 ```
+
+The mistake is storing an offset instead of a zone name: an offset does not know about daylight saving
+changes.
 
 </Level>
 
 <Level name="Advanced">
 
-Distributed schedulers must ensure a job runs once even with several instances: a lock (Postgres advisory
-lock), a leader, or a unique row per scheduled slot (`unique(job, slot_time)`). Missed runs during
-downtime need a policy: catch up all, run once, or skip.
+The exact rules underneath: a time zone is a history of offset rules, published in the IANA database and
+updated several times a year. In zones with daylight saving time, one local hour is skipped in spring (02:30
+does not exist that day) and one is repeated in autumn (01:30 happens twice). Cron implementations differ on
+what they do then. Day-of-month and day-of-week fields in classic cron are combined with OR when both are
+set, which surprises people. Running a scheduler on every instance runs every job N times; one leader, or a
+job table with a unique key per run, prevents it.
+
+```sql
+insert into job_runs(job, scheduled_for) values ('nightly-cleanup', '2026-10-24 03:00Z')
+on conflict do nothing returning id;   -- only one instance gets a row back and runs it
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- 02:30 on a spring-forward day does not exist in many zones; 01:30 on a fall-back day happens twice.
-- Day 31 in a month with 30 days.
-- India has no daylight saving, so a bug only shows up for users elsewhere.
+A monthly job on the 31st in a 30-day month; a job scheduled for 02:30 on the spring-forward day; a daily job
+at 01:30 on the fall-back day (runs twice unless deduplicated); a user who changes their time zone after
+scheduling; leap seconds (most systems smear them and I can ignore them); a server whose clock has drifted.
 
 </Level>
 
 <Level name="Corner cases">
 
-A job scheduled at 01:30 local on the fall-back night runs twice, and the job is not idempotent. Time zone
-plus idempotency. Key each run by its intended instant so the second is a no-op. Another: the server's
-time zone is changed by an OS update and every cron line shifts.
+A scheduler down for two hours (a deploy, an outage) plus jobs that should have run during that time: does it
+run all the missed runs on restart (catch-up), only the latest, or none? Each job needs an explicit
+misfire policy; a digest should run once, not twelve times. A long job plus a short interval: the 15-minute
+job takes 20 minutes and the next run starts before it finishes, so two run concurrently unless the schedule
+takes a lock.
 
 </Level>
 
 <Level name="Production level">
 
-Every scheduled job has a heartbeat: it records its last success, and an alert fires if it has not run on
-time (a dead man's switch). Logs say the intended slot and the actual start time.
+In production I monitor scheduled jobs with a dead-man's switch: each run pings a monitor, and the monitor
+alerts if the ping does not arrive on time, which catches the silent failure where the job simply stopped
+running. Every scheduled job is idempotent, logs its scheduled time and actual start, and has a documented
+misfire policy.
 
 </Level>
 
 <Level name="Mindset">
 
-Time is input. Treat "now" as a parameter so code is testable and zones are explicit.
+The habit is "time is data with a zone, and schedules are promises with a policy for when they break."
+Whenever I see a bare time, I ask which zone and what happens on the days the clocks change.
 
 </Level>
 
 <Level name="System design">
 
-Schedules feed the job queue: the scheduler only enqueues; workers do the work. That keeps scheduling cheap
-and retries uniform.
+Scheduling is a coordination problem across instances: one leader, a lock, or a deduplicating run table.
+At scale it becomes a separate service. For this plan a Postgres-backed scheduler with a unique run key is
+enough, and its runs are visible in the same job dashboard.
 
 </Level>
 
 <Level name="Strategy">
 
-Implement per-user daily reminders and test them with an injected clock across DST transitions in three
-zones. Done when the tests cover the missing hour and the repeated hour and each produces exactly one
-reminder.
+I write tests for the next-run function across the daylight saving changes in `America/New_York` and
+`Europe/London`, and for `Asia/Calcutta` (no DST, a half-hour offset). Then I run two app instances and prove
+the nightly job runs once. Done when both are automated and a stopped scheduler pages me within an hour.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: caching: HTTP caching, application caching, Redis and invalidation
+#### Phase 3: Caching: HTTP caching, application caching, Redis and invalidation
 
-<Layers
-  caption="Caches between the user and the database"
-  layers={[
-    { name: 'Browser cache', note: 'Cache-Control, ETag' },
-    { name: 'CDN', note: 'public, s-maxage' },
-    { name: 'Application cache', note: 'Redis or in-process LRU' },
-    { name: 'Database buffer cache', note: 'hot pages in memory' },
-    { name: 'Disk', note: 'the source of truth' },
-  ]}
+<Flow
+  caption="Cache-aside, the default pattern. Each step has a failure I must decide about."
+  steps={["Request arrives", "Look up key in Redis", "Hit: return it", "Miss: query Postgres", "Store with a TTL", "On write: delete the key", "Return the fresh value"]}
 />
 
-<Levels label="Phase 3, HTTP caching, application caching, Redis and invalidation">
+<Levels label="Phase 3, caching: HTTP caching, application caching, Redis and invalidation">
 
 <Level name="Beginner">
 
-A cache stores the result of expensive work to reuse it. HTTP caching uses headers; application caching
-uses Redis or memory.
+A cache keeps a copy of a result so the next request is faster. HTTP caching tells browsers and CDNs to keep
+responses (`Cache-Control`, `ETag`). Application caching keeps computed values in memory or Redis. The hard
+part is invalidation: knowing when the copy is wrong.
 
 ```ts
 async function getProfile(id: string) {
-  const hit = await redis.get(`profile:${id}`);
+  const key = `profile:v1:${id}`;
+  const hit = await redis.get(key);
   if (hit) return JSON.parse(hit);
-  const p = await db.one('select * from profiles where id = $1', [id]);
-  await redis.set(`profile:${id}`, JSON.stringify(p), 'EX', 300);
-  return p;
+  const row = (await db.query('select id, name, plan from users where id = $1', [id])).rows[0];
+  await redis.set(key, JSON.stringify(row), { EX: 300 });
+  return row;
 }
 ```
 
-Common mistake: caching without a TTL or an invalidation plan. Fix: every key has a TTL and an event that
-deletes it.
+The common mistake is caching before measuring. A cache adds a second source of truth; it should fix a
+measured slowness, not a feeling.
 
 </Level>
 
 <Level name="Intermediate">
 
-Cache-aside (above) reads through the cache; on writes, delete the key after the database commit. Hashed
-static assets get `Cache-Control: public, max-age=31536000, immutable`; HTML gets a short or no cache;
-personalised responses are `private`.
+In a real app I combine a TTL (an upper bound on staleness) with explicit invalidation on write (delete the
+key when the row changes). Keys include a version (`v1`) so a change in the cached shape can be rolled out by
+bumping it. HTTP caching handles public, shared responses: static assets with long `max-age` and hashed
+names, public pages with `s-maxage` at the CDN and `stale-while-revalidate`.
+
+```http
+Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=600
+```
+
+The mistake is deleting the cache key before the database write commits: a concurrent reader refills the
+cache with the old value in between. Delete after commit.
 
 </Level>
 
 <Level name="Advanced">
 
-A cache stampede: a hot key expires and a thousand requests miss at once and hit the database. Fixes are
-request coalescing (one fetch, others wait), early probabilistic refresh, or a lock per key. Delete-on-write
-has a race: a reader fetches old data, the writer commits and deletes, the reader writes the old data
-back. Short TTLs bound the damage; versioned keys avoid it.
+Underneath, every cache trades consistency for speed, and the exact failure modes are well known. Stampede
+(the "cache stamps" in the plan's Phase 4 list): a popular key expires and a thousand requests miss at once
+and all hit the database. Fixes: a lock so one request recomputes while others wait or get the stale value,
+early random refresh before expiry, or `stale-while-revalidate`. Redis eviction policies (`allkeys-lru`,
+`volatile-ttl`) decide what goes when memory fills; with `noeviction`, writes fail.
+
+```ts
+const got = await redis.set(`lock:${key}`, '1', { NX: true, PX: 5000 }); // only one recomputes
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- Caching a "not found" result (negative caching) prevents repeated misses but delays visibility of new
-  rows.
-- A cached value larger than Redis's practical limits or memory.
-- A key that contains user input with spaces or colons.
+Caching a "not found" result (negative caching) prevents repeated misses for missing IDs, but must expire
+quickly or a newly created item stays invisible. Caching `null` from a failed query caches the failure. A
+value larger than a few hundred kilobytes in Redis slows every client sharing the connection. Redis
+unavailable: the code must fall through to the database, not fail the request.
 
 </Level>
 
 <Level name="Corner cases">
 
-A cache key without the tenant or permissions: an admin's view of a page is cached and served to a viewer.
-Caching plus authorization. The key includes everything the response depends on. Another: Redis restarts
-during a traffic spike and the cold cache sends full load to the database (thundering herd).
+A cached value that depends on the user's permissions plus a key that omits the user or role: one user's view
+is served to another. Keys must include everything the value depends on. A write that updates two rows that
+are cached under different keys, plus a crash between the two deletes: one key is stale until its TTL. The
+TTL is the backstop that bounds every invalidation bug, which is why every key has one.
 
 </Level>
 
 <Level name="Production level">
 
-Hit rate, latency and eviction metrics. The app works, slower, with Redis down. Caches are never the only
-copy of data.
+In production I track hit rate, latency with and without the cache, memory and evictions. I make the cache
+optional (the system is correct with it empty, only slower), test a cold start under load, and document each
+cached key: what it holds, its TTL, and what invalidates it.
 
 </Level>
 
 <Level name="Mindset">
 
-Caching is a consistency tradeoff. Decide how stale each piece of data is allowed to be, then cache.
+The habit is "a cache is a bet that the data has not changed; know the odds and the cost of losing." For
+each key I can say how stale it may be and what a user sees when it is.
 
 </Level>
 
 <Level name="System design">
 
-AI features add caches: embedding caches, retrieval caches and response caches keyed by prompt and model
-version. The same invalidation rules apply when a document changes.
+Caches live at every layer: browser, CDN, reverse proxy, application, database buffer. Each one closer to the
+user is faster and harder to invalidate. In Phase 7 caching returns as prompt and embedding caches, where a
+hit also saves money.
 
 </Level>
 
 <Level name="Strategy">
 
-Add a cache to the slowest read, measure p95 before and after, then simulate a stampede with a load test
-and add coalescing. Done when the stampede test shows one database query per expiry instead of hundreds.
+I load-test one slow endpoint, add cache-aside with invalidation and a stampede lock, and load-test again,
+then flush Redis under load and watch the database. Done when I have before-and-after p95 numbers and the app
+stays correct with Redis stopped.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: rate limiting, quotas and abuse prevention
+#### Phase 3: Rate limiting, quotas and abuse prevention
 
-<Compare
-  caption="Rate-limit algorithms side by side"
-  left="Algorithm"
-  right="Behaviour"
-  rows={[
-    ["Fixed window", "Simple counter per minute; allows a burst of double at window edges"],
-    ["Sliding window log", "Exact; stores every timestamp, memory grows with traffic"],
-    ["Sliding window counter", "Weighted mix of two windows; close to exact, cheap"],
-    ["Token bucket", "Allows bursts up to capacity, steady refill; what phase 1 built"],
-  ]}
-/>
+<Figure art={`
+  token bucket, capacity 10, refill 1 token / second
 
-<Levels label="Phase 3, rate limits, quotas and abuse prevention">
+  t=0s   [##########]  10   burst of 10 requests -> all allowed
+  t=0s   [          ]   0   11th request -> 429, Retry-After: 1
+  t=5s   [#####     ]   5   refilled 5
+  t=60s  [##########]  10   full again, never more than capacity
+`} caption="A token bucket allows short bursts and enforces an average rate. Its state is two numbers per key." />
+
+<Levels label="Phase 3, rate limiting, quotas and abuse prevention">
 
 <Level name="Beginner">
 
-A rate limit caps requests per client per time window and returns 429 with `Retry-After`. A quota caps
-total usage over a longer period (per day, per month), often tied to a plan.
+A rate limit caps how many requests a client can make in a period, to protect the service and other users. A
+quota caps total usage over a longer period (a plan's monthly AI requests). When a limit is hit the API
+returns 429 with a `Retry-After` header.
 
 ```http
 HTTP/1.1 429 Too Many Requests
-Retry-After: 12
+Retry-After: 30
 RateLimit-Limit: 60
 RateLimit-Remaining: 0
 ```
 
-Common mistake: limiting by IP only. Fix: limit by user for signed-in routes and by IP for anonymous
-ones, with stricter limits on sign-in and expensive endpoints.
+The common mistake is an in-memory counter in the app process: with three instances, each allows the full
+limit, so the real limit is three times higher.
 
 </Level>
 
 <Level name="Intermediate">
 
-With several instances the limiter state must be shared, usually in Redis. A Lua script makes the check
-and the decrement atomic.
+A real limiter keeps its state in Redis so all instances share it, and limits by the right key: by user for
+signed-in traffic, by IP for anonymous traffic, by account for sign-in attempts (to stop guessing one
+account's password from many IPs). A fixed window (count per minute) is simple; a sliding window or token
+bucket avoids the double burst at a window boundary.
 
-```lua
-local tokens = tonumber(redis.call('get', KEYS[1]) or ARGV[1])
-if tokens > 0 then redis.call('set', KEYS[1], tokens - 1, 'EX', ARGV[2]) return 1 end
-return 0
+```ts
+async function allow(key: string, limit: number, windowSec: number) {
+  const k = `rl:${key}:${Math.floor(Date.now() / 1000 / windowSec)}`;
+  const n = await redis.incr(k);
+  if (n === 1) await redis.expire(k, windowSec);
+  return n <= limit;
+}
 ```
 
 </Level>
 
 <Level name="Advanced">
 
-Abuse prevention is layered: rate limits, quotas, CAPTCHAs on suspicious sign-ups, email verification,
-anomaly detection, and per-account cost caps. For AI endpoints the limit is in tokens or cost, not just
-requests, because one request can cost a hundred times another.
+The exact behaviour of each algorithm: a fixed window allows up to twice the limit across a boundary (the
+end of one minute and the start of the next); a sliding log is exact but stores every timestamp; a sliding
+window counter approximates it with two counters; a token bucket has a capacity and a refill rate. The check
+and the update must be atomic, which is why Redis implementations use a Lua script or `MULTI`. The gate's
+"from scratch" rate limiter in Phase 1 was in memory; this one is distributed.
+
+```lua
+-- token bucket in Redis: KEYS[1]=bucket, ARGV: capacity, refill_per_ms, now_ms
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or tonumber(ARGV[1]); local ts = tonumber(b[2]) or tonumber(ARGV[3])
+tokens = math.min(tonumber(ARGV[1]), tokens + (tonumber(ARGV[3]) - ts) * tonumber(ARGV[2]))
+local ok = tokens >= 1; if ok then tokens = tokens - 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', ARGV[3]); redis.call('PEXPIRE', KEYS[1], 60000)
+return ok and 1 or 0
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- Clients behind one corporate NAT share an IP.
-- IPv6 users can rotate addresses within a /64: limit by prefix.
-- A client that ignores `Retry-After` and hammers: escalate to a longer block.
+Many users behind one corporate IP or mobile carrier NAT all share an IP limit; an IP read from
+`X-Forwarded-For` without trusting only my own proxy can be spoofed by the client; a limit of 0 for a
+suspended account; clock differences between instances when the time comes from each app server rather than
+from Redis.
 
 </Level>
 
 <Level name="Corner cases">
 
-Redis is down: fail open (no limits, risk abuse) or fail closed (block everyone)? Limiter plus outage. For
-sign-in, fail closed with a local fallback limit; for reads, fail open with an alert. Another: retries from
-my own frontend on 429 multiply the load unless they respect `Retry-After`.
+Redis down plus a rate limiter in the request path: failing closed (reject everything) causes an outage;
+failing open (allow everything) removes protection exactly when something is already wrong. I choose per
+route: fail open for reading notes, fail closed for sign-in and the expensive AI endpoint. A retrying client
+plus a 429 without `Retry-After`: it retries immediately, makes the overload worse, and its own retries count
+against it.
 
 </Level>
 
 <Level name="Production level">
 
-Limits are tuned from data, documented, and visible to users through headers. Metrics on 429s per route
-show whether limits are too tight or an attack is happening.
+In production limits protect the bill as much as the servers, especially on AI endpoints where one request
+can cost real money. I set per-user limits on the chat endpoint, a daily token quota per plan, alerts on
+users near their quota, and dashboards of 429s by route. Abuse prevention adds sign-up friction (email
+verification, a captcha after failures) and blocking of known-bad patterns.
 
 </Level>
 
 <Level name="Mindset">
 
-Every endpoint has a cost to me. Limits make that cost bounded.
+The habit is to assume someone will call every endpoint as fast as they can, by accident or on purpose, and
+to decide in advance what happens when they do.
 
 </Level>
 
 <Level name="System design">
 
-Limits live at several layers (edge, gateway, app, per-tenant), and quotas connect to billing in phase 8.
+Limits live at several layers: the CDN or edge for floods, the API for per-user fairness, the worker pool for
+downstream protection, and the provider's own limits on model APIs, which my system must respect with its own
+queue. Quotas tie into billing and metering in Phase 8.
 
 </Level>
 
 <Level name="Strategy">
 
-Move the phase 1 limiter into Redis, add per-user and per-route limits and a daily quota, and load test
-with two instances. Done when the combined rate across instances matches the configured limit within a
-few percent.
+I implement the token bucket in Redis, then run two app instances and a load generator and prove the limit is
+global. Done when the limit holds across instances, `Retry-After` is correct, and the fail-open or fail-closed
+choice for each route is written down and tested with Redis stopped.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: file uploads, object storage, signed URLs and image processing
+#### Phase 3: File uploads, object storage, signed URLs and image processing
 
 <Figure art={`
-  1. client  --POST /uploads {name,type,size}-->  API  (checks auth, quota)
-  2. API     --create signed PUT URL, 5 min-->    client
-  3. client  --PUT bytes------------------------> object storage (direct)
-  4. storage --event: object created----------->  queue -> worker
-  5. worker  scans, checks real type, resizes, writes metadata row
-  6. client  GET /files/42 -> API -> short-lived signed GET URL
-`} caption="Direct-to-storage uploads with signed URLs: the API authorises, storage receives the bytes, and a worker verifies and processes them." />
+  1. browser -> API:  "I want to upload avatar.png, 340 KB, image/png"
+  2. API: check session, size, type; create row uploads(id, status='pending')
+  3. API -> browser:  signed PUT URL for bucket/tenant-7/u/9f2c..., expires 5 min
+  4. browser -> object storage: PUT bytes directly (API never sees them)
+  5. storage event or client -> API: "done"
+  6. worker: read object, verify magic bytes, strip metadata, resize, status='ready'
+  7. reads: API checks access, returns signed GET URL, expires 10 min
+`} caption="Direct-to-storage uploads with signed URLs. The API authorises; the bucket stores; a worker verifies." />
 
-<Levels label="Phase 3, uploads, object storage, signed URLs and image processing">
+<Levels label="Phase 3, file uploads, object storage, signed URLs and image processing">
 
 <Level name="Beginner">
 
-Files belong in object storage (S3 or compatible), not the database or local disk. The database stores
-metadata: owner, key, size, type, status.
+Files do not belong in the database. They go to object storage (S3 or a compatible service): a bucket of
+objects addressed by key. The database keeps the metadata (owner, key, type, size, status). A signed URL is
+a link with a signature and an expiry that lets one client upload or download one object without having my
+storage credentials.
 
-Common mistake: streaming uploads through the API server to disk. Fix: signed URLs so the client uploads
-directly to storage, and the server only authorises.
+```ts
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: 'app-uploads', Key: `t/${tenantId}/u/${uploadId}`, ContentType: 'image/png' }), { expiresIn: 300 });
+```
+
+The common mistake is a public bucket, so every user's file is readable by anyone who guesses or finds a
+key.
 
 </Level>
 
 <Level name="Intermediate">
 
-A signed URL grants one operation on one key for a short time. The API generates it after checking auth
-and quota, with constraints on content type and size.
+A real upload flow validates before signing (allowed types, maximum size), uses unguessable keys that
+include the tenant, uploads directly from the browser to storage so large files never pass through the API,
+and processes the file in a background job: verify it, generate thumbnails, mark it ready. Until then it is
+"pending" and not shown to anyone.
 
 ```ts
-const key = `t/${user.teamId}/${crypto.randomUUID()}`;
-const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket, Key: key, ContentType: type, ContentLength: size }), { expiresIn: 300 });
+import sharp from 'sharp';
+const out = await sharp(input).rotate().resize({ width: 512, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+// rotate() applies EXIF orientation; re-encoding drops EXIF metadata, including GPS location
 ```
-
-The key is random, never the user's filename, which prevents collisions and path tricks.
 
 </Level>
 
 <Level name="Advanced">
 
-The declared content type is a claim. The worker checks the real type from magic bytes, scans for
-malware, strips metadata such as EXIF GPS, and generates resized variants with a library like `sharp`.
-Images are re-encoded, never served as uploaded, which neutralises many polyglot file tricks.
+The exact rules: the `Content-Type` a client declares is a claim, not a fact. The file's first bytes (magic
+numbers) identify its real format, for example PNG starts with bytes `89 50 4E 47`. A signed PUT URL can
+bind the content type and, with a POST policy, a maximum size, so the client cannot upload something else.
+Image libraries parse complex formats and have had memory-safety bugs, so image processing runs in a worker
+with limits, never in the request path, and the library is kept updated.
+
+```ts
+import { fileTypeFromBuffer } from 'file-type';
+const t = await fileTypeFromBuffer(firstBytes); // { ext: 'png', mime: 'image/png' } or undefined
+if (!t || !['image/png', 'image/jpeg', 'image/webp'].includes(t.mime)) throw new Rejected('unsupported type');
+```
 
 </Level>
 
 <Level name="Edge cases">
 
-- A zero-byte file; a 5 GB file (multipart upload); a file named `....pdf`.
-- An SVG upload: it can contain script, so serve it as an attachment or sanitise.
-- A signed URL used after the user lost access, within its five minutes.
+A zero-byte file; a file named `../../etc/passwd` (never use the client's filename as a path or key); a
+filename with Unicode right-to-left characters that disguises `exe.png` as `png.exe`; an SVG "image", which is
+XML and can contain script, so it must be sanitised or served with a content type and `Content-Disposition`
+that stop it running; a 50-megapixel PNG of a few kilobytes that decompresses to gigabytes (a decompression
+bomb), which `sharp`'s `limitInputPixels` stops.
 
 </Level>
 
 <Level name="Corner cases">
 
-The upload succeeds but the client never calls "complete", leaving orphaned objects that cost money
-forever. Upload plus abandonment. A lifecycle rule deletes objects with no metadata row after a day.
-Another: a decompression bomb, a small PNG that decodes to gigabytes of pixels; set pixel limits.
+A signed GET URL shared by a user outside the app, plus a long expiry: anyone with the link can download until
+it expires, even after the owner's access is revoked. Keep expiries short and re-sign per view. An upload that
+completes in storage but whose "done" callback never reaches the API: an orphaned object that costs money and
+holds personal data. A lifecycle rule that deletes pending objects older than a day cleans them up.
 
 </Level>
 
 <Level name="Production level">
 
-Buckets are private by default; files are served through short-lived signed GET URLs or a CDN with signed
-cookies. Content-Disposition and a separate download domain keep user files from running script on the
-app's origin.
+In production uploads are a privacy and cost surface. I scan or verify every file, strip metadata, enforce
+per-user storage quotas, set lifecycle rules for temporary objects, log access to sensitive files, and include
+object storage in tenant deletion (Phase 4's gate asks me to prove a deleted tenant's data is gone from every
+store, and the bucket is one).
 
 </Level>
 
 <Level name="Mindset">
 
-An uploaded file is the largest, least trusted input the app will ever receive.
+The habit is to treat every uploaded file as hostile until a worker has verified it. A file is input like a
+JSON body, only larger and with more ways to hide things.
 
 </Level>
 
 <Level name="System design">
 
-Upload processing is an asynchronous pipeline: storage event, queue, worker, metadata. Phase 7's document
-ingestion for RAG reuses it: extract text, chunk, embed.
+Separating the control path (the API authorises and records) from the data path (bytes go straight to
+storage) scales and keeps the API fast. In Phase 7 the same pipeline ingests documents for retrieval, adding
+text extraction and chunking as further job steps.
 
 </Level>
 
 <Level name="Strategy">
 
-Build signed uploads, the processing worker and the lifecycle rule; then try to upload an SVG with script,
-a renamed executable and a decompression bomb. Done when all three are rejected or neutralised and
-orphaned objects are cleaned up.
+I build the signed upload flow and then attack it: wrong type with a renamed extension, an oversized file, an
+SVG with a script, a decompression bomb, another tenant's key. Done when each is rejected, files are private
+by default, and pending uploads clean themselves up.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: email, notifications and deliverability
+#### Phase 3: Email, notifications and deliverability
 
-<Flow
-  caption="An email from event to inbox"
-  steps={['Event in the app', 'Enqueue a job', 'Render template', 'Provider API with idempotency key', 'SPF, DKIM, DMARC checked by receiver', 'Inbox or spam', 'Bounce or complaint webhook back']}
+<Layers
+  caption="What decides whether an email reaches the inbox, bottom to top"
+  layers={[
+    { name: "Content and engagement", note: "expected, useful, easy to unsubscribe" },
+    { name: "Reputation", note: "bounce and complaint rates, sending history" },
+    { name: "DMARC", note: "policy: what to do when SPF or DKIM fail, and reports" },
+    { name: "DKIM", note: "a signature proving the message was not altered" },
+    { name: "SPF", note: "which servers may send for my domain" },
+    { name: "Sending provider", note: "a transactional email API, not my own SMTP server" },
+  ]}
 />
 
 <Levels label="Phase 3, email, notifications and deliverability">
 
 <Level name="Beginner">
 
-Transactional email (sign-up confirmation, password reset, receipts) goes through a provider's API, from a
-job, never inline in the request.
+Transactional email (welcome, password reset, receipts) is sent through a provider's API, from a background
+job, never inline in the request. Deliverability is whether it lands in the inbox rather than spam, and it
+depends mostly on DNS records that prove the email is really from my domain.
 
-Common mistake: sending from a free email address domain. Fix: send from my own domain with SPF, DKIM and
-DMARC records published.
+```text
+example.dev.               TXT  "v=spf1 include:_spf.provider.example ~all"
+s1._domainkey.example.dev. TXT  "v=DKIM1; k=rsa; p=MIIBIjANBg..."
+_dmarc.example.dev.        TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.dev"
+```
+
+The common mistake is sending from a free mail address or an unauthenticated domain; providers like Gmail
+increasingly reject or spam-folder it.
 
 </Level>
 
 <Level name="Intermediate">
 
-SPF lists which servers may send for my domain; DKIM signs each message; DMARC tells receivers what to do
-when checks fail and where to send reports. Without them, mail lands in spam or is rejected.
+A real notification system has templates with both HTML and plain-text versions, user preferences (which
+notifications, which channel), an unsubscribe link on anything that is not strictly transactional, and a
+log of what was sent to whom. Sending goes through a job with an idempotency key so retries do not send
+twice.
 
-```txt
-example.com.  TXT  "v=spf1 include:_spf.provider.example ~all"
-_dmarc.example.com.  TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"
+```ts
+await queue.add('email', { template: 'password-reset', to: user.email, vars: { link } }, { jobId: `reset:${tokenId}` });
 ```
+
+The provider's webhooks report bounces and complaints; a hard bounce marks the address as invalid so I stop
+sending to it.
 
 </Level>
 
 <Level name="Advanced">
 
-Bounces (hard: address does not exist; soft: mailbox full) and complaints arrive by webhook and must stop
-future sends to that address, or the domain's reputation drops. Transactional and marketing mail use
-separate streams or subdomains so one does not damage the other. Notification preferences are per user
-and per channel.
+The exact mechanisms: SPF lists the servers allowed to send for the envelope sender domain; DKIM signs headers
+and body with a key published in DNS; DMARC requires that SPF or DKIM pass and align with the visible From
+domain, and tells receivers what to do otherwise. Since 2024 Gmail and Yahoo require SPF, DKIM and DMARC for
+bulk senders, plus one-click unsubscribe (`List-Unsubscribe-Post`) for marketing mail. Webhooks from the
+provider must be verified by signature before I trust them, because anyone can POST to my webhook URL.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A user with no verified email.
-- Email addresses with plus tags or unusual but valid characters.
-- A template with a missing variable renders "Hello undefined".
+An address that changes after the job was queued; a user who unsubscribed between queueing and sending (check
+preferences at send time); a reset link clicked by a corporate email scanner that pre-fetches links, which
+uses up a single-use token (so the link opens a page with a button, and the POST from the button uses the
+token); an email to an address with international characters.
 
 </Level>
 
 <Level name="Corner cases">
 
-The retry from the jobs topic sends a password reset twice with two different valid tokens. Retry plus
-security token. Generate the token once, store it, and make the job idempotent per reset request.
+A bug that loops and sends the same email a thousand times, plus no per-recipient rate limit: the domain's
+reputation is damaged for every user. A per-recipient and global send cap is cheap insurance. A password reset
+email plus an account that does not exist: the response must look identical either way (to avoid revealing
+accounts), and the email may say "someone asked to reset a password, but there is no account here".
 
 </Level>
 
 <Level name="Production level">
 
-Deliverability metrics (bounce rate, complaint rate), templates in version control with tests, and a
-sandbox mode in non-production environments so test runs never email real people.
+In production I watch bounce and complaint rates (providers suspend accounts above small thresholds), keep
+DMARC reports, test templates in major clients, and make every email traceable by job ID. Notification
+fatigue is a product risk too, so digests replace a stream of single messages.
 
 </Level>
 
 <Level name="Mindset">
 
-Email is a production system I do not control. Watch its feedback loops.
+The habit is "email is a public, permanent, unrecallable side effect." Before any send I ask whether it can
+be sent twice, sent to the wrong person, or sent when the user said no.
 
 </Level>
 
 <Level name="System design">
 
-Notifications are a fan-out service: one event, many channels, user preferences, rate limits and digests.
+Notifications are a fan-out system: one event, many channels and recipients, each with preferences, retries
+and delivery tracking. A single notifications service with a queue and an outbox table is the usual shape,
+and it is where AI-generated summaries in Phase 8 would be delivered.
 
 </Level>
 
 <Level name="Strategy">
 
-Set up the domain records, send through a job with idempotency, handle bounce webhooks, and check headers
-in a received message. Done when a mail tester reports SPF, DKIM and DMARC passing and a bounced address
-is suppressed automatically.
+I set up SPF, DKIM and DMARC on a test domain, send through a provider's sandbox, read the authentication
+results in the received headers, and process a simulated bounce webhook. Done when headers show
+`spf=pass dkim=pass dmarc=pass` and a retried email job sends once.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: logging, correlation IDs, structured errors and graceful shutdown
+#### Phase 3: Logging, correlation IDs, structured errors and graceful shutdown
 
-<Figure art={`
-  SIGTERM
-    |
-    v
-  stop accepting new connections (server.close)
-    |
-  readiness check -> 503, load balancer drains
-    |
-  wait for in-flight requests (deadline 25 s)
-    |
-  stop workers claiming jobs, finish or release current ones
-    |
-  close DB pool, flush logs and traces
-    |
-  exit 0  (or exit 1 if the deadline passed)
-`} caption="Graceful shutdown: stop new work, finish in-flight work within a deadline, release resources, then exit." />
+<Flow
+  caption="Graceful shutdown on SIGTERM. The order matters; each step protects one kind of in-flight work."
+  steps={["SIGTERM arrives", "Fail readiness: stop getting new traffic", "Stop accepting connections", "Finish in-flight requests (with a deadline)", "Stop workers taking jobs; finish or release", "Close DB and Redis pools", "Flush logs and traces", "Exit 0"]}
+/>
 
 <Levels label="Phase 3, logging, correlation IDs, structured errors and graceful shutdown">
 
 <Level name="Beginner">
 
-Structured logs are JSON lines with consistent fields. A correlation ID ties every line from one request
-together, across services.
+Every request gets an ID, and every log line about that request carries it. Logs are JSON with fixed fields,
+so they can be searched and counted. Errors returned to clients are structured and include the same ID. When
+the platform wants to stop the process, it sends `SIGTERM`, and the server should finish what it is doing
+before exiting.
 
-```ts
-import pino from 'pino';
-const log = pino({ redact: ['req.headers.authorization', 'req.headers.cookie', '*.password'] });
-app.use((req, res, next) => { req.id = req.headers['x-request-id'] ?? crypto.randomUUID(); req.log = log.child({ reqId: req.id }); next(); });
+```text
+{"level":"info","reqId":"01JB8Q4Z6M","method":"POST","path":"/notes","status":201,"ms":38,"userId":"u_9"}
+{"level":"error","reqId":"01JB8R2K1T","msg":"query failed","err":{"type":"Error","message":"timeout exceeded when trying to connect"}}
 ```
 
-Common mistake: logging the same error at every layer, so one failure is ten lines. Fix: log once, at the
-boundary that handles it.
+The common mistake is exiting immediately on `SIGTERM`, which drops every in-flight request as a 502 during
+each deploy.
 
 </Level>
 
 <Level name="Intermediate">
 
-Errors have classes that map to responses (`ValidationError` to 400, `NotFound` to 404, `Forbidden` to
-403, anything else to 500 with a generic message). The log line gets the full error with cause and stack;
-the response gets the request ID.
+In a real service the request ID comes from an incoming `X-Request-Id` (set by the load balancer) or is
+generated, is stored in `AsyncLocalStorage` so code deep in the call stack can log with it without passing it
+around, and is forwarded on outbound calls and job payloads.
+
+```ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+export const ctx = new AsyncLocalStorage<{ reqId: string; userId?: string }>();
+app.use((req, _res, next) => ctx.run({ reqId: req.id }, next));
+export const logger = () => base.child(ctx.getStore() ?? {});
+```
+
+Graceful shutdown in Node:
+
+```ts
+process.on('SIGTERM', async () => {
+  ready = false;                                    // /ready now returns 503
+  server.close(async () => { await pool.end(); await redis.quit(); process.exit(0); });
+  setTimeout(() => process.exit(1), 25_000).unref(); // hard deadline under the platform's grace period
+});
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Graceful shutdown: on `SIGTERM`, stop accepting connections, fail readiness so the load balancer stops
-sending traffic, wait for in-flight requests with a deadline, close pools and exit.
-
-```ts
-process.on('SIGTERM', () => {
-  ready = false;
-  server.close(async () => { await pool.end(); await log.flush?.(); process.exit(0); });
-  setTimeout(() => process.exit(1), 25_000).unref();
-});
-```
-
-Keep-alive connections keep `server.close` waiting; `server.closeIdleConnections()` in recent Node helps.
+The exact rules underneath: `server.close()` stops accepting new connections and waits for existing ones, but
+keep-alive connections stay open indefinitely unless closed; Node 18.2 and later have
+`server.closeIdleConnections()`, and setting `Connection: close` on responses during shutdown ends the rest.
+Platforms send `SIGTERM`, wait a grace period (often 30 seconds), then `SIGKILL`, which cannot be caught. A
+process started through `npm start` may not forward signals to Node; run `node` directly as the container's
+main process, or use an init like `tini`. Log levels matter: `debug` off in production, `info` for each
+request, `warn` for handled problems, `error` for failures that need a look.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A request that takes longer than the shutdown deadline.
-- `SIGKILL` cannot be caught: the platform sends it after its grace period.
-- Logs written after the logger closed are lost.
+A request that takes longer than the grace period (a long upload or a streaming AI answer): it will be cut, so
+long operations should be jobs, and streams should end cleanly with a "reconnect" event. A second `SIGTERM`
+during shutdown. Logging a full request body containing a password. A log line over the platform's size limit
+gets truncated, dropping the end where the error usually is.
 
 </Level>
 
 <Level name="Corner cases">
 
-A deploy sends `SIGTERM` while a request has started a database transaction and a job enqueue. Shutdown
-plus partial work. With the outbox pattern, the transaction either commits both or neither. Another: the
-container runs the app through `npm start`, and npm does not forward the signal, so the app never sees it;
-run `node` directly as PID 1 or use an init.
+A rolling deploy plus a load balancer that keeps sending traffic for a few seconds after `SIGTERM`: if the
+server closes immediately, those requests fail. The fix is to fail readiness first and wait a few seconds
+before closing the listener. Graceful shutdown plus a worker holding a job lock: if the worker exits without
+releasing the job, it waits for the lock timeout before another worker picks it up, delaying it for minutes.
 
 </Level>
 
 <Level name="Production level">
 
-The gate asks to show graceful shutdown with in-flight requests: I start a load test, deploy, and show zero
-failed requests. Logs have retention, redaction and sampling for noisy routes.
+In production I can follow one user's request from the browser (the ID in the response header) through the
+API, into the job it enqueued, and into the worker's logs. Deploys produce zero 5xx responses, which I check
+on the dashboard during each deploy. Structured errors use the one envelope from the API design topic.
 
 </Level>
 
 <Level name="Mindset">
 
-A process will be stopped many times a week. Leaving cleanly is normal operation.
+The habit is "write logs for the person debugging at 2am, and stop like a guest leaving a party: finish the
+conversation, then go."
 
 </Level>
 
 <Level name="System design">
 
-Correlation IDs become trace context in phase 5's OpenTelemetry setup; graceful shutdown is what makes
-rolling deploys zero-downtime.
+Correlation IDs become trace IDs in Phase 5's OpenTelemetry setup, linking spans across services. Graceful
+shutdown is what makes rolling deploys, autoscaling and spot instances safe, so it is a prerequisite for every
+zero-downtime technique.
 
 </Level>
 
 <Level name="Strategy">
 
-Add structured logging with redaction, the error mapping and shutdown handling; then run a load test while
-redeploying three times. Done when no request fails during the deploys and every error in the logs carries
-its request ID.
+I run a load test against the API and deploy during it, counting failed requests, then add graceful shutdown
+and repeat. Done when a deploy under load produces zero errors and the gate's "graceful shutdown with
+in-flight requests" is demonstrated with the numbers.
 
 </Level>
 
@@ -1251,198 +1500,244 @@ its request ID.
 
 #### Phase 3: API tests, contract tests and load tests
 
-<Layers
-  caption="Backend tests by what they protect"
-  layers={[
-    { name: 'Load tests', note: 'p50, p95, p99 and the error rate under traffic' },
-    { name: 'Contract tests', note: 'responses match the OpenAPI spec' },
-    { name: 'API integration tests', note: 'HTTP in, real database' },
-    { name: 'Unit tests', note: 'policies, validators, pure logic' },
+<Compare
+  left="Test type"
+  right="What it proves"
+  caption="Three kinds of test, three different questions. The gate needs all three."
+  rows={[
+    ["API integration test, real Postgres", "this endpoint enforces its rules end to end"],
+    ["contract test against the OpenAPI spec", "the implementation still matches what clients rely on"],
+    ["load test with a ramp", "how latency and errors behave as traffic grows, and where it breaks"],
   ]}
 />
 
-<Levels label="Phase 3, API, contract and load tests">
+<Levels label="Phase 3, API tests, contract tests and load tests">
 
 <Level name="Beginner">
 
-API tests send HTTP requests to the running app and assert on status and body, against a real database
-reset between tests.
+API tests send real HTTP requests to the app and check the responses. Contract tests check that responses
+match the documented schema. Load tests send many requests to measure latency and find the breaking point.
+Latency is reported as percentiles: p50 is the median, p95 means 95% of requests were faster, p99 is the slow
+tail that the unluckiest users feel.
 
 ```ts
-test('creating a note returns 201 and a Location', async () => {
-  const res = await app.inject({ method: 'POST', url: '/notes', headers: auth(alice), payload: { title: 'x' } });
-  assert.equal(res.statusCode, 201);
-  assert.match(res.headers.location, /^\/notes\/\w+$/);
+import request from 'supertest';
+test('creating a note returns 201 and a Location header', async () => {
+  const res = await request(app).post('/notes').set('Cookie', cookieA).send({ title: 't', body: 'b' });
+  expect(res.status).toBe(201);
+  expect(res.headers.location).toMatch(/^\/notes\/\d+$/);
 });
 ```
 
+The common mistake is reporting an average latency, which hides the tail.
+
 </Level>
 
 <Level name="Intermediate">
 
-Contract tests check that real responses match the OpenAPI schema, so docs, clients and server agree. A
-test helper validates every response in the API suite against the spec automatically.
+Real integration tests run against a real Postgres (in Docker or Testcontainers), with each test in a
+transaction rolled back at the end, or a fresh schema per test file. Contract tests validate every response
+in the test suite against the OpenAPI schema automatically. A load test script describes a realistic mix of
+requests and a ramp.
+
+```js
+// k6 script
+import http from 'k6/http';
+import { check } from 'k6';
+export const options = { stages: [{ duration: '1m', target: 50 }, { duration: '3m', target: 50 }, { duration: '1m', target: 0 }],
+  thresholds: { http_req_duration: ['p(95)<300', 'p(99)<800'], http_req_failed: ['rate<0.01'] } };
+export default function () { const r = http.get(`${__ENV.BASE}/notes?limit=20`, { headers: { Cookie: __ENV.COOKIE } }); check(r, { ok: (x) => x.status === 200 }); }
+```
+
+```text
+http_req_duration: avg=48ms  p(50)=31ms  p(95)=142ms  p(99)=611ms
+http_req_failed:   0.12%
+```
 
 </Level>
 
 <Level name="Advanced">
 
-Load tests (k6, autocannon) measure latency percentiles and error rates under realistic traffic. Report
-p50, p95 and p99, not the average, because the tail is what users notice.
-
-```js
-// k6
-import http from 'k6/http';
-export const options = { vus: 50, duration: '2m', thresholds: { http_req_duration: ['p(95)<300'], http_req_failed: ['rate<0.01'] } };
-export default () => http.get(`${__ENV.BASE}/notes`, { headers: { cookie: __ENV.COOKIE } });
-```
+Underneath load testing there are traps. Coordinated omission: a tool that waits for each response before
+sending the next stops sending when the server slows, so it under-reports the latency real users (who keep
+arriving) would see; open-model arrival rates (`constant-arrival-rate` in k6) avoid it. Little's law
+(concurrent requests = arrival rate times average latency) predicts how many connections and pool slots a
+target throughput needs. The first bottleneck is usually the database pool or a slow query, not the CPU.
 
 </Level>
 
 <Level name="Edge cases">
 
-- A load test against a cold cache versus a warm one gives different numbers; report both.
-- A load test from my laptop measures my laptop's network.
-- Coordinated omission: a tool that waits for each response under-reports tail latency.
+A load test from my laptop measures my laptop's network; run it near the server. A test that hits only cached
+endpoints reports fantasy numbers. A test with one user ID never exercises contention across rows. Testing
+against production without warning the team (or the platform's abuse detection) causes an incident.
 
 </Level>
 
 <Level name="Corner cases">
 
-The load test hits the rate limiter and reports great latency for 429s. Load test plus limits. Exclude or
-raise limits for the test identity, and assert on status codes.
+A load test plus rate limits: the test measures the limiter, returning fast 429s that look like great latency.
+Exclude 429s from latency, or use test users with high limits. Integration tests plus parallel workers plus a
+shared database: tests pass alone and fail together. Each worker gets its own schema or database.
 
 </Level>
 
 <Level name="Production level">
 
-Load tests run before major releases against a staging environment sized like production, and the results
-are kept to compare over time.
+In production these become gates: integration and contract tests on every pull request, a breaking-change check
+on the spec, and a load test before releases that change hot paths, with thresholds that fail the run. The
+p95 and p99 from the load test become the starting SLO targets in Phase 5.
 
 </Level>
 
 <Level name="Mindset">
 
-Performance claims without percentiles and a load profile are not claims.
+The habit is "a performance claim without a percentile and a load profile is a guess." I say "p95 of 142 ms at
+50 requests per second on the notes list," not "it is fast."
 
 </Level>
 
 <Level name="System design">
 
-Load tests find the first bottleneck (usually the database pool or one slow query), which feeds phase 4's
-tuning and phase 10's capacity estimates.
+Load tests are how capacity planning starts: they tell me requests per second per instance, the pool size
+needed, and which dependency saturates first. Phase 10's "estimate cost at 10x and 100x load" starts from
+these numbers.
 
 </Level>
 
 <Level name="Strategy">
 
-Write API tests for every route, add the contract check, and run a k6 test at three load levels. Done when
-I have a table of p50, p95 and p99 at each level and can name the bottleneck at the highest.
+I write the integration suite first (rules), then the contract check (shape), then a k6 script with a ramp,
+and record p50, p95 and p99 before and after one optimisation. Done when the gate's load test report exists
+with all three percentiles and an explanation of the first bottleneck.
 
 </Level>
 
 </Levels>
 
-#### Phase 3: the build: an API with auth, roles, jobs, limits and uploads
+#### Phase 3: the build, an API with auth, roles, jobs, limits and uploads
 
 <Figure art={`
-  +---------+   +-------------------------------------------+   +----------+
-  | client  |-->| API: limit > auth > validate > authorize  |-->| Postgres |
-  +---------+   |      routes: /auth /notes /files /jobs    |   | + outbox |
-                +--------------------+----------------------+   +----+-----+
-                                     | signed URL                    | jobs
-                                     v                               v
-                              object storage <----------------- worker(s)
-                                                                 email, files
-  OpenAPI at /docs   tests: API + contract + isolation matrix + chaos + k6
-`} caption="The phase 3 API and its parts: one service, one database with an outbox, object storage and workers, all covered by tests." />
+                 +-------------------- API (2 instances) --------------------+
+  client  -----> | request id | rate limit | session | validate | authz | handler |
+                 +------------------------------------------------------------+
+                        |            |          |                      |
+                      Redis       Redis     Postgres  <---- jobs table / queue ----> worker
+                   (limits)    (sessions?)  (truth)                                  |
+                                                       object storage <--- signed URLs, image job
+  OpenAPI doc generated from the schemas; k6 + integration tests in CI
+`} caption="The Phase 3 build. Two instances on purpose, so every shared-state bug shows up." />
 
-<Levels label="Phase 3, the build: auth, roles, a protected resource, jobs, limits, uploads and docs">
+<Levels label="Phase 3, the build: an API with auth, roles, jobs, limits and uploads">
 
 <Level name="Beginner">
 
-The API has email and password auth, session cookies, roles, a protected notes resource, a background
-job (the welcome email), a rate limit, file upload and OpenAPI docs. It is the phase 0 baseline grown up.
+The build is one API with: email and password sign-up and sign-in, session cookies, roles, a protected
+resource, a background job, a rate limit, file upload and OpenAPI docs. I extend the Phase 0 notes app so the
+frontend from Phase 2 has a real backend. The first step is the skeleton: the middleware order from the layer
+diagram, an error envelope, and a health route.
 
 </Level>
 
 <Level name="Intermediate">
 
-Integration tests run against a real Postgres in Docker in CI. The isolation matrix covers every route,
-role and tenant combination. The job uses the outbox pattern so enqueueing is transactional.
+Then I add capabilities in the order of the timeline, each with its test: idempotent create, sessions,
+tenant-scoped queries with roles, the "embed note" or "resize avatar" job, the Redis rate limit, signed
+uploads, and generated OpenAPI. Integration tests run against a real Postgres in CI.
+
+```text
+ ✓ auth: session id rotates on sign-in
+ ✓ authz: member of tenant B gets 404 for tenant A's note
+ ✓ notes: same Idempotency-Key twice creates one note
+ ✓ jobs: worker killed mid-job, job retried, side effect once
+ ✓ limits: 61st request in a minute gets 429 on either instance
+ ✓ uploads: renamed .exe as image/png is rejected
+```
 
 </Level>
 
 <Level name="Advanced">
 
-The chaos test: start a thousand jobs, kill workers at random with `SIGKILL`, restart them, and assert
-each job's side effect happened exactly once. That proves the retry is safe, as the plan asks.
-
-```sh
-for i in $(seq 20); do sleep $((RANDOM % 5)); pkill -9 -f worker.js; node worker.js & done
-psql -c "select count(*), count(distinct job_id) from sent_emails"   # equal
-```
+The plan's specific drill: kill a worker mid-job and prove the job is retried safely. I make the job's side
+effect observable (a row in `sent_emails` with a unique key), start a worker, enqueue a job that sleeps
+between two steps, `kill -9` the worker at the sleep, start another, and assert exactly one row and a job
+status of done. Then I repeat with the kill after the side effect and before the acknowledgement, which is the
+case that tests idempotency.
 
 </Level>
 
 <Level name="Edge cases">
 
-- Sign-up with an existing email; upload with no file; a job for a deleted user.
-- A request with a valid session for a deleted team.
+Each capability gets its boundary tests from its topic: a limit of zero, an empty upload, an expired session,
+a job with a deleted row, a page size over the cap. I keep them in one file per capability so the gate review
+can read them in order.
 
 </Level>
 
 <Level name="Corner cases">
 
-A user is downgraded from admin while an upload they started as admin is processing; the worker must
-re-check permissions when it writes metadata. Permissions plus asynchronous work.
+The interactions get their own tests: a rate-limited user whose session expires mid-burst, an upload by a user
+removed from the tenant before the image job runs (the job must re-check and discard), a graceful shutdown
+while a job is running and a request is streaming.
 
 </Level>
 
 <Level name="Production level">
 
-Health and readiness endpoints, graceful shutdown, structured logs and the problem-details error shape are
-all in from the start; the API is deployed with the same pipeline as phase 0.
+I deploy the API to the Phase 0 target with two instances, run the load test against it, and deploy during the
+load test to check graceful shutdown. Logs show request IDs flowing into job logs. The OpenAPI document is
+published with the deploy.
 
 </Level>
 
 <Level name="Mindset">
 
-Build the boring parts properly. They are what users trust without noticing.
+The build is evidence. Every rule I claim the API enforces has a test that would fail without it, and every
+number in the gate comes from a run I can repeat.
 
 </Level>
 
 <Level name="System design">
 
-This API is the capstone's backend. Its module boundaries (auth, notes, files, jobs) become the domains
-phase 10 reasons about.
+This API is the capstone's backend in miniature. Phase 4 deepens its schema, Phase 5 operates it, Phase 6
+attacks it, and Phase 7 adds the model behind the same middleware chain, so the AI endpoint inherits auth,
+limits, validation and logging rather than reinventing them.
 
 </Level>
 
 <Level name="Strategy">
 
-One commit per capability, each with its tests: auth, roles, notes, jobs, limits, uploads, docs, chaos,
-load. Done when CI runs all suites green and the OpenAPI docs match the contract tests.
+One capability every two or three days, each merged with its tests and a study log entry. Done when every
+item in the gate below has a test, a number or a written explanation I can give without notes.
 
 </Level>
 
 </Levels>
 
+#### Phase 3: exercises
+
+- Paginate ten thousand notes while inserting new ones and prove no gaps or duplicates.
+- Send the same POST twice, sequentially and concurrently, with one idempotency key.
+- Write attack tests for session fixation, reset-token reuse and a cookie used after sign-out.
+- Write the cross-tenant isolation suite before the second role exists.
+- Fuzz every endpoint with a list of nasty strings and assert no 500 and no reflected script.
+- Build a Postgres queue with `SKIP LOCKED`, then kill a worker mid-job.
+- Test the next-run function across daylight saving changes in three time zones.
+- Add cache-aside with a stampede lock and measure before and after.
+- Prove the rate limit is global across two instances, and test it with Redis stopped.
+- Attack the upload flow with a renamed file, an SVG with script and a decompression bomb.
+- Set up SPF, DKIM and DMARC on a test domain and read the received headers.
+- Deploy during a load test, before and after adding graceful shutdown.
+
 #### Phase 3: the gate
 
-<Compare
-  caption="Each gate item and its evidence"
-  left="Gate item"
-  right="Evidence"
-  rows={[
-    ["Threat-model the auth flow", "A table of assets, entry points, threats and mitigations, each mitigation linked to code or a test"],
-    ["JWT in local storage against an HttpOnly cookie", "Two-minute explanation: XSS steals one, CSRF targets the other"],
-    ["Prove an endpoint is idempotent", "Ten parallel identical POSTs with one key create one record"],
-    ["Load test with p50, p95 and p99", "k6 output at three load levels, in the README"],
-    ["Graceful shutdown with in-flight requests", "Redeploy during a load test, zero failed requests in the report"],
-  ]}
-/>
-
-The threat model uses a simple structure per entry point (sign-up, sign-in, reset, session use, logout):
-what an attacker wants, how they would try (stuffing, enumeration, fixation, CSRF, token theft, reset
-token reuse), and what stops it. Every row without a mitigation is a task before phase 4 begins.
+- **Threat-model the auth flow:** a diagram of sign-up, sign-in, session use, reset and sign-out, with every
+  token, where it is stored, who can read it, how long it lives, and the attack each control stops.
+- **JWT in local storage versus an HttpOnly cookie:** explained with the XSS case (script reads the token)
+  and the CSRF case (browser sends the cookie), and which control covers each.
+- **Prove an endpoint is idempotent:** the sequential and concurrent idempotency tests, passing, explained
+  line by line.
+- **Load test with p50, p95, p99:** a k6 report against the deployed API with an open arrival rate, plus the
+  first bottleneck and what I would change.
+- **Graceful shutdown with in-flight requests:** a deploy during the load test with zero failed requests, and
+  the shutdown order explained.
