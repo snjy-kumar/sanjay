@@ -1,5 +1,15 @@
 # Writing a book page
 
+> **Books are now one page per chapter.** Each chapter is its own file,
+> `src/content/chapters/<book>/<nn>.mdx`, written to textbook depth by
+> [`CHAPTER_PAGE_GUIDE.md`](CHAPTER_PAGE_GUIDE.md). Once a book has chapter
+> files, its `src/content/books/<slug>.mdx` is the overview, learning
+> strategy and contents page only (section 1 of that guide): no `###`
+> chapter bodies and no `<Levels>` on it. The rest of this guide still holds
+> for the book page's frontmatter, the table-of-contents check, diagrams,
+> copyright and commits; section 3, step 4 and section 4's chapter levels
+> apply only to books that have no chapter files yet.
+
 One page per book the plans cite, at `/books/<slug>/`. This guide is for
 whoever writes the next one. The finished example is
 [`src/content/books/c-programming-a-modern-approach.mdx`](../src/content/books/c-programming-a-modern-approach.mdx):
