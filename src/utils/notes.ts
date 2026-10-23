@@ -217,3 +217,37 @@ export function notesByMonth(notes: Note[]): { month: string; notes: Note[] }[] 
   }
   return groups;
 }
+
+/** The rules an undated note has to keep, checked when the note pages are
+ *  built so a mistake stops the build instead of shipping:
+ *  - a note in an undated series is `undated: true`, and a note in a dated
+ *    series is not (the daily series keep their days);
+ *  - its file name is its seriesOrder, two digits;
+ *  - its seriesOrder is a row in the series' `planned` list, and its title
+ *    is that row's title, so the series page and the note agree. */
+export function checkUndatedNotes(notes: Note[]): void {
+  const problems: string[] = [];
+  for (const note of notes) {
+    const s = seriesOf(note.data.series);
+    if (!s) {
+      problems.push(`${note.id}: series "${note.data.series}" is not in series.ts`);
+      continue;
+    }
+    const undated = isUndated(note);
+    if (s.undated && !undated) problems.push(`${note.id}: ${s.id} is an undated series, so the note needs undated: true and no date`);
+    if (!s.undated && undated) problems.push(`${note.id}: ${s.id} is a dated series, so the note needs a date`);
+    if (!undated) continue;
+    const [, file] = note.id.split('/');
+    if (file !== String(note.data.seriesOrder).padStart(2, '0')) {
+      problems.push(`${note.id}: the file name must be the seriesOrder, ${String(note.data.seriesOrder).padStart(2, '0')}`);
+    }
+    const row = s.planned?.[note.data.seriesOrder - 1];
+    if (!row) problems.push(`${note.id}: seriesOrder ${note.data.seriesOrder} is not a row in ${s.id}.planned`);
+    else if (row.title !== note.data.title) {
+      problems.push(`${note.id}: the title must be "${row.title}", the row in ${s.id}.planned`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(`Undated notes disagree with series.ts:\n  ${problems.join('\n  ')}`);
+  }
+}
