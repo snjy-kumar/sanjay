@@ -1,0 +1,796 @@
+---
+title: "Loading, error, empty and stale states"
+series: "ui"
+seriesOrder: 4
+undated: true
+readTime: "about 30 min"
+description: "Every screen that fetches data has more states than the one in the mockup: modelling loading, error, empty and stale with one status field, guarding against out-of-order responses, and designing what each state shows."
+tags: ['state', 'async', 'accessibility']
+related: ['ui/03']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+A mockup shows a screen full of data, loaded, correct and recent. A real
+screen spends part of its life in other states: waiting for the first
+response, failing, receiving nothing, or showing data that was right a
+minute ago and may not be now. Users meet those states on slow phones, bad
+networks and new accounts, which is to say often. This note is about naming
+those states, modelling them so that impossible combinations cannot happen,
+handling responses that arrive in the wrong order, and deciding what each
+state should show and say.
+
+## Before you start
+
+After this note you will be able to:
+
+- list the states any data-fetching screen can be in, and spot the ones a
+  design forgot;
+- model them as one status field with a reducer, instead of separate
+  boolean flags that can contradict each other;
+- keep showing old data while new data loads, and say so when a refresh
+  fails;
+- stop a slow, older response from overwriting a newer one;
+- design a loading, error and empty state that tells the user what is
+  happening and what they can do.
+
+What you should already know: promises and `async`/`await`, and the idea
+of component state from React or similar. The
+[previous note](/sanjay/posts/ui/03/) on component APIs is useful for the
+idea of making invalid combinations impossible, which this note applies to
+state.
+
+Reading time: about 30 minutes, plus ten for the scripts.
+
+## Note map
+
+<Flow steps={[
+  "List the states: idle, loading, success, empty, error",
+  "Add the in-between: refreshing and stale",
+  "Model them: one status field and a reducer",
+  "Guard the order: drop responses that are no longer the latest",
+  "Design each state: what it shows, says and offers",
+]} caption="The note in one line. First find every state, then make the code unable to be in two at once, then make each one useful to a person." />
+
+## The states a screen can be in
+
+### In one sentence
+
+Any screen that loads data can be idle, loading, successful, empty or
+failed, and once it has shown data it can also be refreshing or stale, so a
+design that shows only the success state is a fifth of a design.
+
+### The idea
+
+Take a screen that lists my notes. The mockup shows ten rows. Ask what the
+screen shows in each of these moments:
+
+1. **Idle.** Before anything has been requested. Often skipped because the
+   fetch starts on mount, but it exists for search screens before the first
+   query.
+2. **Loading.** The first request is in flight and there is nothing to show
+   yet.
+3. **Success.** Data arrived and there is at least one item.
+4. **Empty.** Data arrived and there are zero items. This is a success at
+   the network level and a different screen for the user.
+5. **Error.** The first request failed, so there is nothing to show and
+   something to explain.
+
+Then, once data has been shown at least once, two more:
+
+6. **Refreshing.** A new request is in flight, and the old data is still on
+   screen. Throwing the old data away to show a spinner again is a choice,
+   usually a bad one.
+7. **Stale.** A refresh failed, and the old data is still on screen. It may
+   be out of date, and the user should know that without losing it.
+
+The list matters because each state is a separate design question, and the
+one nobody asked gets answered by accident. The accidental answers are
+familiar: a blank screen while loading, a spinner forever after a failure,
+"0 results" in an empty table with column headings and nothing else.
+
+<Layers layers={[
+  { name: "stale: old data shown, latest refresh failed", note: "needs a quiet warning" },
+  { name: "refreshing: old data shown, new request in flight", note: "needs a quiet indicator" },
+  { name: "success / empty: data arrived", note: "rows, or a reason there are none" },
+  { name: "loading / error: no data yet", note: "a placeholder, or a reason and a retry" },
+  { name: "idle: nothing requested", note: "a prompt to start" },
+]} caption="The states stacked by how much the screen already knows. The bottom layers have nothing to show; the top two have data and a question mark over it." />
+
+### Worked example
+
+The simple example is a search box. Idle shows a hint ("Search notes by
+title or topic"). Loading shows a small indicator next to the box. Success
+shows results. Empty shows "No notes match 'flexbx'" with a suggestion to
+check the spelling. Error shows "Search is not responding" with a retry
+button.
+
+The realistic example is a dashboard of several panels, each fetching its
+own data. Each panel has its own copy of the seven states, and they can
+disagree: one panel loaded, one empty, one failed. A design that has one
+full-page spinner until everything arrives means the slowest panel holds
+the rest hostage, and one failure blanks the page. Per-panel states let
+the fast panels show while the slow one loads.
+
+### Step by step
+
+Walking the notes list through a realistic session:
+
+<Trace
+  columns={["moment", "what happened", "state", "what the screen should show"]}
+  rows={[
+    ["open the page", "request 1 sent", "loading", "placeholder rows"],
+    ["300 ms later", "10 notes arrive", "success", "10 rows"],
+    ["pull to refresh", "request 2 sent", "refreshing", "10 rows, a small indicator"],
+    ["network drops", "request 2 fails", "stale", "10 rows, 'could not refresh', retry"],
+    ["retry", "request 3 sent", "refreshing", "10 rows, indicator"],
+    ["back online", "0 notes arrive (all deleted elsewhere)", "empty", "'no notes yet', a way to add one"],
+  ]}
+  caption="One session through six states. Only one of them is in the mockup. The stale row is the one most apps get wrong: they replace good data with an error."
+/>
+
+### Common mistake
+
+The common mistake is treating empty as an error, or an error as empty.
+Showing "No results" when the request actually failed tells the user their
+notes are gone. Showing "Something went wrong" for an empty list tells them
+the app is broken when it is just new. The two need different checks: a
+failed request goes to error, a successful response with zero items goes
+to empty.
+
+### In real systems
+
+Design reviews in mature teams ask for all states explicitly: the mockup
+file has a frame for loading, empty and error next to the main one. Data
+libraries such as TanStack Query and SWR expose the distinctions directly,
+with separate flags or statuses for "first load", "fetching in the
+background" and "error", plus the last good data. Their shape is a strong
+hint that these states are real and not an invention of fussy designers.
+
+### Check yourself
+
+<details>
+<summary>1. A request succeeds and returns an empty list. Which state is that?</summary>
+
+Empty. It is a success at the network level, and the screen should explain
+why there is nothing and what to do, not report an error.
+
+</details>
+
+<details>
+<summary>2. What is the difference between refreshing and stale?</summary>
+
+Both show old data. Refreshing means a new request is in flight. Stale
+means the latest refresh failed, so the old data may be out of date.
+
+</details>
+
+## One status, not many flags
+
+### In one sentence
+
+Model the states as one `status` field with the data and error that belong
+to it, and change it only through a reducer, so the screen can never be
+loading and failed at the same time.
+
+### The idea
+
+The first version of fetching code usually has three pieces of state:
+`isLoading`, `error` and `data`. Three independent values allow eight
+combinations, and the code has to keep them consistent by hand. Forget to
+reset `error` when a new request starts and the screen shows an old error
+over new data. Forget to clear `isLoading` on failure and the spinner never
+stops.
+
+The same counting argument as boolean props in the previous note applies.
+The fix is the same too: one field that names the state, with only the
+data that state needs.
+
+In TypeScript this is a **discriminated union**:
+
+```ts
+type State<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: T[] }
+  | { status: 'empty' }
+  | { status: 'error'; error: string }
+  | { status: 'refreshing'; data: T[] }
+  | { status: 'stale'; data: T[]; error: string };
+```
+
+Each variant carries exactly what it needs. `loading` has no data, so the
+type checker refuses `state.data` until the code has checked
+`state.status`. An error with no data and an error with old data are
+different variants, so the screen cannot mix them up.
+
+The transitions live in one **reducer**: a function from the current state
+and an event to the next state. All the rules about what happens on a
+fetch, a success or a failure are in one place, and they can be tested
+without rendering anything.
+
+### Worked example
+
+```js
+// states.mjs
+export function reducer(state, event) {
+  switch (event.type) {
+    case 'fetch':
+      // keep showing old data while refreshing: that is the "stale" state
+      return state.data ? { status: 'refreshing', data: state.data } : { status: 'loading' };
+    case 'success':
+      return event.data.length === 0 ? { status: 'empty' } : { status: 'success', data: event.data };
+    case 'failure':
+      return state.data
+        ? { status: 'stale', data: state.data, error: event.error }
+        : { status: 'error', error: event.error };
+    default:
+      throw new Error(`unknown event ${event.type}`);
+  }
+}
+```
+
+Fed the session from the previous section, fetch, success, fetch, failure,
+fetch, empty success, it prints:
+
+```text
+fetch    -> {"status":"loading"}
+success  -> {"status":"success","data":["a","b"]}
+fetch    -> {"status":"refreshing","data":["a","b"]}
+failure  -> {"status":"stale","data":["a","b"],"error":"timeout"}
+fetch    -> {"status":"refreshing","data":["a","b"]}
+success  -> {"status":"empty"}
+```
+
+The failure kept the two rows and added an error, which is the stale
+state. The retry went back to refreshing with the same rows. Nowhere did
+the code set a flag by hand.
+
+<Compare left="Three flags" right="One status" caption="The same fetch logic, two models. The left column has to keep three values consistent on every path; the right column cannot represent the inconsistent ones." rows={[
+  ["isLoading, error, data", "status plus what that status needs"],
+  ["8 combinations, about 5 valid", "7 variants, all valid"],
+  ["reset error on every fetch, by hand", "fetch returns a new state, error gone"],
+  ["spinner stuck if one path forgets", "every event names the next state"],
+  ["state.data readable while loading", "type error until status is checked"],
+]} />
+
+In React the reducer plugs straight into `useReducer`, and the component
+renders by switching on `state.status`. The render becomes a list of seven
+cases, each small, rather than a nest of conditions.
+
+### Step by step
+
+How the reducer decides on a failure, for two different starting states:
+
+<Trace
+  columns={["current state", "event", "has data?", "next state"]}
+  rows={[
+    ["loading", "failure: timeout", "no", "error: timeout"],
+    ["refreshing, 2 rows", "failure: timeout", "yes", "stale: 2 rows, timeout"],
+    ["stale, 2 rows", "fetch", "yes", "refreshing: 2 rows"],
+    ["error", "fetch", "no", "loading"],
+  ]}
+  caption="The same failure event leads to different states depending on whether data was already on screen. That one branch is what keeps a dropped connection from wiping a good list."
+/>
+
+### Common mistake
+
+The common mistake is a reducer that handles the happy path and lets the
+rest fall through to a default that returns the old state. An event that
+should have been handled is silently ignored, and the screen stays in
+loading. The reducer above throws on unknown events instead. In TypeScript,
+a `never` check in the default case makes a missing event a compile error.
+
+### In real systems
+
+Real applications rarely write this reducer for every fetch; a data library
+does it. The value of writing it once by hand is knowing what the library
+is doing, so its statuses make sense and its defaults (does it keep old
+data during a refetch? does an error clear the data?) can be checked
+rather than assumed. State machine libraries go further and make the
+allowed transitions explicit, which pays off for flows with many steps,
+such as a multi-page checkout.
+
+### Check yourself
+
+<details>
+<summary>1. Three booleans isLoading, isError and hasData: how many combinations?</summary>
+
+Two to the power three, eight. Several are contradictions, such as loading
+and error at once, which a single status field cannot express.
+
+</details>
+
+<details>
+<summary>2. Why does the failure branch check state.data?</summary>
+
+To decide between error and stale. If rows are already on screen, they
+should stay, with a warning, instead of being replaced by an error.
+
+</details>
+
+## Out-of-order responses
+
+### In one sentence
+
+Requests do not finish in the order they started, so a screen that shows
+whichever response arrives last can show results for a query the user has
+already changed.
+
+### The idea
+
+A search box fetches as the user types. They type "r", "re", "rea". Three
+requests leave in that order. The server answers the shortest query
+slowest, because "r" matches the most notes. The responses arrive as
+"rea", "re", "r". If each response simply replaces the results, the final
+screen shows results for "r" while the box says "rea".
+
+This is a **race condition**: the outcome depends on timing the code does
+not control. It is rare on a fast laptop with a local server and common on
+a phone on a train, which is why it survives testing.
+
+There are three standard guards:
+
+1. **Request ids.** Number each request. When a response arrives, show it
+   only if its number is still the latest. Older responses are dropped.
+2. **Cancellation.** Abort the previous request when a new one starts, with
+   an `AbortController`. This also saves bandwidth, but the guard is still
+   needed for responses already in flight.
+3. **Keyed caching.** Store results by query, and render the entry for the
+   current query. A late answer for "r" goes into the "r" slot, which is
+   not on screen.
+
+### Worked example
+
+A simulation with made-up latencies, 300 ms for "r", 120 ms for "re" and
+60 ms for "rea", typed 10 ms apart:
+
+```js
+// race.mjs
+const latency = { r: 300, re: 120, rea: 60 };
+const fakeFetch = (q) => new Promise((ok) => setTimeout(() => ok(`results for "${q}"`), latency[q]));
+
+async function run(guarded) {
+  let shown = '', latest = 0;
+  const search = async (q) => {
+    const id = ++latest;
+    const result = await fakeFetch(q);
+    if (guarded && id !== latest) { console.log(`  drop  ${result} (request ${id}, latest ${latest})`); return; }
+    shown = result;
+    console.log(`  show  ${result}`);
+  };
+  await Promise.all(['r', 're', 'rea'].map((q, i) =>
+    new Promise((ok) => setTimeout(() => search(q).then(ok), i * 10))));
+  console.log(`  final screen: ${shown}`);
+}
+```
+
+Run once without the guard and once with it:
+
+```text
+without a guard:
+  show  results for "rea"
+  show  results for "re"
+  show  results for "r"
+  final screen: results for "r"
+with a request id guard:
+  show  results for "rea"
+  drop  results for "re" (request 2, latest 3)
+  drop  results for "r" (request 1, latest 3)
+  final screen: results for "rea"
+```
+
+Without the guard, the screen flickers through three result sets and lands
+on the wrong one. With it, the two late responses are dropped and the
+screen matches the box.
+
+### Step by step
+
+The guarded run on a timeline:
+
+<Trace
+  columns={["time", "event", "latest id", "action"]}
+  rows={[
+    ["0 ms", "request 1 for r starts", "1", "-"],
+    ["10 ms", "request 2 for re starts", "2", "-"],
+    ["20 ms", "request 3 for rea starts", "3", "-"],
+    ["80 ms", "request 3 answers", "3", "3 is latest: show"],
+    ["130 ms", "request 2 answers", "3", "2 is not latest: drop"],
+    ["300 ms", "request 1 answers", "3", "1 is not latest: drop"],
+  ]}
+  caption="Request ids against the race. The check is one comparison, and it makes the arrival order irrelevant."
+/>
+
+### Common mistake
+
+The common mistake is debouncing and calling it fixed. Waiting 300 ms after
+the last keystroke reduces the number of requests, but two requests can
+still overlap if the user pauses, types again, and the first is slow. A
+debounce is a cost saving; the request id or cancellation is the
+correctness fix. Use both.
+
+In React, the same race shows up in effects. An effect that fetches when a
+prop changes, and sets state when the promise resolves, can set state for a
+prop value that is no longer current. The standard fix is an `ignore` flag
+set in the effect's cleanup, which is the request-id idea with a boolean.
+
+### In real systems
+
+Data libraries key their cache by query, which solves the race by
+construction: each query's answer goes to its own entry. They also cancel
+superseded requests when the fetch function accepts an abort signal. On the
+server side, the same problem appears as "lost updates" when two writes
+race, which the backend series covers with transactions and version
+numbers.
+
+### Check yourself
+
+<details>
+<summary>1. Why does a debounce not prevent out-of-order responses?</summary>
+
+It reduces how many requests are sent, but two requests can still be in
+flight at once if the user pauses and types again, and the older one can
+still answer last.
+
+</details>
+
+<details>
+<summary>2. What does a keyed cache do with a late response for an old query?</summary>
+
+It stores it under the old query's key. The screen renders the current
+query's entry, so the late answer never appears.
+
+</details>
+
+## Designing each state
+
+### In one sentence
+
+Each state should tell the user what is happening and what they can do
+next, in words and in a form assistive technology can announce, without
+throwing away anything they already had.
+
+### The idea
+
+Modelling the states correctly makes them possible to design; it does not
+design them. Each needs its own small decision:
+
+- **Loading.** For short waits, nothing at all for the first few hundred
+  milliseconds avoids a flash. For longer waits, a **skeleton** (grey
+  shapes where the rows will be) keeps the layout stable, so nothing jumps
+  when data arrives. A spinner says "wait" but not "for what".
+- **Empty.** Say why it is empty and offer the next step. A new account's
+  empty list ("No notes yet. Write your first one.") is different from a
+  filter's empty result ("No notes tagged 'grid'. Clear the filter.").
+- **Error.** Say what failed in plain words, whether it is likely
+  temporary, and offer a retry. Do not show a stack trace or an error code
+  alone. Keep anything the user typed.
+- **Refreshing.** A quiet indicator, not a full-page spinner. The data is
+  still useful.
+- **Stale.** A visible note near the data ("Could not refresh. Showing
+  notes from 2 minutes ago.") with a retry. Never replace the data.
+
+Accessibility matters for every state change, because a screen-reader user
+does not see a spinner appear or a list fill. A **live region**, an element
+with `role="status"` or `aria-live="polite"`, is announced when its text
+changes. One status line per region ("Loading notes", "10 notes loaded",
+"Could not refresh") turns visual changes into spoken ones. Errors that
+block the user can use `role="alert"`, which interrupts; use it sparingly.
+
+### Worked example
+
+The simple example is the markup for the notes list region:
+
+```html
+<section aria-labelledby="notes-h" aria-busy="false">
+  <h2 id="notes-h">Notes</h2>
+  <p role="status" class="visually-hidden">10 notes loaded</p>
+  <ul><!-- rows --></ul>
+</section>
+```
+
+While loading, `aria-busy="true"` tells assistive technology the region is
+being updated, and the status text changes to "Loading notes". When the
+data arrives, the text becomes "10 notes loaded", and that is announced
+once, politely, after whatever the user was hearing.
+
+The realistic example is the stale state in a list someone is working in.
+The refresh fails while they are reading row seven. The bad design replaces
+the list with an error panel, and they lose their place. The good design
+keeps the list, adds a line above it with the time of the last good data
+and a retry button, and updates the status region to "Could not refresh,
+showing notes from 2 minutes ago". Their place, their scroll position and
+their focus are untouched.
+
+<Compare left="Accidental design" right="Deliberate design" caption="Each state as it tends to ship when nobody designs it, and as it can be with one decision each." rows={[
+  ["loading: blank, then a jump", "skeleton rows in the final layout"],
+  ["empty: table headings, no rows", "why it is empty, and the next step"],
+  ["error: 'Error 500'", "what failed, is it temporary, a retry"],
+  ["refreshing: full spinner, data gone", "data stays, small indicator"],
+  ["stale: error replaces data", "data stays, 'last updated', retry"],
+]} />
+
+### Step by step
+
+What a screen-reader user hears through the session from the first part:
+
+<Trace
+  columns={["state", "status region text", "announced?"]}
+  rows={[
+    ["loading", "Loading notes", "yes, politely"],
+    ["success", "10 notes loaded", "yes"],
+    ["refreshing", "Refreshing notes", "yes, or skip if it is quick"],
+    ["stale", "Could not refresh, showing notes from 2 minutes ago", "yes"],
+    ["empty", "No notes yet", "yes"],
+  ]}
+  caption="The status region turns each visual change into one short sentence. Without it, the list fills or empties in silence."
+/>
+
+### Common mistake
+
+The common mistake is a live region added at the same time as its text.
+Some screen readers only announce changes to a live region that was already
+in the page. Render the empty status element from the start and change its
+text, rather than inserting a new element with the message inside.
+
+The second mistake is announcing too much: every row as it arrives, or a
+status for a refresh that took 50 ms. Announce the outcome, once.
+
+### In real systems
+
+Production apps add a few details. Skeletons match the real layout closely,
+so the content does not shift when it arrives, which also helps layout
+stability metrics. Errors carry an id that support can look up, shown in
+small text under the plain message. Retries back off, so a failing server
+is not hammered. And empty states are treated as onboarding: for a new
+user, the empty screen is the first screen, and it deserves the most
+design attention, not the least.
+
+### Check yourself
+
+<details>
+<summary>1. Why might a status message not be announced when it first appears?</summary>
+
+Some screen readers only watch live regions that already existed. Insert
+the region early, empty, and change its text.
+
+</details>
+
+<details>
+<summary>2. What should a stale state keep, and what should it add?</summary>
+
+Keep the data, scroll position and focus. Add a visible note with the time
+of the last good data, a retry, and a status announcement.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Loading, error, empty and stale states">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the goal is to stop forgetting states. For every
+screen that fetches, write the five words loading, success, empty, error and
+idle on a card, and make sure the screen does something deliberate for each
+one. Test them by throttling the network in dev tools, blocking the
+request, and pointing it at an account with no data.
+
+A worked example: a list page that shows a spinner forever when offline.
+Blocking the request in dev tools reproduces it in seconds. The fix is a
+`catch` that sets an error state with a retry.
+
+The mistake at this level is testing only on a fast connection with a full
+account. Every missing state is invisible there.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, you replace flags with a status union and a
+reducer, and you add refreshing and stale. You keep old data during a
+refetch and show a quiet indicator instead of a full spinner.
+
+A worked example: a dashboard panel that refetches every minute. With
+flags, each refetch flashes the panel to a spinner and back. With the
+reducer from this note, the panel goes to refreshing, keeps its numbers,
+and only changes when new numbers arrive.
+
+The mistake at this level is losing the error when data is kept. Stale is
+not success; the user needs to know the numbers might be old.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, you guard against races and cancel superseded
+requests. Every fetch that depends on changing input has a request id or a
+keyed cache, and every effect that sets state after an `await` has a
+cleanup that ignores late answers.
+
+A worked example: a detail page that loads note `id` from the URL. The user
+clicks note 3, then quickly note 4. Note 3's response arrives last and the
+page shows note 3 under note 4's address. An ignore flag in the effect's
+cleanup fixes it.
+
+The mistake at this level is cancelling a request and treating the abort
+as an error. An `AbortError` is expected; it should not move the state to
+error or show a message.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries:
+
+- **A response with a 200 status and an error body.** Some APIs return
+  errors this way. Check the body's shape, not only the status code, before
+  going to success.
+- **An instant response.** Loading lasts 5 ms, and the skeleton flashes.
+  Delay showing the loading UI by a couple of hundred milliseconds, or keep
+  it for a minimum time once shown.
+- **A list that empties after a deletion.** The user deletes the last item.
+  The screen should go to the empty state, not keep a stale row or show an
+  error.
+- **A partial response.** Some panels or pages loaded and one failed. Show
+  what arrived and mark the missing part, rather than failing the whole
+  screen.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **Stale data plus an optimistic update.** The user edits a row while the
+  list is stale. The edit should apply to the row on screen, and the next
+  refresh must not overwrite it with an older server copy. Version numbers
+  or timestamps per row decide which wins.
+- **A race plus pagination.** Page 2 is requested, then the filter
+  changes. Page 2 of the old filter arrives and is appended to page 1 of
+  the new one. Key pages by filter as well as page number.
+- **Offline plus retry with backoff.** The app retries every few seconds
+  while offline, draining the battery and filling the log. Listen for the
+  browser's online event and retry then, instead of on a timer.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, states become measurable. Log how often each screen reaches
+error and stale, and how long loading lasts at the 95th percentile. A
+screen that is in loading for three seconds for one user in twenty has a
+problem the median hides.
+
+Use a data library for caching, deduplication, retries and keyed results,
+and write the screen's render as a switch on its status. Keep the copy for
+every state in one place, reviewed like any other interface text. Add
+end-to-end tests that force each state with a mocked network.
+
+The mistake in production is an error state that cannot be reached in
+tests, so its copy and retry button are never seen until an outage, which
+is the worst time to discover the retry does nothing.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that the network is not a function call. It is slow, it
+fails, it answers out of order, and sometimes it answers with nothing. A
+screen that treats a fetch as if it returned instantly and always worked is
+designed for a world that does not exist.
+
+So I design the unhappy states first. If I know what the screen does when
+the request fails and when it returns nothing, the happy state is easy.
+The reverse order leaves the unhappy states to whatever the code happens
+to do.
+
+The mistake in mindset is thinking of these as edge cases. On a phone, for
+a new user, loading and empty are the first two screens they ever see.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, the states are a contract between server and client.
+The server's job is to answer with a clear distinction between "nothing
+found", "you may not see this" and "I failed", and with a hint on whether a
+retry might help. The client's job is to map each answer to a state.
+
+A concrete design: list endpoints return `200` with an empty array for no
+results, `404` only for a missing resource, `401` and `403` for access,
+`429` with a retry-after header when rate limited, and `5xx` for failures.
+The client reducer maps `429` and `5xx` to retryable errors, `401` to a
+sign-in prompt, and an empty array to empty.
+
+The mistake at this level is a server that returns `404` for an empty list
+or `200` for a failure. The client cannot tell empty from missing, or
+success from error, and every screen inherits the confusion.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+How I learn this and how I know I have. I pick one screen of mine that
+fetches data and force each state by hand: throttle, block, return empty,
+return an error body, and type quickly in any input that triggers a fetch.
+I write down what happens in each, which is usually the fastest way to find
+three bugs.
+
+Then I rewrite its state as the union and reducer from this note, add the
+request-id guard, and add a status region. Finally I write the copy for
+each state as a small table and review it out loud.
+
+Done when: every fetching screen I own has a deliberate design for all
+seven states, no screen can show an older answer over a newer one, and a
+screen reader announces each change once.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Spinner or skeleton?** A skeleton when the layout of the result is known,
+because it prevents a jump and suggests what is coming. A spinner for
+actions with no layout, such as a button that saves.
+
+**How long before showing a loading indicator?** A common rule of thumb is
+to show nothing for the first couple of hundred milliseconds, so fast
+responses do not flash, and to keep the indicator up for a minimum time
+once shown, so it does not flicker.
+
+**Should the error message say what went wrong technically?** In plain
+words, yes: "Could not reach the server" is useful, "TypeError: failed to
+fetch" is not. Put any technical id in small text for support.
+
+**Is stale data dangerous to show?** It depends on the data. Notes from two
+minutes ago are fine with a label. A bank balance or a stock level may need
+a stronger warning or to be hidden. Decide per screen.
+
+**Do I need a data library?** For one or two screens, the reducer and a
+request id are enough. For an app with many screens sharing data, a library
+saves writing caching, deduplication and retries again and again.
+
+## Key takeaways
+
+- A fetching screen has at least five states, plus refreshing and stale once
+  data has been shown; design each one on purpose.
+- Empty is a success with no items; error is a failure. Never confuse them.
+- Model state as one status field with a reducer, so contradictions cannot
+  be represented.
+- Keep old data during a refresh, and label it when the refresh fails.
+- Guard every changing fetch against out-of-order answers with request ids,
+  cancellation or a keyed cache.
+- Announce state changes once through a live region that exists from the
+  start.
+
+## Glossary
+
+- **Loading state**: no data yet and a request in flight.
+- **Empty state**: a successful response with nothing to show.
+- **Error state**: a failed request with no data to fall back on.
+- **Refreshing state**: old data on screen while a new request is in flight.
+- **Stale state**: old data on screen after a refresh failed.
+- **Discriminated union**: a type made of variants that share a tag field,
+  such as `status`, each carrying its own data.
+- **Reducer**: a function from the current state and an event to the next
+  state.
+- **Race condition**: a bug whose outcome depends on the timing of events
+  the code does not control.
+- **Request id**: a counter used to recognise and drop responses that are no
+  longer the latest.
+- **Skeleton**: placeholder shapes in the layout of the content that will
+  load.
+- **Live region**: an element whose text changes are announced by screen
+  readers, such as one with `role="status"`.
+
+## Practice
+
+**Warm-up.** Pick a screen you use daily and force each state with dev
+tools: throttle, block and an empty account. Write down what each looks
+like and which one surprised you.
+
+**Build.** Implement the reducer from this note with TypeScript types and an
+exhaustive switch. Add a `cancel` event and decide which state it leads to
+from each starting state.
+
+**Stretch.** Build a search box that fetches on input with a debounce, an
+`AbortController` and a request-id guard. Add artificial random latency to
+the server and type fast. Then add a status region and check what a screen
+reader announces.
