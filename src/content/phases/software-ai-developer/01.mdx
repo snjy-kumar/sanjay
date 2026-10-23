@@ -1,0 +1,1522 @@
+---
+plan: software-ai-developer
+phase: 1
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Four weeks under the syntax. The plan is blunt about it: I am not here to learn syntax, I am here to learn what
+the runtime is doing when the syntax succeeds. The primary book is *Eloquent JavaScript* or *You Don't Know JS
+Yet*, with JavaScript.info and the TypeScript Handbook as the free references and *Refactoring* for depth. The
+build is a CLI tool and an HTTP server with no framework, and the gate asks for a router, a JSON parser and a
+rate limiter written from a blank file, plus an explanation of the event loop with a concrete example.
+
+#### Phase 1: how I would learn it
+
+Eleven topics in four weeks is about three a week. Each one gets the same cycle: read the chapter or the
+reference page, predict what a small program prints, run it, explain the difference, then use the idea in the
+server. Prediction is the point. When I predict wrong, I have found the exact place where my model of the
+runtime is wrong, and that is worth more than any amount of reading. No AI in the first pass on any topic;
+afterwards I ask for a review and log what it caught that I missed.
+
+<Timeline
+  caption="Phase 1's four weeks"
+  items={[
+    { when: "week 3", what: "Values, types, scope, lifetime and mutation; functions, closures, recursion and the call stack; the event loop and async." },
+    { when: "week 4", what: "Errors and exit codes; data structures; complexity. Start the CLI tool." },
+    { when: "week 5", what: "HTTP; JSON and validation at the boundary. Start the HTTP server with routing and errors." },
+    { when: "week 6", what: "Testing, debugging and Git. Rate limiter, request logger, the router as a library. Then the gate." },
+  ]}
+/>
+
+<Flow
+  caption="The cycle for every topic. The gap between prediction and output is where the learning is."
+  steps={["Read", "Predict the output", "Run it", "Explain the gap", "Use it in the server", "Write the note"]}
+/>
+
+#### Phase 1: Values, types, scope, lifetime and mutation
+
+<Figure art={`
+  stack (per call)                 heap (shared, garbage collected)
+  +-----------------------+
+  | n     = 3             |        (primitives live in the binding itself)
+  | name  = "ada"         |
+  | user  = ref ----------+------> { name: "ada", tags: ref --+ }
+  | alias = ref ----------+------^                            |
+  +-----------------------+                                   v
+                                                        [ "admin", "beta" ]
+  alias.name = "grace"   ->  user.name is "grace" too: one object, two references
+  user = { ...user }     ->  a new object; alias still points at the old one
+`} caption="Bindings hold primitives or references. Mutation through one reference is visible through every other." />
+
+<Levels label="Phase 1, values, types, scope, lifetime and mutation">
+
+<Level name="Beginner">
+
+JavaScript has two kinds of values. Primitives (numbers, strings, booleans, `null`, `undefined`, bigints and
+symbols) are immutable: "changing" one creates a new value. Objects (including arrays, functions, maps and
+dates) are mutable, and variables hold a reference to them, not a copy. A variable declared with `const` cannot
+be reassigned, but the object it points at can still change.
+
+```ts
+const user = { name: 'ada' };
+const alias = user;
+alias.name = 'grace';
+console.log(user.name);   // grace
+```
+
+Scope is where a name is visible. `let` and `const` are block scoped (inside the nearest braces); `var` is
+function scoped and should not be used in new code. The common mistake is believing `const` makes an object
+immutable. It only fixes the binding; `Object.freeze` (shallow) or a readonly type is the tool for the object.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice, mutation is the source of a whole class of bugs: a function that changes its argument surprises
+every caller. I prefer returning new values, and I copy deliberately when I need to.
+
+```ts
+const a = { tags: ['x'] };
+const shallow = { ...a };
+shallow.tags.push('y');
+console.log(a.tags);                    // [ 'x', 'y' ]   the inner array is shared
+const deep = structuredClone(a);
+deep.tags.push('z');
+console.log(a.tags);                    // [ 'x', 'y' ]   untouched
+```
+
+Types in TypeScript describe values at compile time and disappear at runtime. `readonly` and `as const` let the
+compiler catch mutation: `const roles = ['admin', 'member'] as const` is a readonly tuple, and `roles.push` is a
+type error.
+
+</Level>
+
+<Level name="Advanced">
+
+The exact rules underneath: equality for objects is identity (`{} === {}` is `false`). `typeof null` is
+`'object'`, a historical bug kept for compatibility. `let` and `const` bindings exist from the start of their
+block but cannot be read before their declaration line, which is the temporal dead zone.
+
+```ts
+console.log(x);  // ReferenceError: Cannot access 'x' before initialization
+let x = 1;
+```
+
+Lifetime is how long a value lives. A value lives as long as something reachable refers to it; the garbage
+collector frees the rest. So a closure, a cache or an event listener that holds a reference keeps the value
+alive. Numbers are 64-bit floats, so integers are exact only up to `Number.MAX_SAFE_INTEGER` (2 to the 53rd
+power, minus 1).
+
+```ts
+console.log(0.1 + 0.2 === 0.3);                       // false
+console.log(9007199254740993);                        // 9007199254740992
+console.log(9007199254740993n);                       // 9007199254740993n (bigint is exact)
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+`NaN !== NaN` (use `Number.isNaN`); `-0 === 0` is true but `Object.is(-0, 0)` is false; `[] + {}` is
+`'[object Object]'`; `typeof []` is `'object'` (use `Array.isArray`); `parseInt('08')` is 8 but
+`parseInt('1e3')` is 1; a database ID above the safe integer range arriving as a JSON number is silently
+rounded, which is why `pg` returns `bigint` columns as strings.
+
+</Level>
+
+<Level name="Corner cases">
+
+A default parameter object shared by mistake: `function add(item, list = cache.items)` mutates the cache on
+every call without a list. A module-level object in a server: it lives for the whole process, so state set
+during one request leaks into the next user's request. That is a real security bug in servers, not a style
+issue. Per-request state belongs in the request.
+
+</Level>
+
+<Level name="Production level">
+
+In production I treat shared mutable state as a hazard: module-level caches have bounds and keys, request data
+never goes in globals, config objects are frozen at startup, and IDs from the database are strings or bigints.
+Lint rules (`prefer-const`, `no-param-reassign`) and readonly types make the safe version the default.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is to ask, for every object: who else holds a reference to this, and who can change it? If I cannot
+answer, I copy or freeze it.
+
+</Level>
+
+<Level name="System design">
+
+Immutability scales up: immutable events, append-only logs, versioned caches and content-addressed images in
+later phases are the same idea as not mutating a shared object. State that can be shared safely is state that
+does not change.
+
+</Level>
+
+<Level name="Strategy">
+
+I write twenty predict-then-run snippets covering references, copies, scope, the temporal dead zone and
+floats, and log every wrong prediction with the reason. Done when I can draw the stack and heap for any snippet
+and predict its output first time.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Functions, closures, recursion and the call stack
+
+<Figure art={`
+  function counter() { let n = 0; return () => ++n; }
+  const next = counter();
+
+  call stack while next() runs          heap
+  +----------------------+
+  | next (arrow fn)      | --scope-->  environment of counter(): { n: 2 }
+  +----------------------+               ^ kept alive because next refers to it
+  | main                 |
+  +----------------------+
+  counter() returned long ago, but its variable n lives on in the closure
+`} caption="A closure is a function plus the environment it was created in. The environment outlives the call." />
+
+<Levels label="Phase 1, functions, closures, recursion and the call stack">
+
+<Level name="Beginner">
+
+A function is a value: it can be stored in a variable, passed to another function and returned. Each call gets
+a new frame on the call stack holding its parameters and local variables; when the function returns, its frame
+is removed. A closure is a function that remembers the variables from where it was created, even after that
+outer function has returned.
+
+```ts
+function counter() { let n = 0; return () => ++n; }
+const next = counter();
+console.log(next(), next(), next());   // 1 2 3
+```
+
+The common mistake is the old `var` in a loop: every callback closes over the same variable.
+
+```ts
+for (var i = 0; i < 3; i++) setTimeout(() => console.log(i));   // 3 3 3
+for (let i = 0; i < 3; i++) setTimeout(() => console.log(i));   // 0 1 2  (a new i per iteration)
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Closures are how real code keeps private state: a rate limiter's counters, a memoised function's cache, a
+configured logger. Higher-order functions (`map`, `filter`, middleware) take or return functions. Recursion is a
+function calling itself on a smaller input, with a base case that stops it, and it fits tree-shaped data such as
+nested JSON or a file system.
+
+```ts
+type Node = { name: string; children?: Node[] };
+const count = (n: Node): number => 1 + (n.children ?? []).reduce((s, c) => s + count(c), 0);
+console.log(count({ name: 'root', children: [{ name: 'a' }, { name: 'b', children: [{ name: 'c' }] }] })); // 4
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The exact rules underneath: scope is lexical, decided by where the function is written, not where it is called.
+`this` is the opposite: for a normal function it is decided by how it is called, while arrow functions take
+`this` from the surrounding code. The stack has a fixed size, so deep recursion fails.
+
+```ts
+const depth = (n: number): number => (n === 0 ? 0 : 1 + depth(n - 1));
+depth(1e6);   // RangeError: Maximum call stack size exceeded
+```
+
+JavaScript engines do not perform tail-call optimisation in practice (only Safari implements it), so deep
+recursion is converted to a loop with an explicit stack.
+
+```ts
+function countIter(root: Node) { let total = 0; const stack = [root];
+  while (stack.length) { const n = stack.pop()!; total++; stack.push(...(n.children ?? [])); }
+  return total; }
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Passing a method as a callback loses `this` (`setTimeout(obj.method)` calls it with `this` undefined in strict
+mode, giving `TypeError: Cannot read properties of undefined`); `arguments` does not exist in arrow functions;
+a recursive function on user-supplied nested JSON can be made to overflow the stack on purpose with deeply nested
+input; default parameters are evaluated on every call.
+
+</Level>
+
+<Level name="Corner cases">
+
+A closure that captures a large object (a whole request) when it only needs one field keeps the whole object
+alive as long as the closure lives, for example in a long-lived event listener, which is a memory leak. Capture
+only what is needed. A memoised function with an unbounded cache keyed by user input grows forever; it needs a
+size limit or an LRU.
+
+</Level>
+
+<Level name="Production level">
+
+In production, stack traces are how I find bugs, so named functions beat anonymous ones (the name shows in the
+trace). Recursion on untrusted input has a depth limit. Closures holding state are bounded and testable, and
+middleware chains are plain functions I can test one at a time.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is to read a function by asking three questions: what does it receive, what does it capture, and what
+does it change? Most surprises live in the second and third.
+
+</Level>
+
+<Level name="System design">
+
+The middleware pipeline in the Phase 3 API is function composition: each layer is a function that takes the
+request and the next function. Understanding closures and the call stack here is what makes that design and its
+stack traces readable later.
+
+</Level>
+
+<Level name="Strategy">
+
+I write `memoize`, `once`, `debounce` and a recursive JSON walker from scratch, with tests, and convert the
+walker to an iterative version that survives a depth of a million. Done when each has passing tests and I can
+draw the closure environments involved.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: The event loop, promises, async/await and concurrency without threads
+
+<Figure art={`
+  console.log('A');
+  setTimeout(() => console.log('B'), 0);
+  Promise.resolve().then(() => console.log('C'));
+  process.nextTick(() => console.log('D'));
+  console.log('E');
+
+  1. run the script to the end (call stack)        prints A, E
+  2. drain process.nextTick queue                  prints D
+  3. drain the microtask queue (promise jobs)      prints C
+  4. event loop: timers phase                      prints B
+  output: A E D C B
+`} caption="One script, four queues. The synchronous code runs first, then nextTick, then microtasks, then the event loop's phases." />
+
+<Levels label="Phase 1, the event loop, promises, async/await and concurrency without threads">
+
+<Level name="Beginner">
+
+JavaScript runs one piece of code at a time on one thread. Slow operations (network, disk, timers) are started
+and then handed off; when they finish, a callback is queued, and the event loop runs it once the current code is
+done. A promise is an object for a value that will arrive later. `async` and `await` let me write promise code
+that reads top to bottom.
+
+```ts
+async function getUser(id: string) {
+  const res = await fetch(`https://api.example.dev/users/${id}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+```
+
+The common mistake is forgetting `await`: the function carries on with a pending promise instead of the value.
+
+```ts
+const user = getUser('7');
+console.log(user.name);   // undefined (user is a Promise, not the object)
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+Concurrency without threads means starting several operations and waiting for them together. Sequential
+`await` in a loop takes the sum of the times; `Promise.all` takes the longest one. `Promise.allSettled` waits for
+all of them and reports each result, success or failure.
+
+```ts
+console.time('seq');  for (const id of ids) await getUser(id);           console.timeEnd('seq');  // seq: 1.512s
+console.time('par');  await Promise.all(ids.map(getUser));                console.timeEnd('par');  // par: 0.311s
+```
+
+Unbounded parallelism has its own problem: ten thousand requests at once overwhelm the other server or my
+connection pool. A small concurrency limit (a pool of five workers pulling from a queue) is the usual fix.
+
+</Level>
+
+<Level name="Advanced">
+
+The exact order underneath, as in the diagram: the current script or callback runs to completion; then Node
+drains the `process.nextTick` queue, then the microtask queue (promise reactions and `await` continuations); then
+the event loop moves through its phases (timers, pending callbacks, poll for I/O, check for `setImmediate`, close
+callbacks), draining microtasks after each callback. An `await` splits a function: the part after it runs as a
+microtask once the promise settles.
+
+The consequence is that CPU-heavy code blocks everything. A loop that takes 200 ms freezes every other request
+for 200 ms.
+
+```ts
+setInterval(() => console.log('tick', Date.now() % 10000), 100);
+const end = Date.now() + 1000; while (Date.now() < end) {}   // no ticks for a whole second
+```
+
+Heavy work goes to a worker thread (`node:worker_threads`), a child process or a job queue.
+
+</Level>
+
+<Level name="Edge cases">
+
+`forEach` with an async callback does not wait (`await` inside it pauses only the callback); `Promise.all` rejects
+on the first failure while the others keep running; `setTimeout(fn, 0)` waits at least about a millisecond;
+an async function always returns a promise, even when it returns a plain value; `await` on a non-promise wraps it
+and still yields to the microtask queue.
+
+</Level>
+
+<Level name="Corner cases">
+
+A promise chain that recursively schedules microtasks starves the event loop: timers and I/O never run because
+the microtask queue never empties. A promise that rejects with nobody listening crashes the process in Node 15
+and later.
+
+```text
+node:internal/process/promises:289
+            triggerUncaughtException(err, true /* fromPromise */);
+[UnhandledPromiseRejection: This error originated either by throwing inside of an async function without a
+catch block, or by rejecting a promise which was not handled with .catch().]
+```
+
+</Level>
+
+<Level name="Production level">
+
+In production I measure event loop delay (`perf_hooks.monitorEventLoopDelay`) as a health metric, put timeouts on
+every outbound call with `AbortSignal.timeout(ms)`, bound concurrency for fan-out, and move CPU work off the main
+thread. A server that feels slow under load often has a blocked event loop, not a slow database.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "everything that waits is a promise, and every promise needs an owner." Someone must await it, catch
+it, or deliberately let it run with a handler attached.
+
+</Level>
+
+<Level name="System design">
+
+This single-threaded model is why Node handles many concurrent connections cheaply (waiting costs almost
+nothing) and why streaming AI responses fit it well. It is also why Phase 3 moves slow work to background jobs
+instead of doing it inside requests.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the diagram's snippet and five harder ones (async functions, nested `then`, `setImmediate` against
+`setTimeout` inside an I/O callback), predict the order, and run them. Done when the gate's "explain the event
+loop with a concrete example" is a snippet I can predict and explain step by step.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Errors: values, exceptions, rejected promises and process exit codes
+
+<Compare
+  left="Kind of failure"
+  right="How I handle it"
+  caption="Four ways a program fails, and the right tool for each."
+  rows={[
+    ["expected outcome (not found, invalid input)", "return a value: a result type or a discriminated union"],
+    ["unexpected bug or broken invariant", "throw; let it reach a top-level handler that logs it"],
+    ["async failure", "a rejected promise; await it inside try/catch, or .catch()"],
+    ["the process cannot continue", "log, clean up, exit with a non-zero code; the supervisor restarts it"],
+  ]}
+/>
+
+<Levels label="Phase 1, errors: values, exceptions, rejected promises and process exit codes">
+
+<Level name="Beginner">
+
+When something goes wrong, code either returns a value that says so or throws an exception. `throw` stops the
+current function and unwinds the call stack until a `try/catch` handles it. In async code, a thrown error becomes
+a rejected promise, which `await` turns back into a throw. When a Node program ends, its exit code says whether it
+succeeded: 0 means success, anything else means failure.
+
+```ts
+try { JSON.parse('{bad'); }
+catch (e) { console.error((e as Error).message); }
+// Expected property name or '}' in JSON at position 1 (line 1 column 2)
+```
+
+The common mistake is an empty `catch {}`, which hides the bug and leaves the program in an unknown state.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I separate expected failures from bugs. "User not found" or "invalid email" are normal outcomes,
+returned as values the type system forces callers to handle. Bugs throw.
+
+```ts
+type Result<T, E = string> = { ok: true; value: T } | { ok: false; error: E };
+function parsePort(s: string): Result<number> {
+  const n = Number(s);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? { ok: true, value: n } : { ok: false, error: `bad port: ${s}` };
+}
+const r = parsePort('99999');
+if (!r.ok) { console.error(r.error); process.exitCode = 2; }   // bad port: 99999
+```
+
+Setting `process.exitCode` lets pending output flush before the process ends, unlike `process.exit()`.
+
+</Level>
+
+<Level name="Advanced">
+
+The exact rules underneath: anything can be thrown (a string, `undefined`), so a `catch` variable is `unknown` in
+strict TypeScript and must be narrowed. `Error` objects carry a `stack`, and since ES2022 a `cause` that chains a
+low-level error to a high-level one. `finally` always runs, even after a `return`. Custom error classes give
+callers something to check with `instanceof`.
+
+```ts
+class NotFound extends Error { constructor(what: string, options?: ErrorOptions) { super(`${what} not found`, options); this.name = 'NotFound'; } }
+try { await db.findUser(id); } catch (e) { throw new NotFound(`user ${id}`, { cause: e }); }
+```
+
+Exit codes by convention: 1 for a general error, 2 for misuse of a command (bad arguments), and 128 plus the
+signal number when killed by a signal (130 for Ctrl-C, 137 for `SIGKILL`).
+
+</Level>
+
+<Level name="Edge cases">
+
+An error thrown inside a `setTimeout` callback cannot be caught by a `try` around the `setTimeout` call (it runs
+later on another stack); an error inside a stream's `data` handler goes to the stream's `error` event, and an
+`error` event with no listener crashes the process; `JSON.stringify(new Error('x'))` gives `{}` because
+`message` and `stack` are not enumerable.
+
+</Level>
+
+<Level name="Corner cases">
+
+`uncaughtException` handlers that log and keep running: the process is now in an unknown state (a half-finished
+transaction, a lock held), so the right response is to log, close what can be closed, and exit for the supervisor
+to restart. A `finally` with a `return` swallows the error thrown in the `try`, so `finally` should never
+return.
+
+</Level>
+
+<Level name="Production level">
+
+In production every error that reaches the top is logged once, with its stack, cause chain and request ID, and
+then mapped to a safe response: a 4xx with a useful message for expected failures, a generic 500 with an ID for
+bugs. CLIs exit non-zero on failure so scripts and CI notice. Error tracking groups identical errors so I see how
+many users each one affects.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "every failure has a home." For each thing that can go wrong I decide whether it is a value, an
+exception or a reason to exit, before writing the happy path.
+
+</Level>
+
+<Level name="System design">
+
+The same split becomes the API's error envelope in Phase 3 (expected errors with codes, unexpected ones with a
+request ID) and the crash-and-restart model in Phase 5, where supervisors and health checks assume a broken
+process exits rather than limping on.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the CLI's error handling first: a result type for validation, custom error classes, a top-level handler
+and exit codes, with a test for each code. Done when every failure path in the CLI has a test that checks its
+message and its exit code.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Data structures I use every day: arrays, maps, sets, queues and trees
+
+<Compare
+  left="Structure"
+  right="Fast at, and slow at"
+  caption="The five structures behind almost every feature, with the operation each one is built for."
+  rows={[
+    ["array", "index and push/pop at the end are fast; shift, unshift and includes are O(n)"],
+    ["Map", "get, set, has, delete by any key in O(1) on average; keeps insertion order"],
+    ["Set", "membership and de-duplication in O(1) on average"],
+    ["queue (two indexes or a ring buffer)", "enqueue and dequeue in O(1); Array.shift is not a queue at scale"],
+    ["tree", "hierarchy (DOM, JSON, files, routes); sorted search when balanced"],
+  ]}
+/>
+
+<Levels label="Phase 1, data structures I use every day: arrays, maps, sets, queues and trees">
+
+<Level name="Beginner">
+
+A data structure is a way of arranging data so certain operations are fast. Arrays hold ordered items by index.
+A `Map` holds key-value pairs with any type of key. A `Set` holds unique values. A queue hands items out in the
+order they came in. A tree holds items with parents and children.
+
+```ts
+const seen = new Set<string>();
+for (const email of ['a@x.io', 'b@x.io', 'a@x.io']) seen.add(email);
+console.log(seen.size, [...seen]);   // 2 [ 'a@x.io', 'b@x.io' ]
+```
+
+The common mistake is `array.includes` inside a loop for membership, which turns a linear job into a quadratic
+one. A `Set` built once makes each check constant time.
+
+</Level>
+
+<Level name="Intermediate">
+
+Choosing is about the operations I do most. Grouping rows by a key is a `Map` of arrays. A lookup table from IDs
+to objects replaces repeated `find` calls. A queue for jobs or a breadth-first walk needs fast removal from the
+front, which `Array.shift` does not give (it moves every remaining element).
+
+```ts
+class Queue<T> { private items: T[] = []; private head = 0;
+  push(x: T) { this.items.push(x); }
+  shift(): T | undefined { if (this.head >= this.items.length) return undefined;
+    const x = this.items[this.head++]; if (this.head > 1024 && this.head * 2 > this.items.length) { this.items = this.items.slice(this.head); this.head = 0; } return x; }
+  get size() { return this.items.length - this.head; } }
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Why a `Map` is not an object, which the gate asks me to explain. An object's keys are strings or symbols only, so
+`obj[1]` and `obj['1']` are the same key, and object keys are converted to `'[object Object]'`. Objects inherit
+from `Object.prototype`, so a key like `__proto__` or `constructor` behaves specially and can be used for
+prototype pollution. Integer-like keys are iterated in numeric order before others, not in insertion order. A
+`Map` accepts any key (objects by identity), always keeps insertion order, has `size`, and is optimised for
+frequent adds and deletes.
+
+```ts
+const o: Record<string, number> = {}; o['b'] = 1; o['2'] = 2; o['a'] = 3; o['1'] = 4;
+console.log(Object.keys(o));                 // [ '1', '2', 'b', 'a' ]
+const m = new Map([['b', 1], ['2', 2], ['a', 3], ['1', 4]]);
+console.log([...m.keys()]);                  // [ 'b', '2', 'a', '1' ]
+const k = { id: 1 }; m.set(k as any, 5); console.log(m.get(k as any), m.get({ id: 1 } as any)); // 5 undefined
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+`NaN` works as a `Map` and `Set` key (they use SameValueZero, so `NaN` equals `NaN`); `new Set([{a:1},{a:1}])` has
+size 2 because objects compare by identity; `JSON.stringify(new Map([['a', 1]]))` gives `'{}'`, so maps need
+`Object.fromEntries` before serialising; sparse arrays (`[1,,3]`) skip holes in `forEach` but not in `for...of`.
+
+</Level>
+
+<Level name="Corner cases">
+
+A `Map` used as a cache keyed by request-supplied strings, with no size limit, is a memory leak an attacker can
+drive. A `WeakMap` keyed by objects lets entries disappear when the key object is garbage collected, which suits
+per-object metadata but cannot be iterated or sized. Objects built from user JSON and then used as lookup tables
+expose `__proto__`; `Object.create(null)` or a `Map` avoids it.
+
+</Level>
+
+<Level name="Production level">
+
+In production I pick the structure for the hot operation, bound every cache, prefer `Map` for dynamic keys, and
+use typed arrays or streaming when data is large. Profiling (the debugging topic) confirms the choice instead of
+guessing.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is to name the operation before the structure: "I need membership checks" means a set; "I need the
+oldest first" means a queue.
+
+</Level>
+
+<Level name="System design">
+
+The same choices reappear at system scale: Redis offers strings, hashes, sets, sorted sets and streams; Postgres
+offers B-tree indexes (trees) and hash indexes; job systems are queues. Knowing the small versions makes the
+big ones obvious.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement a queue, an LRU cache on top of `Map` and a tree walker, with tests and a benchmark against the naive
+array version. Done when I can explain why a `Map` is not an object with the code above, from memory.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Complexity: the cost of a loop, a lookup, a copy and a serialization
+
+<Figure art={`
+  n items        O(1)     O(log n)    O(n)        O(n log n)     O(n^2)
+  10             1        3           10          33             100
+  1,000          1        10          1,000       9,966          1,000,000
+  1,000,000      1        20          1,000,000   19,931,569     1,000,000,000,000
+  hidden O(n) inside "one line":
+    arr.includes(x)   arr.indexOf(x)   [...arr]   arr.slice()   JSON.stringify(obj)   str + str (in a loop)
+`} caption="Growth rates at three sizes. The quadratic column is why a feature that works with ten rows dies with a million." />
+
+<Levels label="Phase 1, complexity: the cost of a loop, a lookup, a copy and a serialization">
+
+<Level name="Beginner">
+
+Complexity describes how the work grows as the input grows. A loop over n items is O(n). A loop inside a loop is
+O(n squared). A `Map` lookup is O(1) on average, meaning it does not grow with the size. Big O ignores constants
+and keeps the growth, because growth is what decides whether a program survives real data.
+
+```ts
+// O(n^2): for each order, scan all users
+orders.map((o) => users.find((u) => u.id === o.userId));
+// O(n): build an index once, then look up
+const byId = new Map(users.map((u) => [u.id, u]));
+orders.map((o) => byId.get(o.userId));
+```
+
+The common mistake is not seeing the hidden loop: `find`, `includes`, `filter` and spread are all loops.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I measure as well as reason. With 20,000 orders and 20,000 users, the nested version does up to 400
+million comparisons; the indexed version does 40,000 operations.
+
+```ts
+console.time('nested'); orders.map((o) => users.find((u) => u.id === o.userId)); console.timeEnd('nested');
+console.time('map');    const byId = new Map(users.map((u) => [u.id, u])); orders.map((o) => byId.get(o.userId)); console.timeEnd('map');
+// nested: 1.204s
+// map: 4.118ms
+```
+
+(The exact times depend on the machine; the ratio is the point.) Copies and serialisation cost O(size) every time:
+`JSON.stringify` of a large object inside a loop, or spreading an array to append one item, makes a linear job
+quadratic.
+
+</Level>
+
+<Level name="Advanced">
+
+The finer points: average versus worst case (a hash map degrades with many collisions, which is why engines
+randomise hashing); amortised cost (`push` is O(1) amortised even though the array sometimes reallocates and copies
+everything); space complexity (an index costs memory). Sorting is O(n log n). Some costs are not about
+operations at all: cache misses, garbage collection pauses and the size of what crosses the network often
+dominate, so the measured profile beats the theory when they disagree.
+
+</Level>
+
+<Level name="Edge cases">
+
+Building a string with `+=` in a loop is usually fine in V8 (it uses ropes) but the final flattening still costs;
+`array.sort()` with no comparator sorts numbers as strings (`[10, 9, 1].sort()` gives `[1, 10, 9]`); `delete
+arr[i]` leaves a hole rather than shrinking; regular expressions with nested quantifiers can take exponential time
+on crafted input (ReDoS), like `/^(a+)+$/` on a long string of `a`s ending in `!`.
+
+</Level>
+
+<Level name="Corner cases">
+
+A cost that is fine per request but multiplied by an N+1 pattern: one query per item in a list of 500 is 500
+round trips, each cheap, together slow. Complexity applies across the network too. Serialising a large response
+blocks the event loop for every other request while it runs, so a 50 MB JSON response makes the whole server
+pause.
+
+</Level>
+
+<Level name="Production level">
+
+In production I look for growth: an endpoint whose latency grows with the tenant's data size, a job that slows as
+the table grows. Profiles and query plans show where; limits (pagination, maximum sizes) stop unbounded inputs
+from reaching quadratic code.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is to ask "what is n here, and how big can it get?" for every loop over data I do not control.
+
+</Level>
+
+<Level name="System design">
+
+Complexity at system scale is fan-out, round trips and data volume: N+1 queries, chatty services, a prompt that
+includes every document. The same reasoning picks indexes in Phase 4 and retrieval sizes in Phase 7.
+
+</Level>
+
+<Level name="Strategy">
+
+I take three quadratic snippets, predict their growth, measure at 1,000, 10,000 and 100,000 items, and fix each.
+Done when my predictions match the measured growth and each fix has a before-and-after time.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: HTTP: methods, headers, status codes, cookies, caching and CORS
+
+<Figure art={`
+  > GET /notes/7 HTTP/1.1
+  > Host: api.example.dev
+  > Cookie: sid=9f2c...
+  > If-None-Match: "v3"
+  >
+  < HTTP/1.1 304 Not Modified
+  < ETag: "v3"
+  < Cache-Control: private, max-age=0, must-revalidate
+  < Vary: Cookie
+  (no body: the browser reuses its cached copy)
+`} caption="One request and response as text. Every part of this topic is a line in this exchange." />
+
+<Levels label="Phase 1, HTTP: methods, headers, status codes, cookies, caching and CORS">
+
+<Level name="Beginner">
+
+HTTP is a text protocol for requests and responses. A request has a method (`GET` to read, `POST` to create,
+`PUT` or `PATCH` to update, `DELETE` to remove), a path, headers and an optional body. A response has a status code,
+headers and a body. Status codes group into 2xx success, 3xx redirects, 4xx client errors and 5xx server errors.
+
+```bash
+curl -i https://api.example.dev/notes/7
+```
+
+```text
+HTTP/1.1 404 Not Found
+content-type: application/json
+{"error":{"code":"not_found","message":"Note not found"}}
+```
+
+The common mistake is returning 200 with an error message in the body, which breaks every client, cache and
+monitor that trusts status codes.
+
+</Level>
+
+<Level name="Intermediate">
+
+Headers carry the rest. `Content-Type` says what the body is. Cookies are set by the server with `Set-Cookie` and
+sent back by the browser automatically. Caching uses `Cache-Control` (how long, and who may cache) and validators
+(`ETag` with `If-None-Match`) so unchanged resources cost a 304 instead of a full body. Methods have properties:
+`GET`, `PUT` and `DELETE` are idempotent (repeating them has the same effect), `POST` is not.
+
+```text
+Set-Cookie: sid=9f2c...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800
+```
+
+`HttpOnly` hides it from JavaScript, `Secure` sends it only over HTTPS, `SameSite=Lax` stops most cross-site
+sends.
+
+</Level>
+
+<Level name="Advanced">
+
+CORS, exactly: browsers block JavaScript on one origin (scheme, host and port) from reading responses from
+another, unless the server allows it with `Access-Control-Allow-Origin`. For requests that are not "simple" (a JSON
+content type, custom headers, methods other than GET, HEAD and POST), the browser first sends an `OPTIONS`
+preflight. CORS protects users' browsers, not my server: `curl` ignores it entirely.
+
+```text
+Access to fetch at 'https://api.example.dev/notes' from origin 'https://app.example.dev' has been blocked by
+CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin'
+header is present on the requested resource.
+```
+
+With cookies, the server must send the exact origin (not `*`) and `Access-Control-Allow-Credentials: true`.
+
+</Level>
+
+<Level name="Edge cases">
+
+Header names are case-insensitive; a `HEAD` request must not get a body; a 301 redirect may turn a `POST` into a
+`GET` in some clients (307 and 308 keep the method); `Content-Length` wrong by one byte hangs or truncates the
+response; a cookie without `Path` defaults to the current path's directory.
+
+</Level>
+
+<Level name="Corner cases">
+
+A shared cache (a CDN) plus a personalised response without `Cache-Control: private` or `Vary: Cookie`: one user's
+page is served to another. A CORS policy that reflects any `Origin` with credentials allowed lets any website
+read logged-in users' data, which is as bad as no same-origin policy at all.
+
+</Level>
+
+<Level name="Production level">
+
+In production I set caching headers on purpose for every route (private for personalised data, long-lived and
+immutable for hashed assets), keep a CORS allowlist, use the right status codes so monitoring can count errors,
+and log method, path, status and duration for every request.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is to read the raw exchange. When something is odd, `curl -i` or the browser's network tab shows the
+exact headers, and the answer is nearly always in them.
+
+</Level>
+
+<Level name="System design">
+
+HTTP semantics are what proxies, CDNs, caches and browsers rely on. Using them correctly gets caching, retries and
+monitoring for free from infrastructure I do not write; misusing them breaks all of it at once.
+
+</Level>
+
+<Level name="Strategy">
+
+I make twenty raw requests with `curl -i` against public APIs and my own server, explaining every header, then
+trigger a CORS failure on purpose and fix it. Done when I can read any request and response and say what each
+line does.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: JSON, validation and the boundary between untrusted input and my types
+
+<Flow
+  caption="The boundary. Data is unknown until it is validated; after that, the types are true."
+  steps={["Bytes arrive", "Limit size", "JSON.parse (may throw)", "Value is unknown", "Validate with a schema", "Typed value, or a 400 with field errors", "Business logic trusts the type"]}
+/>
+
+<Levels label="Phase 1, JSON, validation and the boundary between untrusted input and my types">
+
+<Level name="Beginner">
+
+JSON is the text format for data between programs: objects, arrays, strings, numbers, booleans and `null`.
+`JSON.parse` turns text into values and throws on invalid text. The key point is that TypeScript types do not exist
+at runtime: writing `as User` does not check anything. Data from outside (requests, files, APIs, model outputs) has
+to be validated before my code can trust its type.
+
+```ts
+const body = JSON.parse(raw) as { age: number };
+console.log(body.age + 1);   // with raw = '{"age":"41"}' this prints 411, not 42
+```
+
+The common mistake is the cast: it silences the compiler and lets wrong data flow deep into the program.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I validate at the boundary with a schema library such as zod, which checks the value and gives me
+the type from the same definition.
+
+```ts
+import { z } from 'zod';
+const CreateNote = z.object({ title: z.string().min(1).max(200), body: z.string().max(10_000), tags: z.array(z.string()).max(10).default([]) });
+type CreateNote = z.infer<typeof CreateNote>;
+const r = CreateNote.safeParse({ title: '', body: 5 });
+console.log(r.success ? r.data : r.error.flatten().fieldErrors);
+// { title: [ 'String must contain at least 1 character(s)' ], body: [ 'Expected string, received number' ] }
+```
+
+Those field errors become a 400 response the frontend can show next to each field.
+
+</Level>
+
+<Level name="Advanced">
+
+JSON's exact limits: no `undefined`, functions, `Date`, `Map`, `BigInt` or comments. `JSON.stringify` drops
+`undefined` properties, turns dates into ISO strings (which do not come back as dates), and throws on bigints and
+circular references. Numbers beyond 2 to the 53rd lose precision when parsed. The gate asks me to write a JSON parser
+from scratch, which teaches the grammar: a recursive descent parser with one function per value type.
+
+```ts
+function parse(s: string) { let i = 0;
+  const ws = () => { while (' \t\n\r'.includes(s[i])) i++; };
+  const value = (): unknown => { ws(); const c = s[i];
+    if (c === '{') return obj(); if (c === '[') return arr(); if (c === '"') return str();
+    if (s.startsWith('true', i)) { i += 4; return true; } if (s.startsWith('false', i)) { i += 5; return false; }
+    if (s.startsWith('null', i)) { i += 4; return null; } return num(); };
+  /* obj, arr, str (with escapes) and num follow the same pattern; each throws with the position on bad input */
+  return value(); }
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Duplicate keys (`{"a":1,"a":2}` gives 2, the last wins); a top-level value that is not an object (`"null"` parses to
+`null`, and code reading `.title` throws); a huge body sent to exhaust memory (limit the size before parsing);
+`"__proto__"` as a key; strings with lone surrogate characters; numbers like `1e400` that parse to `Infinity`.
+
+</Level>
+
+<Level name="Corner cases">
+
+A schema that allows unknown keys plus code that spreads the body into a database update: an attacker adds
+`"role":"admin"` and it is saved (mass assignment). Strict schemas (`.strict()`) or picking known fields fixes it.
+Model outputs are untrusted input too: a JSON reply from an LLM must be parsed and validated exactly like a request
+body, because it can be malformed or shaped by a prompt injection.
+
+</Level>
+
+<Level name="Production level">
+
+In production every boundary has a schema: request bodies, query strings, environment variables, webhook
+payloads, third-party responses, queue messages and model outputs. Validation errors are 400s with field details;
+invalid data from a dependency is logged and handled as that dependency's failure.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "unknown until proven." A type is a promise my code makes to itself, and only validation at the
+boundary makes it true.
+
+</Level>
+
+<Level name="System design">
+
+Schemas become contracts: Phase 3 generates OpenAPI from them, the frontend shares them, and Phase 8 validates
+structured model output with them. One schema per boundary, reused everywhere, is the design that keeps them in
+sync.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the JSON parser from scratch with tests from the JSON grammar (including escapes and bad input with
+positions), then add zod validation to every route in the server. Done when the parser passes my test suite and no
+route reads a field without a schema.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Testing: unit, integration, and the difference between a mock and a lie
+
+<Layers
+  caption="What each kind of test trusts. The more a test fakes, the less it proves about the real thing."
+  layers={[
+    { name: "End-to-end", note: "a real browser against the deployed app; slow, few, the most convincing" },
+    { name: "Integration", note: "real HTTP, real database in Docker; my code plus what it talks to" },
+    { name: "Unit", note: "one function, pure inputs and outputs; fast, many" },
+    { name: "Types and lint", note: "whole classes of mistake caught before any test runs" },
+  ]}
+/>
+
+<Levels label="Phase 1, testing: unit, integration, and the difference between a mock and a lie">
+
+<Level name="Beginner">
+
+A test is code that runs my code and checks the result. A unit test checks one function on its own. An
+integration test checks several parts working together: a real HTTP request to the server, a real database query.
+Node has a built-in test runner, so no library is needed to start.
+
+```ts
+// slug.test.ts
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { slug } from './slug.ts';
+test('slug lowercases and joins words', () => assert.equal(slug('Hello World'), 'hello-world'));
+```
+
+```text
+$ node --test
+✔ slug lowercases and joins words (0.6ms)
+ℹ tests 1  ℹ pass 1  ℹ fail 0
+```
+
+The common mistake is writing the test after the code and only for the happy path, so it never fails and proves
+nothing. A test I have not seen fail has not been tested itself.
+
+</Level>
+
+<Level name="Intermediate">
+
+A good test has three parts: arrange, act, assert. It tests behaviour (what goes in and what comes out), not
+implementation details, so a refactor does not break it. For the server, integration tests start it on a random
+port and make real requests.
+
+```ts
+import { before, after, test } from 'node:test';
+let server, base;
+before(async () => { server = createServer(handler).listen(0); await once(server, 'listening'); base = `http://localhost:${server.address().port}`; });
+after(() => server.close());
+test('POST /notes with no title is 400 with a field error', async () => {
+  const res = await fetch(`${base}/notes`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal(res.status, 400);
+  assert.deepEqual((await res.json()).error.fields.title, ['Required']);
+});
+```
+
+</Level>
+
+<Level name="Advanced">
+
+A mock is a fake replacement for a dependency. It becomes a lie when it behaves differently from the real thing:
+a mocked database that accepts a query the real one rejects, a mocked API that never times out, a mocked clock that
+never crosses midnight. Then the tests pass and production fails. My rules: fake only what I own the contract of
+or what is truly slow or external; prefer real dependencies in Docker for databases; and inject time and
+randomness instead of mocking modules.
+
+```ts
+// injected clock: the test controls time without sleeping
+export function makeLimiter(capacity: number, refillPerSec: number, now = () => Date.now()) { /* ... */ }
+const t = { ms: 0 }; const lim = makeLimiter(2, 1, () => t.ms);
+assert.ok(lim.take('a')); assert.ok(lim.take('a')); assert.ok(!lim.take('a'));
+t.ms += 1000; assert.ok(lim.take('a'));   // refilled one token after one second
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Tests that depend on order (one test leaves data the next relies on); tests that pass alone and fail in parallel
+because they share a port or a database table; tests that use the real clock and fail at midnight or on the last
+day of the month; snapshot tests approved without reading them.
+
+</Level>
+
+<Level name="Corner cases">
+
+A flaky async test, which the gate asks me to debug without a sleep. The cause is nearly always a race: the test
+asserts before the event it depends on has happened. Adding `setTimeout(500)` makes it pass most of the time and
+hides the bug. The fix is to await the real event (`await once(emitter, 'done')`, awaiting the returned promise,
+polling with a deadline), then prove it by running the test a hundred times in a loop.
+
+```bash
+for i in $(seq 100); do node --test test/queue.test.ts > /dev/null || { echo "failed on run $i"; break; }; done
+```
+
+</Level>
+
+<Level name="Production level">
+
+In production tests run on every push in CI, against a real Postgres for integration tests, and a failing or
+flaky test blocks the merge. Bug fixes start with a test that reproduces the bug. Coverage is a hint about untested
+code, not a target to game.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "make it fail first." I break the code on purpose and check that the test catches it; a test that
+cannot fail is decoration.
+
+</Level>
+
+<Level name="System design">
+
+Testability is a design property: pure functions, injected clocks and dependencies, and clear boundaries make
+code easy to test, and code that is hard to test is usually tangled. The same idea drives the evaluation harness
+for AI features in Phase 9, which is testing for outputs that are not deterministic.
+
+</Level>
+
+<Level name="Strategy">
+
+I write tests for the CLI and server as I build them, inject the clock into the rate limiter, and write one racy
+test on purpose and fix it without a sleep. Done when the hundred-run loop passes and every gate item has tests.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Debugging: stack traces, breakpoints, logging and reproducing a bug
+
+<Flow
+  caption="The debugging loop. Most time is saved in the first two steps."
+  steps={["Reproduce it reliably", "Shrink to the smallest case", "Read the stack trace from the top", "Form one hypothesis", "Test it (breakpoint or log)", "Fix", "Add a test that would have caught it"]}
+/>
+
+<Levels label="Phase 1, debugging: stack traces, breakpoints, logging and reproducing a bug">
+
+<Level name="Beginner">
+
+Debugging is finding why the program does something different from what I expected. A stack trace shows where an
+error happened and the chain of calls that led there; the top line is the error, the next lines are the most
+recent calls first.
+
+```text
+TypeError: Cannot read properties of undefined (reading 'title')
+    at renderNote (/srv/app/src/render.ts:14:22)
+    at handleGet (/srv/app/src/routes/notes.ts:31:10)
+    at Server.<anonymous> (/srv/app/src/server.ts:48:5)
+```
+
+Line 14 of `render.ts` read `.title` from something undefined, called from line 31 of `notes.ts`. The common
+mistake is changing code at random until the error goes away, which often moves the bug instead of fixing it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The tools, in the order I reach for them: read the trace; reproduce with the smallest input; add a breakpoint and
+inspect the values. Node has a built-in inspector that Chrome DevTools or VS Code attaches to, and `debugger;` in
+the code pauses there.
+
+```bash
+node --inspect-brk dist/server.js
+# Debugger listening on ws://127.0.0.1:9229/... ; open chrome://inspect
+```
+
+Logging is for things I cannot pause: production, timing problems, many requests. Structured logs with a request
+ID let me filter one request's story. Source maps (`node --enable-source-maps`) make traces point at the
+TypeScript lines, not the compiled ones.
+
+</Level>
+
+<Level name="Advanced">
+
+The method underneath is the scientific one: one hypothesis at a time, a test that would prove it wrong, and a
+written log of what I tried. `git bisect` finds the commit that introduced a bug by binary search, which takes
+about 10 steps across 1,000 commits.
+
+```bash
+git bisect start; git bisect bad HEAD; git bisect good v1.2.0
+git bisect run node --test test/regression.test.ts
+# 3f2a1c9 is the first bad commit
+```
+
+Async stack traces in Node include the `await` chain, but callbacks scheduled with timers or event emitters
+lose the original caller, so the request ID in logs is what connects them.
+
+</Level>
+
+<Level name="Edge cases">
+
+A bug that disappears under the debugger (a timing race, a Heisenbug); a bug only in production because of real
+data (an emoji in a name, a null in an old row); a bug that depends on time zone or locale (`toLocaleDateString`
+differs between my laptop and the server); minified code with no source maps.
+
+</Level>
+
+<Level name="Corner cases">
+
+A memory leak: no error, just a process that grows until it is killed. Heap snapshots (`node --inspect`, then a
+snapshot in DevTools, taken twice minutes apart and compared) show which objects grow. A swallowed promise
+rejection with no trace at all: `node --trace-uncaught` and an `unhandledRejection` handler that logs the stack help
+find it.
+
+</Level>
+
+<Level name="Production level">
+
+In production I cannot attach a debugger, so the system must explain itself: structured logs with request IDs,
+error tracking with stack traces and source maps, metrics, and the ability to reproduce a request locally from
+its logged inputs (minus personal data). Every fixed bug gets a regression test.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "the computer is doing exactly what the code says." The bug is in my assumptions, and each
+experiment is designed to find which one is wrong.
+
+</Level>
+
+<Level name="System design">
+
+Debuggability is designed in: clear error messages, correlation IDs, traces, deterministic tests and small
+commits that make bisect useful. Phase 5's observability is this topic for a system that runs without me
+watching.
+
+</Level>
+
+<Level name="Strategy">
+
+I keep a debugging journal: for every bug this phase, the symptom, the hypotheses, what proved it and the test I
+added. I also bisect one regression on purpose. Done when the journal has ten entries and the last few took less
+time than the first.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: Git: small commits, branches and a readable history
+
+<Figure art={`
+  * 9c1e2f0 (HEAD -> feat/rate-limit) Return 429 with Retry-After when the bucket is empty
+  * 4b7d3a1 Add a token bucket with an injected clock, and tests for refill
+  * e02f9b8 Add request IDs to every log line
+  | * 7aa01c3 (main) Fix 405 for unknown methods on known paths
+  |/
+  * 1d9c4e7 Route requests by method and path, with params
+  each commit: one reason to change, tests passing, a message that says why
+`} caption="A readable history. Each commit could be reverted on its own and the message says what changed and why." />
+
+<Levels label="Phase 1, Git: small commits, branches and a readable history">
+
+<Level name="Beginner">
+
+Git records snapshots of the project as commits. A branch is a movable name pointing at a commit, used to work on
+something without disturbing `main`. A good commit is small, does one thing, leaves the tests passing and has a
+message that says what it does and why.
+
+```bash
+git switch -c feat/rate-limit
+git add src/limiter.ts test/limiter.test.ts
+git commit -m "Add a token bucket with an injected clock, and tests for refill"
+git log --oneline -5
+```
+
+The common mistake is a single commit at the end of the day called "changes", which cannot be reviewed, reverted
+or bisected.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I stage deliberately (`git add -p` to pick hunks), keep a branch per piece of work, and merge to
+`main` through a pull request even when I work alone, because the diff view is a review. When `main` moves, I
+rebase my unpublished branch on it or merge it in; both are fine, as long as published history is not rewritten.
+
+```text
+$ git status
+On branch feat/rate-limit
+Changes to be committed:
+	modified:   src/limiter.ts
+Changes not staged for commit:
+	modified:   src/server.ts
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The model underneath: a commit is a snapshot (a tree of file contents) plus parent pointers, an author and a
+message, all named by a hash of that content. Branches and tags are just names for hashes, and `HEAD` is the
+current one. Because commits are content-addressed, changing any earlier commit changes every hash after it, which
+is why rewriting shared history breaks everyone who has it. `git reflog` records where `HEAD` has been, so "lost"
+commits can almost always be recovered.
+
+```bash
+git reflog -5
+# 9c1e2f0 HEAD@{0}: commit: Return 429 with Retry-After when the bucket is empty
+# 4b7d3a1 HEAD@{1}: reset: moving to HEAD~1
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A merge conflict (both sides changed the same lines) is resolved by editing the file to the correct combined
+version, then `git add` and continuing, and running the tests before committing; line-ending differences between
+Windows and Linux show whole files as changed (`.gitattributes` fixes it); a large binary committed by mistake stays
+in history forever; a file in `.gitignore` that was already tracked stays tracked until `git rm --cached`.
+
+</Level>
+
+<Level name="Corner cases">
+
+A secret committed and then deleted in the next commit is still in history, and once pushed it must be treated as
+leaked: rotate the key first, then consider cleaning history. A force push to a shared branch erases teammates'
+commits from the remote. `--force-with-lease` refuses if the remote moved, and protected branches forbid it.
+
+</Level>
+
+<Level name="Production level">
+
+In production history is a tool: small commits make review fast, bisect effective and reverts safe. `main` is
+protected, needs passing CI, and every deploy maps to a commit. Commit messages explain why, because the diff
+already shows what.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "write history for the person debugging this in a year," who may be me. Each commit is a sentence in
+the project's story.
+
+</Level>
+
+<Level name="System design">
+
+Git is the source of truth for code, infrastructure, schema migrations, prompts and evaluation sets in later
+phases. Small, reviewed, reversible changes in Git are what make deploys, rollbacks and audits work.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the whole phase in small commits on branches with pull requests, practise a conflict, a revert, a bisect
+and a reflog recovery on a scratch repository. Done when the Phase 1 repository's `git log --oneline` reads like a
+changelog.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: the build: a CLI tool and an HTTP server without a framework
+
+<Figure art={`
+  node:http server
+    request -> logger (id, method, path, status, ms)
+            -> rate limiter (token bucket per IP, 429 + Retry-After)
+            -> router: match method + path, extract :params  -> 404 / 405
+            -> body: size limit -> JSON.parse -> schema validate -> 400 with fields
+            -> handler -> JSON response
+            -> error handler: expected -> 4xx; bug -> 500 with request id
+  CLI: notes add|list|rm  -> same validation, exit codes 0/1/2
+  router extracted into a small library with its own README and tests
+`} caption="The Phase 1 build. Every box is something the gate asks me to write or explain from scratch." />
+
+<Levels label="Phase 1, the build: a CLI tool and an HTTP server without a framework">
+
+<Level name="Beginner">
+
+The build is two programs and a library. A CLI tool (for example a notes tool: add, list, remove, stored in a
+JSON file) and an HTTP server with no framework, using only `node:http`. The server routes requests, parses JSON,
+validates input, returns useful errors and has tests. Then a rate limiter and a request logger, and finally the
+router rebuilt as a small library with documented API. No framework is the point: everything Express would hide, I
+write once.
+
+</Level>
+
+<Level name="Intermediate">
+
+The router matches method and path, extracts parameters, and distinguishes 404 (no such path) from 405 (path
+exists, method not allowed, with an `Allow` header).
+
+```ts
+type Handler = (req: IncomingMessage, res: ServerResponse, params: Record<string, string>) => Promise<void>;
+const routes: { method: string; parts: string[]; h: Handler }[] = [];
+export const add = (method: string, path: string, h: Handler) => routes.push({ method, parts: path.split('/').filter(Boolean), h });
+export function match(method: string, url: string) {
+  const segs = new URL(url, 'http://x').pathname.split('/').filter(Boolean); let pathMatched = false;
+  for (const r of routes) {
+    if (r.parts.length !== segs.length) continue;
+    const params: Record<string, string> = {};
+    if (!r.parts.every((p, i) => (p.startsWith(':') ? ((params[p.slice(1)] = decodeURIComponent(segs[i])), true) : p === segs[i]))) continue;
+    pathMatched = true; if (r.method === method) return { h: r.h, params };
+  }
+  return pathMatched ? 405 : 404;
+}
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The rate limiter is a token bucket per client with an injected clock: each client has up to N tokens, refilled at
+a fixed rate; a request takes one or gets a 429 with `Retry-After`. The body reader enforces a size limit while
+streaming, before parsing, so a huge body is rejected without being held in memory.
+
+```ts
+async function readJson(req: IncomingMessage, limit = 100_000) {
+  let size = 0; const chunks: Buffer[] = [];
+  for await (const c of req) { size += c.length; if (size > limit) throw new HttpError(413, 'body too large'); chunks.push(c); }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new HttpError(400, 'invalid JSON'); }
+}
+```
+
+```text
+$ curl -i -X DELETE localhost:3000/notes
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, POST
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Trailing slashes (`/notes/` versus `/notes`), encoded characters in parameters (`%2F`), query strings, an empty body
+on a POST, a `Content-Type` that is not JSON, a client that sends the body slowly, a path with `..` segments, a
+`HEAD` request. Each gets a test.
+
+</Level>
+
+<Level name="Corner cases">
+
+A rate limiter keyed by IP behind a proxy sees every request from the proxy's IP, so all clients share one bucket;
+the key comes from `X-Forwarded-For` only when the proxy is trusted. A limiter map that never forgets idle clients
+grows forever, so idle buckets are removed. A handler that throws after starting the response cannot send a 500
+any more; the error handler checks `res.headersSent` and destroys the connection instead.
+
+</Level>
+
+<Level name="Production level">
+
+The server shuts down gracefully on `SIGTERM`, logs one structured line per request with a request ID, has a
+health route, and passes its tests in CI. The CLI exits with the right codes and prints errors to stderr.
+
+</Level>
+
+<Level name="Mindset">
+
+Writing it without a framework is not about avoiding frameworks forever. It is about knowing exactly what the
+framework does, so in Phase 3 its behaviour is never magic.
+
+</Level>
+
+<Level name="System design">
+
+This small server already has the layers of every backend: logging, limiting, routing, parsing, validation,
+handlers, error mapping. Phase 3 replaces pieces with libraries and adds a database, auth and jobs, but keeps the
+shape.
+
+</Level>
+
+<Level name="Strategy">
+
+CLI in week 4, server in week 5, limiter, logger and router library in week 6, each in small commits with tests.
+Done when the router library has a README documenting its API and every gate item below passes closed-book.
+
+</Level>
+
+</Levels>
+
+#### Phase 1: exercises
+
+- Predict and run twenty snippets on references, copies, scope and floating point.
+- Write `memoize`, `once` and `debounce` from scratch, with tests.
+- Predict the output order of five event loop snippets, then run them.
+- Fetch twenty URLs with a concurrency limit of five and measure against sequential and unbounded.
+- Give the CLI a result type, custom errors and exit codes, each with a test.
+- Implement a queue and an LRU cache and benchmark them against naive arrays.
+- Turn three quadratic snippets into linear ones and record the timings.
+- Make twenty raw requests with `curl -i` and explain every header.
+- Write a JSON parser and compare it with `JSON.parse` on valid and invalid inputs.
+- Write a racy async test, prove it flakes, and fix it without a sleep.
+- Bisect a regression on purpose and recover a lost commit with the reflog.
+
+#### Phase 1: the gate
+
+<Compare
+  caption="Passing the gate, item by item"
+  left="Gate item"
+  right="How I prove it"
+  rows={[
+    ["A router from scratch", "blank file, 30 minutes, 404 and 405 and params, tests pass"],
+    ["A JSON parser from scratch", "agrees with JSON.parse on a test corpus, rejects invalid input with a position"],
+    ["A rate limiter from scratch", "token bucket with an injected clock, a test for refill and for 429"],
+    ["The event loop with a concrete example", "predict and explain the nextTick, promise and timeout ordering aloud"],
+    ["A failing async test without a sleep", "find the race, await the real event, the test passes 100 times in a row"],
+    ["Why a Map is not an object", "key coercion, prototype keys, ordering and size, with a snippet each"],
+  ]}
+/>
+
+I take the gate closed-book. For the async test, I write a deliberately racy test, run it in a loop to prove it
+flakes, then fix it and run the loop again to prove it does not. A gate item I can only pass with notes open goes
+back on the board for another week.

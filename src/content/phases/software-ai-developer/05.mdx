@@ -1,0 +1,1682 @@
+---
+plan: software-ai-developer
+phase: 5
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Six weeks on the second skill. Shipping is one skill; operating is a different one, and this phase is about
+the second. The primary books are *Release It!* and *Site Reliability Engineering*, with the Google SRE books
+(free online), the OpenTelemetry docs and the Docker docs as references, and *Accelerate* for the research on
+delivery performance. The phase ends with a pipeline, dashboards, alerts that page only when users are
+affected, a runbook, a game day and a postmortem.
+
+#### Phase 5: how I would learn it
+
+Fourteen topics, learned from the bottom of the stack up: the Linux box, the container, the pipeline, the
+infrastructure, the traffic layer, then the signals and the human process on top. For part of the phase I move
+the Phase 3 API from the Phase 0 platform to a small VPS, so I can see each layer the platform was hiding,
+then decide where it should live. Every topic leaves a command transcript, a config file or a dashboard
+screenshot description in the study log.
+
+<Timeline
+  caption="Phase 5's six weeks"
+  items={[
+    { when: "week 25", what: "Linux processes, files, permissions, ports and signals; Docker images, layers, volumes, networks, multi-stage builds." },
+    { when: "week 26", what: "CI/CD from build to rollback; the smallest useful infrastructure as code; cloud primitives." },
+    { when: "week 27", what: "Reverse proxies, load balancers, health checks, zero-downtime deploys; environments; configuration and secrets." },
+    { when: "week 28", what: "Observability: logs, metrics, traces, dashboards, alerts; SLOs and SLIs." },
+    { when: "week 29", what: "Incident response; scaling; feature flags, canaries and rollbacks; cost as a metric." },
+    { when: "week 30", what: "Runbook, game day, postmortem. Then the gate." },
+  ]}
+/>
+
+<Flow
+  caption="The operating loop this phase builds. Every incident feeds the next round of alerts and runbooks."
+  steps={["Commit", "CI: build, test, scan", "Artefact (image digest)", "Deploy (canary)", "Observe: SLIs, logs, traces", "Alert when users hurt", "Respond and mitigate", "Postmortem", "Fix and add a check"]}
+/>
+
+#### Phase 5: Linux: processes, files, permissions, ports and signals
+
+<Figure art={`
+  $ ps -o pid,ppid,user,stat,cmd -C node
+    PID  PPID USER  STAT CMD
+    812     1 app   Ssl  node dist/server.js
+  $ ss -ltnp | grep 3000
+  LISTEN 0 511 0.0.0.0:3000  users:(("node",pid=812,fd=21))
+  $ ls -l /srv/app/.env
+  -rw------- 1 app app 412 Oct 23 18:40 /srv/app/.env      (owner read/write only)
+  $ kill -TERM 812      -> graceful shutdown handler runs
+  $ kill -KILL 812      -> no handler, process gone immediately
+`} caption="The five things this topic covers, on one screen: a process, its parent, its port, a file's permissions, and two signals." />
+
+<Levels label="Phase 5, Linux: processes, files, permissions, ports and signals">
+
+<Level name="Beginner">
+
+Every server I deploy to is Linux, even when a platform hides it. A process is a running program with a
+process ID (PID), an owner and open files. Files have an owner, a group and permissions for read, write and
+execute. A port is a number a process listens on for network connections. A signal is a message the kernel
+delivers to a process, such as "please stop" (`SIGTERM`) or "stop now" (`SIGKILL`).
+
+```bash
+ps aux | grep node        # which processes, which user
+ss -ltnp                  # which ports are listening, by which process
+ls -l /srv/app            # owners and permissions
+journalctl -u app -n 50   # last 50 log lines of a systemd service
+```
+
+The common mistake is running the app as root, so any bug that runs a command runs it with full control of the
+machine.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I run the app as its own user, under a supervisor (systemd on a VPS, the container runtime in
+Docker) that restarts it when it crashes and captures its logs. Permissions are written in octal: `640` is
+owner read and write, group read, others nothing. Ports below 1024 need privileges, so the app listens on 3000
+and a reverse proxy listens on 443.
+
+```ini
+# /etc/systemd/system/app.service
+[Service]
+User=app
+WorkingDirectory=/srv/app
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+EnvironmentFile=/srv/app/.env
+KillSignal=SIGTERM
+TimeoutStopSec=30
+```
+
+```text
+Error: listen EADDRINUSE: address already in use :::3000
+```
+
+That error means another process holds the port; `ss -ltnp` shows which.
+
+</Level>
+
+<Level name="Advanced">
+
+The model underneath: each process has a parent; when a child exits, the parent must collect its status or it
+stays as a zombie. PID 1 is special: the kernel does not apply default signal actions to it, so a Node process
+running as PID 1 in a container ignores `SIGTERM` unless it installs a handler (or an init like `tini` runs as
+PID 1). Everything is a file descriptor (files, sockets, pipes), and the per-process limit (`ulimit -n`) caps
+open connections. Memory limits enforced by cgroups end in the OOM killer sending `SIGKILL`, which leaves exit
+code 137 (128 plus signal 9).
+
+</Level>
+
+<Level name="Edge cases">
+
+A full disk (`df -h`) makes writes and logs fail in strange ways; inodes can run out with space left (`df -i`);
+a deleted log file still held open keeps using space until the process restarts; the clock drifting without NTP
+breaks TLS and token expiry; a `.env` file readable by every user leaks secrets to any process on the box.
+
+</Level>
+
+<Level name="Corner cases">
+
+`npm start` as the container command plus `SIGTERM`: npm may not forward the signal to Node, so graceful
+shutdown never runs and the platform kills it after the grace period. Running `node` directly fixes it. A
+process that forks children plus a kill of only the parent: the children are orphaned and keep holding the
+port.
+
+</Level>
+
+<Level name="Production level">
+
+In production I can answer, on any box: what is running, as whom, on which port, how much memory and CPU it
+uses (`top`, `free -m`), how much disk is free, and what the last error was. Hosts get automatic security
+updates, SSH by key only, and a firewall allowing only the ports I need.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "the platform is a Linux box I cannot see." When something odd happens on a managed platform,
+I ask which process, file, port or signal it is about, because it is always one of them.
+
+</Level>
+
+<Level name="System design">
+
+Containers, systemd units and platform services are all wrappers around these same primitives: processes in
+groups with limits, files with permissions, ports and signals. Understanding them is what makes Docker,
+Kubernetes and serverless debuggable rather than magic.
+
+</Level>
+
+<Level name="Strategy">
+
+I set up a fresh VPS by hand once: a user, SSH keys, firewall, the app as a systemd service, logs in journald,
+then I break it four ways (port in use, wrong permission, full disk, killed process). Done when I can diagnose
+each from the shell in under five minutes.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Docker: images, layers, volumes, networks and multi-stage builds
+
+<Layers
+  caption="An image is a stack of read-only layers; a container adds one writable layer on top. Order the stack so the slow-changing layers sit at the bottom."
+  layers={[
+    { name: "Container writable layer", note: "lost when the container is removed; use volumes for data" },
+    { name: "COPY dist/ (my code)", note: "changes on every commit" },
+    { name: "RUN npm ci --omit=dev", note: "changes when the lockfile changes" },
+    { name: "COPY package*.json", note: "small, changes rarely" },
+    { name: "FROM node:22-slim", note: "base OS and runtime, pinned by version or digest" },
+  ]}
+/>
+
+<Levels label="Phase 5, Docker: images, layers, volumes, networks and multi-stage builds">
+
+<Level name="Beginner">
+
+A Docker image packages the app with its runtime and dependencies, so it runs the same everywhere. A container
+is a running instance of an image. A Dockerfile lists the steps to build the image, and each step creates a
+layer that Docker caches.
+
+```dockerfile
+FROM node:22-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY dist ./dist
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+The common mistake is `COPY . .` before `npm ci`: any code change invalidates the cache and reinstalls every
+dependency, so builds take minutes instead of seconds.
+
+</Level>
+
+<Level name="Intermediate">
+
+A multi-stage build compiles in one stage with all the dev tools and copies only the output into a small final
+stage. Volumes keep data outside the container's writable layer (a database's files). Networks let containers
+reach each other by service name in Docker Compose. A `.dockerignore` keeps `node_modules`, `.git` and `.env`
+out of the build context.
+
+```dockerfile
+FROM node:22 AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+</Level>
+
+<Level name="Advanced">
+
+How it works underneath: containers are ordinary Linux processes with namespaces (their own view of PIDs,
+network, mounts) and cgroups (limits on CPU and memory). Layers are stacked by a union file system; a file
+deleted in a later layer still exists in the earlier one, so a secret copied in and then deleted is still in
+the image. Build secrets go through `RUN --mount=type=secret`. Images are addressed by a content digest
+(`sha256:...`); tags like `latest` move, digests do not.
+
+```text
+$ docker history app:1.4.2
+IMAGE        CREATED BY                              SIZE
+3f1c...      CMD ["node" "dist/server.js"]           0B
+a91e...      COPY /app/dist ./dist                   2.1MB
+77b0...      RUN npm ci --omit=dev                   48MB
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+An image built on an ARM laptop does not run on an x86 server (`exec format error`) without `--platform` or a
+multi-platform build. Native modules (argon2, sharp) compiled on Alpine's musl do not work on Debian's glibc and
+the other way round. `localhost` inside a container is the container itself, not the host. A bind-mounted
+`node_modules` from macOS breaks inside a Linux container.
+
+</Level>
+
+<Level name="Corner cases">
+
+A container with a memory limit plus Node's default heap: Node versions before 20 sized the heap from the host's
+memory, not the container's limit, and got OOM-killed (exit 137). Current versions read the cgroup limit, and
+`--max-old-space-size` sets it explicitly. A health check in the Dockerfile plus a platform with its own health
+check: two checks with different timeouts disagree about whether the container is healthy.
+
+</Level>
+
+<Level name="Production level">
+
+In production images are small (slim or distroless bases), run as a non-root user, are scanned for known
+vulnerabilities in CI, are built once and promoted by digest through environments, and carry labels with the
+git commit. Compose is for local development and small single-host deploys.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "an image is a build artefact, like a compiled binary." It is built once, identified by digest,
+and the same bytes run in staging and production.
+
+</Level>
+
+<Level name="System design">
+
+The container is the unit every later tool schedules: platforms, Kubernetes, serverless containers. Getting
+the image right (small, non-root, signal-aware, configured by environment) makes the choice of where it runs
+reversible.
+
+</Level>
+
+<Level name="Strategy">
+
+I containerise the API with a multi-stage build, measure image size and rebuild time before and after ordering
+layers, and run it with Postgres and Redis in Compose. Done when the image is under a size I set, runs as
+non-root, and shuts down gracefully on `docker stop`.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: CI/CD: build, test, artefact, deploy and rollback
+
+<Flow
+  caption="A pipeline from commit to production. The artefact is built once; deploys and rollbacks move a pointer to a digest."
+  steps={["Push or pull request", "Install from lockfile", "Lint, type-check, unit tests", "Integration tests (real Postgres)", "Build image, scan, push by digest", "Deploy to staging, smoke test", "Deploy to production (canary)", "Rollback = redeploy previous digest"]}
+/>
+
+<Levels label="Phase 5, CI/CD: build, test, artefact, deploy and rollback">
+
+<Level name="Beginner">
+
+Continuous integration (CI) runs the build and tests on every push, so broken code is caught before it is
+merged. Continuous delivery (CD) deploys every merged change automatically, or with one click. A rollback puts
+the previous version back.
+
+```yaml
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run lint && npm run typecheck && npm test
+```
+
+The common mistake is a pipeline that only runs on `main`, so problems are found after merging, when they
+block everyone.
+
+</Level>
+
+<Level name="Intermediate">
+
+A real pipeline has stages, each gating the next: fast checks first, integration tests with a Postgres service
+container, then the image build. The artefact is pushed with the commit SHA as its tag and recorded by digest.
+Deploying means telling the platform to run that digest; rolling back means telling it to run the previous
+one, which takes seconds because nothing is rebuilt.
+
+```yaml
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: test }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The principles underneath, from *Accelerate*'s research: small, frequent changes with fast feedback correlate
+with both speed and stability, measured by four metrics (deployment frequency, lead time for changes, change
+failure rate, time to restore). Pipelines should be deterministic: pinned action versions (by SHA for
+third-party actions), lockfile installs, cached dependencies keyed on the lockfile hash. Secrets in CI are
+scoped to the jobs that need them, and short-lived cloud credentials through OIDC replace long-lived keys.
+
+</Level>
+
+<Level name="Edge cases">
+
+A flaky test that fails one run in twenty trains everyone to click "re-run" and ignore real failures; I
+quarantine and fix flaky tests. Pull requests from forks do not get secrets (good, and it means some jobs
+cannot run for them). A migration that must run before the new code: the pipeline runs migrations as their own
+step and stops if they fail.
+
+</Level>
+
+<Level name="Corner cases">
+
+Rollback plus a migration: rolling the code back to a version that does not understand the new schema breaks
+it, which is why Phase 4's expand and contract keeps every migration compatible with the previous app version.
+Rollback plus a changed message or cache format: old code reads data the new code wrote. Rolling back is safe
+only when every change was backward compatible.
+
+</Level>
+
+<Level name="Production level">
+
+In production the main branch is always deployable, deploys happen many times a week with no ceremony, every
+deploy is recorded (who, what commit, when), and rollback is practised, not theoretical. I track the four
+metrics for my own project, even as one person.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "if it hurts, do it more often." Deploys and rollbacks become boring by doing them constantly in
+small pieces.
+
+</Level>
+
+<Level name="System design">
+
+The pipeline is the system that builds the system. It holds credentials to production, so it is a security
+boundary too (Phase 6's supply chain topic), and its speed sets how fast every fix reaches users.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the pipeline in stages, time each, then deploy a deliberately broken change to staging and roll it back,
+timing the rollback. Done when the gate's "deploy a change and roll it back" is a recorded run with both
+timings.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Infrastructure as code: the smallest useful setup
+
+<Compare
+  left="Option"
+  right="When it is the smallest useful setup"
+  caption="Infrastructure as code at three sizes. Pick the smallest one that makes the setup reproducible."
+  rows={[
+    ["platform config file (fly.toml, render.yaml)", "one app, one database, managed by the platform"],
+    ["Compose plus a provisioning script", "one VPS, a few containers"],
+    ["Terraform or OpenTofu, or Pulumi in TypeScript", "several cloud resources, DNS, buckets, more than one environment"],
+    ["Kubernetes", "many services and a team to run it; not this phase"],
+  ]}
+/>
+
+<Levels label="Phase 5, infrastructure as code: the smallest useful setup">
+
+<Level name="Beginner">
+
+Infrastructure as code (IaC) means describing servers, databases, buckets and DNS records in files in the
+repository, and creating them with a tool, instead of clicking in a console. The files are reviewed, versioned
+and repeatable: if the environment is lost, it can be recreated.
+
+```hcl
+resource "aws_s3_bucket" "uploads" { bucket = "notes-uploads-prod" }
+resource "aws_s3_bucket_public_access_block" "uploads" {
+  bucket = aws_s3_bucket.uploads.id
+  block_public_acls = true
+  block_public_policy = true
+  ignore_public_acls = true
+  restrict_public_buckets = true
+}
+```
+
+The common mistake is a Kubernetes cluster for one app, which adds a system I cannot debug to an app that did
+not need it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The workflow: write the desired state, run `plan` to see the changes, review, then `apply`. The tool keeps a
+state file mapping the config to real resources; it lives in remote storage with locking, never on a laptop,
+and it contains secrets, so it is protected.
+
+```text
+$ tofu plan
+  # aws_s3_bucket.uploads will be created
+  + resource "aws_s3_bucket" "uploads" {
+      + bucket = "notes-uploads-prod"
+    }
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The model underneath is declarative reconciliation: the tool compares desired state, recorded state and real
+state, and computes a plan to converge them. Drift is when someone changes a resource by hand; the next plan
+shows it and would undo it. Some changes force replacement (destroy then create), which for a database means
+data loss; `prevent_destroy` lifecycle rules and careful reading of `plan` output guard against it. Modules and
+variables make staging and production the same code with different inputs.
+
+</Level>
+
+<Level name="Edge cases">
+
+Renaming a resource in code looks to the tool like deleting one and creating another (a `moved` block tells it
+otherwise); two people applying at once without state locking corrupt the state; a provider upgrade changes
+defaults; resources created by hand before IaC must be imported.
+
+</Level>
+
+<Level name="Corner cases">
+
+A plan that says "1 to destroy" on the production database because an argument changed that forces
+replacement: applied without reading, it deletes the data, and backups decide how bad the day is. Secrets
+passed as variables end up in the state file in plain text, so they come from a secret manager at runtime, not
+through IaC values.
+
+</Level>
+
+<Level name="Production level">
+
+In production plans run in CI on every pull request and are posted for review, applies happen from CI with
+scoped credentials, and drift detection runs on a schedule. Nothing in production is created by hand except in
+an incident, and those changes are written back into code afterwards.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "the smallest setup I can rebuild from scratch." Reproducibility is the goal; sophistication is a
+cost.
+
+</Level>
+
+<Level name="System design">
+
+IaC is what makes environments (the next topics) cheap: preview and staging become copies of production's code
+with smaller inputs. It also documents the system's real shape better than any diagram, because it cannot
+drift from it.
+
+</Level>
+
+<Level name="Strategy">
+
+I describe the bucket, DNS records and database for the capstone in the smallest tool that fits, destroy the
+staging environment, and recreate it from code. Done when staging comes back with one command and the plan
+afterwards shows no changes.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Cloud primitives: compute, object storage, managed Postgres, DNS, TLS and secrets
+
+<Figure art={`
+  user -> DNS: api.example.dev ?  -> A/AAAA or CNAME -> load balancer
+  user -> TLS handshake with load balancer (certificate for api.example.dev, auto-renewed)
+       -> HTTP -> compute (2 containers) --private network--> managed Postgres (backups, PITR)
+                                         \\----------------> object storage (private bucket)
+                                          \\---------------> secret manager (read at start)
+`} caption="The six primitives one request touches. Each is a managed service I configure rather than a server I run." />
+
+<Levels label="Phase 5, cloud primitives: compute, object storage, managed Postgres, DNS, TLS and secrets">
+
+<Level name="Beginner">
+
+Almost every product is built from the same six cloud primitives: compute (where code runs: VMs, containers,
+functions), object storage (files), a managed database (Postgres with backups handled for me), DNS (names to
+addresses), TLS (encrypted connections with certificates) and a secret manager (credentials outside the code).
+
+```bash
+dig +short api.example.dev
+openssl s_client -connect api.example.dev:443 -servername api.example.dev < /dev/null | openssl x509 -noout -dates
+```
+
+The common mistake is exposing the database to the internet with a password as the only protection.
+
+</Level>
+
+<Level name="Intermediate">
+
+The choices that matter: compute that scales to more than one instance (so deploys and failures are survivable),
+a managed Postgres in a private network reachable only from the app, TLS certificates from Let's Encrypt or the
+platform renewed automatically, DNS with a low TTL on records I might change during an incident, and IAM roles
+that give each service only the permissions it needs.
+
+```json
+{ "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::notes-uploads-prod/t/*" }
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The details underneath: DNS answers are cached for their TTL across resolvers, so a change takes up to the old
+TTL to reach everyone, and some resolvers ignore low TTLs. TLS termination happens at the load balancer or the
+app; behind a terminating proxy, the app must trust `X-Forwarded-Proto` only from the proxy. Managed databases
+have connection limits tied to instance size, so a pooler (PgBouncer or the platform's) sits between many app
+instances and the database. Serverless functions open a connection per instance and can exhaust those limits
+quickly.
+
+</Level>
+
+<Level name="Edge cases">
+
+A certificate that expires because renewal silently failed (monitor expiry dates); a CNAME at the zone apex,
+which DNS does not allow (providers offer ALIAS or flattening); a region outage; egress costs for moving data
+between regions or to the internet; a managed database's maintenance window restarting it.
+
+</Level>
+
+<Level name="Corner cases">
+
+IAM permissions that are wide in staging and narrow in production: everything works in staging and fails in
+production with `AccessDenied`. Same policies in both, different resource names. A deleted DNS record for a
+subdomain still pointing at a released cloud resource (a dangling record) lets someone else claim the resource
+and serve content on my domain, which is subdomain takeover.
+
+</Level>
+
+<Level name="Production level">
+
+In production I know each primitive's limits, failure modes and bill: database connections and storage, bucket
+request costs, compute memory, DNS TTLs, certificate expiry. All of it is in IaC, with alerts on certificate
+expiry, database storage and connection count.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "managed does not mean unmanaged." The provider runs the service; I still own its configuration,
+limits, permissions and cost.
+
+</Level>
+
+<Level name="System design">
+
+Choosing primitives is choosing failure modes. A single region is simpler and fails as a whole; multi-region
+survives more and costs much more. For the capstone, one region with backups in another is the honest
+starting point.
+
+</Level>
+
+<Level name="Strategy">
+
+I trace one request through all six primitives with commands (`dig`, `openssl`, the database's connection list,
+the bucket's access log). Done when I can draw the path and name each primitive's limit and alert.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Reverse proxies, load balancers, health checks and zero-downtime deploys
+
+<Figure art={`
+  rolling deploy, 2 instances, v1 -> v2
+  t0   LB -> [v1 A ready] [v1 B ready]
+  t1   start v2 C; LB checks /ready on C ... 503 ... 503 ... 200 -> add C
+  t2   LB -> [v1 A] [v1 B] [v2 C]
+  t3   send SIGTERM to A; A fails /ready -> LB removes A; A drains in-flight, exits
+  t4   start v2 D ... ready -> add D; SIGTERM B ... drained
+  t5   LB -> [v2 C] [v2 D]          errors during the deploy: 0
+`} caption="A rolling deploy. Readiness decides when traffic arrives; graceful shutdown decides how it leaves." />
+
+<Levels label="Phase 5, reverse proxies, load balancers, health checks and zero-downtime deploys">
+
+<Level name="Beginner">
+
+A reverse proxy (nginx, Caddy, the platform's edge) sits in front of the app: it terminates TLS, serves static
+files, adds headers and forwards requests. A load balancer spreads requests across several instances. A health
+check is an endpoint the load balancer calls to decide whether an instance should get traffic.
+
+```text
+# Caddyfile: TLS certificates are obtained and renewed automatically
+api.example.dev {
+  reverse_proxy app1:3000 app2:3000 {
+    health_uri /ready
+    health_interval 5s
+  }
+}
+```
+
+The common mistake is one instance: every deploy and every crash is an outage.
+
+</Level>
+
+<Level name="Intermediate">
+
+Two health endpoints, with different meanings. Liveness (`/healthz`): is the process working at all? If not,
+restart it. Readiness (`/ready`): can it serve traffic right now (started, connected, not shutting down)? If
+not, stop sending it requests but do not kill it. A zero-downtime deploy starts new instances, waits for
+readiness, then drains old ones.
+
+```ts
+app.get('/healthz', (_req, res) => res.send('ok'));
+app.get('/ready', async (_req, res) => {
+  if (shuttingDown) return res.status(503).send('draining');
+  try { await pool.query('select 1'); res.send('ready'); } catch { res.status(503).send('db'); }
+});
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The rules underneath: load balancers balance connections or requests (round robin, least connections), and
+HTTP keep-alive means one client's connection can stay on one instance, so new instances get traffic slowly.
+Timeouts must nest: the proxy's timeout is longer than the app's request timeout, which is longer than the
+database's statement timeout, so the inner layer fails first with a useful error rather than the proxy cutting
+the connection with a bare 502 or 504. The proxy must pass the real client IP (`X-Forwarded-For`), and the app
+must trust it only from the proxy.
+
+</Level>
+
+<Level name="Edge cases">
+
+A readiness check that calls the database: if the database is down, every instance goes unready and the load
+balancer has nowhere to send traffic, turning a partial outage into a total one. Some teams keep readiness
+local and alert on the dependency separately. Streaming responses (Server-Sent Events for AI answers) need the
+proxy's buffering turned off and longer timeouts, or tokens arrive all at once at the end.
+
+</Level>
+
+<Level name="Corner cases">
+
+A liveness check that does real work: under load it times out, the platform restarts a healthy but busy
+instance, the remaining ones get more load and also fail, and the restarts cascade. Liveness should be trivial.
+A deploy with a new version that passes readiness but has a bug in one endpoint: rolling deploys spread it to
+every instance, which is why canaries (later in this phase) exist.
+
+</Level>
+
+<Level name="Production level">
+
+In production I verify zero downtime with numbers: a load test running through a deploy, with the error count
+and latency recorded. Proxy access logs include the request ID, upstream time and status, so I can tell an app
+error from a proxy timeout.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "instances are cattle that arrive and leave all day." The system is designed so that any one of
+them can disappear at any moment without a user noticing.
+
+</Level>
+
+<Level name="System design">
+
+This layer is where many reliability features live: TLS, rate limits at the edge, retries, timeouts, circuit
+breaking, and later canary traffic splitting. *Release It!* calls timeouts and circuit breakers stability
+patterns, and they start here.
+
+</Level>
+
+<Level name="Strategy">
+
+I put two instances behind Caddy on the VPS, run a load test, deploy during it without and with readiness and
+graceful shutdown, and compare errors. Done when the second deploy shows zero errors.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Environments: development, preview, staging, production and seed data
+
+<Compare
+  left="Environment"
+  right="Purpose and data"
+  caption="Each environment answers a different question, and each needs data that is realistic without being real."
+  rows={[
+    ["development", "does it work on my machine? Compose, seed script, fake data"],
+    ["preview (per pull request)", "does this change look and behave right? short-lived, seeded"],
+    ["staging", "does it work like production? same IaC, same image, anonymised or synthetic data"],
+    ["production", "real users and real data; changed only by the pipeline"],
+  ]}
+/>
+
+<Levels label="Phase 5, environments: development, preview, staging, production and seed data">
+
+<Level name="Beginner">
+
+An environment is a full copy of the system: code, configuration, database and services. Development runs on
+my machine, staging is a production-like copy for final checks, and production is what users use. Seed data is
+a script that fills a fresh database with useful example data.
+
+```ts
+// scripts/seed.ts
+for (let t = 1; t <= 50; t++) {
+  const tenant = await createTenant({ name: `Tenant ${t}` });
+  await createNotes(tenant.id, t <= 3 ? 20_000 : faker.number.int({ min: 5, max: 200 })); // a few huge tenants
+}
+```
+
+The common mistake is copying the production database to staging or a laptop, which puts real people's data
+on less protected machines.
+
+</Level>
+
+<Level name="Intermediate">
+
+The same image and the same IaC run in every environment, with only configuration differing. Preview
+environments, one per pull request with its own seeded database, let a change be reviewed in a browser. Seed
+data is deterministic (a fixed random seed) so bugs are reproducible, and it includes the hard cases: huge
+tenants, long names, Unicode, deleted users.
+
+</Level>
+
+<Level name="Advanced">
+
+The principle underneath is dev and prod parity from the twelve-factor method: keep the gaps in time (deploy
+often), people (the same person writes and deploys) and tools (the same Postgres version, not SQLite locally)
+small. Each gap is a class of bug that appears only in production. Staging data at production volume is what
+makes migrations and query plans honest, and synthetic data generated at that volume gives it without the
+privacy risk.
+
+</Level>
+
+<Level name="Edge cases">
+
+Preview environments that are never cleaned up keep costing money; third-party services (email, payments) need
+sandbox keys in non-production environments so staging never charges a real card or emails a real customer;
+OAuth redirect URLs must be registered for each preview domain or use a wildcard proxy.
+
+</Level>
+
+<Level name="Corner cases">
+
+Staging pointed at a production dependency by a leftover variable: tests in staging send real emails or write to
+the production bucket. A startup check that refuses to run if the environment name and a dependency's
+environment tag disagree catches it. An anonymisation script that misses a new column of personal data:
+review the script whenever the schema changes.
+
+</Level>
+
+<Level name="Production level">
+
+In production the only way to change the environment is the pipeline; staging gets every change first; preview
+environments are created and destroyed automatically; and access to production data is limited, logged and
+rare.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "production is the only environment that matters, and the others exist to protect it." Each one
+is worth its cost only if it catches a class of bug the others miss.
+
+</Level>
+
+<Level name="System design">
+
+Environments multiply everything: costs, secrets, DNS records, OAuth apps. IaC with variables keeps them in
+sync, and a clear naming scheme (`notes-uploads-staging`) prevents cross-environment accidents.
+
+</Level>
+
+<Level name="Strategy">
+
+I add a preview environment per pull request and a deterministic seed with hard cases, and write the startup
+guard. Done when a pull request gets a working preview URL and staging refuses to start with a production
+credential.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Configuration and secrets: environment variables, secret managers and rotation
+
+<Flow
+  caption="Rotating a database password with no downtime. Two credentials overlap so nothing breaks in between."
+  steps={["Create new credential (both valid)", "Store it in the secret manager", "Roll app instances; they read the new one", "Verify no connections use the old one", "Revoke the old credential", "Record the rotation date"]}
+/>
+
+<Levels label="Phase 5, configuration and secrets: environment variables, secret managers and rotation">
+
+<Level name="Beginner">
+
+Configuration is everything that differs between environments: URLs, feature settings, credentials. It comes
+from environment variables, not from code. Secrets (passwords, API keys, signing keys) are configuration that
+must stay private, so they are never committed to git.
+
+```ts
+import { z } from 'zod';
+export const env = z.object({
+  DATABASE_URL: z.string().url(),
+  SESSION_SECRET: z.string().min(32),
+  OPENAI_API_KEY: z.string().startsWith('sk-'),
+}).parse(process.env);
+```
+
+```text
+ZodError: [ { "path": ["SESSION_SECRET"], "message": "String must contain at least 32 character(s)" } ]
+```
+
+The common mistake is a secret committed once and removed in the next commit; it is still in the git history
+and must be treated as leaked.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice the app validates all configuration at startup and refuses to run if anything is missing, so a
+misconfiguration fails the deploy instead of the first user request. Secrets live in a secret manager (the
+platform's, a cloud provider's, or Doppler or 1Password) and are injected at start. `.env` files are for local
+development only and are in `.gitignore`. Secret scanning (gitleaks, GitHub push protection) blocks commits
+with keys.
+
+</Level>
+
+<Level name="Advanced">
+
+The practice underneath is rotation: every secret can be replaced without downtime, which requires the system to
+accept two at once for a while (two database users, or a signing key list where new tokens use the newest key
+and verification accepts both). Short-lived credentials (OIDC tokens from CI, IAM roles for compute) remove
+whole classes of leak, because there is nothing long-lived to steal.
+
+```ts
+const keys = [env.SESSION_SECRET, env.SESSION_SECRET_PREVIOUS].filter(Boolean);
+// sign with keys[0]; verify with any
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Secrets printed in logs by a startup "config dump", in error messages, in crash reports, or in a URL query
+string that the proxy logs; environment variables are visible to every process the app starts and in
+`/proc/<pid>/environ` to anyone with access to the box; a newline at the end of a secret pasted into a
+dashboard.
+
+</Level>
+
+<Level name="Corner cases">
+
+The leaked-key drill (Phase 6 asks for it): a key pushed to a public repository is found by automated scanners
+within minutes. The order is revoke first, then rotate, then investigate usage, then remove it from history;
+cleaning history first leaves a working key in the wild. A rotated key plus a long-running job holding the old
+one fails mid-run, so jobs re-read secrets or tolerate the overlap.
+
+</Level>
+
+<Level name="Production level">
+
+In production I keep an inventory of secrets with owner, scope, where it is used and last rotation date;
+rotate on a schedule and immediately on any suspicion; scope each key to the least access (a read-only key for
+analytics, a per-environment model API key with a spend limit).
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "assume every secret will leak, and make that a five-minute event." The question is not whether I
+can keep it secret forever but how fast I can replace it.
+
+</Level>
+
+<Level name="System design">
+
+Configuration as data separates the artefact from the environment: one image, many deployments. Model API keys
+are a special case worth isolating per environment and per feature, because a leaked one is a direct bill.
+
+</Level>
+
+<Level name="Strategy">
+
+I add startup validation, move secrets into a manager, turn on push protection, and rotate the database
+password and the session key under load. Done when both rotations finish with zero errors and the inventory
+lists every secret.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Observability: structured logs, metrics, traces, dashboards and alerting
+
+<Layers
+  caption="Three signals and what each answers. Together they let me ask questions I did not plan for."
+  layers={[
+    { name: "Alerts", note: "a person is needed now, because users are affected" },
+    { name: "Dashboards", note: "the shape of the system at a glance" },
+    { name: "Traces", note: "where did this request spend its time, across services?" },
+    { name: "Metrics", note: "how much, how fast, how often, over time (cheap, aggregated)" },
+    { name: "Logs", note: "what exactly happened in this one event (detailed, expensive)" },
+  ]}
+/>
+
+<Levels label="Phase 5, observability: structured logs, metrics, traces, dashboards and alerting">
+
+<Level name="Beginner">
+
+Observability is being able to understand what the system is doing from the outside, using the data it
+emits. Logs are records of events. Metrics are numbers over time (requests per second, error rate, latency).
+Traces follow one request through every service and step it touches, with timings. Dashboards show them, and
+alerts tell a person when something needs attention.
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+new NodeSDK({ serviceName: 'notes-api', instrumentations: [getNodeAutoInstrumentations()] }).start();
+```
+
+The common mistake is logs only: they show single events but not trends, and searching them during an incident
+is slow.
+
+</Level>
+
+<Level name="Intermediate">
+
+OpenTelemetry instruments HTTP, Postgres and Redis automatically, producing a trace per request with a span for
+each query and call. The trace ID goes into every log line, so I can jump from a slow trace to its logs. The
+key metrics per service are RED: rate, errors and duration, plus saturation of resources (CPU, memory, database
+connections, queue depth).
+
+```text
+trace 4bf92f3577b34da6  POST /chat                            1840 ms
+  ├─ pg.query  select ... from chunks order by embedding        42 ms
+  ├─ http POST api.model-provider/v1/responses                1730 ms
+  └─ pg.query  insert into messages                             6 ms
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The trade-offs underneath: metrics are cheap because they aggregate, but every unique label value creates a new
+time series, so a `userId` label (high cardinality) can blow up cost and storage. User-level detail belongs in
+logs and traces. Traces are sampled: head sampling decides at the start (cheap, misses rare errors), tail
+sampling decides after seeing the whole trace (keeps errors and slow ones, needs a collector). Latency metrics
+are histograms, so percentiles can be computed across instances; averaging per-instance p95s is mathematically
+wrong.
+
+</Level>
+
+<Level name="Edge cases">
+
+Clock differences between hosts make spans look out of order; a missing context propagation (a job queue that
+does not carry the trace header) breaks the trace in two; logging every request body at high traffic costs more
+than the servers; personal data and prompts in logs and traces are a privacy problem that needs redaction.
+
+</Level>
+
+<Level name="Corner cases">
+
+An alert on CPU above 80%: it fires at night when a batch job runs, nobody is affected, and people learn to
+ignore pages. Alerts should be on symptoms users feel (errors, latency, SLO burn), with causes (CPU, disk) on
+dashboards. An observability pipeline that is down during the outage: the same dependency failing both, which is
+why the monitoring stack's health is checked from outside.
+
+</Level>
+
+<Level name="Production level">
+
+In production one dashboard per service shows rate, errors, latency percentiles, saturation and recent deploys
+as markers; alerts link to a runbook; and every alert that fires is reviewed: was a person needed? If not, it is
+changed or deleted.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "instrument before I need it." The question I will have during an incident is one I did not
+predict, so I emit rich, structured, correlated data ahead of time.
+
+</Level>
+
+<Level name="System design">
+
+For AI features, observability extends to token counts, model latency, cost per request, retrieval scores and
+evaluation results (Phase 9). The same trace that shows a slow query shows a slow model call and what it cost.
+
+</Level>
+
+<Level name="Strategy">
+
+I add OpenTelemetry to the API and worker, propagate trace IDs into jobs and logs, build one dashboard, and
+find a slow endpoint from a trace alone. Done when one request can be followed from browser to job and back by
+its trace ID.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: SLOs and SLIs: availability, latency, error rate and saturation
+
+<Figure art={`
+  SLI:  good requests / valid requests      (good = status < 500 and latency < 300 ms)
+  SLO:  99.5% good over 28 days
+  error budget:  0.5% of requests may be bad  ->  with 2,000,000 requests: 10,000 bad allowed
+  burn rate:     how fast the budget is being spent relative to plan
+     burn 1   -> budget lasts exactly 28 days
+     burn 14  -> 2% of budget gone in 1 hour  -> page someone
+     burn 1-3 -> sustained slow burn          -> ticket, fix this week
+`} caption="From an SLI to an error budget to an alert. The budget turns reliability into a number the team can spend." />
+
+<Levels label="Phase 5, SLOs and SLIs: availability, latency, error rate and saturation">
+
+<Level name="Beginner">
+
+An SLI (service level indicator) is a measurement of what users experience, such as the share of requests that
+succeed quickly. An SLO (service level objective) is the target for it, such as 99.5% over 28 days. The error
+budget is the remaining 0.5%: the amount of failure that is acceptable. Saturation (how full a resource is)
+predicts problems before they show up in the SLI.
+
+The common mistake is a 100% target, which is impossible, blocks every change, and means nobody knows how
+reliable is reliable enough.
+
+</Level>
+
+<Level name="Intermediate">
+
+I choose SLIs from the user's point of view: availability (non-5xx share), latency (share under a threshold,
+not an average), and for jobs, freshness (share processed within a time). I write them as ratios of good events
+to valid events, measured at the load balancer or from the app's metrics.
+
+```text
+# PromQL-style: share of requests that were good over 28 days
+sum(rate(http_requests_total{status!~"5.."}[28d])) / sum(rate(http_requests_total[28d]))
+```
+
+99.5% over 28 days allows about 3 hours 22 minutes of total failure; 99.9% allows about 40 minutes.
+
+</Level>
+
+<Level name="Advanced">
+
+The practice underneath, from the Google SRE workbook: alert on burn rate, not on the SLI itself. A fast burn
+(say 14 times the planned rate over an hour, which spends 2% of a 28-day budget) pages someone; a slow burn
+creates a ticket. Multi-window alerts (a long window to be sure, a short window to know it is still happening)
+reduce false pages. The error budget policy says what happens when it is spent: reliability work before features.
+
+</Level>
+
+<Level name="Edge cases">
+
+Low traffic: at 100 requests a day, a single failure is 1%, so the SLI is noisy and needs longer windows or
+synthetic checks. Requests that never reach my server (DNS or TLS failure) are invisible to server-side SLIs;
+an external probe sees them. A 4xx caused by my bug (a broken validation rejecting valid input) is a failure,
+though the status says client error.
+
+</Level>
+
+<Level name="Corner cases">
+
+An SLO met on average while one tenant is completely broken: aggregated SLIs hide concentrated pain, so I also
+check per-tenant or per-endpoint error rates. Latency SLIs plus streaming AI responses: total time is long by
+design, so the SLI is time to first token, and a separate one tracks completion.
+
+</Level>
+
+<Level name="Production level">
+
+In production the SLO is on the main dashboard with the remaining budget, burn-rate alerts are the main paging
+alerts, and the budget is reviewed when planning: a spent budget means the next work is reliability.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "reliability is a feature with a target, not a feeling." The budget gives permission to ship when
+it is healthy and a reason to stop when it is not.
+
+</Level>
+
+<Level name="System design">
+
+SLOs compose: if the API depends on a model provider with 99.9% and a database with 99.95%, my endpoint cannot
+promise more than their product without fallbacks. That arithmetic drives the fallback and degradation design of
+Phase 9 and Phase 10.
+
+</Level>
+
+<Level name="Strategy">
+
+I define availability and latency SLIs for the capstone, an SLO for each, burn-rate alerts, and a dashboard
+panel with the remaining budget. Done when the gate's "show an SLO and the error budget" is that panel with a
+real number after a week of traffic.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Incident response: severity, roles, communication, mitigation and postmortem
+
+<Timeline
+  caption="One incident, end to end (times in IST). Mitigation comes before root cause; the postmortem comes after both."
+  items={[
+    { when: "02:07", what: "Burn-rate alert pages: chat endpoint 5xx at 18%. On-call acknowledges." },
+    { when: "02:10", what: "Declared SEV-2. Roles: incident commander (me), with a status note posted." },
+    { when: "02:14", what: "Dashboard: errors began at 01:58, two minutes after a deploy marker." },
+    { when: "02:16", what: "Mitigation: roll back to the previous digest. Error rate falls within three minutes." },
+    { when: "02:35", what: "Watched for 15 minutes under the SLO; incident resolved, status note updated." },
+    { when: "next day", what: "Blameless postmortem: timeline, impact, causes, what went well, action items with owners." },
+  ]}
+/>
+
+<Levels label="Phase 5, incident response: severity, roles, communication, mitigation and postmortem">
+
+<Level name="Beginner">
+
+An incident is any unplanned event that hurts users or puts them at risk. Responding well is a skill with a
+process: notice (an alert), declare (say it is an incident and how bad), mitigate (stop the harm), resolve,
+then learn (a postmortem). Severity levels set how urgent it is: SEV-1 for a full outage or data loss, SEV-2 for
+a major feature broken, SEV-3 for a minor problem.
+
+The common mistake is debugging the root cause while users are still affected. Mitigate first: roll back,
+turn off the flag, fail over, then investigate.
+
+</Level>
+
+<Level name="Intermediate">
+
+Roles keep a response organised even when one person holds several of them. The incident commander
+coordinates and decides; the operations lead makes the changes; the communications lead updates users and
+stakeholders. A running log (a document or channel) records every observation and action with a time. Status
+updates go out on a schedule, even when the update is "still investigating."
+
+```text
+[02:16 IST] Identified: errors began after the 01:56 deploy. Rolling back now. Next update by 02:30.
+[02:35 IST] Resolved: rollback complete at 02:19, error rate normal since 02:22. Postmortem to follow.
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The practice underneath, from the SRE books: postmortems are blameless, meaning they look at how the system
+(code, process, tooling, alerting) allowed the failure, not at who typed the command, because people hide
+mistakes when they are blamed and the same failure returns. Root causes are rarely one thing; I write the
+contributing factors (a missing test, a migration not checked against the old version, an alert with too long a
+window). Action items are specific, owned and tracked to done.
+
+```md
+## Action items
+- [ ] Add a contract test for the chat response shape (owner: me, due 30 Oct)
+- [ ] Canary deploys for the API, 5% for 10 minutes (owner: me, due 6 Nov)
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+An incident with no alert, reported by a user first, means the monitoring missed it, which becomes an action
+item. An incident at the model provider (outside my control) still needs mitigation on my side: a fallback,
+degraded mode or a clear message. A security incident (a leaked key, unusual data access) follows the same
+shape with extra steps: preserve evidence, revoke access, and assess whether notification obligations apply.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two changes at once during mitigation (a rollback and a config change) make it impossible to know which one
+helped; one change at a time, and watch. A rollback that cannot work because the deploy included a
+non-backward-compatible migration: the incident gets longer, which is why expand and contract matters here too.
+
+</Level>
+
+<Level name="Production level">
+
+In production there is an on-call schedule (for a solo project, me with a phone that rings), a severity guide,
+a status page, templates for updates and postmortems, and a review of open action items every week. Mean time to
+restore is tracked, and so is how often incidents were caught by alerts first.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "calm, small, reversible steps, written down." An incident is not the moment for clever fixes.
+
+</Level>
+
+<Level name="System design">
+
+Incident response shapes the architecture: fast rollback, feature flags, read-only modes and fallbacks exist
+because mitigation must be quick. Each postmortem's action items feed the failure matrix of Phase 10.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the severity guide and templates, then run the game day as a real incident with the timeline, updates
+and postmortem. Done when the gate's postmortem exists, is blameless, and its action items are closed or
+scheduled.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Scaling: vertical, horizontal, caching, queues and the database bottleneck
+
+<Flow
+  caption="The order I scale in. Each step is cheaper and less risky than the next, and the database is usually where it ends."
+  steps={["Measure: which resource saturates first?", "Fix the slow query or N+1", "Vertical: a bigger instance", "Horizontal: more stateless app instances", "Cache hot reads", "Move slow work to queues", "Pool and limit DB connections", "Read replicas, then partitioning"]}
+/>
+
+<Levels label="Phase 5, scaling: vertical, horizontal, caching, queues and the database bottleneck">
+
+<Level name="Beginner">
+
+Scaling means handling more load. Vertical scaling is a bigger machine; horizontal scaling is more machines.
+App servers scale horizontally easily when they are stateless (no sessions or files on local disk). Databases do
+not, so the database is usually the bottleneck.
+
+The common mistake is adding app instances when the database is the problem: each new instance opens more
+connections, and the database gets slower.
+
+</Level>
+
+<Level name="Intermediate">
+
+The first step is always measurement: a load test (Phase 3) shows which resource saturates first. Then the cheap
+fixes: an index, removing an N+1 query, caching a hot read, moving slow work (emails, embeddings) to a queue so
+requests return fast. Autoscaling adds instances on CPU or request rate, with a maximum so a traffic spike or a
+bug does not create unlimited cost.
+
+```text
+instances  rps   p95     db connections  db cpu
+1          120   140 ms  20              35%
+2          230   150 ms  40              68%
+4          260   900 ms  80              97%   <- the database saturated; more app instances made it worse
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The theory underneath: Little's law (concurrency = throughput times latency) says how many connections a target
+throughput needs; Amdahl's law says the serial part (often the database or a lock) caps the speed-up from
+adding parallel workers. Queueing theory says latency climbs sharply as utilisation approaches 100%, so servers
+run with headroom. Connection pooling (PgBouncer in transaction mode) lets many app instances share a few
+database connections.
+
+</Level>
+
+<Level name="Edge cases">
+
+A hot key or hot tenant that one instance or one row cannot spread; a cold start for new instances (loading,
+JIT warm-up, empty caches) that makes autoscaling late for sudden spikes; a scheduled job that runs on every
+instance once it is scaled out (needs a lock or a single scheduler); rate limits at the model provider, which no
+amount of my own scaling fixes.
+
+</Level>
+
+<Level name="Corner cases">
+
+Autoscaling plus a retry storm: errors cause retries, retries raise load, load triggers scaling, new instances
+open connections, the database gets slower and errors rise. Retry budgets, backoff with jitter and connection
+limits break the loop. A queue that absorbs a spike plus workers that cannot catch up: the queue grows without
+bound, so queue age is a metric with an alert.
+
+</Level>
+
+<Level name="Production level">
+
+In production I know my capacity: requests per second per instance at the SLO, the database's limit, and the
+headroom. Autoscaling has minimum and maximum bounds, queues have age alerts, and capacity is rechecked after
+big features.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "find the bottleneck, then move it." Scaling is a sequence of bottlenecks, and each fix reveals
+the next.
+
+</Level>
+
+<Level name="System design">
+
+AI features change the shape of load: long-running requests, expensive calls to providers, token rate limits
+and costs per request. Queues, streaming, caching and per-tenant budgets become the main scaling tools, which
+Phase 9 and Phase 10 build on.
+
+</Level>
+
+<Level name="Strategy">
+
+I load test the capstone with 1, 2 and 4 instances, find the saturation point, fix one bottleneck and test
+again. Done when the table of instances, throughput, latency and database load exists and names the bottleneck.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Feature flags, canaries and rollbacks
+
+<Compare
+  left="Tool"
+  right="What it limits"
+  caption="Three ways to limit the blast radius of a change, from cheapest to most involved."
+  rows={[
+    ["feature flag", "who sees the new code path, changed without a deploy"],
+    ["canary deploy", "what share of traffic runs the new build, judged by its metrics"],
+    ["rollback", "how long a bad build stays live: redeploy the previous digest"],
+  ]}
+/>
+
+<Levels label="Phase 5, feature flags, canaries and rollbacks">
+
+<Level name="Beginner">
+
+A feature flag is a switch in configuration that turns a code path on or off without a deploy. A canary deploy
+sends a small share of traffic to the new version and watches its metrics before sending everyone. A rollback
+returns to the previous version. All three separate deploying code from releasing a change to users.
+
+```ts
+if (await flags.isOn('new-retriever', { tenantId })) return hybridRetrieve(q);
+return vectorRetrieve(q);
+```
+
+The common mistake is a flag that is never removed: after a year the code has dozens of dead branches and
+combinations nobody has tested.
+
+</Level>
+
+<Level name="Intermediate">
+
+Flags have types: release flags (temporary, removed after rollout), operational kill switches (permanent, to
+turn off an expensive feature in an incident), and permission flags (plans and entitlements). Rollouts go by
+percentage with a stable hash of the user or tenant ID, so a user does not flip between versions on each
+request.
+
+```ts
+import { createHash } from 'node:crypto';
+const bucket = (id: string) => createHash('sha256').update(id).digest().readUInt32BE(0) % 100;
+const on = bucket(`new-retriever:${tenantId}`) < rolloutPercent;
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Canary analysis underneath: compare the canary's error rate and latency with the stable version's over the
+same window, with enough traffic for the difference to mean something; a canary at 5% with 20 requests proves
+nothing. Automated canaries promote or roll back based on those metrics. Flags evaluated per request must be
+fast (cached locally, updated by streaming), and must have a safe default when the flag service is down.
+
+</Level>
+
+<Level name="Edge cases">
+
+A flag that changes data written to the database: turning it off does not undo the writes, so the old code path
+must read them. A flag checked in the API but not in the worker, so the two disagree. A canary that gets only
+health checks and little real traffic, so it looks perfect.
+
+</Level>
+
+<Level name="Corner cases">
+
+A canary plus sticky sessions plus a cache shared with the stable version: the canary writes a new cache format
+and the stable version fails to read it, so the canary breaks the stable fleet. Version the cache key. Flags plus
+evaluations: an AI feature behind a flag needs its evaluation run on both paths before rollout, otherwise the
+flag only hides the regression from me.
+
+</Level>
+
+<Level name="Production level">
+
+In production every risky change ships dark behind a flag, rolls out by percentage while I watch the
+dashboard, and the flag is removed within weeks of reaching 100%. Every flag change is logged like a deploy and
+shows as a marker on the dashboards.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "every change has an off switch and a small first audience." I decide how I will undo a change
+before I ship it.
+
+</Level>
+
+<Level name="System design">
+
+Flags are how model changes, prompt changes and retriever changes reach production safely in Phase 9: shadow
+traffic, percentage rollouts and kill switches for features whose cost or behaviour surprises me.
+
+</Level>
+
+<Level name="Strategy">
+
+I add a small flag module with percentage rollouts and a kill switch, then roll out a change to 5%, 25% and
+100% while watching errors, and remove the flag. Done when the rollout and the flag removal are both commits.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: Cost: the bill is a production metric
+
+<Figure art={`
+  monthly bill, small AI product (shape, not real figures)
+  compute (2 small instances) ........ ####
+  managed Postgres .................... ######
+  object storage + egress ............. ##
+  observability (logs, traces) ........ #####
+  model API (tokens) .................. ####################
+  cost per active user = total / monthly active users
+  cost per request     = tokens x price + infra share
+`} caption="For AI products the model bill usually dominates, and logs are often the surprise second." />
+
+<Levels label="Phase 5, cost: the bill is a production metric">
+
+<Level name="Beginner">
+
+The cloud bill is a production metric like latency: it changes with every feature and deploy, and it can break
+the product as surely as an outage. I watch it daily, set budget alerts, and know what each service costs.
+
+The common mistake is finding out the cost at the end of the month, after a loop, a leaked key or a forgotten
+preview environment has run for weeks.
+
+</Level>
+
+<Level name="Intermediate">
+
+In practice I tag every resource with its environment and feature, set budget alerts at 50%, 80% and 100% of
+the plan, put spend limits on model API keys, and add cost panels to the dashboard. For AI features I record
+input and output tokens per request and compute cost per request and per tenant.
+
+```ts
+const cost = (usage.input_tokens * PRICE_IN + usage.output_tokens * PRICE_OUT) / 1_000_000;
+metrics.histogram('llm_cost_usd', cost, { feature: 'chat', model });
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The economics underneath: unit economics (cost per user, per request, per tenant) matter more than the total,
+because they say whether growth makes the product more or less viable. Costs split into fixed (database
+instance) and variable (tokens, egress, requests). The levers are right-sizing instances, caching, cheaper
+models for easy tasks, shorter prompts, batching, storage lifecycle rules, log sampling and reserved capacity
+once usage is stable.
+
+</Level>
+
+<Level name="Edge cases">
+
+Egress (data leaving the cloud) priced per gigabyte surprises people serving files; log ingestion priced per
+gigabyte makes debug logging expensive; NAT gateways charged per gigabyte processed; idle resources (unused IPs,
+stopped instances with disks, orphaned snapshots) that cost money doing nothing.
+
+</Level>
+
+<Level name="Corner cases">
+
+A retry loop against a model API plus no spend limit: a bug becomes a large bill in hours. Per-key spend
+limits, per-tenant budgets and a circuit breaker on cost cap it. One tenant using a hundred times the average,
+priced at a flat rate: the most active customer becomes the least profitable.
+
+</Level>
+
+<Level name="Production level">
+
+In production cost is reviewed weekly with the other metrics, each feature has a cost per use, anomalies alert
+like errors, and large changes come with a cost estimate before and a measurement after.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "every request has a price." Before shipping a feature I estimate its cost per use and at 10x
+usage.
+
+</Level>
+
+<Level name="System design">
+
+Cost shapes architecture: caching, model routing, batch versus real-time, and per-tenant quotas are cost
+decisions as much as performance ones. Phase 10 asks for cost at 10x and 100x load, starting from these numbers.
+
+</Level>
+
+<Level name="Strategy">
+
+I add tags, budget alerts, key spend limits and a cost panel, compute cost per request for the chat feature,
+and find one saving. Done when the dashboard shows cost next to latency and errors, and the saving is measured.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: the build: pipeline, dashboards, alerts, runbook and game day
+
+<Figure art={`
+  commit -> CI -> image:sha -> staging -> canary 5% -> prod
+                                   |            |
+                              smoke tests   SLO burn alert
+  dashboards: latency | errors | saturation | cost
+  runbook: 1. DB down   2. provider down   3. bad deploy
+  game day: kill Postgres primary / block provider -> respond -> postmortem
+`} caption="The Phase 5 build: one pipeline, four dashboard groups, symptom alerts, a three-entry runbook and one rehearsed failure." />
+
+<Levels label="Phase 5, the build: pipeline, dashboards, alerts, runbook and game day">
+
+<Level name="Beginner">
+
+The build has five parts: a pipeline from commit to deploy with tests and a rollback; dashboards for latency,
+errors, saturation and cost; alerts that page only when a user is affected; a runbook for the top three
+failures; and a game day where I kill a dependency and recover. I build them in that order, because each one
+uses the one before it: the runbook links to dashboards, and the game day tests the runbook.
+
+</Level>
+
+<Level name="Intermediate">
+
+The runbook entries follow one shape: symptom, how to confirm, mitigation, verification, escalation. Each alert
+links to its entry.
+
+```md
+### Postgres unreachable
+Symptom: 5xx on all write routes, readiness failing.  Confirm: psql "$DATABASE_URL" -c 'select 1'.
+Mitigate: check provider status; fail over if the primary is down; turn on the read-only flag.
+Verify: error rate under SLO for 10 minutes.  Escalate: provider support ticket.
+```
+
+The other two entries are "model provider down or slow" (switch to the fallback model or the degraded
+message) and "bad deploy" (roll back to the previous digest).
+
+</Level>
+
+<Level name="Advanced">
+
+The game day is planned like an experiment: a hypothesis ("if Redis dies, the app degrades but stays up"), a
+blast radius (staging, or a small canary), abort criteria, observers, and a write-up. I inject the failure
+(stop the container, block the provider's host with a firewall rule), respond using only the runbook and
+dashboards, and time detection, mitigation and recovery.
+
+```text
+injected 14:00  alert 14:03  mitigated 14:07  recovered 14:12  (detection 3 min, restore 12 min)
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+The game day reveals a runbook command that is wrong, which is a success. An alert fires that should not have,
+or one that should have stays silent; both become action items.
+
+</Level>
+
+<Level name="Corner cases">
+
+Killing one dependency triggers a retry storm that takes down a second one. Game days find exactly these
+cascades, which is why the abort criteria are written before starting.
+
+</Level>
+
+<Level name="Production level">
+
+Everything is in the repository: pipeline, IaC, dashboards as code where possible, alert rules and the
+runbook. A new environment gets all of it from code.
+
+</Level>
+
+<Level name="Mindset">
+
+Practise failure while it is cheap and scheduled, so the unscheduled one is familiar.
+
+</Level>
+
+<Level name="System design">
+
+The runbook's three failures are the start of Phase 10's failure matrix, and the dashboards gain the AI
+signals (tokens, cost, eval scores) in Phase 9.
+
+</Level>
+
+<Level name="Strategy">
+
+One commit per part, and the game day write-up last. Done when every gate item has evidence.
+
+</Level>
+
+</Levels>
+
+#### Phase 5: exercises
+
+- Diagnose four broken VPS setups from the shell: port in use, wrong permission, full disk, killed process.
+- Reorder a Dockerfile's layers and measure rebuild time and image size before and after.
+- Make Node ignore `SIGTERM` as PID 1, then fix it with a direct `node` command or `tini`.
+- Deploy a broken change to staging and roll it back, timing both.
+- Destroy staging and recreate it from IaC with one command.
+- Deploy under load with and without readiness and graceful shutdown, counting errors.
+- Rotate the database password and the session key under load.
+- Follow one request by its trace ID from the browser to the worker.
+- Write burn-rate alerts for a 99.5% SLO and trigger the fast-burn one on purpose.
+- Load test with 1, 2 and 4 instances and name the bottleneck.
+- Roll out a flag to 5%, 25% and 100%, then remove it.
+- Compute cost per request for the chat feature.
+
+#### Phase 5: the gate
+
+<Compare
+  caption="Each gate item and its evidence"
+  left="Gate item"
+  right="Evidence"
+  rows={[
+    ["Deploy a change and roll it back", "pipeline run links for both, total time recorded"],
+    ["Respond to an injected failure, write a postmortem", "game day timeline and the blameless postmortem"],
+    ["Show an SLO and the error budget", "the budget dashboard with burn-rate alerts"],
+    ["The first three things to check at 2am", "a spoken answer, matched by the runbook"],
+  ]}
+/>
+
+My 2am answer, which the gate asks me to explain. First, what changed: the deploy and flag markers on the
+dashboard, because most incidents follow a change. Second, where it hurts: the rate, errors and duration
+dashboard, which route, which status, since when. Third, what is saturated or down: database connections, queue
+age, memory, and the model provider's status. Then mitigate before diagnosing.
