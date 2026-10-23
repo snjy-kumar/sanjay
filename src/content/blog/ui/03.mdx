@@ -1,0 +1,806 @@
+---
+title: "Component APIs: props, variants and composition"
+series: "ui"
+seriesOrder: 3
+undated: true
+readTime: "about 30 min"
+description: "Designing the props of a shared component: variants as one enum instead of many booleans, composition instead of a prop for every need, and the escape hatches a component should and should not offer."
+tags: ['design-systems', 'composition']
+related: ['ui/02']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+A shared component is a small library, and its props are the library's
+public API. Everyone who uses the button learns its props, writes code
+against them, and breaks when they change. So the design of those props
+deserves the care an API gets: few concepts, invalid states made hard to
+write, and room to grow without a new prop for every request. This note
+covers the three tools that do most of that work: props as a contract,
+variants as enums, and composition.
+
+## Before you start
+
+After this note you will be able to:
+
+- treat a component's props as an API, with a contract that can be broken;
+- replace a pile of boolean props with one enum per dimension, and count
+  why that is safer;
+- write a variant map that turns props into classes and rejects values it
+  does not know;
+- use composition (children and named parts) where a configuration prop
+  would grow forever;
+- decide which escape hatches a component should offer, and which it should
+  refuse.
+
+What you should already know: what a component and a prop are, from React
+or any similar library, and the token tiers from the
+[previous note](/sanjay/posts/ui/02/), since variants are where component
+tokens get chosen.
+
+Reading time: about 30 minutes, plus ten for the scripts.
+
+## Note map
+
+<Flow steps={[
+  "Props are a contract: names, types, defaults",
+  "Variants: one enum per visual dimension, not many booleans",
+  "Variant map: props to classes, unknown values rejected",
+  "Composition: pass parts in instead of adding props",
+  "Escape hatches: what to expose, and what to keep closed",
+]} caption="The note in one line. Each step narrows what a caller can write, so the calls that compile are the calls that make sense." />
+
+## Props are a contract
+
+### In one sentence
+
+A component's props are the promises it makes to its callers, so adding,
+renaming or changing the meaning of one is an API change, with the same
+costs as changing a function signature.
+
+### The idea
+
+A function `formatPrice(amount, currency)` has a signature. Callers depend
+on the order, the types and what each argument means. Change any of them and
+every caller has to change. Nobody argues with that for functions.
+
+Components are functions too, with props as named arguments. A `Button`
+with `variant`, `size`, `disabled` and `onClick` has made four promises.
+Every screen that renders a button depends on them. If `variant="primary"`
+quietly changes from a filled style to an outlined one, nothing fails to
+compile, and a hundred screens change appearance.
+
+So the props deserve a deliberate design. Four questions cover most of it:
+
+1. **What are the concepts?** A button has an intent (primary, secondary,
+   danger), a size, and a state (enabled, disabled, busy). Three concepts,
+   not eleven props.
+2. **What are the defaults?** The default should be the most common use, so
+   most calls are short: `<Button>Save</Button>`.
+3. **What is invalid?** Can a button be primary and danger at once? If not,
+   the API should make that impossible to write.
+4. **What will people ask for next?** An icon, a loading spinner, a link
+   that looks like a button. The API should have a place for each without a
+   rewrite.
+
+One more contract question comes up for any component that holds a value,
+such as an input, a toggle or a set of tabs: **who owns the state?** A
+*controlled* component takes its value as a prop and reports changes
+through a callback (`value` and `onChange`); the parent owns the state. An
+*uncontrolled* component keeps its own state and takes only a starting value
+(`defaultValue`). Both are legitimate, and good shared components usually
+support both, with one rule: a given instance picks one mode for its whole
+life. Switching from uncontrolled to controlled halfway, which happens when
+`value` starts as `undefined` and later becomes a string, is a classic bug,
+and React warns about it in development for exactly that reason. The
+[React note on controlled inputs](/sanjay/posts/react/05/) walks through
+that warning in detail.
+
+### Worked example
+
+The simple example is a button's props written as TypeScript types:
+
+```ts
+type ButtonProps = {
+  intent?: 'primary' | 'secondary' | 'danger'; // default 'secondary'
+  size?: 'sm' | 'md' | 'lg';                     // default 'md'
+  disabled?: boolean;
+  type?: 'button' | 'submit' | 'reset';          // default 'button'
+  onClick?: () => void;
+  children: React.ReactNode;
+};
+```
+
+Each concept has one prop. Each has a small, named set of values. The
+defaults make the plain case short, and `children` holds the label, so the
+button does not need a `label` prop.
+
+The realistic example is the `type` default. The HTML `button` element's
+default type is `submit`, so a plain button inside a form submits it. A
+component that defaults `type` to `button` saves every caller from an
+accidental submit, and a caller who wants submission says so with
+`type="submit"`. That is a contract decision, made once, that prevents a
+class of bug everywhere.
+
+### Step by step
+
+How a small API change reaches callers:
+
+<Trace
+  columns={["change", "compiles?", "looks the same?", "who notices"]}
+  rows={[
+    ["add an optional prop", "yes", "yes", "nobody: safe"],
+    ["add a required prop", "no: every call fails", "-", "the compiler: loud, safe"],
+    ["rename a prop", "no, with types", "-", "the compiler, if typed"],
+    ["remove a value from a union", "no, with types", "-", "the compiler, if typed"],
+    ["change what a value looks like", "yes", "no", "users, after release: the dangerous one"],
+  ]}
+  caption="Five kinds of change to a component API. Types catch the structural ones. The behavioural change, same name with a new meaning, passes every check and is the one to review hardest."
+/>
+
+### Common mistake
+
+The common mistake is mirroring every CSS property as a prop: `color`,
+`padding`, `borderRadius`, `fontWeight`. The component becomes a thin
+wrapper over `style`, every caller makes their own visual decisions, and
+the consistency a shared component exists to provide is gone. Props should
+name **design decisions** (intent, size), and the component maps them to
+tokens.
+
+### In real systems
+
+In real systems the props are documented next to the component with every
+value shown rendered, often in a tool like Storybook, and the TypeScript
+types are the source of truth for what is allowed. Changes to a shared
+component's props go through the same review as changes to a public
+function, and a removal is announced a release before it happens.
+
+### Check yourself
+
+<details>
+<summary>1. Why is changing what variant="primary" looks like riskier than renaming the prop?</summary>
+
+A rename fails to compile at every call site, so it is found before
+release. A visual change compiles everywhere and is only found by people
+looking at screens.
+
+</details>
+
+<details>
+<summary>2. Why default a Button's type to "button" rather than the HTML default?</summary>
+
+The HTML default is `submit`, so a button inside a form submits it unless
+told otherwise. Defaulting to `button` makes the common case safe and the
+submit case explicit.
+
+</details>
+
+## Variants: one enum, not many booleans
+
+### In one sentence
+
+When a component has mutually exclusive styles, model them as one prop with
+a set of values, because boolean props multiply into combinations that
+contradict each other.
+
+### The idea
+
+The tempting first API for a styled button is a boolean per style:
+`<Button primary>`, `<Button danger>`, `<Button ghost>`. It reads nicely.
+The problem shows up in the combinations nobody wrote:
+`<Button primary danger>`. Which wins? Whatever the CSS order says, which
+is an accident.
+
+Counting makes the problem concrete. Four boolean style props have two
+states each, so `2 × 2 × 2 × 2 = 16` combinations. Only five make sense:
+none set, or exactly one set. The other eleven are contradictions the
+component has to handle somehow. One enum prop with four values, plus "not
+set", has five combinations, and all five make sense.
+
+The general rule: each **independent dimension** gets one prop. Intent is
+one dimension. Size is another. They multiply legitimately: three intents
+times three sizes is nine buttons, all valid. Booleans for a dimension's
+values are the mistake, not multiplication itself.
+
+### Worked example
+
+A script that counts both designs:
+
+```js
+// booleans.mjs
+const flags = ['primary', 'secondary', 'danger', 'ghost'];
+let valid = 0, total = 0;
+for (let mask = 0; mask < 2 ** flags.length; mask++) {
+  total++;
+  const on = flags.filter((_, i) => mask & (1 << i));
+  if (on.length <= 1) valid++;
+}
+console.log(`${flags.length} booleans: ${total} combinations, ${valid} make sense, ${total - valid} contradict`);
+console.log(`1 enum with ${flags.length} values + none: ${flags.length + 1} combinations, all make sense`);
+```
+
+Its output:
+
+```text
+4 booleans: 16 combinations, 5 make sense, 11 contradict
+1 enum with 4 values + none: 5 combinations, all make sense
+```
+
+Every new boolean doubles the total, while the sensible count grows by one.
+At six style booleans there are 64 combinations and 7 sensible ones.
+
+<Compare left="Boolean per style" right="One enum per dimension" caption="The same button API, two ways. The right column cannot express a contradiction, and adding a style adds a value rather than doubling the states." rows={[
+  ["<Button primary>", "<Button intent=\"primary\">"],
+  ["<Button primary danger>: which wins?", "cannot be written"],
+  ["<Button small large>: which wins?", "<Button size=\"sm\">, one value"],
+  ["new style: a new prop, states double", "new style: a new value, states + 1"],
+  ["types allow every mix", "types allow only valid values"],
+]} />
+
+The realistic example keeps one boolean that is genuinely independent:
+`disabled`. A disabled button can be primary or danger, so `disabled` is
+its own dimension, and a boolean is the right type for a dimension with two
+values. The test is "can these be true at the same time and still make
+sense?" If yes, separate props. If no, one enum.
+
+### Step by step
+
+Deciding the props for a badge, one candidate at a time:
+
+<Trace
+  columns={["candidate", "exclusive with", "decision"]}
+  rows={[
+    ["success / warning / error / info", "each other", "one prop: tone, four values"],
+    ["small / large", "each other", "one prop: size, two values"],
+    ["pill (rounded ends)", "nothing", "boolean: pill"],
+    ["outline / filled", "each other", "one prop: appearance, two values"],
+    ["dot (a leading dot)", "nothing", "boolean, or better a slot: see composition"],
+  ]}
+  caption="Sorting candidate props by exclusivity. Values that exclude each other become one enum; independent on/off traits stay booleans."
+/>
+
+### Common mistake
+
+The common mistake is the **compound** variant handled by a new prop. The
+design says "danger buttons in the small size use a bolder weight".
+Someone adds `boldSmallDanger`. The right place for that rule is the
+variant map: a list of compound rules that apply when two values meet,
+which the next section shows. The API stays the same; the styling knows
+about the combination.
+
+### In real systems
+
+Libraries for this exist: class-variance-authority and similar tools take a
+base class, a map of variants, defaults and compound rules, and return a
+function from props to class names. Their shape is the same as the variant
+map in this note, which is a sign the pattern is right rather than a
+reason to add a dependency for one button.
+
+### Check yourself
+
+<details>
+<summary>1. Five boolean style props: how many combinations, and how many sensible?</summary>
+
+2 to the power 5 is 32 combinations. Sensible ones are none set or exactly
+one set: 6.
+
+</details>
+
+<details>
+<summary>2. Is disabled a variant value or a separate boolean?</summary>
+
+A separate boolean. It is independent of intent: a danger button can be
+disabled, so it is its own dimension.
+
+</details>
+
+## A variant map: props to classes
+
+### In one sentence
+
+A variant map is a small table from each prop's values to classes, plus
+defaults, and a function that reads it, so the component's styling logic is
+data that can be checked.
+
+### The idea
+
+Inside the component, props have to turn into styles. The ad-hoc version is
+a chain of conditions: if primary add this class, else if danger add that,
+and if small add another. It works and grows into the hardest code in the
+component to read.
+
+The variant map moves the conditions into data. A base class always
+applies. Each prop has an object from value to class. Defaults fill in what
+the caller left out. A function walks the map. Because the map is data, the
+function can also **reject** what it does not know, so a typo like
+`intent="warnign"` fails in development instead of rendering an unstyled
+button.
+
+The classes themselves read component tokens: `.btn-primary` sets
+`background: var(--button-primary-bg)`. That is how variants connect to the
+token tiers from the previous note.
+
+### Worked example
+
+```js
+// variants.mjs
+const button = {
+  base: 'btn',
+  variants: {
+    intent: { primary: 'btn-primary', secondary: 'btn-secondary', danger: 'btn-danger' },
+    size: { sm: 'btn-sm', md: 'btn-md', lg: 'btn-lg' },
+  },
+  defaults: { intent: 'secondary', size: 'md' },
+};
+
+export function classes(spec, props = {}) {
+  const out = [spec.base];
+  for (const key of Object.keys(props)) {
+    if (!(key in spec.variants)) throw new Error(`unknown prop "${key}"`);
+  }
+  for (const [key, options] of Object.entries(spec.variants)) {
+    const value = props[key] ?? spec.defaults[key];
+    if (!(value in options)) {
+      throw new Error(`${key}="${value}" is not one of ${Object.keys(options).join(', ')}`);
+    }
+    out.push(options[value]);
+  }
+  return out.join(' ');
+}
+```
+
+Called with no props, with two valid props, and with two mistakes:
+
+```text
+btn btn-secondary btn-md
+btn btn-danger btn-sm
+intent="warning" is not one of primary, secondary, danger
+unknown prop "color"
+```
+
+The errors name the prop and the allowed values, which is the fix.
+
+The realistic version adds compound rules: a list of
+`{ when: { intent: 'danger', size: 'sm' }, add: 'btn-danger-sm' }`
+entries, each applied when every key in `when` matches. In TypeScript, the
+prop types can be derived from the map itself, so the map is the single
+source of both the classes and the allowed values.
+
+### Step by step
+
+`classes(button, { intent: 'danger', size: 'sm' })`, line by line:
+
+<Trace
+  columns={["step", "key", "value used", "class added"]}
+  rows={[
+    ["base", "-", "-", "btn"],
+    ["check props", "intent, size", "both known", "-"],
+    ["intent", "intent", "danger (given)", "btn-danger"],
+    ["size", "size", "sm (given)", "btn-sm"],
+    ["join", "-", "-", "btn btn-danger btn-sm"],
+  ]}
+  caption="The variant map in action. Every class comes from the table, so a reviewer reads one object to know every style a button can have."
+/>
+
+### Common mistake
+
+The common mistake is throwing in production. A thrown error inside a render
+takes down the screen, which is worse than an unstyled button. The usual
+compromise is to throw in development and tests, where the mistake is
+cheap to fix, and fall back to the default with a console warning in a
+production build. With TypeScript types derived from the map, most of
+these errors never reach runtime at all.
+
+### In real systems
+
+In production code the map often lives beside the component's CSS, and the
+types are generated from it. Visual regression tests render every value of
+every variant, which is easy precisely because the map lists them:
+iterate the map, render each combination, screenshot.
+
+### Check yourself
+
+<details>
+<summary>1. What does the variant map give that a chain of if statements does not?</summary>
+
+The styling rules become data. A function can list every value, reject
+unknown ones, derive types, and drive a test that renders every
+combination.
+
+</details>
+
+<details>
+<summary>2. Why not throw on an unknown variant in production?</summary>
+
+A thrown render error breaks the whole screen. Falling back to the default
+style with a warning keeps the screen usable while the bug is fixed.
+
+</details>
+
+## Composition: pass parts in
+
+### In one sentence
+
+When callers need to put different things inside a component, let them pass
+the parts in, as children or named slots, instead of adding a prop for each
+new kind of content.
+
+### The idea
+
+A card starts with a title and a body. Then someone needs an image, so
+`imageSrc` is added. Then a subtitle, a footer with buttons, an icon next
+to the title, a badge, a menu in the corner. Each request adds a prop, and
+each prop needs its own layout rules. Twenty props later, the card is a
+configuration format, and the one thing it cannot do is the next request.
+
+Composition stops the growth. The card owns its **frame**: the border, the
+padding, the spacing between regions, the semantic element. The caller owns
+the **content** of each region and passes it in. React does this with
+`children` and with props that take elements (`header={<h2>…</h2>}`).
+Other frameworks call the same thing slots.
+
+The trade-off is real. Composition gives callers freedom, which includes
+the freedom to put something odd in the header. Configuration gives the
+component control. The usual balance: compose the content, configure the
+frame. The card decides spacing and borders; the caller decides what goes
+in each region.
+
+### Worked example
+
+String-rendering functions show the shape without a framework:
+
+```js
+// compose.mjs
+const card = ({ header = '', body, footer = '' }) =>
+  ['<article class="card">', header && `  <header>${header}</header>`,
+   `  <div class="card-body">${body}</div>`, footer && `  <footer>${footer}</footer>`, '</article>']
+    .filter(Boolean).join('\n');
+
+const button = (label, intent = 'secondary') => `<button class="btn btn-${intent}">${label}</button>`;
+```
+
+A card with all three regions, footer built from two buttons, and a card
+with only a body:
+
+```text
+<article class="card">
+  <header><h2>Draft saved</h2></header>
+  <div class="card-body"><p>Your note was saved 2 minutes ago.</p></div>
+  <footer><button class="btn btn-secondary">Undo</button> <button class="btn btn-primary">Open</button></footer>
+</article>
+<article class="card">
+  <div class="card-body"><p>No header, no footer, no extra props.</p></div>
+</article>
+```
+
+The card never learned about buttons, headings or undo. A new need, such as
+a progress bar in the footer, is a different value for `footer`, not a new
+prop. Empty regions are left out, so there are no empty wrappers.
+
+<Layers layers={[
+  { name: "caller: what goes in each region", note: "headings, buttons, text" },
+  { name: "slots: header, body, footer", note: "the agreed places" },
+  { name: "frame: element, border, padding, gaps", note: "owned by the card" },
+  { name: "tokens: space, colour, radius", note: "read by the frame" },
+]} caption="Who owns what in a composed card. The frame and tokens stay consistent across every card; the content above the slot line is free." />
+
+The realistic version is a compound component: `Card`, `Card.Header`,
+`Card.Body` and `Card.Footer`, used as nested elements. The parts share
+context (a card can tell its header which heading level to use), and the
+caller arranges them. Menus, tabs and dialogs are usually built this way,
+because their parts need to coordinate focus and state.
+
+### Step by step
+
+The same request handled by each style:
+
+<Trace
+  columns={["request", "configuration API", "composition API"]}
+  rows={[
+    ["title", "title prop", "header={<h2>…</h2>}"],
+    ["title with an icon", "titleIcon prop", "header={<h2><Icon/> …</h2>}"],
+    ["two footer buttons", "primaryAction, secondaryAction props", "footer={<>…</>}"],
+    ["a progress bar in the footer", "footerProgress prop", "footer={<Progress/>}"],
+    ["props after four requests", "6 and counting", "3, unchanged"],
+  ]}
+  caption="Four feature requests against a configured card and a composed card. The composed card's API did not change once."
+/>
+
+### Common mistake
+
+The common mistake is composition with no frame: a "card" that is just a
+`div` with children, so every caller re-creates padding, header spacing and
+the footer layout. That is no component at all. The frame is the value; the
+slots are the flexibility. Keep both.
+
+The second mistake is the render-prop maze: so many function props
+(`renderHeader`, `renderTitle`, `renderTitleIcon`) that composition becomes
+configuration with extra steps. One slot per region is usually enough.
+
+### In real systems
+
+Headless component libraries take composition to its end: they ship the
+behaviour (focus management, keyboard handling, ARIA attributes) with no
+styling, and the caller composes styled parts. A design system then wraps
+them once with its tokens. That split, behaviour from the headless layer
+and looks from the tokens, is a common shape for a modern React design
+system.
+
+### Check yourself
+
+<details>
+<summary>1. What does a composed card own, and what does the caller own?</summary>
+
+The card owns the frame: element, border, padding and the spacing between
+regions. The caller owns the content of each region.
+
+</details>
+
+<details>
+<summary>2. A request comes in for a badge next to the card title. What changes in a composed API?</summary>
+
+Nothing in the card's API. The caller puts the badge inside the header
+content they already pass.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Component APIs: props, variants and composition">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, a component API is the list of props. Start every
+component by writing that list before the markup: name, type, default, and
+one sentence on what each is for. If a sentence is hard to write, the prop
+is probably two concepts or none.
+
+A worked example: a `Tag` component. Props: `tone`, one of neutral,
+success or danger, default neutral; `children`, the label. Two props, and
+every use reads clearly: `<Tag tone="success">Published</Tag>`.
+
+The mistake at this level is a `label` prop where `children` would do. It
+makes rich content (a label with an icon or emphasis) impossible without a
+second prop. Use `children` for the main content.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you model variants as enums and keep a variant map
+inside the component. You derive the types from the map, so the allowed
+values live in one place, and you add compound rules for the combinations
+the design treats specially.
+
+A worked example: an `Alert` with `tone` and `appearance` (subtle or
+solid). The design wants solid danger alerts to use a heavier border. That
+is one compound rule in the map, not a third prop.
+
+The mistake at this level is a variant that is really content. A
+`withIcon` boolean that renders a fixed icon is fine until someone needs a
+different icon. An `icon` slot that takes an element is the composed
+answer.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level you handle the props a component passes through. A
+button should accept the native button attributes (`aria-*`, `name`,
+`form`, `data-*`) and forward them to the element, so callers are not
+blocked from accessibility or form features the component did not think of.
+It should forward a ref, so focus can be managed from outside.
+
+A worked example: a dialog needs to return focus to the button that opened
+it. Without ref forwarding, the caller cannot get the underlying element,
+and the dialog cannot do it right. With it, the caller passes a ref and the
+dialog focuses it on close.
+
+The mistake at this level is passing everything through, including
+`className` and `style`, with no thought. Those let any caller override any
+look, and within months the "shared" button has thirty local variations. A
+common middle ground is to allow `className` for layout only (margins,
+grid placement) by convention and review.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries:
+
+- **No children.** An icon-only button has no text, so it has no accessible
+  name. The API should require an `aria-label` when children are absent,
+  enforced in types or a development warning.
+- **An unknown variant value.** From an untyped caller or a CMS. Fall back
+  to the default and warn, rather than rendering with no variant class.
+- **A link that looks like a button.** It must stay an `a` element, because
+  it navigates. A polymorphic `as` prop or a separate `ButtonLink`
+  component keeps the right element; styling a `button` to navigate breaks
+  middle-click and "open in new tab".
+- **A disabled button that must explain why.** A natively disabled button
+  is skipped by Tab, so a keyboard user never reaches it to learn why, and some browsers fire no pointer events on it either. When the
+  reason matters, `aria-disabled="true"` keeps it focusable while the click
+  handler refuses.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **Polymorphic `as` plus a forwarded ref.** `<Button as="a" ref={r}>`
+  must type the ref as an anchor, not a button. Typing this correctly in
+  TypeScript is notoriously fiddly; a separate `ButtonLink` is often the
+  simpler API.
+- **A busy state plus a submit button.** While a form submits, the button
+  shows a spinner. If it becomes `disabled`, it loses focus for keyboard
+  users mid-action. `aria-busy` and ignoring repeat clicks keeps focus
+  where it was.
+- **A compound component plus a caller who reorders parts.** `Card.Footer`
+  placed before `Card.Header` renders in the wrong order. Either the card
+  lays out regions by role with CSS grid areas, or it accepts the order as
+  given and documents that.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, a shared component's API changes are versioned. Adding an
+optional prop or a variant value is a minor change. Removing or renaming
+either, or changing a default, is major. Changing what a value looks like
+is the one to flag in the changelog in plain words, because no tool will.
+
+A deprecation path makes majors cheap: keep the old prop working for one
+release, log a development warning naming the replacement, and ship a
+codemod when the rename is mechanical. The last note in this series has a
+small script that decides the version bump from an API diff.
+
+The mistake in production is "fixing" a default in a patch release, such as
+changing the default size from `md` to `sm`. Every call that relied on the
+default changes size.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is to design for the caller you will never meet. A shared
+component will be used by people who did not write it, in screens it was
+not designed for, months after its author has moved on. They will read the
+types and one example and guess the rest.
+
+So make the guess right: obvious names, the common case as the default,
+contradictions impossible to write, and a place for the next request. When
+I find myself writing a long comment explaining which props cannot be
+combined, I take it as a sign the props are wrong.
+
+The mistake in mindset is optimising the API for the first screen that
+needs the component. That screen's needs leak into names and props that
+make no sense anywhere else.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, components form layers. Primitives (Box, Stack, Text)
+handle layout and typography with tokens. Controls (Button, Input, Select)
+handle one interaction each. Patterns (Card, Dialog, Form field) compose
+controls into a reusable arrangement. Product components compose patterns
+for one feature and are not shared.
+
+Each layer has a different API style. Primitives are configured with a few
+token-valued props. Controls have variants and pass native attributes
+through. Patterns are composed through slots. Product components can be as
+specific as they like, because nobody else uses them.
+
+The mistake at this level is promoting a product component into the shared
+library too early, with its one screen's assumptions still in the props.
+Wait for a second and third use, then extract with an API designed for all
+three.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+How I learn this and how I know I have. I take one component I wrote,
+usually a button or card, and write its props as a table: name, type,
+default, meaning. Then I count combinations, find the contradictions, and
+merge booleans into enums. Then I list the last five feature requests and
+check whether each would need a new prop.
+
+Next I build the variant map from this note with compound rules and
+derived types, and write a test that renders every combination. Finally I
+refactor one configured component into a composed one and count the props
+before and after.
+
+Done when: none of my shared components can express a contradictory
+combination, every variant value is rendered in a test, and the last three
+feature requests needed no new props.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Is a boolean prop always wrong?** No. A boolean is right for one
+independent on/off trait, such as `disabled` or `fullWidth`. It is wrong
+for one value of a dimension that has several, such as `primary`.
+
+**Should I accept className on a shared component?** Many teams do, for
+layout only: margin, width, grid placement. Visual overrides through
+`className` defeat the shared look, so a review rule or lint helps.
+
+**When should a component be compound instead of slotted?** When its parts
+need to share state or coordinate focus, such as tabs, menus and dialogs.
+For static regions like a card's header and footer, slot props are simpler.
+
+**Do I need a library for variant maps?** Not for a few components. The
+function in this note is about twenty lines. A library earns its place when
+many components share the pattern and you want its type inference.
+
+**How do I name variants?** By intent, not appearance: `danger` rather than
+`red`, `subtle` rather than `light-gray`. Appearance names break the moment
+a theme changes the appearance.
+
+**Should a shared input be controlled or uncontrolled?** Support both. Take
+`value` and `onChange` for callers who need to own the state, and
+`defaultValue` for callers who only need a starting value. Decide the mode
+once per instance: if `value` is not `undefined` on the first render, the
+component is controlled for its whole life.
+
+**How many props is too many?** There is no fixed number, but a useful
+signal is the documentation. If the props table needs a second table of
+which props cannot be combined, or a paragraph explaining what happens when
+two of them disagree, the API has more concepts than it has props for, and
+merging booleans into enums or moving content into slots will usually
+shrink it.
+
+**What about a component that needs many optional pieces of text, like an
+empty state with a title, a description and an action?** Those are content
+regions, so they are slots. The empty state owns the layout and spacing;
+the caller passes a heading, a paragraph and a button. When the next screen
+wants a link instead of a button, or two actions, nothing in the API has to
+change.
+
+## Key takeaways
+
+- A component's props are a public API; change them with the care of a
+  function signature.
+- Each independent dimension gets one prop. Mutually exclusive styles are
+  one enum, never several booleans.
+- Booleans multiply states: n style booleans give 2 to the n combinations,
+  only n + 1 of them sensible.
+- A variant map turns props into classes from data, rejects unknown values,
+  and lets types and tests be derived from it.
+- Compose content through children and slots; configure only the frame.
+- Pass native attributes and refs through; be careful with style overrides.
+
+## Glossary
+
+- **Component API**: the props a component accepts, with their types,
+  defaults and meaning.
+- **Variant**: a named visual or behavioural alternative of a component,
+  chosen by a prop value.
+- **Enum prop**: a prop limited to a fixed set of string values.
+- **Variant map**: a data structure from prop values to classes, with
+  defaults and compound rules.
+- **Compound variant**: a style applied only when two or more prop values
+  occur together.
+- **Composition**: building a component's content from parts the caller
+  passes in.
+- **Slot**: a named place in a component where the caller's content goes.
+- **Compound component**: a set of components that work together and share
+  state, such as `Tabs` and `Tabs.Panel`.
+- **Polymorphic component**: a component whose rendered element can be
+  changed with a prop such as `as`.
+- **Ref forwarding**: passing a reference to a component's underlying
+  element through to the caller.
+
+## Practice
+
+**Warm-up.** Write the props table for a component you use daily. Mark each
+boolean that excludes another boolean, and merge them into enums.
+
+**Build.** Extend the variant map with compound rules and a development
+versus production mode: throw in development, warn and fall back in
+production. Write a loop that prints every combination's classes.
+
+**Stretch.** Take a configured card with at least five props and rewrite it
+as a composed card with header, body and footer slots. Then implement the
+same card as a compound component in React, where `Card.Header` reads the
+heading level from context.
