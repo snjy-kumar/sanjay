@@ -1,0 +1,1546 @@
+---
+book: the-devops-handbook
+number: 14
+title: "Create Telemetry to Enable Seeing and Solving Problems"
+description: "Telemetry in depth: centralised logs, events and metrics, useful log levels, problem solving with data, self-service dashboards and filling gaps at every layer."
+part: "Part IV, The Second Way: The Technical Practices of Feedback"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Part III made changes flow quickly into production. Part IV is about the
+other direction: feedback from production back to the people who build
+it. The first requirement for feedback is being able to see what is
+happening. This chapter explains **telemetry**: the logs, events and
+metrics that systems emit so people can understand their behaviour. It
+covers building a central place where telemetry is collected, writing logs
+that actually help, using telemetry to solve problems with evidence rather
+than guesses, making new metrics part of everyday work, giving everyone
+self-service access, filling the gaps at every layer from business to
+infrastructure, and overlaying events such as deployments onto the graphs.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- describe a centralised telemetry system and the flow of data through it;
+- write structured, levelled logs that help people in production;
+- use telemetry to test hypotheses about a problem instead of guessing;
+- add a new production metric as part of normal development work;
+- explain why self-service telemetry and information radiators matter;
+- find telemetry gaps across business, application, infrastructure, client and pipeline layers;
+- overlay deployments and other events onto metrics to connect cause and effect.
+
+What I should already know: the Second Way from
+<a href={withBase('/books/the-devops-handbook/03-the-second-way-the-principles-of-feedback/')}>chapter 3</a>,
+low-risk releases from
+<a href={withBase('/books/the-devops-handbook/12-automate-and-enable-low-risk-releases/')}>chapter 12</a>,
+and the architecture ideas of
+<a href={withBase('/books/the-devops-handbook/13-architect-for-low-risk-releases/')}>chapter 13</a>.
+All code examples on this page are JavaScript run with node.
+
+Reading time: about 75 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Flow caption="The chapter as a path. Read left to right: build the place telemetry goes, make what goes into it useful, use it to solve problems, then make it part of everyone's daily work." steps={[
+  "Centralised telemetry",
+  "Logging that helps production",
+  "Telemetry guides problem solving",
+  "Metrics as daily work",
+  "Self-service and radiators",
+  "Fill the gaps at every layer",
+  "Overlay events on metrics",
+]} />
+
+## Create centralised telemetry infrastructure
+
+### In one sentence
+
+Collect logs, events and metrics from every part of the system into one
+place where they can be stored, searched, graphed and alerted on, so
+anyone can see what is happening in production.
+
+### The idea
+
+The book opens Part IV with a familiar scene: something goes wrong in
+production, and nobody can tell what. People log in to servers one by
+one, read scattered log files, and argue about causes. Each team has its
+own partial view. Problems take a long time to diagnose, and the same
+problem is often diagnosed differently by different people.
+
+The book's answer is a **centralised telemetry infrastructure**. Every
+component, application, database, server, network device, pipeline,
+sends its telemetry to a common system. The book describes the pieces of
+such a system.
+
+- **Collection** at the source: applications and infrastructure emit
+  events, logs and metrics, often through agents or libraries.
+- **An event router** that receives telemetry and sends it on, so sources
+  do not need to know where it ends up.
+- **Storage** suited to each kind of data: searchable logs, time series of
+  metrics.
+- **Analysis and display**: search, graphs, dashboards.
+- **Alerting**: rules that notify people when something needs attention.
+
+The key word is "everyone". Telemetry locked in one team's tool, or on
+servers only operations can reach, cannot provide feedback to developers,
+testers or product people. Centralising it makes one shared view of the
+truth.
+
+The book also distinguishes kinds of telemetry. **Logs** and **events**
+record that something happened, with details: a payment failed for order
+81 with code U30. **Metrics** are numbers measured over time: payments per
+minute, error rate, response time. Both are needed. Metrics show that
+something changed; logs and events explain what.
+
+<Flow caption="The path of telemetry. Read left to right: every source emits, a router forwards, storage keeps, and people search, graph and get alerted from one place." steps={[
+  "Sources: apps, databases, servers, pipeline",
+  "Collectors and agents",
+  "Event router",
+  "Storage: logs and time series",
+  "Search, graphs, dashboards",
+  "Alerts to people",
+]} />
+
+<Compare left="Scattered telemetry" right="Centralised telemetry" caption="Two ways to see production. Read across each row: centralising turns many partial views into one shared one." rows={[
+  ["Logs on each server", "All logs searchable in one place"],
+  ["Each team has its own tools", "Everyone uses the same view"],
+  ["Diagnosis starts by logging in to servers", "Diagnosis starts with a search"],
+  ["Different people see different facts", "One shared set of facts"],
+  ["Old logs rotated away", "Retention chosen deliberately"],
+]} />
+
+#### Logs, metrics and traces
+
+Many teams today add a third kind of telemetry, the **trace**, which
+follows a single request through every part of a system and records how
+long each part took. In a loosely coupled system from chapter 13, where
+one user action may touch several services, traces show where the time
+went and where an error began. The book's principle covers all three:
+collect them centrally and make them available to everyone.
+
+<Layers caption="Three kinds of telemetry. Read top to bottom: each answers a different question, and together they move from noticing a problem to explaining it." layers={[
+  { name: "Metrics", note: "is something different? numbers over time, cheap to keep and graph" },
+  { name: "Logs and events", note: "what happened? detailed records of individual occurrences" },
+  { name: "Traces", note: "where? one request's path and timing across components" },
+]} />
+
+#### Following one request through many services
+
+Centralising telemetry pays off most when one request touches several
+parts of the system. If every log line and trace carries the same
+**request identifier**, generated at the edge and passed along on every
+call, one search returns the whole story of that request.
+
+<Trace columns={["Time", "Service", "Event", "Request id"]} rows={[
+  ["09:00:00.000", "web", "checkout_clicked", "r-5521"],
+  ["09:00:00.020", "orders", "order_created order=81", "r-5521"],
+  ["09:00:00.045", "payments", "payment_started gateway=upi", "r-5521"],
+  ["09:00:03.045", "payments", "payment_retry reason=gateway_timeout", "r-5521"],
+  ["09:00:06.050", "payments", "payment_failed code=U30", "r-5521"],
+  ["09:00:06.060", "web", "error_page_shown", "r-5521"],
+]} caption="One request's events, found with one search. Read top to bottom: the shared request id ties events from three services into a single story, showing that six seconds went to two gateway waits." />
+
+Without the shared identifier, the same investigation would mean matching
+timestamps across three services' logs by hand, which is slow and easy to
+get wrong when many requests run at once.
+
+### Worked example
+
+**Simple.** My site's host keeps build logs and access logs in separate
+places. I add a simple step that sends build results and a daily summary of
+errors to one place I check. When a page breaks, I start from one view
+instead of three.
+
+**Realistic.** A team runs a dozen services, each logging to its own
+servers. During an incident, three people spend an hour collecting logs by
+hand. The team adds a log collector to every server, sends everything to a
+central search tool, and adds a service name and request identifier to
+every log line. The next incident's diagnosis starts with one search
+across all services.
+
+**In production: one view for all teams.** An organisation gives
+developers, operations, testers and product people access to the same
+telemetry system. Product managers start checking feature usage
+themselves; developers check how their changes behave after deployment;
+operations stop being the only people who can answer "what is
+happening?".
+
+### Step by step
+
+1. **List every telemetry source**: applications, databases, servers,
+   network, pipeline.
+2. **Choose central stores** for logs, metrics and, where useful, traces.
+3. **Send everything there**, through collectors or libraries.
+4. **Add common fields**: service, environment, version, request
+   identifier.
+5. **Give everyone access**, with sensible permissions for sensitive data.
+6. **Set retention deliberately**, by how long each kind is useful.
+
+### Common mistake
+
+The common mistake is to centralise only infrastructure metrics, CPU and
+memory, and leave application logs and business events scattered. The
+most useful telemetry for solving problems usually comes from the
+application. The fix is to centralise all kinds.
+
+### In real systems
+
+Log aggregation tools, time-series databases, tracing systems and
+dashboard tools are combined, or provided together by observability
+platforms.
+
+### Check yourself
+
+<details>
+<summary>1. What are the main parts of a centralised telemetry system?</summary>
+
+Collection at sources, an event router, storage, analysis and display, and
+alerting.
+
+</details>
+
+<details>
+<summary>2. How do metrics and logs complement each other?</summary>
+
+Metrics show that something changed; logs and events explain what happened.
+
+</details>
+
+## Create application logging telemetry that helps production
+
+### In one sentence
+
+Write logs for the people who will read them during a problem: structured,
+at the right level, with the context needed to understand what happened.
+
+### The idea
+
+The book points out that every developer writes logs, but often for
+themselves while developing, not for the people who will need them in
+production. The result is logs that are either too noisy, filled with
+details nobody needs, or too sparse, missing the one fact that would
+explain a failure.
+
+The book describes **logging levels**, each with a purpose:
+
+- **DEBUG**: detailed information useful while developing or diagnosing a
+  specific problem; normally off in production.
+- **INFO**: normal, significant events, such as a user logging in or a
+  payment starting.
+- **WARN**: something unexpected that the system handled, but which may
+  become a problem, such as a retry.
+- **ERROR**: a failure of an operation, such as a payment that could not be
+  processed.
+- **FATAL**: a failure that stops the application or a major part of it.
+
+Choosing the right level matters, because alerts and searches depend on
+it. If everything is logged as ERROR, real errors are lost. If real
+errors are logged as INFO, nobody notices them.
+
+The book also lists the kinds of events worth logging, including
+authentication decisions, access to sensitive data, system and data
+changes, invalid input, resource limits, health and availability, startup
+and shutdown, faults and errors, and calls to and from other systems.
+Each is a point where someone, later, may need to know what happened.
+
+#### Structured logs
+
+Logs are most useful when machines can read them as well as people. A
+**structured log** writes each event as a set of named fields, often as
+JSON, rather than a sentence. Then a search can ask "all payment_failed
+events for gateway upi in the last hour" directly. Here is a sketch, run
+with node, with a minimum level that can be changed without a code change:
+
+```js
+// Structured logging with levels: one event per line, machine-readable fields.
+const LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"];
+const minLevel = process.env.LOG_LEVEL || "INFO";
+function log(level, event, fields = {}) {
+  if (LEVELS.indexOf(level) < LEVELS.indexOf(minLevel)) return;
+  console.log(JSON.stringify({ ts: "2026-10-23T09:00:00Z", level, event, service: "checkout", ...fields }));
+}
+log("DEBUG", "cart_loaded", { items: 3 });
+log("INFO", "payment_started", { order: 81, amount: 499 });
+log("WARN", "payment_retry", { order: 81, attempt: 2, reason: "gateway_timeout" });
+log("ERROR", "payment_failed", { order: 81, gateway: "upi", code: "U30" });
+```
+
+With the default level it prints:
+
+```text
+{"ts":"2026-10-23T09:00:00Z","level":"INFO","event":"payment_started","service":"checkout","order":81,"amount":499}
+{"ts":"2026-10-23T09:00:00Z","level":"WARN","event":"payment_retry","service":"checkout","order":81,"attempt":2,"reason":"gateway_timeout"}
+{"ts":"2026-10-23T09:00:00Z","level":"ERROR","event":"payment_failed","service":"checkout","order":81,"gateway":"upi","code":"U30"}
+```
+
+Run with `LOG_LEVEL=DEBUG`, it also prints the first line:
+
+```text
+{"ts":"2026-10-23T09:00:00Z","level":"DEBUG","event":"cart_loaded","service":"checkout","items":3}
+```
+
+The three default lines tell a story someone can follow at three in the
+morning: a payment for order 81 started, the gateway timed out, a retry
+was made, and the payment failed with a specific code. Each line carries
+the order number, so all events for one order can be found with one
+search.
+
+<Compare left="Unhelpful log line" right="Helpful log line" caption="The same failure logged two ways. Read across each row: the helpful version carries the context needed to act." rows={[
+  ["'Error occurred'", "event payment_failed, level ERROR"],
+  ["No identifiers", "order 81, request id, user id where allowed"],
+  ["No cause", "gateway upi, code U30"],
+  ["Free text only", "named fields that can be searched and counted"],
+  ["Logged as INFO", "logged at the level that matches its meaning"],
+]} />
+
+#### What not to log
+
+Helpful logs are also careful logs. Passwords, full card numbers, secret
+keys and unnecessary personal data should never appear in logs, because
+logs are copied, kept and read by many people. A common practice is to
+log identifiers rather than contents, and to mask sensitive fields in the
+logging library so a mistake in one place cannot leak them.
+
+#### Reviewing a log line like code
+
+Because logs are read by other people under pressure, it helps to review
+new log lines in code review with a few questions in mind.
+
+<Compare left="Review question" right="What a good answer looks like" caption="Questions to ask of a new log line. Read across each row: each question checks one property that makes the line useful later." rows={[
+  ["Who will read this, and when?", "on-call, during a failure; or analysts, later"],
+  ["Is the level right?", "matches the agreed meaning of each level"],
+  ["Can it be found?", "a stable event name and searchable fields"],
+  ["Can it be connected?", "request id, order id, service, version"],
+  ["Is anything sensitive in it?", "no secrets; personal data only if necessary and masked"],
+  ["How often will it fire?", "not once per item in a tight loop"],
+]} />
+
+The last question catches a common problem: a log line inside a loop that
+runs a million times a minute, which floods storage and hides everything
+else. Such detail belongs in a metric, or in a single summary event.
+
+#### Log volume and its cost
+
+Logs are not free. Every line is sent, stored, indexed and searched, and
+at scale the cost becomes a real budget item. Teams keep this under
+control without losing value by keeping debug output off in production by
+default and turning it on for one service or one request when needed,
+sampling very frequent success events while keeping every error, and
+setting retention by value: errors and audit events kept longer, routine
+information shorter. The goal is not fewer logs for its own sake, but logs
+whose cost matches how often they help someone answer a question.
+
+### Worked example
+
+**Simple.** My build script used to print "failed" when a page had a broken
+link. I changed it to print the page, the link and the status code on one
+line. Fixing broken links went from a hunt to a glance.
+
+**Realistic.** A team's logs are mostly free text at INFO, with real
+failures mixed in. They adopt structured logging with event names and
+levels, add the request identifier to every line, and agree what each
+level means. Alerts on ERROR events become meaningful, and searches for one
+customer's problem take seconds.
+
+**In production: a level change without a deploy.** A rare bug affects a
+few customers. The team raises the log level to DEBUG for one service, for
+an hour, through configuration, catches the detailed events around the
+failure, and sets the level back. No deployment, and no permanent flood of
+debug logs.
+
+### Step by step
+
+1. **Agree what each level means**, and write it down.
+2. **Log structured events** with names and fields.
+3. **Add identifiers**: request, order, user where allowed, service,
+   version.
+4. **Log at the points that matter**: authentication, changes, calls to
+   other systems, errors.
+5. **Keep secrets out** with masking in the logging library.
+6. **Make the level configurable** at run time.
+
+### Common mistake
+
+The common mistake is to log everything at one level, so the logs are a
+wall of noise. The fix is clear level definitions and reviews of new log
+lines like any other code.
+
+### In real systems
+
+Structured logging libraries exist for every major language, and log
+search tools index JSON fields automatically. Many teams review log lines
+in code review.
+
+### Check yourself
+
+<details>
+<summary>1. What is the difference between WARN and ERROR?</summary>
+
+WARN is something unexpected that was handled but may become a problem;
+ERROR is a failed operation.
+
+</details>
+
+<details>
+<summary>2. Why are structured logs more useful than free text?</summary>
+
+Named fields can be searched, filtered and counted directly, so questions
+about many events are quick to answer.
+
+</details>
+
+<details>
+<summary>3. Name two things that should never appear in logs.</summary>
+
+Any two of: passwords, full card numbers, secret keys and unnecessary
+personal data.
+
+</details>
+
+## Use telemetry to guide problem solving
+
+### In one sentence
+
+Use telemetry to form and test hypotheses about a problem, the way a
+scientist uses experiments, instead of relying on guesses, opinions or
+blame.
+
+### The idea
+
+The book argues that without telemetry, problem solving in production
+tends to become a contest of opinions. Each team suspects another, people
+reboot things to see if it helps, and the loudest voice decides. This is
+slow, and it damages trust, because when the cause is not known, blame
+fills the gap.
+
+With good telemetry, problem solving can follow something like the
+**scientific method**. State a hypothesis: "the failures are in one
+region". Look at the data that would confirm or refute it. Discard
+hypotheses the data refutes, and refine the ones it supports. Each step
+narrows the search, and the conclusion rests on evidence everyone can see.
+
+The book connects this to culture. When the facts are visible to all,
+discussion moves from "whose fault is it?" to "what does the data show?".
+That shift supports the blameless culture the Third Way needs, which
+chapter 19 develops.
+
+#### Narrowing down a cause with grouped telemetry
+
+Here is a sketch, run with node. Five thousand payment events have a
+gateway, an app version and a region. A hidden cause makes card payments
+from app version 5.2 fail far more often. The script tests one hypothesis
+per field by grouping failures:
+
+```js
+// Using telemetry to test hypotheses: group failed payments by each field.
+let seed = 21;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+const pick = (a) => a[Math.floor(rand() * a.length)];
+const events = [];
+for (let i = 0; i < 5000; i++) {
+  const e = { gateway: pick(["upi", "card", "netbanking"]), app: pick(["5.1", "5.2"]), region: pick(["north", "south", "west"]) };
+  const failRate = e.gateway === "card" && e.app === "5.2" ? 0.2 : 0.01; // hidden cause
+  e.failed = rand() < failRate;
+  events.push(e);
+}
+for (const field of ["region", "gateway", "app"]) {
+  const groups = {};
+  for (const e of events) {
+    const g = (groups[e[field]] ??= { n: 0, f: 0 });
+    g.n++; if (e.failed) g.f++;
+  }
+  console.log(`by ${field.padEnd(8)}`, Object.entries(groups).map(([k, g]) => `${k}: ${((g.f / g.n) * 100).toFixed(1)}%`).join("  "));
+}
+const both = events.filter((e) => e.gateway === "card" && e.app === "5.2");
+console.log(`card AND app 5.2: ${((both.filter((e) => e.failed).length / both.length) * 100).toFixed(1)}% of ${both.length}`);
+```
+
+It prints:
+
+```text
+by region   south: 4.2%  north: 3.8%  west: 4.0%
+by gateway  netbanking: 0.6%  upi: 0.9%  card: 10.5%
+by app      5.2: 7.4%  5.1: 0.8%
+card AND app 5.2: 21.2% of 775
+```
+
+Read as a sequence of hypotheses, the output is a small investigation.
+"It is one region": refuted, all regions are similar. "It is one
+gateway": supported, card is far worse. "It is the new app version":
+also supported. Combining the two supported hypotheses shows the real
+pattern: card payments from version 5.2 fail about one time in five, while
+everything else is near normal. The next step is obvious, look at what
+changed in card handling in 5.2, and nobody had to guess or blame.
+
+<Trace columns={["Hypothesis", "Evidence", "Verdict", "Next step"]} rows={[
+  ["One region is failing", "4.2, 3.8, 4.0 percent", "refuted", "drop it"],
+  ["One gateway is failing", "card 10.5 against under 1", "supported", "look at card"],
+  ["The new app version", "5.2 at 7.4 against 0.8", "supported", "look at 5.2"],
+  ["Card on 5.2 together", "21.2 percent of 775", "strongly supported", "diff card handling in 5.2"],
+]} caption="The script's output as an investigation. Read top to bottom: each row tests one idea against data, and the combination of two supported ideas reveals the cause." />
+
+#### One incident, with and without telemetry
+
+The difference telemetry makes is clearest when the same incident is told
+twice. The times below are illustrative.
+
+<Timeline caption="The same payment failure, investigated two ways. Read top to bottom: without telemetry, time goes to gathering facts and arguing; with it, time goes to testing hypotheses and fixing." items={[
+  { when: "Without, first hour", what: "Customer reports arrive. Teams log in to servers to read logs. Each suspects another." },
+  { when: "Without, second hour", what: "Someone restarts the payment service; failures continue; the evidence from before the restart is gone." },
+  { when: "Without, later", what: "A developer notices the app version in a support ticket. The cause is found by luck." },
+  { when: "With, first minutes", what: "Payment error rate alert fires; the graph shows a step aligned with no deployment marker." },
+  { when: "With, next minutes", what: "Grouping failures by field shows card on app 5.2; the 5.2 release notes mention card changes." },
+  { when: "With, soon after", what: "Card payments on 5.2 are switched to the old flow by a toggle; a fix is prepared calmly." },
+]} />
+
+#### Keeping the evidence
+
+Telemetry also protects evidence. In the first story above, the restart
+erased the state that would have explained the failure. A team that
+relies on telemetry learns a simple habit: before restarting, rolling back
+or scaling, capture what is needed, a snapshot of the graphs, the relevant
+log search, a thread dump if the process is stuck. It takes a minute and
+it means the later review, the subject of chapter 19, works from facts
+rather than memory. Restoring service still comes first; the habit is to
+take that one minute when it is safe to do so.
+
+### Worked example
+
+**Simple.** Readers told me some pages were slow. I guessed it was my
+images. My host's analytics showed the slow pages were all ones with
+embedded code playgrounds, regardless of images. The guess was wrong; the
+data pointed to the real cause in one look.
+
+**Realistic.** An outage meeting starts with the database team blaming a
+recent application release and the application team blaming the
+database. Someone shares the telemetry: database response times were
+normal throughout, but one application endpoint began making ten times
+more queries after the release. The discussion ends in minutes, and the
+fix follows.
+
+**In production: telemetry ends a long argument.** A team has argued for
+weeks about whether a cache is helping. They add metrics for cache hits,
+misses and the response time of each. The data shows the cache serves most
+requests and makes them much faster, but one kind of request always
+misses. The argument becomes a specific improvement.
+
+### Step by step
+
+1. **State the problem** as a measurable symptom.
+2. **List hypotheses**, including unpopular ones.
+3. **For each, say what data would refute it.**
+4. **Check the data**, starting with the cheapest hypotheses.
+5. **Combine supported hypotheses** to narrow further.
+6. **Share the evidence** with everyone involved.
+
+### Common mistake
+
+The common mistake is to change things, reboot, roll back, scale up,
+before looking at data, so the evidence is lost and the cause never
+found. Where safety allows, capture the telemetry first, then act.
+Restoring service always comes first when users are suffering, but even a
+quick snapshot of key graphs helps later.
+
+### In real systems
+
+Log search with grouping, metric dashboards that can be split by any
+field, and traces that show where time went are the main tools.
+Incident reviews, chapter 19, often reconstruct the investigation from
+the telemetry.
+
+### Check yourself
+
+<details>
+<summary>1. How does telemetry change problem solving?</summary>
+
+It lets people test hypotheses against evidence instead of guessing,
+which is faster and replaces blame with shared facts.
+
+</details>
+
+<details>
+<summary>2. In the script, why did neither "card" nor "5.2" alone show the full picture?</summary>
+
+The cause was the combination; each alone mixed affected and unaffected
+events, diluting the failure rate.
+
+</details>
+
+## Enable creation of production metrics as part of daily work
+
+### In one sentence
+
+Make adding a new metric as easy as adding a line of code, so developers
+measure what they build as a normal part of building it.
+
+### The idea
+
+The book argues that if creating a metric requires a request to another
+team, a ticket and a wait, few metrics will be created, and those that are
+will be the ones someone thought of long ago. Instead, the telemetry
+system should make it trivial for any developer to add a metric from code:
+a counter for an event, a timer for an operation, a gauge for a level.
+The metric should then appear in the central system automatically, ready
+to graph and alert on.
+
+When metrics are this cheap, developers add them as they write features:
+how often is the new button used, how long does the new query take, how
+often does the new fallback trigger. The book describes organisations
+where developers routinely add metrics for every feature, and where the
+volume and variety of metrics become a strength, because almost any
+question about production can be answered from existing data.
+
+#### Why percentiles, not averages
+
+The most common metric is response time, and the most common mistake is
+to graph its average. Here is a sketch, run with node, with a thousand
+requests, most fast and a few very slow:
+
+```js
+// Why percentiles: 1000 request timings, most fast, a few very slow.
+let seed = 5;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+const times = Array.from({ length: 1000 }, () => (rand() < 0.04 ? 2000 + rand() * 3000 : 80 + rand() * 60));
+times.sort((a, b) => a - b);
+const pct = (p) => times[Math.ceil((p / 100) * times.length) - 1];
+const mean = times.reduce((a, b) => a + b, 0) / times.length;
+console.log(`mean ${mean.toFixed(0)} ms | median ${pct(50).toFixed(0)} ms | p95 ${pct(95).toFixed(0)} ms | p99 ${pct(99).toFixed(0)} ms | max ${times.at(-1).toFixed(0)} ms`);
+console.log(`requests slower than 1 s: ${times.filter((t) => t > 1000).length} of 1000`);
+```
+
+It prints:
+
+```text
+mean 262 ms | median 110 ms | p95 139 ms | p99 4452 ms | max 4935 ms
+requests slower than 1 s: 43 of 1000
+```
+
+The numbers disagree in an instructive way. The mean, 262 ms, describes
+no real request: typical ones take about 110 ms, and the slow ones take
+seconds. The 95th percentile, 139 ms, looks healthy because the slow
+requests are only about four percent of the total, just under its
+threshold. The 99th percentile, 4452 ms, reveals them. Forty-three users
+in a thousand waited more than a second, and neither the mean nor p95
+shows that clearly. The lesson is to graph several percentiles and to
+count requests over a limit, not to trust one summary number.
+
+<Trace columns={["Summary", "Value", "What it tells me"]} rows={[
+  ["Mean", "262 ms", "misleading: no request took about this long"],
+  ["Median (p50)", "110 ms", "the typical request is fast"],
+  ["p95", "139 ms", "95 in 100 are fast; hides a 4 percent tail"],
+  ["p99", "4452 ms", "a slow tail exists and is severe"],
+  ["Over 1 s", "43 of 1000", "how many users actually suffered"],
+]} caption="One set of timings, five summaries. Read top to bottom: each statistic shows part of the picture, and the tail is visible only in the higher percentiles and the count." />
+
+#### The kinds of metric a developer adds
+
+<Compare left="Kind of metric" right="Example and use" caption="Common metric types. Read across each row: each type fits a different kind of question, and all should be one line of code to add." rows={[
+  ["Counter", "payments_failed_total: how often something happens"],
+  ["Timer or histogram", "search_duration_ms: how long something takes, as percentiles"],
+  ["Gauge", "queue_depth: a level that goes up and down"],
+  ["Business event", "signup_completed: whether users do what we hoped"],
+]} />
+
+#### Naming metrics so others can find them
+
+When everyone can add metrics, consistent naming keeps the result usable.
+A common convention puts the thing measured first, then what is measured,
+then the unit, with a small set of tags for dimensions.
+
+<Trace columns={["Name", "Tags", "Good because"]} rows={[
+  ["payments_failed_total", "gateway, app_version", "clear subject, counter suffix, bounded tags"],
+  ["search_duration_ms", "endpoint", "unit in the name; graph as percentiles"],
+  ["checkout_queue_depth", "region", "a gauge with an obvious meaning"],
+  ["metric1", "user_id", "BAD: meaningless name, unbounded tag"],
+]} caption="Metric names and tags. Read across each row: the first three can be found and understood by anyone; the last cannot, and its tag would overwhelm the store." />
+
+#### Making metrics part of the definition of done
+
+The simplest way to make metrics daily work is to put them in the
+definition of done. A feature is not finished until it reports whether it
+is being used and whether it is working: a counter for its main action, a
+counter for its failures, and a timer for its slowest step. Reviewers ask
+for these the same way they ask for tests. Over time this produces a
+system where every feature can answer two questions from a dashboard, is
+anyone using this, and is it healthy, without a special project to add
+monitoring later. It also feeds chapter 17, because a feature that
+already reports its usage is ready for an experiment.
+
+### Worked example
+
+**Simple.** I add a counter to my site's search component for searches
+with no results. A week later, the counts show which topics readers look
+for that I have not written about. That metric cost one line.
+
+**Realistic.** A team adopts a metrics library that sends counters and
+timers to the central system with no extra setup. Their definition of done
+gains a line: "new features emit usage and timing metrics". Within a few
+months, questions that used to need a special report are answered from a
+dashboard in minutes.
+
+**In production: the fallback counter.** A developer adds a counter each
+time a service falls back to cached data because a dependency timed out,
+from chapter 13's resilience patterns. The counter is normally near zero.
+One afternoon it rises sharply, giving the team an early warning that the
+dependency is struggling, well before users notice anything.
+
+### Step by step
+
+1. **Provide a metrics library** that makes counters, timers and gauges
+   one line each.
+2. **Send metrics automatically** to the central store, tagged with
+   service and version.
+3. **Add metrics to the definition of done** for new features.
+4. **Graph percentiles**, not averages, for timings.
+5. **Review metrics occasionally** and retire unused ones.
+
+### Common mistake
+
+The common mistake is to make metrics an operations concern, created by
+request. The fix is self-service metrics in code, created by the people
+who build the feature.
+
+A second mistake is to tag metrics with unbounded values, such as user
+identifiers, which can overwhelm metric stores. Such detail belongs in
+logs and events; metrics use a small set of tags.
+
+### In real systems
+
+Metrics libraries and agents for common languages send data to
+time-series stores; dashboards show percentiles from histograms.
+
+### Check yourself
+
+<details>
+<summary>1. Why should adding a metric be one line of code?</summary>
+
+So developers add metrics as part of building features, and production
+questions can be answered from existing data.
+
+</details>
+
+<details>
+<summary>2. In the script, why did p95 look healthy while p99 did not?</summary>
+
+The slow requests were about four percent of the total, so the 95th
+percentile fell just below them; the 99th percentile fell among them.
+
+</details>
+
+## Create self-service access to telemetry and information radiators
+
+### In one sentence
+
+Make telemetry visible to everyone without asking, through self-service
+tools and information radiators placed where people work.
+
+### The idea
+
+Telemetry only provides feedback if people look at it. The book argues
+for two kinds of visibility.
+
+**Self-service access** means anyone in the value stream can search logs,
+build a graph or set up a dashboard without asking another team. If
+developers must ask operations for data, they will rarely ask, and
+feedback from production will stay thin.
+
+**Information radiators** are displays placed where people work, showing
+the most important measures continuously, a term from agile practice. A
+screen in the team area, or a dashboard pinned in the team chat, shows
+deployment status, error rates, response times and key business numbers.
+Nobody has to remember to look; the information radiates.
+
+The book also describes a cultural effect. When the state of production is
+visible to everyone, including people outside engineering, the
+organisation shares one picture of reality. Problems are harder to hide,
+and the visibility itself is a signal of trust: the team has nothing to
+conceal.
+
+<Layers caption="Levels of visibility. Read top to bottom: from data that exists to data that people actually see while they work." layers={[
+  { name: "Collected", note: "telemetry exists in the central system" },
+  { name: "Self-service", note: "anyone can search and graph it without asking" },
+  { name: "Dashboards", note: "useful views built and shared by teams" },
+  { name: "Information radiators", note: "key measures always visible where people work" },
+  { name: "Shared with the wider organisation", note: "product, support and leaders see the same truth" },
+]} />
+
+#### What a good radiator shows
+
+A radiator that shows everything shows nothing. The most useful ones show
+a few measures that the team acts on, each with a clear sense of normal.
+
+<Trace columns={["Panel", "Shows", "Normal looks like", "Act when"]} rows={[
+  ["Deployments", "last deploys with versions", "several a day, all green", "a red deploy or none for days"],
+  ["Error rate", "errors per minute, by service", "a low, flat line", "a step change"],
+  ["Response time", "p50 and p99", "steady", "p99 rising"],
+  ["Business pulse", "orders or signups per minute", "the usual daily curve", "a drop against the same time last week"],
+]} caption="A four-panel team radiator. Read across each row: each panel has a known normal and a clear trigger for action, so a glance is enough." />
+
+#### Radiating to users: status pages
+
+The same idea extends beyond the organisation. A public **status page**
+shows users whether the service is healthy and, during an incident, what
+is known and when the next update will come. It reduces the flood of
+support requests during problems and builds trust, because users see that
+the team knows and is acting. Its content should come from the same
+telemetry the team uses, so it is not a separate story that drifts from
+the truth.
+
+#### A radiator nobody looks at
+
+A common failure is the dashboard on a big screen that everyone walks past.
+It usually happens for one of three reasons: it shows too many graphs to
+read at a glance, it shows measures nobody acts on, or it is always red so
+red means nothing. The fix follows from the cause.
+
+<Compare left="Symptom" right="Fix" caption="Why radiators get ignored, and what to change. Read across each row: each fix makes the screen answer one question quickly." rows={[
+  ["Forty small graphs", "four large ones: users served, errors, latency, pipeline"],
+  ["Measures nobody owns", "remove them, or name the team that acts on each"],
+  ["Always red", "fix the thresholds, or fix the system; never accept it"],
+  ["Only engineers understand it", "plain labels and a business measure on top"],
+]} />
+
+A good test is to ask someone walking past what the screen tells them. If
+they can say whether things are healthy within a few seconds, it works.
+
+### Worked example
+
+**Simple.** I keep a small dashboard of my site's build status, page
+views and broken links on my desktop's home screen. When something
+changes, I notice without going looking.
+
+**Realistic.** A team puts a screen in its area showing the four panels
+above. In the first week, a developer notices the error rate step up a few
+minutes after their deployment and rolls back before any customer reports
+arrive. The radiator becomes the first place everyone glances in the
+morning.
+
+**In production: support and engineering on one screen.** Support staff
+gain access to the same dashboards as engineers. When customers call about
+slow payments, support can see whether payments are slow for everyone or
+just one customer, and tells engineers with evidence attached. Incidents
+are noticed sooner, and support calls are shorter.
+
+### Step by step
+
+1. **Give everyone access** to search and dashboards.
+2. **Build a team dashboard** with a few measures the team acts on.
+3. **Show it where people work**: a screen or the team chat.
+4. **Define normal and act-when** for each panel.
+5. **Share with support and product** so they see the same picture.
+
+### Common mistake
+
+The common mistake is a radiator with dozens of graphs that nobody reads.
+The fix is a few panels with clear normals and triggers.
+
+### In real systems
+
+Dashboard tools, chat integrations that post key graphs and status pages
+are common forms of radiators.
+
+### Check yourself
+
+<details>
+<summary>1. What is an information radiator?</summary>
+
+A display placed where people work that shows the most important measures
+continuously, so nobody has to go looking.
+
+</details>
+
+<details>
+<summary>2. Why does self-service access matter for feedback?</summary>
+
+If people must ask another team for data, they rarely do, so feedback from
+production stays thin.
+
+</details>
+
+## Find and fill any telemetry gaps
+
+### In one sentence
+
+Check that telemetry covers every layer, business, application,
+infrastructure, client software and the deployment pipeline, and add
+what is missing, because problems hide in the layers nobody measures.
+
+### The idea
+
+The book lists the levels at which telemetry is needed and suggests that
+teams look systematically for gaps.
+
+**Business level.** Measures of what the business cares about: sales,
+signups, active users, revenue, conversion through a funnel, the success
+of a campaign. These tell whether the system is achieving its purpose.
+
+**Application level.** Measures of how the application behaves: response
+times, error rates, throughput, the behaviour of individual features and
+dependencies. These tell whether the software is working.
+
+**Infrastructure level.** Measures of servers, databases, networks and
+storage: CPU, memory, disk, connections, saturation. These tell whether
+the platform has the capacity and health the application needs.
+
+**Client software level.** Measures from the user's device: page load in
+the browser, app crashes, errors in client code, how long screens take to
+become usable. These tell what users actually experience, which can
+differ greatly from what the servers report.
+
+**Deployment pipeline level.** Measures of the pipeline itself: build
+status, test times, deployment frequency and duration, failed deployments.
+These tell whether the flow of changes is healthy.
+
+The book stresses connecting the levels. An infrastructure metric alone,
+"CPU at 90 percent", does not say whether it matters. Linked to the
+application, "response time rising", and the business, "orders falling",
+it becomes a clear signal. The reverse also holds: a drop in orders is
+easier to explain when application and infrastructure telemetry is on the
+same view.
+
+<Layers caption="The five levels of telemetry. Read top to bottom: from whether the business is working to whether the pipeline is, with each level helping explain the ones above it." layers={[
+  { name: "Business", note: "orders, signups, revenue, funnel conversion" },
+  { name: "Application", note: "response times, errors, throughput, feature use" },
+  { name: "Infrastructure", note: "CPU, memory, disk, network, saturation" },
+  { name: "Client software", note: "page load, crashes, client errors, as users see them" },
+  { name: "Deployment pipeline", note: "build status, test times, deploys, failures" },
+]} />
+
+#### Finding gaps with a coverage table
+
+A simple way to find gaps is to take the most important user journeys and
+check, for each level, whether there is telemetry that would show a
+problem.
+
+<Trace columns={["Journey", "Business", "Application", "Infrastructure", "Client", "Pipeline"]} rows={[
+  ["Sign up", "signups per hour", "signup errors, timing", "database health", "GAP: form errors in browser", "deploys of signup service"],
+  ["Search", "GAP: searches with no results", "search p99, errors", "index node health", "search box load time", "yes"],
+  ["Checkout", "orders per minute", "payment errors by gateway", "queue depth", "GAP: app crashes on payment screen", "yes"],
+]} caption="A telemetry coverage table. Read across each row: every cell should name a measure, and each GAP marks a way a problem could hide." />
+
+The gaps in the table are typical. Client-side problems are invisible to
+server metrics: if the payment screen crashes in the app, the server sees
+fewer payment requests, not an error. Business gaps, such as searches
+with no results, hide product problems that no error rate will show.
+
+#### Business and application metrics together
+
+The book encourages teams to put business measures next to technical ones
+and to look at them together. A useful habit is to graph a business
+measure against the same time last week, because many businesses have
+strong daily and weekly patterns, and a drop is only visible against what
+is normal for that hour.
+
+<Compare left="Technical metric alone" right="With business context" caption="The same graph with and without the business view. Read across each row: business context turns technical numbers into decisions." rows={[
+  ["Error rate 1 percent", "1 percent of payments failing: urgent"],
+  ["CPU at 90 percent", "orders still normal: watch, not urgent"],
+  ["Response time up 20 percent", "conversion down at the same time: act"],
+  ["All green", "orders half of last week's: something is wrong that we do not measure"],
+]} />
+
+The last row is the most important. When business measures fall and all
+technical measures look normal, there is a gap: something users
+experience is not being measured.
+
+#### Telemetry for the pipeline itself
+
+The deployment pipeline is the level teams most often forget, yet it is
+the one that shows whether the flow from Part III is healthy. A few
+pipeline measures, collected in the same central system as everything
+else, make slow drift visible before it becomes a crisis.
+
+<Trace columns={["Pipeline measure", "Healthy", "Drifting"]} rows={[
+  ["Commit stage duration", "steady within budget", "creeping up a little every week"],
+  ["Share of runs that are red", "low, and red is short", "rising; red lasting hours"],
+  ["Flaky test count", "near zero", "a growing quarantine list"],
+  ["Deployments per day", "steady or rising", "falling as people batch"],
+  ["Lead time, commit to production", "hours", "days"],
+]} caption="Pipeline telemetry. Read across each row: each drift is gradual and easy to miss without a graph, and each erodes flow." />
+
+These measures connect directly to chapter 10's andon cord and chapter
+11's small batches. A commit stage that grows by a few seconds a week
+will, unwatched, double within a year, and people will start batching to
+avoid the wait.
+
+### Worked example
+
+**Simple.** My site's server metrics were all fine, but readers emailed
+that a page was broken. The page rendered; a script in the browser was
+failing. I added a tiny client-side error report, and the next browser
+error appeared in my logs before anyone emailed.
+
+**Realistic.** A team builds the coverage table for its three main
+journeys and finds five gaps, mostly client-side and business. They fill
+them over two iterations: browser error reporting, app crash reporting, a
+"no results" counter for search, and a signup funnel. A month later, a
+drop in the signup funnel at one step leads them to a confusing form
+field that no technical metric had flagged.
+
+**In production: the silent failure.** One evening, orders fall to half
+the usual level for that hour, but every technical dashboard is green.
+Because the team graphs orders against last week, the drop is noticed in
+minutes. The cause is a change by a third-party payment provider that
+made a button invisible on some phones. No server ever saw an error.
+Client telemetry is added afterwards so the next such problem shows
+directly.
+
+### Step by step
+
+1. **List the key user journeys.**
+2. **Build a coverage table** across the five levels.
+3. **Fill the gaps**, starting with client and business ones.
+4. **Graph business measures** against the same time last week.
+5. **Put levels side by side** on dashboards.
+6. **Repeat the table** when journeys change.
+
+### Common mistake
+
+The common mistake is to trust server-side metrics as the whole picture.
+Users experience the client; many problems never reach the servers. The
+fix is client telemetry and business measures as early warnings.
+
+### In real systems
+
+Real user monitoring in browsers, crash reporting in mobile apps,
+business event streams and pipeline dashboards fill the different levels.
+
+### Check yourself
+
+<details>
+<summary>1. Name the five levels of telemetry.</summary>
+
+Business, application, infrastructure, client software and the deployment
+pipeline.
+
+</details>
+
+<details>
+<summary>2. What does it mean when business measures fall but all technical measures are normal?</summary>
+
+There is a telemetry gap: something users experience is not being
+measured.
+
+</details>
+
+## Overlay other relevant information onto metrics
+
+### In one sentence
+
+Mark deployments, configuration changes and other events directly on
+metric graphs, so a change in behaviour can be linked to its likely cause
+at a glance.
+
+### The idea
+
+The book's final practice is simple and powerful. When a graph shows a
+sudden change, the first question is "what changed?". If deployments,
+configuration changes, feature toggle flips, infrastructure changes and
+even marketing campaigns are drawn on the same graph as vertical markers,
+the answer is often visible immediately.
+
+The book notes that changes are a frequent cause of production problems,
+so connecting changes to effects is the fastest way to diagnose many of them.
+It also supports the culture of small, frequent deployments: when each
+deployment is small and marked, a problem that appears just after one
+points to a short list of changes.
+
+Here is a sketch, run with node, of an error-rate series with a deployment
+marked at minute 30:
+
+```js
+// Overlay deployments on a metric: did the error rate change after a deploy?
+const minutes = [];
+let seed = 9;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+for (let m = 0; m < 60; m++) {
+  const base = m < 30 ? 0.5 : 2.5; // deploy at minute 30 raises errors
+  minutes.push(+(base + (rand() - 0.5)).toFixed(1));
+}
+const deploys = { 30: "build 412 to production" };
+for (let m = 24; m < 36; m++)
+  console.log(`${String(m).padStart(2)}  ${"#".repeat(Math.round(minutes[m] * 4)).padEnd(14)} ${minutes[m].toFixed(1)}%${deploys[m] ? "   <-- deploy: " + deploys[m] : ""}`);
+const avg = (a) => (a.reduce((x, y) => x + y, 0) / a.length).toFixed(2);
+console.log(`avg error rate 30 min before: ${avg(minutes.slice(0, 30))}% | after: ${avg(minutes.slice(30))}%`);
+```
+
+It prints:
+
+```text
+24  ####           0.9%
+25  #              0.2%
+26                 0.1%
+27  ##             0.6%
+28  ###            0.8%
+29  ##             0.5%
+30  #########      2.2%   <-- deploy: build 412 to production
+31  #########      2.3%
+32  #########      2.3%
+33  ############   2.9%
+34  #########      2.2%
+35  #########      2.3%
+avg error rate 30 min before: 0.46% | after: 2.47%
+```
+
+Without the marker, the step at minute 30 is a mystery to investigate.
+With it, the first hypothesis writes itself: build 412. The averages
+confirm a jump from under half a percent to about two and a half. The
+team can look at the small set of changes in that build, or simply roll
+it back and investigate calmly, using chapter 12's patterns.
+
+<Trace columns={["Marker type", "Example", "Why overlay it"]} rows={[
+  ["Deployment", "build 412 to production", "many problems follow a change"],
+  ["Feature toggle", "newCheckout to 50 percent", "a release without a deployment"],
+  ["Configuration", "cache size raised", "changes behaviour without code"],
+  ["Infrastructure", "database failover", "explains sudden latency shifts"],
+  ["Business event", "sale starts at noon", "explains traffic surges that are not problems"],
+]} caption="Events worth marking on graphs. Read across each row: each kind of change can explain a shift in a metric, and the last kind prevents false alarms." />
+
+#### From markers to automatic correlation
+
+Once changes are recorded as events in the telemetry system, the next
+step is to let the system do the first comparison. When a key metric
+shifts, the dashboard can list the changes in the preceding minutes,
+deployments, toggles, configuration, ordered by how close they are in
+time and whether they touched the affected service. This does not replace
+judgement, since a change near a shift is a suspect, not a proven cause,
+but it gives the on-call person a short, ranked list of hypotheses to test
+straight away.
+
+<Flow caption="From a shifted metric to a ranked list of suspects. Read left to right: the system gathers recent changes so people start testing hypotheses at once." steps={[
+  "Metric shifts beyond normal",
+  "Collect changes in the last 30 minutes",
+  "Rank by time and affected service",
+  "Show the list beside the graph",
+  "Person tests the top suspect",
+]} />
+
+#### What else is worth overlaying
+
+Deployments and toggles are the obvious markers, but other events explain
+shifts just as often: a marketing email going out, a partner's outage, a
+holiday, a database maintenance window, or a change in a third-party
+library's configuration. Recording these as events too, even by hand at
+first, saves the on-call person from chasing a code cause for a traffic
+spike that a campaign explains.
+
+### Worked example
+
+**Simple.** I mark each site deployment on my page-view graph. When views
+dropped one day, the marker showed a deploy an hour earlier; I had
+accidentally removed a page from the sitemap. Without the marker, I would
+have blamed a quiet news day.
+
+**Realistic.** A team's dashboards show markers for every deployment,
+toggle change and configuration change, posted automatically by the
+pipeline and the toggle system. Incident diagnosis often starts and ends
+with "the step lines up with this marker", and rollback follows.
+
+**In production: a false alarm avoided.** At noon, traffic triples and
+response times rise. On-call engineers start an investigation, then see
+the marker: a promoted sale started at noon. The system is busy, not
+broken. They watch capacity instead of hunting for a fault.
+
+### Step by step
+
+1. **Have the pipeline post a marker** for every deployment.
+2. **Post markers for toggles and configuration changes** too.
+3. **Add business events**, such as campaigns, to the same timeline.
+4. **Show markers on every key graph** by default.
+5. **Start investigations** by checking markers near the change.
+
+### Common mistake
+
+The common mistake is to keep deployment records in a separate tool from
+metrics, so connecting the two needs manual comparison of timestamps. The
+fix is automatic markers on the graphs.
+
+### In real systems
+
+Most dashboard tools support annotations posted by pipelines and toggle
+services; some show deployments and changes on every graph by default.
+
+### Check yourself
+
+<details>
+<summary>1. Why overlay deployments on metrics?</summary>
+
+Many problems follow a change, so seeing changes on the graph points
+straight to a likely cause.
+
+</details>
+
+<details>
+<summary>2. Why mark business events such as sales?</summary>
+
+So expected surges are not mistaken for problems, avoiding false alarms.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 14, Create Telemetry to Enable Seeing and Solving Problems">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that we cannot fix what we cannot
+see. I learn the difference between logs, metrics and traces, the meaning
+of each log level, and why telemetry should be collected in one place
+rather than scattered across servers. I learn to write a log line that
+someone else could act on.
+
+An example: I replace "error" in one of my scripts with a structured line
+naming the event, the item affected and the cause, and I notice how much
+faster I find the next failure.
+
+The habit to build here is asking, for anything I write, "how would I
+know if this stopped working in production?".
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I write structured logs with identifiers and
+consistent levels, keep secrets out of them, and make the level
+configurable at run time. I add counters and timers to features as I
+build them, and I graph percentiles rather than averages. I use a team
+dashboard with a few panels that have clear normals.
+
+An example: I add a timer around a new database query and graph its p50
+and p99, which shows a slow tail that the average had hidden.
+
+I also add the request identifier to every log line in my service and
+check that one search returns a full request's story, which is the first
+test of whether my logs will help during a real problem.
+
+I also start testing hypotheses with grouped telemetry during
+problems, rather than guessing.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I design centralised telemetry for a system of
+services, with common fields, request identifiers and traces across
+service boundaries. I build coverage tables for key journeys across all
+five levels and fill the gaps, especially client and business ones. I
+make the pipeline and toggle system post markers on every graph.
+
+An example: I find that a checkout journey has no client-side crash
+reporting, add it, and connect it to the same dashboard as payment
+errors and orders per minute.
+
+I choose retention for each kind of telemetry deliberately, keeping cheap
+metrics for a long time and detailed logs for as long as they are useful.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: very high-volume events, where logging every one is
+too costly and sampling is needed; batch jobs and scheduled tasks, which
+need telemetry about whether they ran at all, not just how they behaved;
+offline-capable clients, whose telemetry arrives late; and third-party
+services we cannot instrument, where we measure our calls to them
+instead.
+
+An example: a nightly report job emits a "completed" event with a count.
+An alert fires if the event does not arrive by morning, catching the
+silent failure where the job never started.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: telemetry that fails at the same time as the system
+it watches, such as a logging pipeline overloaded during an incident;
+clocks that disagree across servers, scrambling the order of events;
+metrics with unbounded tags that overwhelm the store; and personal data
+leaking into logs through error messages that echo user input.
+
+An example: during a traffic surge, the log pipeline drops events just
+when they are needed. The team gives error-level events priority and
+keeps a small, separate path for the most important metrics.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, every component sends structured logs, metrics and
+traces to central systems, with common fields and request identifiers.
+Developers add metrics in one line as part of the definition of done.
+Everyone has self-service access, and teams keep radiators with a few
+actionable panels. Coverage tables exist for key journeys across all five
+levels, with gaps tracked. Deployments, toggles and configuration
+changes appear as markers on every graph, and business measures are
+compared with the same time last week.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that telemetry is part of the product, not an
+afterthought. I measure what I build as I build it. I prefer evidence to
+opinion, and I share data openly so discussions start from the same facts.
+When something surprises me in production, I ask what telemetry would have
+shown it sooner, and I add it.
+
+An example of the mindset: after every incident, one follow-up is always
+"what signal would have told us earlier?", and it is added that week.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, telemetry is a cross-cutting capability that
+should be built into the platform: libraries that make logging, metrics
+and tracing automatic, collectors on every host, a central router and
+stores, and dashboards and alerts on top. It connects to chapter 13:
+loosely coupled services need request identifiers and traces to be
+understandable as a whole.
+
+An example: a shared service template includes structured logging,
+standard metrics for every endpoint and trace propagation, so every new
+service is observable from its first deployment.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to make production visible to everyone, then make it
+understandable, then make it part of daily work. Centralise all kinds of
+telemetry. Standardise log levels and structure. Make metrics
+self-service in code. Build coverage tables and fill gaps at every level.
+Overlay changes on graphs. Put radiators where people work. And use
+telemetry to replace opinion and blame with evidence.
+
+Done when any person in the value stream can see, without asking, how
+production is behaving at every level, any shift in a key graph can be
+linked to a change at a glance, and new features ship with their own
+metrics.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>How much should we log?</summary>
+
+Enough to understand what happened during a problem, at levels that let
+people filter. Log significant events at INFO, handled surprises at WARN,
+failures at ERROR, and keep DEBUG off in production unless diagnosing.
+Review new log lines like code.
+
+</details>
+
+<details>
+<summary>Is telemetry the same as monitoring?</summary>
+
+Monitoring usually means watching known signals and alerting on them.
+Telemetry is the data that makes monitoring, and much more, possible:
+investigation, learning about users and checking changes.
+
+</details>
+
+<details>
+<summary>Who owns the telemetry system?</summary>
+
+Often a platform team builds and runs it, while every team owns the
+telemetry its own services emit and the dashboards it uses.
+
+</details>
+
+<details>
+<summary>What about the cost of storing all this?</summary>
+
+Costs are real. Keep metrics, which are compact, for a long time; keep
+detailed logs for shorter periods; sample very high-volume events. Choose
+retention by how long each kind of data is useful.
+
+</details>
+
+<details>
+<summary>Do we need traces?</summary>
+
+For a single application, logs and metrics may be enough. For many
+services, traces become very valuable, because they show where a slow or
+failing request spent its time.
+
+</details>
+
+<details>
+<summary>How do we stop dashboards multiplying?</summary>
+
+Keep a few team dashboards with clear purposes and owners, and let people
+build ad hoc views when investigating without saving them all.
+
+</details>
+
+<details>
+<summary>Should non-engineers see production telemetry?</summary>
+
+The book argues yes, for the most part. Support, product and leaders
+make better decisions with the same facts. Sensitive data can be
+restricted while the overall picture is shared.
+
+</details>
+
+<details>
+<summary>How does this chapter connect to the next?</summary>
+
+Chapter 15 analyses telemetry: finding anomalies, setting good alerts and
+anticipating problems before they affect users.
+
+</details>
+
+<details>
+<summary>What is the first telemetry to add to a system with almost none?</summary>
+
+Usually three things: structured error logs with request identifiers, a
+response time and error rate metric for the main entry points, and one
+business measure such as orders or signups per minute, graphed against the
+same time last week. Together they show whether users are being served and
+point to where failures are.
+
+</details>
+
+<details>
+<summary>How do we keep personal data safe while sharing telemetry widely?</summary>
+
+Log identifiers rather than contents, mask sensitive fields in the logging
+library, restrict access to the few logs that must contain personal data,
+and share aggregated metrics and dashboards broadly. Most questions can
+be answered without personal data at all.
+
+</details>
+
+<details>
+<summary>Should every team pick its own telemetry tools?</summary>
+
+Usually not. Teams can add their own metrics, logs and dashboards freely,
+but sharing one central system means a request can be followed across
+team boundaries and everyone learns one set of tools. Variety in what is
+measured is healthy; variety in where it is stored makes cross-team
+problems much harder to solve.
+
+</details>
+
+## Key takeaways
+
+- Centralise logs, events, metrics and traces so everyone shares one view of production.
+- Metrics show that something changed; logs and events explain what; traces show where.
+- Write structured logs at meaningful levels, with identifiers, and never with secrets.
+- Use telemetry to test hypotheses, replacing guesses and blame with evidence.
+- Make metrics one line of code and part of the definition of done.
+- Graph percentiles and counts over a limit, not averages.
+- Give everyone self-service access, and keep a few radiators where people work.
+- Fill gaps at every level: business, application, infrastructure, client and pipeline.
+- Overlay deployments and other changes on graphs to connect causes and effects.
+
+## Glossary
+
+- **Telemetry**: data that systems emit about their behaviour: logs, events, metrics and traces.
+- **Centralised telemetry**: one system that collects, stores and shows telemetry from every source.
+- **Event router**: the part that receives telemetry and forwards it to stores.
+- **Log**: a record of something that happened.
+- **Structured log**: a log entry written as named fields rather than free text.
+- **Log level**: a label, such as DEBUG, INFO, WARN, ERROR or FATAL, describing an entry's importance.
+- **Metric**: a number measured over time.
+- **Counter**: a metric that counts occurrences.
+- **Gauge**: a metric that shows a level that rises and falls.
+- **Histogram**: a metric that records the distribution of values, such as response times.
+- **Percentile**: the value below which a given share of measurements fall, such as p99.
+- **Trace**: the path and timing of one request through a system's components.
+- **Request identifier**: a value carried through all telemetry for one request.
+- **Information radiator**: a display of key measures placed where people work.
+- **Telemetry gap**: a part of the system or user experience with no telemetry to show problems.
+- **Annotation or marker**: an event, such as a deployment, drawn on a graph.
+
+## Exercises and self-check
+
+**Warm-up.** List every place telemetry from one of my projects lives
+today. Rewrite three log lines as structured events with identifiers and
+the right levels.
+
+**Build.** Send logs and one metric from a project to a central place.
+Add a counter and a timer to a feature, graph p50 and p99, and mark
+deployments on the graph.
+
+**Stretch.** Build a coverage table for two journeys across all five
+levels, fill one client gap and one business gap, and run the grouping
+script against real or sample events to test a hypothesis.
+
+### Self-check
+
+<details>
+<summary>1. What does each of metrics, logs and traces answer?</summary>
+
+Metrics: is something different? Logs and events: what happened? Traces:
+where did it happen?
+
+</details>
+
+<details>
+<summary>2. What level would a handled gateway timeout with a successful retry use?</summary>
+
+WARN: unexpected and handled, but possibly a sign of trouble.
+
+</details>
+
+<details>
+<summary>3. Why was the mean in the percentile script misleading?</summary>
+
+It mixed many fast requests with a few very slow ones and described no
+real request.
+
+</details>
+
+<details>
+<summary>4. Which telemetry level would have caught a button invisible on some phones?</summary>
+
+Client software level, with business measures as an early warning.
+
+</details>
+
+<details>
+<summary>5. What is the first thing to check when a graph shows a sudden step?</summary>
+
+The change markers near it: deployments, toggles, configuration and
+business events.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter by instrumenting something I own and then breaking
+it on purpose. Seeing a deliberate fault appear in my own telemetry, and
+finding it from the data alone, is the best test of whether the telemetry
+is good.
+
+<Timeline caption="Three sessions and a habit for chapter 14." items={[
+  { when: "Session 1", what: "Read the chapter. Run the four scripts. List where my project's telemetry lives." },
+  { when: "Session 2", what: "Centralise logs and a metric; restructure log lines; graph percentiles with deploy markers." },
+  { when: "Session 3", what: "Build a coverage table; fill two gaps; break something on purpose and find it from data." },
+  { when: "Every feature", what: "Ship it with a usage counter, a timer and structured logs." },
+]} />
+
+This chapter is part of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+The next chapter turns from collecting telemetry to analysing it.
+
+Done when my project's telemetry lives in one place, every key graph shows
+deployment markers, and I can find a deliberately introduced fault from
+the data alone.
