@@ -1,0 +1,1420 @@
+---
+book: introduction-to-algorithms
+number: 6
+title: "Heapsort"
+description: "Binary heaps as arrays, sift-down, the linear-time build and its proof, heapsort traced step by step, and priority queues with handles, with tested TypeScript throughout."
+part: "Part II, Sorting and Order Statistics"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Part II of the book is about sorting, and it opens with an algorithm that
+is really about a data structure. A binary heap is an array that behaves
+like a tree, cheap to build and cheap to keep in order. Heapsort uses it
+to sort in place in Θ(n lg n) time in the worst case, which neither
+insertion sort nor quicksort can promise. And the same heap, used as a
+priority queue, runs schedulers, timers, shortest-path searches and
+top-k queries. This chapter builds it from nothing.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- picture an array as a nearly complete binary tree and move between them with the parent and child index formulas, zero-based and one-based;
+- state the max-heap and min-heap properties and check them in code;
+- write sift-down (the book's MAX-HEAPIFY), prove it correct, and show it costs O(lg n);
+- build a heap bottom-up and prove the surprising fact that it takes only O(n) time;
+- write heapsort, trace it by hand, and explain why it is in place, Θ(n lg n) and not stable;
+- implement a priority queue with insert, maximum, extract-max and increase-key, including the handle map that real code needs.
+
+**You should already know:** <a href={withBase('/books/introduction-to-algorithms/02-getting-started/')}>chapter 2</a>
+(loop invariants and the cost model) and
+<a href={withBase('/books/introduction-to-algorithms/03-characterizing-running-times/')}>chapter 3</a>
+(asymptotic notation and logarithms). The linear-time build uses a
+geometric-style sum like the ones in
+<a href={withBase('/books/introduction-to-algorithms/04-divide-and-conquer/')}>chapter 4</a>.
+
+**Reading time:** about 70 minutes to read, and four sessions of one to
+two hours to trace the algorithms by hand and write the code.
+
+## Chapter map
+
+The chapter is a straight line: define the structure, give its one
+repair operation, use that to build a heap, use the heap to sort, then
+reuse the heap for priority queues.
+
+<Layers caption="The chapter as a stack. Each layer is built from the one above it: sift-down is the single primitive, the build calls it n/2 times, heapsort calls it n times, and the priority queue adds its mirror image, sift-up." layers={[
+  { name: "6.1 Heaps", note: "array as a tree; parent, left, right; max-heap and min-heap property; height Θ(lg n)" },
+  { name: "6.2 Maintaining the heap property", note: "sift-down (MAX-HEAPIFY): fix one node whose subtrees are heaps, O(lg n)" },
+  { name: "6.3 Building a heap", note: "sift down every internal node from the bottom up; O(n), not O(n lg n)" },
+  { name: "6.4 The heapsort algorithm", note: "build, then swap the max to the end and sift down, n − 1 times" },
+  { name: "6.5 Priority queues", note: "maximum, extract-max, increase-key (sift-up), insert; handles map items to positions" },
+]} />
+
+<Flow steps={["Unsorted array", "Build a max-heap in O(n)", "Swap root (the max) with the last heap slot", "Shrink the heap by one", "Sift the new root down in O(lg n)", "Repeat until the heap has one element", "Sorted array, in place"]} caption="Heapsort end to end. The heap occupies a shrinking prefix of the array, and the sorted output grows from the right end." />
+
+A word about the name. "Heap" also means the region of memory a garbage
+collector manages, where `new` objects live. The two are unrelated. The
+book points this out, and in this chapter heap always means the data
+structure.
+
+## 6.1 Heaps
+
+### In one sentence
+
+A binary heap is an array read as a nearly complete binary tree, in which
+every parent's key is at least as large as its children's (a max-heap) or
+at most as large (a min-heap).
+
+### The idea
+
+#### An array that is a tree
+
+A **nearly complete binary tree** is one where every level is full except
+possibly the last, and the last level is filled from the left with no
+gaps. Such a tree can be stored in an array with no pointers at all:
+put the root at the first slot, then the next level left to right, then
+the next. Because there are no gaps, the position of every node's
+parent and children is a formula of its own position.
+
+With one-based indexing, as in the book: the parent of i is ⌊i/2⌋, the
+left child is 2i and the right child is 2i + 1. With zero-based indexing,
+as in TypeScript: the parent of i is ⌊(i − 1)/2⌋, the left child is
+2i + 1 and the right child is 2i + 2. The book notes that these are
+cheap on real hardware: a multiply or divide by 2 is a single bit shift.
+
+The array also has two sizes. Its length is how many slots it has; the
+**heap size** is how many of those slots, from the front, are currently
+part of the heap. Elements after the heap size are in the array but not
+in the heap. Heapsort depends on this: the sorted part grows in the
+slots past the heap size.
+
+<Figure art={`
+                      index 0
+                      [ 20 ]
+                  /            \\
+           index 1              index 2
+           [ 14 ]               [ 17 ]
+          /      \\             /      \\
+     idx 3       idx 4      idx 5       idx 6
+     [ 8 ]       [ 6 ]      [ 9 ]       [ 4 ]
+     /
+  idx 7
+  [ 1 ]
+
+  array:  index  0   1   2   3   4   5   6   7
+          key   20  14  17   8   6   9   4   1
+  children of i: 2i + 1 and 2i + 2      parent of i: floor((i − 1) / 2)
+`} caption="The same max-heap as a tree and as an array, zero-based. Read any node's children by doubling its index and adding 1 and 2; read its parent by the reverse." />
+
+#### The heap property
+
+A **max-heap** satisfies the **max-heap property**: for every node other
+than the root, the parent's key is at least the node's key. So the
+largest key is at the root, and every path from the root down is
+non-increasing. A **min-heap** is the mirror: every parent is at most its
+children, and the smallest key is at the root.
+
+The property says nothing about siblings, or about left versus right.
+In the figure, 17 on the right is bigger than 14 on the left, and 9 is
+bigger than 8 although it sits further right. A heap is far weaker than
+a sorted array or a search tree, and that weakness is exactly why it is
+cheap to maintain.
+
+#### Height
+
+The **height** of a node is the number of edges on the longest path down
+from it to a leaf, and the height of the heap is the height of its root.
+A nearly complete tree with n nodes has height ⌊lg n⌋, so Θ(lg n).
+Every basic heap operation walks one root-to-leaf path at most, which is
+why they all cost O(lg n).
+
+The last fact the chapter uses about the shape: in an n-element heap,
+the leaves are exactly the last ⌈n/2⌉ elements. In zero-based terms, the
+nodes at indices ⌊n/2⌋ to n − 1 are leaves, and indices 0 to ⌊n/2⌋ − 1 are
+internal. Building a heap skips the leaves for that reason.
+
+### Worked example
+
+#### A simple example: the index formulas, run
+
+```ts
+// shape.ts (excerpt): zero-based index arithmetic and the heap check.
+export const parent = (i: number) => (i - 1) >> 1;
+export const left = (i: number) => 2 * i + 1;
+export const right = (i: number) => 2 * i + 2;
+export function isMaxHeap(a: number[], n = a.length) {
+  for (let i = 1; i < n; i++) if (a[parent(i)] < a[i]) return false;
+  return true;
+}
+```
+
+```text
+i=0  parent=-  left=1  right=2
+i=1  parent=0  left=3  right=4
+i=2  parent=0  left=5  right=6
+i=3  parent=1  left=7  right=8
+i=6  parent=2  left=13  right=14
+```
+
+The heap check visits each non-root node once and compares it with its
+parent, so it is Θ(n). On the figure's array it prints `true`; change the
+6 at index 4 to 15 and it prints `false`, because 15 is larger than its
+parent 14.
+
+#### A realistic example: heights and leaves at scale
+
+```text
+n=1  height=0  leaves=1  first leaf index=0
+n=7  height=2  leaves=4  first leaf index=3
+n=8  height=3  leaves=4  first leaf index=4
+n=16  height=4  leaves=8  first leaf index=8
+n=1000  height=9  leaves=500  first leaf index=500
+n=1000000  height=19  leaves=500000  first leaf index=500000
+```
+
+A heap of a million elements is 19 levels tall. Any operation that walks
+one path does at most about 20 steps of work, and half the elements are
+leaves. Those two numbers explain most of the chapter's running times.
+
+### Step by step
+
+#### Why the height is ⌊lg n⌋
+
+A nearly complete tree of height h has full levels 0 to h − 1, holding
+1 + 2 + ... + 2^(h−1) = 2^h − 1 nodes, plus between 1 and 2^h nodes on
+level h. So n is at least 2^h and at most 2^(h+1) − 1. Taking logs,
+h is at most lg n and lg n is below h + 1. That pins h = ⌊lg n⌋.
+
+#### Why the leaves start at ⌊n/2⌋ (zero-based)
+
+Node i has a left child exactly when 2i + 1 is at most n − 1, that is,
+when i is at most (n − 2)/2. The largest such integer is ⌊n/2⌋ − 1. So
+nodes 0 to ⌊n/2⌋ − 1 have at least one child, and nodes ⌊n/2⌋ onward have
+none. For n = 9, nodes 0 to 3 are internal and 4 to 8 are leaves: five
+leaves, ⌈9/2⌉.
+
+### Common mistake
+
+The common mistake is mixing the indexing conventions: using the book's
+one-based formulas (children 2i and 2i + 1) on a zero-based JavaScript
+array. The root at index 0 then has "children" at 0 and 1, so it is its
+own child, and the code loops or silently corrupts the heap. The fix is
+to pick one convention and write the three helpers once, then use only
+the helpers. My helpers are zero-based throughout this page.
+
+The second mistake is reading the heap as sorted. Only the root is known
+to be extreme. The second-largest is one of the root's children, but the
+third-largest could be at depth 1 or 2. The fix is to remember the
+property is parent-versus-child only.
+
+### In real systems
+
+Array-backed heaps are the standard priority queue in almost every
+standard library: Java's `PriorityQueue`, Python's `heapq`, C++'s
+`priority_queue` and Go's `container/heap` are all binary heaps over a
+contiguous array. JavaScript ships none, which is why so many Node
+projects contain a hand-written one. libuv, under Node's event loop, keeps
+its timers in a min-heap so the next timer to fire is always at the root.
+
+### Check yourself
+
+**In a zero-based heap of 12 elements, which indices are leaves?**
+
+<details>
+<summary>Answer</summary>
+
+Indices 6 to 11, since ⌊12/2⌋ = 6. That is six leaves, ⌈12/2⌉.
+
+</details>
+
+**Where can the smallest key of a max-heap be?**
+
+<details>
+<summary>Answer</summary>
+
+Only at a leaf. Any internal node is at least as large as its child, so
+it cannot be strictly the smallest, unless keys are equal.
+
+</details>
+
+## 6.2 Maintaining the heap property
+
+### In one sentence
+
+Sift-down fixes a single node that may be smaller than its children,
+assuming both of its subtrees are already heaps, by swapping it with its
+larger child and repeating one level lower, in O(lg n) time.
+
+### The idea
+
+#### The precondition
+
+The book's procedure is called MAX-HEAPIFY; I call my version
+`siftDown`, the common name in libraries. It takes an array, an index i
+and the heap size. Its **precondition** is precise: the subtrees rooted
+at i's left and right children are already max-heaps, but a[i] itself
+might be smaller than one of its children. Its job is to move the value
+at i down to where it belongs, so that the subtree rooted at i becomes a
+max-heap.
+
+That precondition is what makes the operation cheap. Because the two
+subtrees are already heaps, the only possible violation is at i. Fix it
+by swapping, and the only possible new violation is one level down,
+where the old a[i] landed. So the problem moves down a single path, and
+never branches.
+
+#### The step
+
+At node i, look at a[i], its left child and its right child. Let m be the
+index of the largest of the three. If m is i, the value is already at
+least as big as both children, and since both subtrees are heaps, the
+whole subtree is a heap: stop. Otherwise swap a[i] with a[m]. Now node i
+holds the largest of the three, so it is fine with respect to both
+children. The subtree at m has had its root replaced by a smaller value,
+so repeat at m.
+
+Why the larger child? If you swapped with the smaller child, that child
+would become the parent of its larger sibling, and the property would
+fail at i. Swapping with the larger one is the only choice that leaves i
+correct.
+
+#### Running time
+
+Each step does a constant amount of work (two comparisons and maybe a
+swap) and moves one level down. The number of steps is at most the
+height of node i, so sift-down from node i costs O(h), where h is that
+node's height, and O(lg n) from the root. The book also writes the cost
+as a recurrence: the worst case is when the bottom level is exactly half
+full, so the larger subtree holds at most 2n/3 nodes, giving
+T(n) ≤ T(2n/3) + Θ(1), which the master method (chapter 4, case 2)
+solves as O(lg n).
+
+### Worked example
+
+#### A simple example: one violation, two swaps
+
+Take the array 20 3 17 8 14 9 4 1 6 11 and sift down at index 1, whose
+value 3 is smaller than its children 8 and 14. Both subtrees of index 1
+(rooted at 3 and 4) are heaps, so the precondition holds.
+
+```ts
+// heap.ts (excerpt): zero-based sift-down, iterative.
+export function siftDown(a: number[], i: number, n: number, log?: string[]) {
+  for (;;) {
+    const l = left(i), r = right(i); let m = i;
+    if (l < n && a[l] > a[m]) m = l;
+    if (r < n && a[r] > a[m]) m = r;
+    if (m === i) return;
+    log?.push(`swap a[${i}]=${a[i]} with a[${m}]=${a[m]}`);
+    [a[i], a[m]] = [a[m], a[i]]; i = m;
+  }
+}
+```
+
+```text
+swap a[1]=3 with a[4]=14
+swap a[4]=3 with a[9]=11
+20 14 17 8 11 9 4 1 6 3 true
+```
+
+First 3 swaps with 14, the larger of 8 and 14. Now at index 4, its only
+child is index 9 with 11, larger than 3: swap. Index 9 has no children:
+stop. The final `true` is the heap check on the whole array.
+
+#### A realistic example: iterative versus recursive
+
+The book's version is recursive: after the swap, call itself on m. That
+is a **tail call**, a recursive call that is the very last thing the
+function does, so it converts mechanically into a loop, which is what my
+code does. In JavaScript the difference matters: engines do not
+generally eliminate tail calls, so a recursive version uses one stack
+frame per level. With height at most about 50 for any array that fits in
+memory, that is harmless here, but the loop is just as clear and never
+risks the stack.
+
+### Step by step
+
+#### The sift-down trace
+
+<Trace
+  columns={["step", "i", "a[i], left, right", "largest", "array after the step"]}
+  rows={[
+    ["start", "1", "3, 8, 14", "", "20 3 17 8 14 9 4 1 6 11"],
+    ["1", "1", "3, 8, 14", "index 4 (14)", "20 14 17 8 3 9 4 1 6 11"],
+    ["2", "4", "3, 11, none", "index 9 (11)", "20 14 17 8 11 9 4 1 6 3"],
+    ["3", "9", "3, none, none", "index 9 itself", "stop: no children"],
+  ]}
+  caption="Sift-down at index 1. Follow the value 3 as it sinks: it always trades places with its larger child, and stops when no child is larger."
+/>
+
+#### Why it is correct
+
+The argument is an induction on the height of node i. If i is a leaf, the
+one-node subtree is a heap. Otherwise, after choosing m: if m = i, a[i]
+is at least both children, both subtrees are heaps by the precondition,
+so the subtree at i is a heap. If m is a child, after the swap a[i] holds
+the largest of the three, so it is at least both children. The subtree at
+m has its two subtrees still heaps (untouched), and its root may now be
+too small: exactly the precondition, on a node of smaller height. By
+induction, the call at m makes that subtree a heap. And a[i] is still at
+least the new a[m], because a[i] is the old maximum of all three. So the
+subtree at i is a heap.
+
+### Common mistake
+
+The common mistake is calling sift-down when the precondition does not
+hold, for example on the root of an arbitrary array. It will move the root
+down one path and stop, leaving violations elsewhere untouched. The
+result passes a quick look and fails the heap check. The fix is to
+remember sift-down repairs one node, given heap subtrees; making a whole
+array a heap is section 6.3's job.
+
+The second mistake is comparing the children with each other but not with
+a[i], or forgetting the bounds check on the right child when the last
+internal node has only a left child. With n = 10, node 4 has a left child
+at 9 and no right child at 10; reading a[10] gives `undefined`, and
+`undefined > 3` is false, which happens to work in JavaScript and fails
+loudly in a typed array language. The fix is the explicit `r < n` test.
+
+### In real systems
+
+Sift-down is the hot loop of every array-based priority queue. Library
+implementations often make one refinement: instead of swapping at each
+level, they hold the sinking value in a variable, shift the larger child
+up into the hole, and write the value once at the end. That halves the
+writes. Some go further and sift the hole all the way to a leaf without
+comparing against the sinking value, then sift it back up a short way,
+which saves comparisons because the value removed from the end usually
+belongs near the bottom.
+
+### Check yourself
+
+**Why must sift-down swap with the larger child?**
+
+<details>
+<summary>Answer</summary>
+
+Because the child that moves up becomes the parent of its sibling. Only
+the larger child is at least its sibling, so only that swap keeps the
+property at i.
+
+</details>
+
+**What does sift-down cost from a node of height h?**
+
+<details>
+<summary>Answer</summary>
+
+O(h): constant work per level, and at most h levels down.
+
+</details>
+
+## 6.3 Building a heap
+
+### In one sentence
+
+Run sift-down on every internal node from the last one back to the root,
+and the whole array becomes a max-heap in O(n) time, not O(n lg n).
+
+### The idea
+
+#### Bottom-up
+
+The leaves, indices ⌊n/2⌋ to n − 1 in zero-based terms, are already
+one-element heaps. So start at the last internal node, ⌊n/2⌋ − 1, and
+sift down each node in decreasing index order to 0. When node i is
+processed, its children have larger indices and were processed earlier
+(or are leaves), so their subtrees are heaps: sift-down's precondition
+holds at every call.
+
+#### The loop invariant
+
+The book proves this with a loop invariant: at the start of each
+iteration, each node with index greater than i is the root of a max-heap.
+
+- **Initialization.** Before the first iteration, i = ⌊n/2⌋ − 1, and every
+  node after it is a leaf, a trivial heap.
+- **Maintenance.** The children of i have larger indices, so by the
+  invariant they are heap roots. Sift-down at i makes i a heap root and
+  leaves every other node after i a heap root (it only changes nodes in
+  i's subtree, and leaves those subtrees heaps). Decrementing i restores
+  the invariant.
+- **Termination.** The loop ends with i = −1, so every node from 0 up is
+  a heap root. In particular node 0, the root of the whole array.
+
+#### The simple bound and the tight bound
+
+The simple bound: n/2 calls to sift-down, each O(lg n), so O(n lg n). It
+is correct but not tight. The tight bound comes from noticing that most
+calls are cheap. Sift-down at a node of height h costs O(h), and most
+nodes are near the bottom. An n-element heap has at most ⌈n/2^(h+1)⌉ nodes
+of height h. About half the nodes are leaves (height 0, never sifted),
+a quarter have height 1, an eighth height 2, and only one node, the root,
+has height lg n.
+
+So the total cost is at most the sum over h of (n/2^(h+1))·O(h), which is
+O(n) times the sum of h/2^h. That series converges: it equals 2. So
+building a heap costs O(n).
+
+<Figure art={`
+  height h    nodes at that height    cost each    total at that height
+  --------    --------------------    ---------    --------------------
+     3                 1                   3              3
+     2                 2                   2              4
+     1                 4                   1              4
+     0                 8                   0              0
+                                                     -----
+                    15 nodes                         11 swaps at most
+
+  n/2 nodes do nothing, n/4 do one step, n/8 do two steps ...
+  total  ≈  n · (1/4 + 2/8 + 3/16 + 4/32 + ...)  =  n · 1  =  O(n)
+`} caption="Why building a heap is linear, for a full tree of 15 nodes. The expensive nodes are few and the many nodes are cheap. The column totals stay small instead of being 15 times the height." />
+
+### Worked example
+
+#### A simple example: building a heap of nine keys
+
+```ts
+// buildtrace.ts: the bottom-up build, one row per siftDown call.
+const a = [5, 13, 2, 25, 7, 17, 20, 8, 4];
+for (let i = (a.length >> 1) - 1; i >= 0; i--) siftDown(a, i, a.length);
+```
+
+```text
+start      5 13 2 25 7 17 20 8 4
+i=3 (0 swaps) 5 13 2 25 7 17 20 8 4
+i=2 (1 swaps) 5 13 20 25 7 17 2 8 4
+i=1 (1 swaps) 5 25 20 13 7 17 2 8 4
+i=0 (3 swaps) 25 13 20 8 7 17 2 5 4
+```
+
+Node 3 (25) is already bigger than 8 and 4. Node 2 (2) swaps with 20.
+Node 1 (13) swaps with 25, and stops because 13 is at least 8 and 4.
+The root 5 sinks three levels: past 25, then 13, then 8. Five swaps in
+all for nine elements.
+
+#### A realistic example: linear in practice
+
+I built heaps from increasing input, the worst case for both methods,
+and compared with inserting the elements one at a time (each insert
+sifts the new element up from the bottom):
+
+```text
+n=1000  build swaps=992 (0.992 n)  build comparisons=1982  insert-one-by-one swaps=7987 (7.99 n)  ok=true
+n=10000  build swaps=9992 (0.999 n)  build comparisons=19982  insert-one-by-one swaps=113631 (11.36 n)  ok=true
+n=100000  build swaps=99990 (1.000 n)  build comparisons=199978  insert-one-by-one swaps=1468946 (14.69 n)  ok=true
+n=1000000  build swaps=999988 (1.000 n)  build comparisons=1999974  insert-one-by-one swaps=17951445 (17.95 n)  ok=true
+```
+
+The bottom-up build does about one swap and two comparisons per element,
+flat as n grows by a thousand times: linear. Inserting one at a time does
+about lg n swaps per element on this input, growing from 8 to 18 per
+element: n lg n. Same final property, very different cost.
+
+### Step by step
+
+#### The sum, line by line
+
+<Trace
+  columns={["step", "expression", "reason"]}
+  rows={[
+    ["1", "cost ≤ Σ over h from 0 to ⌊lg n⌋ of (nodes of height h) · c·h", "sift-down at height h costs at most c·h"],
+    ["2", "nodes of height h ≤ ⌈n / 2^(h+1)⌉", "the shape fact from 6.1"],
+    ["3", "cost ≤ Σ ⌈n / 2^(h+1)⌉ · c·h ≤ c·n · Σ h / 2^h", "drop the ceiling into a constant factor"],
+    ["4", "Σ over h from 0 to infinity of h / 2^h = 2", "the series Σ h·x^h = x/(1 − x)² at x = 1/2"],
+    ["5", "cost ≤ 2c·n = O(n)", "substitute"],
+  ]}
+  caption="The linear-time build as a five-step derivation. Step 4 is the one fact to remember: h/2^h sums to a constant, because the heights grow slowly while the node counts halve."
+/>
+
+The series in step 4 is worth checking numerically once: 0 + 1/2 + 2/4 +
+3/8 + 4/16 + 5/32 is already 1.78, and the remaining terms add the last
+0.22.
+
+### Common mistake
+
+The common mistake is building the heap top-down: running sift-down from
+index 0 to ⌊n/2⌋ − 1 in increasing order. When node 0 is processed, its
+subtrees are not yet heaps, so the precondition fails, and the result is
+not a heap. Try it on 5 13 2 25 7 17 20 8 4: the root ends up 13, not
+25. The fix is the decreasing order, which is what makes the invariant
+true.
+
+The second mistake is believing the O(n lg n) bound is the real cost and
+avoiding the build for that reason, for instance by inserting elements
+one at a time. As the measurement shows, that is the slower method. The
+fix is to use the bulk build whenever all elements are available up
+front.
+
+### In real systems
+
+Python's `heapq.heapify` and C++'s `std::make_heap` are this bottom-up
+build, and they are documented as linear. Java's `PriorityQueue`
+constructor that takes a collection also heapifies in bulk. When a
+scheduler restarts and reloads ten million pending jobs from disk,
+building the queue in one pass instead of ten million inserts is a real
+saving at startup.
+
+### Check yourself
+
+**Why does the build loop start at ⌊n/2⌋ − 1 rather than n − 1?**
+
+<details>
+<summary>Answer</summary>
+
+Every node from ⌊n/2⌋ on is a leaf, already a heap, and sift-down would do
+nothing there. Starting at the last internal node saves half the calls.
+
+</details>
+
+**Is building a heap faster than sorting? Why does that not contradict the
+sorting lower bound?**
+
+<details>
+<summary>Answer</summary>
+
+Yes, O(n) versus Ω(n lg n) for comparison sorting. A heap is only
+partially ordered, so building one does not sort; the n lg n is paid
+later, when heapsort extracts the elements one by one.
+
+</details>
+
+## 6.4 The heapsort algorithm
+
+### In one sentence
+
+Build a max-heap, then repeatedly swap the root (the largest remaining
+key) into the last slot of the heap, shrink the heap by one and sift the
+new root down, so the array fills with sorted keys from the right.
+
+### The idea
+
+#### Two phases in one array
+
+Heapsort has two phases. Phase one builds a max-heap from the whole
+array in O(n). Phase two runs n − 1 times: the root holds the largest key
+still in the heap, so swap it with the last element of the heap, which
+is exactly where that key belongs in sorted order. Decrease the heap size
+by one, so the key just placed is no longer part of the heap. The new
+root, which came from the bottom, is probably too small, but both its
+subtrees are still heaps, so one sift-down restores the heap.
+
+The array is always split in two: a max-heap on the left, holding the
+smallest keys in heap order, and a sorted run on the right, holding the
+largest keys in their final positions. The boundary moves one step left
+each iteration.
+
+#### The invariant
+
+The book states the loop invariant for phase two: at the start of each
+iteration, with the heap occupying positions 0 to end, the prefix is a
+max-heap holding the end + 1 smallest keys, and the suffix after end
+holds the remaining keys in sorted order. Initialization: after the build,
+the heap is the whole array and the suffix is empty. Maintenance: the
+root is the largest key in the prefix, and every key in the prefix is at
+most every key in the suffix, so swapping it to position end extends the
+sorted suffix by one; sift-down restores the prefix. Termination: when
+the heap has one element, it is the smallest, and the array is sorted.
+
+#### Cost and properties
+
+Phase one is O(n). Phase two does n − 1 sift-downs from the root, each
+O(lg n), so O(n lg n) total, and that is the worst case: heapsort is
+Θ(n lg n) in the worst case on distinct keys. It is **in place**: beyond
+the array it uses only a constant number of extra variables. And it is
+**not stable**: equal keys can come out in a different order from the
+one they went in, because the long-distance swaps jump keys past each
+other.
+
+#### Why about 2n lg n comparisons
+
+Each sift-down step from the root compares the two children with each
+other and then the larger child with the sinking key: two comparisons per
+level. In phase two the key moved to the root comes from the bottom of
+the heap, so it is usually among the smallest and sinks almost all the
+way back down, about lg n levels. That gives roughly 2 lg n comparisons
+per extraction and about 2n lg n in total, which is what my counts show
+(1.85 to 1.89 times n lg n at a million keys). Merge sort, by contrast,
+does at most one comparison per element output per level.
+
+This also explains the "sift to the bottom, then up" refinement from
+6.2: since the sinking key nearly always goes to the bottom, skipping the
+comparison against it on the way down and fixing it up afterwards saves
+about half the comparisons on average.
+
+<Compare left="Heapsort" right="Merge sort (chapter 2)" caption="Heapsort next to merge sort. Both are Θ(n lg n) in the worst case; heapsort wins on memory and loses on stability and locality." rows={[
+  ["Worst case Θ(n lg n)", "Worst case Θ(n lg n)"],
+  ["In place: O(1) extra memory", "Θ(n) extra memory for merging"],
+  ["Not stable", "Stable when merging takes from the left on ties"],
+  ["Jumps across the array: poor cache locality", "Sequential scans: good locality"],
+  ["About 2n lg n comparisons in practice", "At most about n lg n comparisons"],
+]} />
+
+### Worked example
+
+#### A simple example: nine keys traced
+
+```ts
+// heapsort.ts (excerpt): sort in place, logging the heap | sorted split.
+export function heapsort(a: number[], log?: string[]) {
+  buildHeap(a); log?.push(`heap: ${a.join(" ")}`);
+  for (let end = a.length - 1; end > 0; end--) {
+    [a[0], a[end]] = [a[end], a[0]];
+    siftDown(a, 0, end);
+    log?.push(`end=${end}: ${a.slice(0, end).join(" ")} | ${a.slice(end).join(" ")}`);
+  }
+  return a;
+}
+```
+
+```text
+heap: 25 13 20 8 7 17 2 5 4
+end=8: 20 13 17 8 7 4 2 5 | 25
+end=7: 17 13 5 8 7 4 2 | 20 25
+end=6: 13 8 5 2 7 4 | 17 20 25
+end=5: 8 7 5 2 4 | 13 17 20 25
+end=4: 7 4 5 2 | 8 13 17 20 25
+end=3: 5 4 2 | 7 8 13 17 20 25
+end=2: 4 2 | 5 7 8 13 17 20 25
+end=1: 2 | 4 5 7 8 13 17 20 25
+```
+
+Read the bar as the boundary. Left of it is always a valid max-heap with
+the current maximum first; right of it is always sorted. Each line is one
+swap of the root to just left of the bar, then a sift-down.
+
+#### A realistic example: counting comparisons
+
+```text
+n=1000 random    comparisons=16829  per n lg n=1.689
+n=1000 sorted    comparisons=17583  per n lg n=1.764
+n=1000 all equal comparisons=2994  per n lg n=0.300
+n=100000 random    comparisons=3019130  per n lg n=1.818
+n=100000 sorted    comparisons=3112517  per n lg n=1.874
+n=100000 all equal comparisons=299994  per n lg n=0.181
+n=1000000 random    comparisons=36793652  per n lg n=1.846
+n=1000000 sorted    comparisons=37692069  per n lg n=1.891
+n=1000000 all equal comparisons=2999994  per n lg n=0.151
+```
+
+Three observations. Random and sorted inputs cost almost the same, just
+under 2n lg n comparisons, because heapsort does not care about input
+order: that is the point of a worst-case guarantee. Merge sort needs
+about half as many comparisons, which is why heapsort is usually slower in
+practice despite the same Θ. And with all keys equal, sift-down stops
+immediately every time (no child is strictly larger), so the sort is
+linear: about 3 comparisons per element.
+
+### Step by step
+
+#### One iteration in detail
+
+<Trace
+  columns={["action", "array", "heap size", "note"]}
+  rows={[
+    ["before", "25 13 20 8 7 17 2 5 4", "9", "a valid max-heap; 25 is the max"],
+    ["swap a[0] and a[8]", "4 13 20 8 7 17 2 5 25", "9", "25 is now in its final slot"],
+    ["shrink", "4 13 20 8 7 17 2 5 | 25", "8", "25 leaves the heap"],
+    ["sift: 4 vs 13, 20", "20 13 4 8 7 17 2 5 | 25", "8", "swap with the larger child, 20"],
+    ["sift: 4 vs 17, 2", "20 13 17 8 7 4 2 5 | 25", "8", "swap with 17; index 5 has no children in the heap, stop"],
+  ]}
+  caption="The first iteration of phase two, step by step. The small key from the bottom (4) is moved to the root and sinks back down two levels, while 25 is fixed at the end."
+/>
+
+### Common mistake
+
+The common mistake is sifting down with the full array length instead of
+the current heap size. Then sift-down sees the already-sorted keys at the
+end as children and pulls the largest ones back into the heap, and the
+output comes out scrambled. The fix is to pass the shrinking `end` as the
+heap size, as my code does, and to test on an input where it matters
+(any array of length at least 3).
+
+The second mistake is expecting stability. Sorting records by one field
+with heapsort and then by another does not give a two-key sort. The fix
+is to use a stable sort, or to add the original position as a tiebreaker
+to the key.
+
+### In real systems
+
+Heapsort is rarely the default sort, because merge sort variants (such
+as Timsort, used by Python and by V8 for `Array.prototype.sort`) and
+quicksort variants are faster on typical data. Its job in production is
+the safety net. Introsort, the hybrid used by many C++ standard library
+implementations, runs quicksort and switches to heapsort if the recursion
+gets too deep, which guarantees O(n lg n) worst case without extra
+memory. Heapsort also suits memory-constrained environments, such as
+embedded systems and kernels, where an Θ(n) buffer is not available and a
+worst-case bound matters.
+
+### Check yourself
+
+**What is heapsort's running time on an array that is already sorted
+in increasing order?**
+
+<details>
+<summary>Answer</summary>
+
+Still Θ(n lg n). The build rearranges it into a heap, and every
+extraction sifts a small key down from the root. My count for a million
+sorted keys was about 1.89 n lg n comparisons.
+
+</details>
+
+**Why is heapsort not stable? Give a tiny example.**
+
+<details>
+<summary>Answer</summary>
+
+Swapping the root to the end jumps keys over each other. For [1a, 1b]
+(two equal keys), the build leaves it unchanged, the first iteration
+swaps positions 0 and 1, and the output is [1b, 1a].
+
+</details>
+
+## 6.5 Priority queues
+
+### In one sentence
+
+A priority queue keeps a set of items with keys and always serves the one
+with the highest (or lowest) key next, and a binary heap supports every
+operation in O(lg n).
+
+### The idea
+
+#### The abstract data type
+
+A **max-priority queue** maintains a set S of elements, each with a
+**key**, and supports four operations:
+
+- **insert**(S, x, k): add element x with key k;
+- **maximum**(S): return the element with the largest key;
+- **extract-max**(S): remove and return the element with the largest key;
+- **increase-key**(S, x, k): raise x's key to the new value k, which must
+  be at least its current key.
+
+A **min-priority queue** is the mirror, with minimum, extract-min and
+decrease-key. The book's main uses for each: max-priority queues schedule
+jobs by priority on a shared computer, and min-priority queues drive
+event-driven simulations, where the next event is the one with the
+smallest timestamp. Later chapters lean on min-priority queues for
+Dijkstra's shortest paths and Prim's minimum spanning trees.
+
+#### The operations on a heap
+
+- **maximum**: the root, a[0]. O(1).
+- **extract-max**: save the root, move the last element to the root,
+  shrink the heap by one, sift down from the root. O(lg n). It is one
+  iteration of heapsort, returning the key instead of storing it at the
+  end.
+- **increase-key**: change the key at position i, then **sift up**: while
+  i is not the root and its parent's key is smaller, swap with the parent
+  and move up. The new key can only violate the property upward, since it
+  got larger. O(lg n).
+- **insert**: append the element at the end with its key, then sift it up.
+  The book phrases it as appending with a key of minus infinity and calling
+  increase-key, which is the same thing. O(lg n).
+
+<Figure art={`
+  insert 22 into the heap 25 13 20 8 7 17 2 5 4
+
+  append at index 9:        25 13 20 8 7 17 2 5 4 22
+  parent of 9 is 4 (7):     22 > 7, swap   ->  25 13 20 8 22 17 2 5 4 7
+  parent of 4 is 1 (13):    22 > 13, swap  ->  25 22 20 8 13 17 2 5 4 7
+  parent of 1 is 0 (25):    22 < 25, stop
+
+          25                       the new key climbed two levels,
+        /    \\                     touching only one path: O(lg n)
+      22      20
+     /  \\    /  \\
+    8   13  17   2
+   / \\  /
+  5  4 7
+`} caption="Sift-up during insert. The new key starts at the first free slot and swaps with its parent while it is larger. Only the path from the new leaf to the root is touched." />
+
+#### Handles: finding the item to update
+
+The operations above talk about "position i", but a user of a priority
+queue has an item, such as a job or a graph vertex, not an array index.
+The book addresses this: the application objects and the heap elements
+need to point to each other, with a **handle** on each side, and every
+swap inside the heap must update the stored positions. Without that,
+increase-key has to search the array for the item, which costs O(n) and
+destroys the point of the heap.
+
+In TypeScript the cleanest handle is a `Map` from item to current index,
+updated in the single `swap` helper. Then every operation stays O(lg n),
+with an expected O(1) map update per swap.
+
+### Worked example
+
+#### A simple example: a job queue
+
+```ts
+// pqtrace.ts: job names with priorities in a max-priority queue.
+const pq = new MaxPQ<string>();
+for (const [job, p] of [["backup", 3], ["deploy", 8], ["email", 5], ["report", 1], ["alert", 9]]) pq.insert(job, p);
+console.log(`max: ${pq.max().item}`);
+pq.increaseKey("report", 10);
+// then extractMax until empty
+```
+
+```text
+max: alert
+extraction order after raising report to 10: report(10) alert(9) deploy(8) email(5) backup(3)
+```
+
+The report started last in priority, was raised to 10 by name (the handle
+map finds it), and comes out first.
+
+#### A realistic example: a tested priority queue with handles
+
+```ts
+// pq.ts (excerpt): the swap keeps the item-to-index map in sync.
+private swap(i: number, j: number) {
+  [this.h[i], this.h[j]] = [this.h[j], this.h[i]];
+  this.pos.set(this.h[i].item, i); this.pos.set(this.h[j].item, j);
+}
+increaseKey(item: T, key: number) {
+  const i = this.pos.get(item)!;
+  if (key < this.h[i].key) throw new Error("new key is smaller than current key");
+  this.h[i].key = key; this.up(i);
+}
+```
+
+I tested it against a brute-force model (a plain `Map` of items to keys,
+taking the maximum by scanning) with 200,000 random inserts,
+extract-maxes and increase-keys:
+
+```text
+200000 random operations, 59799 extractMax results checked against a brute-force model: all matched
+increaseKey(-1, 5): new key is smaller than current key
+```
+
+Every extracted maximum matched the model. The second line shows the
+guard the book also has: increase-key refuses to decrease a key, because
+sift-up only fixes upward violations.
+
+#### A realistic example: top-k with a min-heap
+
+To find the k largest of n values, keep a min-heap of size k: the root is
+the smallest of the current top k. For each new value, if it beats the
+root, replace the root and sift down. Cost: O(n lg k) time and O(k)
+memory, instead of O(n lg n) and O(n) for sorting.
+
+```text
+same answer: true
+heap of 10 over 2,000,000 values: more than 5x faster than a full sort
+```
+
+That is the pattern behind "top 10 slowest requests" in a log pipeline:
+the stream can be endless, and the memory stays at k.
+
+#### A realistic example: merging k sorted lists
+
+A min-heap with one entry per list merges k sorted lists. Each entry is
+a tuple of the value, which list it came from, and its index in that
+list. Extract the minimum, output it, and replace it with the next value
+from the same list, or remove it if the list is finished.
+
+```ts
+// kmerge.ts (excerpt): h is a min-heap of [value, list, index]; down() sifts the root.
+lists.forEach((L, li) => { if (L.length) { h.push([L[0], li, 0]); up(h.length - 1); } });
+while (h.length) {
+  const [v, li, idx] = h[0]; out.push(v);
+  if (idx + 1 < lists[li].length) h[0] = [lists[li][idx + 1], li, idx + 1];
+  else { h[0] = h[h.length - 1]; h.pop(); }
+  if (h.length) down(0);
+}
+```
+
+```text
+1 2 3 5 6 7 9 14 20 21 30
+matches sort: true
+```
+
+The input included an empty list, which the setup loop skips. Replacing
+the root and sifting down once, rather than extracting and inserting,
+does one O(lg k) repair per output element, so N elements cost O(N lg k).
+This is how external sorting merges sorted runs from disk, and how a
+log aggregator merges time-ordered streams from k servers.
+
+### Step by step
+
+#### Extract-max, traced
+
+<Trace
+  columns={["step", "heap", "what happened"]}
+  rows={[
+    ["start", "25 22 20 8 13 17 2 5 4 7", "after inserting 22 (see the figure)"],
+    ["save root", "25 is the answer", "maximum is always at index 0"],
+    ["move last to root", "7 22 20 8 13 17 2 5 4", "heap size drops from 10 to 9"],
+    ["sift: 7 vs 22, 20", "22 7 20 8 13 17 2 5 4", "swap with the larger child, 22"],
+    ["sift: 7 vs 8, 13", "22 13 20 8 7 17 2 5 4", "swap with 13; index 4's children (9, 10) are past the heap, stop"],
+  ]}
+  caption="Extract-max on a ten-element heap. The returned key is the old root; the rest is one sift-down from the root, the same step heapsort repeats."
+/>
+
+### Common mistake
+
+The common mistake is implementing increase-key (or decrease-key in a
+min-heap) by searching the array for the item. It works, it passes small
+tests, and it makes every update O(n). Dijkstra's algorithm on a big graph
+then runs in quadratic time. The fix is the handle map, updated inside
+the one swap function so no code path can forget it.
+
+The second mistake is the "lazy deletion" shortcut done wrong. Many
+programs skip decrease-key and instead insert a duplicate with the new
+key, ignoring stale entries when they are extracted. That is a valid
+technique, but only if the extract loop checks staleness (for example,
+the item is already finalised, or the stored key no longer matches).
+Forgetting the check processes the same item twice.
+
+### In real systems
+
+Priority queues are everywhere. Operating system schedulers pick the
+next runnable task by priority or deadline. Timer systems, including
+libuv under Node, keep timers in a min-heap keyed by expiry time. Network
+routers' quality-of-service queues serve higher-priority packets first.
+Graph searches in routing and maps use a min-priority queue as the
+frontier. Job queues in background workers (send this email at 9:00,
+retry this webhook in 30 seconds) are delay queues: a min-heap on the
+time each job becomes due.
+
+### Check yourself
+
+**Why does increase-key only need sift-up, never sift-down?**
+
+<details>
+<summary>Answer</summary>
+
+Raising a key can only make it too large for its parent; it is still at
+least as large as its children, because it was before and it only grew.
+
+</details>
+
+**What does extract-max cost, and what single operation dominates it?**
+
+<details>
+<summary>Answer</summary>
+
+O(lg n), dominated by one sift-down from the root after the last element
+is moved there.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 6, Heapsort">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, a heap is a pile where the biggest thing is always
+on top. You can look at the top for free, take it off, or add something,
+and the pile reorganises itself in a handful of steps. It is stored in an
+ordinary array, read level by level as a tree.
+
+A smallest worked example: the array 9 5 7 1 3 is a max-heap. The 9 at
+index 0 has children 5 and 7 at indices 1 and 2; the 5 has children 1
+and 3 at indices 3 and 4. Every parent is at least its children. Take the
+9 off: move the last element, 3, to the top, and since 7 is the larger
+child, swap: 7 5 3 1. Still a heap, with the next biggest on top.
+
+The beginner's mistake is to think a heap is sorted. 9 5 7 1 3 is not in
+order, and it does not need to be. Only the top is guaranteed. Asking a
+heap for its second-smallest element costs a full scan.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, you can write the whole thing from memory:
+the three index helpers, sift-down, the bottom-up build, heapsort, and a
+priority queue with sift-up for insert and increase-key. You know the
+costs: O(1) for maximum, O(lg n) for insert, extract and increase-key,
+O(n) for build, O(n lg n) for heapsort.
+
+A worked example in code: merging k sorted lists, a classic heap job.
+Put the first element of each list in a min-heap keyed by value, along
+with which list it came from. Repeatedly extract the minimum, output it,
+and insert the next element from the same list. Total cost O(N lg k) for
+N elements in all. I wrote it for k = 4 lists of 5 numbers each and
+checked the output against concatenating and sorting.
+
+The intermediate mistake is to reach for a full sort when you only need
+the top few or the next one. Sorting a million values to take the top 10
+costs O(n lg n); a size-10 heap costs O(n lg 10). My measurement above
+showed more than a fivefold difference. The fix is to ask whether you
+need everything ordered or just the extreme.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, you can prove what the code does. Sift-down is
+correct by induction on height, with its precondition stated exactly.
+The build is correct by its loop invariant and linear by the sum of
+h/2^h. Heapsort is correct by its two-part invariant (heap prefix,
+sorted suffix) and Θ(n lg n) in the worst case.
+
+A worked derivation that goes beyond the chapter: heapsort's phase two
+is Ω(n lg n) even though the build is O(n). The reason is a counting
+argument, not a property of heaps: any comparison sort needs Ω(n lg n)
+comparisons in the worst case (chapter 8), and the build is a comparison
+procedure, so the rest of heapsort must pay the remainder. Linear
+building and n lg n sorting do not contradict each other; they split the
+cost.
+
+The advanced mistake is to forget that the O(lg n) bounds assume O(1)
+handle lookups. With a `Map`, that is expected O(1); with a search, O(n).
+The fix is to state the bound together with its handle mechanism.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases are single boundaries. An empty heap: maximum and extract-max
+have nothing to return. The book's procedures report an underflow error;
+my class would return `undefined` from `max()`, which is a silent bug.
+The fix is an explicit check that throws or returns an option type.
+
+A heap of one element: it is already a heap, the build loop runs zero
+times (⌊1/2⌋ − 1 = −1), and heapsort's phase two runs zero times. A heap
+of two elements: the build does one comparison at index 0, and the
+right-child check must not read index 2. This is the case that catches a
+missing `r < n` test.
+
+Duplicates: with strict comparisons, sift-down stops when a child is
+equal, which is correct and makes all-equal input linear, as measured.
+With non-strict comparisons it swaps equal keys pointlessly, still
+correct but slower. And a key of `NaN` breaks everything: every
+comparison with `NaN` is false, so a `NaN` sits wherever it lands and the
+heap property becomes meaningless around it.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two boundaries. One: increase-key on the last
+element when it becomes the new maximum. It must climb the whole height,
+and the handle map must be updated at every level. A version that updates
+only the final position leaves stale positions for the items it passed,
+and the next update to one of them corrupts the heap. A property test
+with random operations, like mine, finds this quickly; a hand-written
+test rarely does.
+
+Two: extract-max when the heap has exactly one element. The code moves
+the last element to the root, but the last element is the root. Mine
+handles it by popping first and only reinserting at the root if anything
+is left. A version that moves before popping either duplicates the
+element or loses it, depending on the order of operations.
+
+Three: priority ties in a scheduler. Two jobs with priority 5: which runs
+first? A heap is not stable, so the answer depends on insertion history,
+and a job can starve behind a stream of equal-priority newcomers. The
+fix is a composite key: priority first, then an increasing sequence
+number, so equal priorities run first-in, first-out.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, the heap is a priority queue far more often than a sort.
+The concerns are memory layout, handle management and observability.
+A heap of objects in JavaScript is an array of pointers to objects
+scattered across memory, so sift-down chases pointers. Storing keys in a
+typed array and payloads in a parallel array keeps the hot comparisons
+in contiguous memory.
+
+For very large heaps, cache behaviour matters. A binary heap's children
+of node i are at 2i + 1 and 2i + 2, far from i once i is large, so each
+level of a sift is likely a cache miss. **d-ary heaps**, where each node
+has d children (often 4), are shallower and keep siblings together,
+trading more comparisons per level for fewer levels and fewer misses.
+Many production timer and scheduler queues use them.
+
+For observability, a queue in a real system should expose its size, the
+age of its oldest item and the key at the root. A growing size or an old
+root means consumers are falling behind. A heap makes the root free to
+read, so these metrics cost nothing.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to sum the real costs instead of
+multiplying the worst case by n. "n/2 sift-downs at O(lg n) each" is a
+correct bound and the wrong answer; counting how many nodes have each
+height gives O(n). Whenever a loop's per-iteration cost varies, I ask how
+many iterations are expensive.
+
+The second habit is to choose the weakest structure that does the job. A
+heap knows less than a sorted array (only the top is in order), and that
+is exactly why it is cheaper to maintain. If I only need the next item,
+paying for total order is waste.
+
+The mistake in mindset is thinking that a data structure's job is fixed.
+Heapsort, top-k, k-way merge, event simulation, Dijkstra and scheduling
+are all the same heap with different keys. The fix is to recognise "I
+repeatedly need the smallest or largest" as the signal for a heap,
+whatever the domain.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, priority queues sit at the heart of anything that
+schedules. A concrete example: a job scheduler for background work,
+where jobs have a run-at time and a priority. The in-memory structure is
+a min-heap keyed by (run-at time, priority, sequence number). A worker
+loop peeks at the root, sleeps until its run-at time, extracts it and
+runs it. Inserts from the API and retries from failed jobs both go into
+the same heap.
+
+At larger scale the single heap becomes a bottleneck and a single point
+of failure. The usual design moves the queue into a durable store (a
+database table with an index on run-at time, or a sorted set in a
+key-value store), which plays the same role: an ordered structure where
+reading the minimum is cheap. Workers claim jobs with a lease so two
+workers do not run the same job. The heap's operations map onto the
+store's: insert, peek at the minimum, remove the minimum, update a key.
+
+The design mistake is a priority queue with no bound and no aging. A
+flood of high-priority work starves low-priority jobs forever. The fix
+is aging (raise a job's priority as it waits, which is an increase-key),
+or separate queues with a fair share of workers each.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+My strategy is to learn the heap by hand first and in code second. I
+draw the tree and the array side by side for every trace on this page,
+then write the helpers, sift-down, build and heapsort without looking,
+and test them against the built-in sort on random arrays of every length
+from 0 to 50.
+
+Then I build the priority queue with handles and the random-operation
+test against a brute-force model. That test is the most valuable thing
+in this chapter's toolkit, because the bugs it catches (stale handles,
+off-by-one in extract) are the ones that survive hand-written tests.
+
+Done when I can, without notes: write a zero-based heapsort and a
+max-priority queue with insert, extract-max and increase-key using a
+handle map; prove the build is O(n) with the h/2^h sum; trace a build, a
+heapsort iteration, an insert and an extract on paper; and pass a
+property test of 100,000 random operations.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Why learn heapsort if nobody uses it as their main sort?</summary>
+
+Because the structure underneath is used everywhere, as the priority
+queue, and because heapsort is the clearest example of an in-place
+worst-case O(n lg n) sort. It is also the fallback in introsort, so it
+runs in production more often than its reputation suggests.
+
+</details>
+
+<details>
+<summary>One-based or zero-based indexing?</summary>
+
+The book uses one-based, where the formulas are slightly neater (2i and
+2i + 1). In TypeScript, use zero-based (2i + 1 and 2i + 2) and write the
+helpers once. Some people waste slot 0 to use the one-based formulas; it
+works, but mixing the two is the classic bug.
+
+</details>
+
+<details>
+<summary>Why is building a heap O(n) when it calls an O(lg n) operation n/2 times?</summary>
+
+Because most of those calls are on nodes near the bottom, where the
+height is small. Half the nodes are leaves and do nothing, a quarter do
+at most one step, and so on. The total is n times the sum of h/2^(h+1),
+which is n.
+
+</details>
+
+<details>
+<summary>Is a heap the same as a binary search tree?</summary>
+
+No. A search tree orders left below right, so you can find any key in
+O(lg n) when balanced. A heap only orders parent against child, so you
+can find the maximum in O(1) but any other key takes O(n). Heaps are
+cheaper to keep and are arrays; search trees answer more questions.
+
+</details>
+
+<details>
+<summary>How do I make a min-heap from max-heap code?</summary>
+
+Flip every key comparison, or keep the code and negate the keys. For
+non-numeric keys, pass a comparator and use it everywhere, so the same
+code serves both.
+
+</details>
+
+<details>
+<summary>What about decrease-key in a max-heap?</summary>
+
+Lower the key and sift down from that position. The book's exercises
+explore it. It costs O(lg n), like increase-key, but in the other
+direction.
+
+</details>
+
+## Key takeaways
+
+- A binary heap is a nearly complete binary tree stored in an array, with children at 2i + 1 and 2i + 2 in zero-based indexing.
+- In a max-heap every parent is at least its children, so the maximum is at the root; nothing is said about siblings.
+- An n-element heap has height ⌊lg n⌋, and its last ⌈n/2⌉ elements are leaves.
+- Sift-down repairs one node whose subtrees are heaps by swapping with the larger child, in O(height).
+- Building a heap bottom-up takes O(n), because the sum of h/2^h is a constant.
+- Heapsort builds a heap and then moves the maximum to the end n − 1 times: Θ(n lg n) worst case, in place, not stable.
+- A heap implements every priority-queue operation in O(lg n), and maximum in O(1).
+- Increase-key and decrease-key need a handle map from items to positions, updated on every swap.
+
+## Glossary
+
+- **Nearly complete binary tree**: every level full except possibly the last, which is filled from the left.
+- **Binary heap**: a nearly complete binary tree stored level by level in an array.
+- **Heap size**: how many leading array slots currently belong to the heap.
+- **Max-heap property**: every parent's key is at least each child's key.
+- **Min-heap property**: every parent's key is at most each child's key.
+- **Height of a node**: edges on the longest downward path from it to a leaf.
+- **Sift-down (MAX-HEAPIFY)**: move a too-small key down by swapping with the larger child until it fits.
+- **Sift-up**: move a too-large key up by swapping with its parent until it fits.
+- **Build heap**: make an array a heap by sifting down every internal node from the last to the root.
+- **Heapsort**: build a max-heap, then repeatedly swap the root to the end of the shrinking heap and sift down.
+- **In place**: using only a constant amount of memory beyond the input array.
+- **Stable sort**: a sort that keeps equal keys in their original relative order.
+- **Priority queue**: a set of keyed elements supporting insert and removal of the maximum (or minimum).
+- **Handle**: a stored link between an application object and its position in the heap.
+- **d-ary heap**: a heap where each node has d children, shallower than a binary heap.
+
+## Exercises and self-check
+
+My own exercises. Do a selection of the book's exercises after each
+section, and the chapter-end problems on a second pass.
+
+**Warm-up (by hand)**
+
+1. Draw the tree for the array 16 4 10 14 7 9 3 2 8 1, mark every place
+   the max-heap property fails, then build the heap by hand.
+2. For n = 20, list the internal nodes (zero-based) and the number of
+   nodes of each height.
+3. Trace heapsort on 3 1 4 1 5 9 2 6, writing the array with the bar after
+   every iteration.
+
+**Build (write and test code)**
+
+4. Write a min-priority queue with insert, extract-min and decrease-key,
+   with handles, and test it against a brute-force model with 100,000
+   random operations.
+5. Implement k-way merge of sorted arrays with your min-heap, and test
+   against concatenate-and-sort for random inputs.
+6. Write a 4-ary heap and compare the number of comparisons and the
+   running time of heapsort with your binary version for n = 10⁶.
+
+**Stretch (change the problem)**
+
+7. Write a "sliding window maximum" for a stream using a heap with lazy
+   deletion, and say exactly when a stale entry is discarded.
+8. Find the median of a stream at every step using two heaps (a max-heap
+   for the lower half, a min-heap for the upper half). What invariant
+   keeps them balanced?
+9. A scheduler must run jobs by priority but never let any job wait more
+   than 10 seconds. Design the key so that one heap enforces both rules.
+
+**Self-check**
+
+<details>
+<summary>1. In a zero-based heap, what are the children and parent of index 5?</summary>
+
+Children 11 and 12, parent 2.
+
+</details>
+
+<details>
+<summary>2. What is sift-down's precondition?</summary>
+
+Both subtrees of the node are already max-heaps; only the node itself may
+violate the property.
+
+</details>
+
+<details>
+<summary>3. Why does the build loop go from the last internal node down to the root?</summary>
+
+So that when a node is processed its children are already heap roots,
+which is sift-down's precondition.
+
+</details>
+
+<details>
+<summary>4. What does the build cost and why?</summary>
+
+O(n): the cost at height h is O(h), at most n/2^(h+1) nodes have height
+h, and the sum of h/2^h converges to 2.
+
+</details>
+
+<details>
+<summary>5. What goes wrong if heapsort sifts down with the full array length?</summary>
+
+The sorted suffix is treated as part of the heap, large keys are pulled
+back to the front, and the output is not sorted.
+
+</details>
+
+<details>
+<summary>6. How do you insert into a max-heap?</summary>
+
+Append at the end and sift up: swap with the parent while the parent's
+key is smaller. O(lg n).
+
+</details>
+
+<details>
+<summary>7. Why do priority queues need handles?</summary>
+
+Increase-key and decrease-key are given an item, not an index. A map from
+item to index, updated on every swap, finds it in O(1) instead of O(n).
+
+</details>
+
+<details>
+<summary>8. What is the cost of finding the k largest of n values with a min-heap?</summary>
+
+O(n lg k) time and O(k) memory.
+
+</details>
+
+## How I'd study this chapter
+
+I would give this chapter four sessions in
+<a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of the traditional core roadmap</a>,
+as the first chapter of the sorting block, right after chapter 5.
+
+<Timeline caption="Four sessions for chapter 6." items={[
+  { when: "Session 1", what: "Read 6.1 and 6.2. Draw five arrays as trees and check the heap property by hand. Write the helpers and sift-down, and trace one sift on paper." },
+  { when: "Session 2", what: "Read 6.3. Build three heaps by hand, then prove the O(n) bound from the h/2^h sum. Measure build versus repeated insert." },
+  { when: "Session 3", what: "Read 6.4. Trace heapsort on eight keys with the bar notation. Write heapsort and test it on every length from 0 to 50 against the built-in sort." },
+  { when: "Session 4", what: "Read 6.5. Write the priority queue with handles and the random-operation test. Do top-k and k-way merge. Do the self-check without notes." },
+]} />
+
+I keep `chapter-06.ts` with the heap helpers, heapsort, the priority
+queue with handles and its property test. The priority queue comes back
+in chapter 15 (Huffman codes), chapter 21 (Prim) and chapter 22
+(Dijkstra), where a min-heap with decrease-key is the core of the
+algorithm, so I make it generic over the key comparison now.
+
+Done when I can write heapsort and a handle-based priority queue from a
+blank file, pass the random-operation test on the first run, and prove on
+paper why the build is linear.
