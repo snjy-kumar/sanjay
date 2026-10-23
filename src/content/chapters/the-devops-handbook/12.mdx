@@ -1,0 +1,1525 @@
+---
+book: the-devops-handbook
+number: 12
+title: "Automate and Enable Low-Risk Releases"
+description: "Low-risk releases in depth: automated self-service deployments, decoupling deploy from release, blue-green and canary patterns, feature toggles and dark launches."
+part: "Part III, The First Way: The Technical Practices of Flow"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+With a releasable trunk and a pipeline that tests every change, the last
+step of flow is getting changes into production. In many organisations
+this step is the most frightening: a long, manual deployment, done at night
+or at the weekend, by a few people who know the steps, with everyone
+hoping nothing goes wrong. This chapter explains how to make that step
+routine. It covers automating the deployment process, letting developers
+deploy on demand through self-service, building deployment into the
+pipeline, and, the central idea, separating deploying code from releasing
+features, with the release patterns that make this possible.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- turn a manual deployment into an automated, repeatable process;
+- explain self-service deployment and why it lowers risk rather than raising it;
+- describe what a deployment step in the pipeline must do;
+- distinguish a deployment from a release, and explain why separating them matters;
+- explain blue-green and canary releases, and how databases are changed safely under them;
+- use feature toggles and dark launches to release features independently of deployments;
+- distinguish continuous delivery from continuous deployment.
+
+What I should already know: continuous integration and feature flags from
+<a href={withBase('/books/the-devops-handbook/11-enable-and-practice-continuous-integration/')}>chapter 11</a>,
+the pipeline and tests from
+<a href={withBase('/books/the-devops-handbook/10-enable-fast-and-reliable-automated-testing/')}>chapter 10</a>,
+and what a server, a load balancer and a database migration are. All code
+examples on this page are JavaScript run with node.
+
+Reading time: about 75 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Flow caption="The chapter as a path. Read left to right: automate deployment, make it self-service and part of the pipeline, separate it from release, then choose release patterns at the environment or application level." steps={[
+  "Automate the deployment process",
+  "Self-service deployments",
+  "Deployment in the pipeline",
+  "Decouple deployment from release",
+  "Environment-based release patterns",
+  "Application-based release patterns",
+  "Continuous delivery and deployment",
+]} />
+
+## Automate the deployment process
+
+### In one sentence
+
+Write down every step of the current deployment, simplify it, then
+automate it, so deploying is fast, repeatable and the same every time.
+
+### The idea
+
+The book begins with an observation: a manual deployment is a long list of
+steps, many of them done by different people, with handoffs and waiting
+between them. Steps get skipped, done in the wrong order or done slightly
+differently each time. Problems are found late, often in production, and
+fixing them under pressure leads to more mistakes. Because deployments are
+painful, they happen rarely, which makes each one larger and riskier.
+
+The way out has three parts. First, **document the steps** as they are
+really done, often in a value stream mapping session like the one in
+chapter 6, including the waiting and the handoffs. Second, **simplify**:
+remove steps that are no longer needed, combine steps, and look for steps
+that exist only because of how things used to be. Third, **automate** what
+remains, so the deployment runs as a script or pipeline stage that anyone
+authorised can start.
+
+The book lists several qualities a good automated deployment has. It uses
+the same process for every environment, so production deployments have
+been rehearsed many times in test environments. It runs **smoke tests**
+after deploying, quick checks that the system is up and its key functions
+work. It is fast. It is recorded, so it is always clear what version is
+where and who deployed it. And it makes the environment consistent, so a
+deployment does not depend on whatever state the servers happen to be in,
+which links back to chapter 9's environments on demand.
+
+The book also suggests that **packaging** matters. If code is built into a
+package once, as chapter 10 described, deployment becomes copying and
+starting that package, not compiling and assembling things on production
+servers. Simpler deployments are easier to automate and less likely to fail.
+
+<Compare left="Manual deployment" right="Automated deployment" caption="Two ways to deploy. Read across each row: automation turns a rare, risky event into a routine one." rows={[
+  ["Long checklist, many people", "One command or button"],
+  ["Steps vary each time", "Same steps, every environment"],
+  ["Done rarely, at night", "Done often, in working hours"],
+  ["Problems found in production", "Smoke tests catch problems at once"],
+  ["Who deployed what is unclear", "Every deployment recorded"],
+]} />
+
+#### From checklist to script: a trace
+
+Here is how a typical manual deployment shrinks as it is documented,
+simplified and automated. The steps are a composite, not one team's.
+
+<Trace columns={["Manual step", "After simplifying", "After automating"]} rows={[
+  ["Email the operations team to book a slot", "removed: deploy any time", "-"],
+  ["Copy build files to each server by hand", "copy one package", "script copies the package"],
+  ["Edit configuration on each server", "configuration in version control", "script applies it"],
+  ["Run database changes from a document", "migrations in version control", "script runs migrations"],
+  ["Restart services in a set order", "order written down once", "script restarts in order"],
+  ["Click through the site to check", "list of key checks", "automated smoke tests"],
+  ["Update the release spreadsheet", "removed", "pipeline records the deployment"],
+]} caption="Shrinking a deployment. Read across each row: some steps disappear when questioned, and the rest become a script that runs the same way every time." />
+
+#### Make every step safe to repeat
+
+A deployment script will sometimes fail halfway: a network blip, a server
+that does not restart in time. If running it again makes things worse, for
+example by applying a database change twice, the team is back to careful
+manual recovery. Good deployment steps are **idempotent**: running them
+twice has the same effect as running them once. "Ensure version 412 is
+installed" is idempotent; "install the next version" is not. "Apply
+migrations that have not yet been applied" is idempotent; "run migration
+file 7" is not.
+
+<Compare left="Fragile step" right="Idempotent step" caption="Two ways to write each deployment step. Read across each row: the idempotent form can simply be rerun after a failure." rows={[
+  ["Install the next version", "Ensure version 412 is installed"],
+  ["Run migration 7", "Apply any migrations not yet applied"],
+  ["Append this line to the config", "Make the config match the file in version control"],
+  ["Start the service", "Ensure the service is running"],
+]} />
+
+With idempotent steps, recovering from a half-finished deployment is
+simply running the deployment again. That single property removes a large
+share of the fear from deploying.
+
+### Worked example
+
+**Simple.** My site used to be deployed by building on my laptop and
+uploading the files by hand. I once forgot a folder of images and the site
+went live with broken pictures. Now the pipeline builds once, uploads the
+whole output, then fetches three pages and checks they load. Forgetting a
+folder is no longer possible.
+
+**Realistic.** A team's deployment takes an evening and three people. In a
+mapping session they find that half the time is waiting: for a slot, for
+another team's sign-off, for a manual database change. They move
+configuration and migrations into version control, script the steps, and
+add smoke tests. Deployment now takes minutes, runs in working hours, and
+the three people spend their evenings at home.
+
+**In production: rehearsal by repetition.** Because the same deployment
+script runs for test, staging and production, a team's production
+deployment has effectively been rehearsed dozens of times before it runs.
+When a step fails, it usually fails first in a test environment, where it
+is cheap to fix.
+
+### Step by step
+
+1. **Map the current deployment**, including waits and handoffs.
+2. **Question every step**: is it still needed?
+3. **Build one package** and deploy that, not source code.
+4. **Put configuration and migrations in version control.**
+5. **Script the remaining steps**, the same for every environment.
+6. **Add smoke tests** that run straight after deploying.
+7. **Record every deployment**: version, environment, time, who.
+
+### Common mistake
+
+The common mistake is to automate the existing process without
+simplifying it first, producing a complicated script that is as fragile as
+the manual steps. The fix is to simplify before automating.
+
+### In real systems
+
+Deployment tools, container platforms and pipeline stages are the usual
+means. Many teams deploy by changing which package version an environment
+should run and letting the platform make it so.
+
+That declarative style, "this environment should run version 412",
+naturally produces idempotent deployments: the platform compares what is
+running with what should be running and closes the gap, and rerunning the
+request does nothing when they already match. It also leaves a clear
+history of desired states, which makes rollback a matter of declaring the
+previous version again.
+
+### Check yourself
+
+<details>
+<summary>1. Why should the same deployment process be used for every environment?</summary>
+
+So production deployments have been rehearsed many times, and problems
+show up first in test environments.
+
+</details>
+
+<details>
+<summary>2. What is a smoke test?</summary>
+
+A quick check right after deploying that the system is up and its key
+functions work.
+
+</details>
+
+## Enable automated self-service deployments
+
+### In one sentence
+
+Let the people who make a change deploy it themselves, through the
+automated process, with controls built into the process rather than into
+handoffs.
+
+### The idea
+
+In many organisations, developers cannot deploy. They hand a package to
+an operations team, which deploys it when it can. The book argues this
+handoff adds waiting and loses information, and that the separation of
+duties it is meant to provide can be achieved better in other ways.
+
+**Self-service deployment** means that anyone authorised, often the
+developers who made the change, can start a deployment to any environment
+by pressing a button or running a command. The automated process does the
+work the same way every time; the pipeline has already run the tests; the
+deployment is recorded; and if something goes wrong, monitoring shows it at
+once and the same people can roll back or fix forward.
+
+Two things make this safe. First, the controls move into the process: the
+pipeline refuses to deploy a package that has not passed its tests, the
+deployment is logged, and changes are reviewed before they reach trunk.
+Second, the people deploying have the context: they know what changed and
+can recognise problems quickly. The book notes that the goal is not that
+developers do operations work by hand, but that the automated process makes
+deployment so routine that it can be self-service.
+
+The book also discusses the concern about **separation of duties**, a
+control that some regulations expect, where the person who writes a change
+is not the person who deploys it. It suggests that peer review of every
+change, combined with an automated, logged deployment process, can meet
+the intent of that control. Chapter 23 returns to this in depth.
+
+<Layers caption="What makes self-service deployment safe. Read top to bottom: the controls are built into the process, so the person pressing the button does not need to be a gatekeeper." layers={[
+  { name: "Peer review", note: "every change reviewed before it reaches trunk" },
+  { name: "Pipeline gates", note: "only packages that passed all tests can deploy" },
+  { name: "Automated deployment", note: "same steps every time; no manual edits" },
+  { name: "Audit trail", note: "who deployed what, where and when" },
+  { name: "Monitoring and rollback", note: "problems seen at once; one-step undo" },
+]} />
+
+#### What the deploy button checks before it acts
+
+A self-service button is only as safe as the checks behind it. Here is the
+kind of sequence a deploy request goes through, written as a trace of one
+request that is refused and one that succeeds.
+
+<Trace columns={["Check", "Request for build 405", "Request for build 412"]} rows={[
+  ["Built from trunk?", "no: from a personal branch", "yes"],
+  ["Every change reviewed?", "not checked", "yes"],
+  ["Passed all pipeline stages?", "not checked", "yes"],
+  ["Requester allowed to deploy here?", "not checked", "yes"],
+  ["Result", "refused with a reason", "deployed and logged"],
+]} caption="The controls behind a deploy button. Read down each column: the process, not a person, decides whether the deployment may run, and records why." />
+
+Because the checks are automatic, they are applied every time, to
+everyone, including in a hurry at the end of a long day, which is exactly
+when manual checks tend to be skipped.
+
+### Worked example
+
+**Simple.** For my own site, self-service is natural: I merge and the
+pipeline deploys. What makes it safe is not that someone else checks, but
+that the build, link check and smoke test run every time.
+
+**Realistic.** A team waits a day or two after each merge for operations to
+deploy. The two teams agree to automate deployment, give developers a
+deploy button for staging and production, and keep operations involved in
+building the process and monitoring. Lead time falls from days to hours,
+and operations people spend their time improving the platform rather than
+running manual deployments.
+
+**In production: an auditor's question.** An auditor asks how the team
+ensures nobody deploys unreviewed code. The team shows that trunk accepts
+only reviewed pull requests, the pipeline deploys only packages built from
+trunk that passed every stage, and each deployment is logged with its
+version and the person who started it. The control is stronger than a
+manual handoff, because it cannot be skipped.
+
+### Step by step
+
+1. **Automate deployment first**; self-service is only safe on top of it.
+2. **Build controls into the pipeline**: review, tests, logging.
+3. **Give a deploy button** to the people who make changes.
+4. **Make rollback one step** and available to the same people.
+5. **Keep operations in the loop** through shared monitoring and platform
+   work.
+
+### Common mistake
+
+The common mistake is to give developers production access without an
+automated process, so they deploy by hand and the risk rises. Self-service
+means self-service through automation, not manual access.
+
+A second mistake is to add an approval step to every deployment "to be
+safe", so each one waits for a manager who has less context than the
+developer. The approval becomes a rubber stamp that adds delay without
+adding safety. If a human check is genuinely needed, put it where it adds
+information, such as reviewing the change itself, and keep the
+deployment automatic.
+
+### In real systems
+
+Pipeline tools with approval rules, protected environments and audit logs
+are the usual way to provide self-service with controls.
+
+### Check yourself
+
+<details>
+<summary>1. What makes self-service deployment safe?</summary>
+
+Controls built into the process: peer review, pipeline gates, automated
+deployment, an audit trail, monitoring and quick rollback.
+
+</details>
+
+<details>
+<summary>2. How can separation of duties be met without a manual handoff?</summary>
+
+Through peer review of every change plus an automated, logged deployment
+process that cannot be bypassed.
+
+</details>
+
+## Integrate code deployment into the deployment pipeline
+
+### In one sentence
+
+Deployment should be a stage of the pipeline itself, using the same package
+and process for every environment, so that a change can flow from commit to
+production without leaving the automated path.
+
+### The idea
+
+Chapter 10 built a pipeline that builds, tests and promotes a package. The
+book's next step is to make deployment part of that pipeline, not a
+separate activity done afterwards. The pipeline deploys the package to each
+environment in turn, runs smoke tests, and records the result.
+
+The book lists what this deployment stage should provide. The same package
+is deployed to every environment. Deployment is fast and can be started on
+demand. Smoke tests confirm the system works after each deployment. It is
+easy to see which version is running in each environment. And the
+pipeline gives quick feedback to whoever started the deployment if
+anything fails.
+
+A useful consequence is that the **lead time** from commit to production,
+from chapter 6, becomes visible and measurable in the pipeline itself.
+Every stage has a start and end time, so the team can see where changes
+wait and work on the slowest part.
+
+<Flow caption="Deployment as pipeline stages. Read left to right: the same package moves through each environment, deployed by the same process and checked by smoke tests at every step." steps={[
+  "Commit stage builds the package",
+  "Deploy to test; acceptance tests",
+  "Deploy to staging; smoke tests",
+  "Deploy to production; smoke tests",
+  "Record version and time",
+]} />
+
+#### What the pipeline should show
+
+<Trace columns={["Environment", "Version", "Deployed", "Smoke tests"]} rows={[
+  ["test", "build 412", "10:02", "pass"],
+  ["staging", "build 412", "10:15", "pass"],
+  ["production", "build 409", "yesterday 16:40", "pass"],
+]} caption="A pipeline's view of what is where. Read top to bottom: anyone can see that build 412 is ready for production and 409 is live, without asking." />
+
+#### Seeing lead time in the pipeline
+
+Once deployment is a pipeline stage, every change carries timestamps from
+commit to production. That makes lead time something the team can read
+off rather than estimate, and it shows where changes wait.
+
+<Trace columns={["Event for one change", "Time", "Waited since previous"]} rows={[
+  ["Committed and merged to trunk", "09:40", "-"],
+  ["Commit stage finished", "09:49", "9 min"],
+  ["Acceptance stage finished", "10:31", "42 min"],
+  ["Waiting for someone to press deploy", "13:05", "2 h 34 min"],
+  ["Production deployment and smoke tests done", "13:12", "7 min"],
+]} caption="One change's journey with timestamps. Read top to bottom: the automated stages took under an hour, and most of the lead time was waiting for a person." />
+
+A trace like this often surprises teams. The obvious targets, slow tests,
+are real but not the largest. The largest wait is frequently a handoff or
+a decision, which is a reason to move toward self-service and, where it
+fits, continuous deployment.
+
+### Worked example
+
+**Simple.** My site's pipeline shows each deployment with the commit it
+came from. When a reader reports a typo, I can see exactly which version
+is live and whether my fix has reached it.
+
+**Realistic.** A team's deployments are scripted but run by hand after the
+pipeline finishes. They add the scripts as pipeline stages, with smoke
+tests after each. Now a change merged at ten can be in production by
+eleven, and the pipeline's timings show that most of that hour is the
+acceptance stage, which the team decides to parallelise.
+
+**In production: a failed smoke test.** A deployment to staging succeeds,
+but the smoke test that loads the checkout page fails because a new
+configuration value is missing. The pipeline stops; production is
+untouched. The fix is a configuration change in version control, and the
+next run passes.
+
+### Step by step
+
+1. **Add deployment stages** to the pipeline for each environment.
+2. **Use the same package and script** for all of them.
+3. **Run smoke tests** after every deployment.
+4. **Show versions per environment** on a dashboard.
+5. **Measure stage times** and work on the slowest.
+
+### Common mistake
+
+The common mistake is to automate deployment but keep it outside the
+pipeline, so the link between tested package and deployed package is lost.
+The fix is to deploy from the pipeline, using the artefact it tested.
+
+A related mistake is to let environments get special treatment, for
+example a production deployment that runs an extra manual step the
+others do not. That step is then the one that was never rehearsed. If
+production needs something, every environment should do it, so the
+pipeline exercises it on every change.
+
+### In real systems
+
+Most pipeline tools support deployment stages, environment dashboards and
+manual approval steps where needed.
+
+### Check yourself
+
+<details>
+<summary>1. Why deploy from the pipeline rather than separately?</summary>
+
+So the deployed package is exactly the one that was tested, deployment is
+repeatable and recorded, and lead time is visible.
+
+</details>
+
+<details>
+<summary>2. What should a team be able to see about each environment?</summary>
+
+Which version is running, when it was deployed, and whether its smoke
+tests passed.
+
+</details>
+
+## Decouple deployments from releases
+
+### In one sentence
+
+A deployment installs a version of software in an environment; a release
+makes a feature available to users; keeping them separate lets teams
+deploy often with low risk and release when the business is ready.
+
+### The idea
+
+The book draws a sharp distinction between two words that are often used
+as if they meant the same thing.
+
+A **deployment** is the technical act of installing a specific version of
+software into a given environment, for example putting build 412 onto the
+production servers. A **release** is making a feature, or a set of
+features, available to all or some customers.
+
+When the two are coupled, every deployment releases whatever is in it, so
+deploying is a business decision and a risk to customers. Teams deploy
+rarely, so deployments are large, so they are risky, so teams deploy even
+more rarely. Developers and operations bear the risk of the deployment,
+while the business owns the release decision, and the two pull against
+each other.
+
+When the two are decoupled, a deployment can go out with new features
+hidden or reaching no one. Deploying becomes a routine technical event that
+can happen many times a day with little risk. Releasing becomes a separate,
+business-controlled decision, often just a configuration change, which
+can be made gradually, to a few users first, and reversed in seconds if
+something goes wrong.
+
+The book groups the ways of decoupling into two families, covered in the
+next sections. **Environment-based release patterns** use two or more
+environments and control which one receives traffic. **Application-based
+release patterns** put switches inside the application so features can be
+turned on and off independently of the code deployed.
+
+<Compare left="Deployment" right="Release" caption="Two different events. Read across each row: separating them lets the technical event become routine while the business event stays deliberate." rows={[
+  ["Installing a version in an environment", "Making a feature available to users"],
+  ["A technical event", "A business decision"],
+  ["Owned by the team that builds the code", "Owned by product or business owners"],
+  ["Should be frequent and boring", "Can be gradual and deliberate"],
+  ["Undo by redeploying or switching back", "Undo by turning a feature off"],
+]} />
+
+#### Why decoupling lowers risk
+
+<Figure caption="The same change, coupled and decoupled. Read top to bottom: when deploying also releases, every deployment exposes all users at once; when they are separate, exposure grows step by step and can be reversed." art={`
+ COUPLED
+   deploy build 412  ===>  every user sees every new feature at once
+                           problem? redeploy old build, under pressure
+
+ DECOUPLED
+   deploy build 412  ===>  no user sees anything new (features off)
+   release feature A ===>  1% of users  -> watch -> 10% -> watch -> 100%
+                           problem?     turn feature A off, in seconds
+`} />
+
+#### Who owns which decision
+
+Decoupling also clarifies ownership. When deploying meant releasing,
+engineering and product argued over every deployment: engineering wanted
+small, frequent ones, product wanted control over what customers saw and
+when. Separated, each side owns its own decision.
+
+<Compare left="Engineering owns" right="Product or business owns" caption="Decisions after decoupling. Read across each row: each group controls what it understands best, and neither blocks the other." rows={[
+  ["When and how often to deploy", "When a feature is shown to users"],
+  ["Rolling back a bad deployment", "Turning a feature off for users"],
+  ["Canary health thresholds", "Which users see a feature first"],
+  ["Keeping trunk deployable", "Launch timing and announcements"],
+]} />
+
+This removes a common source of friction. Engineering can deploy whenever
+it is ready without asking for permission, and product can launch on its
+own schedule without needing a deployment.
+
+### Worked example
+
+**Simple.** On my site, a post marked as a draft is deployed with every
+build but not shown. Publishing is changing one field, not a deployment.
+That is a tiny version of decoupling: the code is out, the release is a
+separate switch.
+
+**Realistic.** A team plans to launch a new checkout on a marketing date.
+Under the old model, the launch would be a big deployment the night
+before. Instead, the new checkout is deployed, switched off, weeks
+earlier, in many small deployments. On the day, product turns it on for a
+small share of customers, watches the numbers, and widens it over hours.
+The launch is a non-event for engineering.
+
+**In production: a quick undo.** A newly released feature causes a spike
+in support tickets. Because release is a toggle, the product owner turns it
+off within minutes, with no deployment. The team fixes the problem and
+releases again the next day.
+
+### Step by step
+
+1. **Use the two words precisely** in the team's language.
+2. **Choose a decoupling mechanism**: environment-based, application-based
+   or both.
+3. **Deploy with new features off** by default.
+4. **Release gradually** and watch the effect.
+5. **Make release reversible** without a deployment.
+
+### Common mistake
+
+The common mistake is to treat every deployment as a release, so deploying
+needs business sign-off, which makes deployments rare and large. The fix is
+to make deployment routine and put release under a separate switch.
+
+### In real systems
+
+Feature flag services, traffic routing at load balancers and percentage
+rollouts are common ways teams separate deployment from release.
+
+### Check yourself
+
+<details>
+<summary>1. What is the difference between a deployment and a release?</summary>
+
+A deployment installs a version in an environment; a release makes
+features available to users.
+
+</details>
+
+<details>
+<summary>2. How does decoupling them lower risk?</summary>
+
+Deployments become small, frequent and invisible to users; releases can be
+gradual and reversed in seconds without a deployment.
+
+</details>
+
+## Environment-based release patterns
+
+### In one sentence
+
+Environment-based patterns run old and new versions side by side and
+control which one receives traffic, as in blue-green deployments, canary
+releases and the cluster immune system.
+
+### The idea
+
+#### Blue-green deployment
+
+In a **blue-green deployment**, there are two production environments,
+call them blue and green, identical in setup. One is live and receives all
+traffic; the other is idle. To deploy, the team installs the new version on
+the idle environment, tests it there, then switches the router so traffic
+goes to it. The old environment stays as it was, so rolling back is
+switching the router back. The switch is quick, and users barely notice.
+
+Here is the idea as a short script, run with node:
+
+```js
+// Blue-green deployment: two identical environments, a router points at one.
+const envs = { blue: "v1", green: null };
+let live = "blue";
+const idle = () => (live === "blue" ? "green" : "blue");
+const log = (msg) => console.log(`${msg.padEnd(38)} live=${live}(${envs[live]}) idle=${idle()}(${envs[idle()]})`);
+log("start");
+envs[idle()] = "v2";                 log("deploy v2 to idle");
+const smokeOk = true;                log(`smoke test idle: ${smokeOk ? "pass" : "fail"}`);
+if (smokeOk) { live = idle(); }      log("switch router");
+const problem = true;
+if (problem) { live = idle(); }      log("problem found: switch back (rollback)");
+```
+
+It prints:
+
+```text
+start                                  live=blue(v1) idle=green(null)
+deploy v2 to idle                      live=blue(v1) idle=green(v2)
+smoke test idle: pass                  live=blue(v1) idle=green(v2)
+switch router                          live=green(v2) idle=blue(v1)
+problem found: switch back (rollback)  live=blue(v1) idle=green(v2)
+```
+
+Rollback is the same operation as release: flip the router. The new
+version stays installed on the idle side, ready to be fixed and switched
+in again.
+
+#### Changing the database under blue-green
+
+The hard part is the database, which is usually shared by both
+environments. If the new version changes the schema in a way the old
+version cannot handle, switching back breaks. The book describes two
+approaches. One is to keep two databases and synchronise them, which is
+complex. The more common one is to **decouple database changes from
+application changes**: make schema changes that both old and new versions
+can work with, an approach often called **expand and contract**. The
+expand step adds new structures without removing old ones; the new version
+is deployed and uses them; only when the old version is gone is the
+contract step run to remove what is no longer needed.
+
+Here is a column rename done that way, run with node:
+
+```js
+// Expand and contract: rename column 'name' to 'full_name' with zero downtime.
+const rows = [{ id: 1, name: "Asha" }];
+const v1 = { read: (r) => r.name, write: (r, x) => { r.name = x; } };
+const v2 = { read: (r) => r.full_name ?? r.name, write: (r, x) => { r.full_name = x; r.name = x; } };
+const show = (step) => console.log(step.padEnd(42), JSON.stringify(rows));
+show("start (v1 running)");
+rows.forEach((r) => (r.full_name = r.name)); show("EXPAND: add full_name, backfill");
+v2.write(rows[0], "Asha K");          show("v2 deployed beside v1; v2 writes both");
+console.log("".padEnd(42), "v1 reads:", v1.read(rows[0]), "| v2 reads:", v2.read(rows[0]));
+rows.forEach((r) => delete r.name);   show("CONTRACT: v1 retired, drop name");
+console.log("".padEnd(42), "v2 reads:", v2.read(rows[0]));
+```
+
+It prints:
+
+```text
+start (v1 running)                         [{"id":1,"name":"Asha"}]
+EXPAND: add full_name, backfill            [{"id":1,"name":"Asha","full_name":"Asha"}]
+v2 deployed beside v1; v2 writes both      [{"id":1,"name":"Asha K","full_name":"Asha K"}]
+                                           v1 reads: Asha K | v2 reads: Asha K
+CONTRACT: v1 retired, drop name            [{"id":1,"full_name":"Asha K"}]
+                                           v2 reads: Asha K
+```
+
+At every step, whichever version is running reads correct data, so
+switching back is always safe until the contract step, which happens only
+once the old version is truly retired.
+
+<Timeline caption="Expand and contract over several deployments. Read top to bottom: each step is a separate, small deployment, and rollback stays safe until the last." items={[
+  { when: "Deploy 1", what: "Expand: add the new column; backfill from the old one." },
+  { when: "Deploy 2", what: "New code writes both columns, reads the new one with a fallback." },
+  { when: "Wait", what: "Old version retired everywhere; switching back no longer needed." },
+  { when: "Deploy 3", what: "New code stops writing the old column." },
+  { when: "Deploy 4", what: "Contract: drop the old column." },
+]} />
+
+#### Canary releases
+
+In a **canary release**, the new version is deployed to a small part of the
+production fleet and receives a small share of traffic. The team watches
+its behaviour, error rates, response times, business measures, against the
+old version. If it looks healthy, the share grows step by step; if not, it
+is rolled back while most users never saw it. The name comes from the
+canaries miners once carried to warn of bad air.
+
+Here is a sketch of the comparison, run with node, sending about one
+request in twenty to the canary:
+
+```js
+// Canary release: send a small share of traffic to the new version,
+// compare error rates, then promote or roll back.
+let seed = 42;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+function serve(version) {
+  const errorRate = version === "v1" ? 0.01 : CANARY_ERROR_RATE;
+  return rand() < errorRate ? "error" : "ok";
+}
+let CANARY_ERROR_RATE;
+for (CANARY_ERROR_RATE of [0.01, 0.05]) {
+  const stats = { v1: { n: 0, err: 0 }, v2: { n: 0, err: 0 } };
+  for (let i = 0; i < 20000; i++) {
+    const v = rand() < 0.05 ? "v2" : "v1"; // 5% canary
+    stats[v].n++;
+    if (serve(v) === "error") stats[v].err++;
+  }
+  const r1 = stats.v1.err / stats.v1.n, r2 = stats.v2.err / stats.v2.n;
+  const decision = r2 > r1 * 2 ? "ROLL BACK canary" : "promote to 25%";
+  console.log(`canary true error rate ${CANARY_ERROR_RATE}: v1 ${stats.v1.n} req ${(r1 * 100).toFixed(2)}% | v2 ${stats.v2.n} req ${(r2 * 100).toFixed(2)}% -> ${decision}`);
+}
+```
+
+It prints:
+
+```text
+canary true error rate 0.01: v1 18930 req 1.08% | v2 1070 req 0.93% -> promote to 25%
+canary true error rate 0.05: v1 18945 req 1.03% | v2 1055 req 6.64% -> ROLL BACK canary
+```
+
+In the first run the canary behaves like the old version and is promoted.
+In the second it has a real problem; its error rate is several times the
+baseline and it is rolled back after about a thousand requests, while the
+other nineteen thousand went to the healthy version. The output also shows
+noise: the true rate was 5 percent, the measured 6.64. A canary needs
+enough traffic for the comparison to mean something, which is why real
+canary analysis uses statistical tests and waits for enough requests.
+
+#### The cluster immune system
+
+The book also describes the **cluster immune system**, an extension of
+canary releases in which the comparison and rollback are automatic. The
+system watches the new version's behaviour against the old and, if user
+experience gets worse beyond a threshold, rolls back without waiting for a
+person. It turns the canary from a manual watch into a guard that never
+gets tired.
+
+<Compare left="Blue-green" right="Canary" caption="Two environment-based patterns. Read across each row: blue-green switches everyone at once with an instant way back; canary exposes a few first and grows." rows={[
+  ["Two full environments", "One fleet, part on the new version"],
+  ["All traffic switches at once", "Traffic share grows step by step"],
+  ["Rollback: switch the router back", "Rollback: move the canary's share back"],
+  ["Needs double capacity during switch", "Needs good comparison measures"],
+  ["Simple to reason about", "Limits how many users see a problem"],
+]} />
+
+### Worked example
+
+**Simple.** My hosting service supports preview deployments: each build
+gets its own address, and the live site points at one of them. Switching
+the live address to a previous build is a blue-green rollback in miniature.
+
+**Realistic.** A team moves from in-place deployments, which caused a few
+minutes of errors each time, to blue-green. They deploy to the idle side,
+run smoke tests against it directly, then switch the load balancer. Errors
+during deployment disappear, and rollback, which used to mean redeploying
+the old build, takes seconds. Their first schema change under blue-green
+breaks rollback, which teaches them expand and contract.
+
+**In production: an automated canary.** A team's pipeline deploys every
+production change as a canary to a small share of servers, compares error
+rate and response time against the rest for a fixed period, and promotes or
+rolls back automatically. Most bad changes are stopped after reaching only
+a small share of users, and the team learns about each one from an alert
+with a comparison graph attached.
+
+### Step by step
+
+1. **Pick a pattern**: blue-green if capacity allows, canary for gradual
+   exposure.
+2. **Make traffic routing controllable** at the load balancer or platform.
+3. **Smoke test the new version** before it receives traffic.
+4. **Use expand and contract** for every schema change.
+5. **Define health measures** for comparing new and old.
+6. **Automate the decision** when the measures are trusted.
+
+### Common mistake
+
+The common mistake is to adopt blue-green or canary for application code
+and forget the database, so rollback works until the first destructive
+schema change. The fix is expand and contract, with the contract step
+separated from the deployment that needs the new schema.
+
+### In real systems
+
+Load balancers, service meshes and container platforms support weighted
+routing for canaries and switching for blue-green. Progressive delivery
+tools automate canary analysis and rollback.
+
+### Check yourself
+
+<details>
+<summary>1. How is rollback done in a blue-green deployment?</summary>
+
+By switching the router back to the environment still running the old
+version.
+
+</details>
+
+<details>
+<summary>2. Why are schema changes the hard part of blue-green?</summary>
+
+The database is usually shared, so a change the old version cannot handle
+breaks rollback. Expand and contract keeps both versions working.
+
+</details>
+
+<details>
+<summary>3. What does the cluster immune system add to canary releases?</summary>
+
+Automatic comparison and rollback when the new version makes user
+experience worse beyond a threshold.
+
+</details>
+
+## Application-based release patterns
+
+### In one sentence
+
+Application-based patterns put switches inside the code, feature toggles
+and dark launches, so features can be released, limited or withdrawn
+independently of what is deployed.
+
+### The idea
+
+#### Feature toggles
+
+A **feature toggle** is a switch in the application that turns a feature
+on or off without a deployment. Chapter 11 used toggles to merge
+unfinished work safely. This chapter uses them to control release. The
+book lists several things toggles make possible.
+
+- **Easy rollback.** A feature causing problems can be switched off in
+  seconds, far faster than redeploying.
+- **Graceful degradation.** Under heavy load, costly features can be
+  switched off to keep the core service working.
+- **Resilience through loose coupling.** A feature that depends on a
+  service not yet ready can be deployed with the dependency switched off,
+  so teams do not have to deploy in lockstep.
+- **Gradual release.** A toggle can be on for some users and off for
+  others: staff first, then a small percentage, then everyone.
+
+Gradual release by percentage needs each user to stay in the same group
+across requests, otherwise a feature would flicker on and off. A common
+method is to hash a stable user identifier into a bucket from 0 to 99 and
+turn the feature on for buckets below the rollout percentage. Here is a
+sketch, run with node:
+
+```js
+// Percentage rollout: a stable hash puts each user in or out of a feature.
+function bucket(userId) {
+  let h = 0;
+  for (const ch of userId) h = (h * 31 + ch.charCodeAt(0)) % 100000;
+  return h % 100; // 0..99, same every time for the same user
+}
+const enabled = (userId, percent) => bucket(userId) < percent;
+const users = Array.from({ length: 1000 }, (_, i) => `user-${i}`);
+for (const pct of [1, 10, 50, 100]) {
+  const on = users.filter((u) => enabled(u, pct)).length;
+  console.log(`rollout ${String(pct).padStart(3)}%: ${String(on).padStart(4)} of 1000 users see the feature`);
+}
+for (const u of ["user-7", "user-123"]) console.log(`${u}: bucket ${bucket(u)}; at 10%: ${enabled(u, 10)}, again: ${enabled(u, 10)}, at 50%: ${enabled(u, 50)}`);
+```
+
+It prints:
+
+```text
+rollout   1%:    8 of 1000 users see the feature
+rollout  10%:   84 of 1000 users see the feature
+rollout  50%:  475 of 1000 users see the feature
+rollout 100%: 1000 of 1000 users see the feature
+user-7: bucket 77; at 10%: false, again: false, at 50%: false
+user-123: bucket 32; at 10%: false, again: false, at 50%: true
+```
+
+Two properties matter. A given user gets the same answer every time, so
+their experience is stable. And as the percentage grows, users already
+included stay included, because a user in a bucket below 10 is also below
+50. The counts are close to the target but not exact, 84 rather than 100
+at ten percent, because this simple hash does not spread similar
+identifiers perfectly evenly; production toggle systems use stronger
+hashes, but the idea is the same.
+
+#### Dark launches
+
+A **dark launch** deploys a feature to production and exercises it with
+real production traffic, without users seeing it. For example, a new
+search service might receive a copy of every real search request and
+compute results, which are recorded and thrown away while users still see
+the old service's results. The team learns how the new service behaves
+under real load, its speed, its errors, its resource use, before any user
+depends on it. When it is ready, a toggle makes its results visible.
+
+The book presents dark launching as a way to make a big launch boring: by
+the time a feature is visibly released, it has already been running in
+production for days or weeks, and its capacity and behaviour are known.
+
+<Layers caption="What application-based patterns give a team. Read top to bottom: from hiding a feature to proving it under real load before anyone sees it." layers={[
+  { name: "Toggle off", note: "feature deployed but invisible" },
+  { name: "Toggle for staff", note: "real use by people who can report problems" },
+  { name: "Percentage rollout", note: "a growing share of users, stable per user" },
+  { name: "Dark launch", note: "real traffic exercises the feature; results hidden" },
+  { name: "Kill switch", note: "turn off in seconds if anything goes wrong" },
+]} />
+
+#### Toggles need care
+
+Toggles bring their own costs. Every toggle is a branch in the code, and
+the number of possible combinations grows quickly. Old toggles that are
+never removed become dead code that confuses readers and can be flipped by
+mistake. The book's lessons, and chapter 11's, apply: test both states of
+each toggle, give each release toggle an owner and removal date, and remove
+it once the feature is fully released.
+
+<Trace columns={["Toggle", "Kind", "State", "Owner", "Remove by"]} rows={[
+  ["newCheckout", "release", "50% rollout", "payments team", "two weeks after 100%"],
+  ["recommendationsOff", "operational kill switch", "off (feature on)", "platform team", "keep"],
+  ["searchV2Shadow", "dark launch", "shadow traffic on", "search team", "when searchV2 is live"],
+  ["oldBanner", "release", "100% on for a year", "nobody", "overdue: remove now"],
+]} caption="A toggle register. Read each row across: every toggle has a kind, owner and removal plan, and one with no owner stands out as debt." />
+
+#### Graceful degradation under load: a trace
+
+Operational toggles earn their keep on a bad day. Here is a sketch of a
+shop under a sudden traffic surge, using kill switches to protect the
+core path of browsing and paying.
+
+<Trace columns={["Time", "Load", "Action", "Effect"]} rows={[
+  ["12:00", "normal", "all features on", "pages fast"],
+  ["12:10", "three times normal", "turn off personalised recommendations", "database load falls; pages fast again"],
+  ["12:25", "four times normal", "turn off live stock counts; show 'in stock'", "checkout stays fast"],
+  ["13:30", "normal", "turn both features back on", "full experience restored"],
+]} caption="Kill switches during a surge. Read top to bottom: the team sheds costly extras one at a time, keeps checkout working, and restores everything when load falls." />
+
+No deployment happened during the surge. Every action was a switch that
+had been built, tested and documented in advance, which is what makes it
+possible to act calmly under pressure.
+
+### Worked example
+
+**Simple.** I add a toggle to my site for a new table of contents
+component, on only when I add a query parameter to the address. I can see
+it on real pages, in production, while readers see the old layout. When I
+am happy, I turn it on for everyone and later delete the toggle.
+
+**Realistic.** A team releases a redesigned product page. It goes first to
+staff for a week, then to one percent of users, then ten, then half, then
+everyone, over two weeks. At each step the team compares page load time
+and conversion with the old page. At ten percent, load time on mobile is
+worse; they turn the percentage back to one, fix the image sizes, and
+continue.
+
+**In production: a dark launch before a big day.** Before a heavily
+promoted launch, a team dark-launches the new feature's backend for two
+weeks, sending it a copy of real traffic. They discover that one query
+does not scale and fix it. On the launch day, they flip the toggle, and
+the feature performs as measured. The launch is uneventful, which was the
+point.
+
+### Step by step
+
+1. **Add a toggle mechanism** with central control, not scattered
+   configuration.
+2. **Use stable bucketing** for percentage rollouts.
+3. **Release in stages**: staff, small share, larger shares, all.
+4. **Dark-launch** heavy features with shadow traffic first.
+5. **Keep a toggle register** with kinds, owners and removal dates.
+6. **Test both states** of every toggle.
+
+### Common mistake
+
+The common mistake is to let toggles accumulate, so the codebase has
+hundreds of switches nobody understands. The fix is a register, owners and
+deletion as part of finishing a feature.
+
+A second mistake is a dark launch that writes data, so hidden traffic
+changes real records. Shadow traffic must be read-only or isolated.
+
+### In real systems
+
+Feature flag services provide central control, percentage rollouts,
+targeting and audit logs. Traffic mirroring in proxies and service meshes
+supports dark launches.
+
+### Check yourself
+
+<details>
+<summary>1. Why must percentage rollouts be stable per user?</summary>
+
+Otherwise a user would see the feature appear and disappear between
+requests, which is confusing and makes results hard to compare.
+
+</details>
+
+<details>
+<summary>2. What is a dark launch?</summary>
+
+Running a new feature in production on real traffic with its results
+hidden from users, to learn how it behaves before release.
+
+</details>
+
+<details>
+<summary>3. Name two things toggles make possible besides gradual release.</summary>
+
+Any two of: instant rollback, graceful degradation under load, and
+deploying features whose dependencies are not ready yet.
+
+</details>
+
+## Continuous delivery and continuous deployment in practice
+
+### In one sentence
+
+Continuous delivery means trunk is always deployable and can be deployed
+on demand at the push of a button; continuous deployment goes further and
+deploys every change that passes the pipeline automatically.
+
+### The idea
+
+The book closes the chapter by clarifying two terms that are often
+confused.
+
+**Continuous delivery** is the practice in which every change is kept in a
+deployable state, trunk is always releasable, and deploying to production
+can be done on demand, by a button press, at any time. Whether to deploy a
+given change is a business decision; the team can do it at any moment
+safely.
+
+**Continuous deployment** goes one step further: every change that passes
+the automated pipeline is deployed to production automatically, without a
+person deciding. Many deployments a day become normal.
+
+Both rest on everything in Part III: environments on demand, a fast and
+reliable test suite, continuous integration, automated deployment, and the
+separation of deployment from release. The book's view is that continuous
+delivery is a prerequisite for continuous deployment, and that which one a
+team chooses depends on its context. Some environments, for example
+software installed on devices or subject to external approval, may stop at
+continuous delivery. Many web services go all the way to continuous
+deployment. In both cases, the decoupling of release from deployment means
+that even automatic deployment does not mean automatic release of features.
+
+<Compare left="Continuous delivery" right="Continuous deployment" caption="Two related practices. Read across each row: delivery makes deployment possible at any time; deployment makes it happen automatically for every change." rows={[
+  ["Trunk always deployable", "Trunk always deployable"],
+  ["Deploy on demand, by a button", "Deploy every passing change automatically"],
+  ["A person chooses when", "The pipeline deploys; toggles control release"],
+  ["Suits regulated or installed software", "Suits many web services"],
+  ["Prerequisite for the other", "Builds on the first"],
+]} />
+
+#### The ladder of deployment practice
+
+<Layers caption="A ladder from manual to continuous deployment. Read top to bottom: each rung builds on the ones above it, and a team can stop at the rung that fits its context." layers={[
+  { name: "Manual deployment", note: "checklists, rare, risky" },
+  { name: "Automated deployment", note: "scripted, repeatable, smoke tested" },
+  { name: "Self-service in the pipeline", note: "anyone authorised can deploy a tested package" },
+  { name: "Continuous delivery", note: "trunk always deployable, deploy on demand" },
+  { name: "Continuous deployment", note: "every passing change deploys automatically" },
+]} />
+
+#### Measures that show progress up the ladder
+
+As a team climbs, a few measures show whether deployment is really getting
+safer and faster. They are widely used in the industry and fit the book's
+argument closely.
+
+<Layers caption="Four measures of delivery performance. Read top to bottom: two describe speed and two describe stability, and improving practices should move both in the right direction together." layers={[
+  { name: "Deployment frequency", note: "how often the team deploys to production" },
+  { name: "Lead time for changes", note: "time from commit to running in production" },
+  { name: "Change failure rate", note: "share of deployments that cause a problem needing a fix" },
+  { name: "Time to restore", note: "how long it takes to recover when something goes wrong" },
+]} />
+
+The important pattern is that speed and stability are not traded against
+each other. Small, automated, reversible deployments are both faster and
+safer than large, manual ones, so a team climbing the ladder well should
+see frequency rise and lead time fall while failure rate and restore time
+also fall. If speed rises while stability worsens, a rung was skipped.
+
+### Worked example
+
+**Simple.** My site practises continuous deployment: every merge that
+passes the build and checks goes live. Drafts are hidden by their flag, so
+deployment does not mean release of unfinished posts.
+
+**Realistic.** A team building a mobile app practises continuous delivery
+for its backend, which deploys automatically, and continuous delivery with
+manual release for the app itself, whose releases go through the app
+stores. Within the app, features ship hidden behind remote toggles so they
+can be turned on without a new store release.
+
+**In production: from weekly to many a day.** A team that deployed weekly
+moves step by step up the ladder over a few months: automated deployment,
+then self-service, then continuous delivery with smoke tests and canaries,
+then continuous deployment with automatic canary analysis. The number of
+deployments rises, the size of each falls, and incidents caused by
+deployments become smaller and easier to diagnose.
+
+### Step by step
+
+1. **Find the team's rung** on the ladder.
+2. **Climb one rung at a time**, making each solid before the next.
+3. **Decide the target** by context: delivery or deployment.
+4. **Decouple release** with toggles so automatic deployment is safe.
+5. **Measure deployment frequency, lead time and failure rate** as the team
+   climbs.
+
+### Common mistake
+
+The common mistake is to aim straight for continuous deployment without
+the foundations, so automatic deployments push untested or unsafe changes.
+The fix is to climb the ladder in order.
+
+### In real systems
+
+Many web services deploy many times a day with continuous deployment;
+regulated and installed software often uses continuous delivery with a
+human release decision. Both use the same pipeline foundations.
+
+### Check yourself
+
+<details>
+<summary>1. What is the difference between continuous delivery and continuous deployment?</summary>
+
+Delivery keeps trunk deployable and deploys on demand; deployment deploys
+every passing change automatically.
+
+</details>
+
+<details>
+<summary>2. Why does continuous deployment not mean every feature goes live at once?</summary>
+
+Because release is decoupled: features ship hidden behind toggles and are
+released separately.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 12, Automate and Enable Low-Risk Releases">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that deployment should be automated,
+repeatable and boring. I learn the difference between deploying, putting a
+version into an environment, and releasing, making a feature available to
+users. I learn what a smoke test is and why the same deployment process
+should run for every environment.
+
+An example: I replace my manual upload with a pipeline step that deploys
+the built site and then fetches the home page to check it loads. I deploy
+three times in a day just to feel how routine it has become.
+
+The habit to build here is noticing every manual step I take when shipping
+something and asking whether a script could do it the same way every time.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I make deployment a pipeline stage that
+promotes one tested package through each environment, with smoke tests and
+a record of what is where. I use feature toggles to release independently
+of deployment, staged from staff to all users. I can explain blue-green and
+canary releases and when each fits.
+
+An example: I release a new page layout to myself first through a toggle,
+then to everyone, and later delete the toggle.
+
+I also start keeping a short register of toggles, so I never lose track of
+what is switched on, for whom, and why.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I design self-service deployments with controls in
+the process: review, gates, audit trail, monitoring and one-step rollback.
+I run blue-green or canary releases with health comparisons. I make every
+schema change with expand and contract so rollback stays safe. I manage
+toggles with a register, owners and removal dates, and I dark-launch heavy
+features with shadow traffic.
+
+An example: I rename a database column across four small deployments,
+with rollback possible at every step until the final contract.
+
+I measure deployment frequency, lead time from commit to production and
+the share of deployments that cause problems, and I use those numbers to
+decide where to invest next.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: stateful services, such as those holding long-lived
+connections, where switching traffic needs draining old connections;
+long-running background jobs that must finish on the old version before it
+is retired; caches that hold data in the old format; clients, such as
+mobile apps, that cannot be updated instantly, so the server must support
+several client versions at once; and low-traffic services, where a canary
+never gets enough requests for a meaningful comparison.
+
+An example: a low-traffic admin service uses a longer canary period and
+synthetic requests to gather enough data before promotion.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: a toggle that is off in production but on in
+tests, so the tested path is not the live one; a dark launch that
+accidentally writes to shared data; a canary that looks healthy because
+the failing feature is used only by a small group of users not in the
+canary; blue-green environments that drift apart because one was patched
+by hand; and a rollback that succeeds for code but not for data already
+written in a new format.
+
+An example: a canary passes its error comparison, but the new version
+breaks a monthly report that runs only on the first of the month. The team
+adds a synthetic check of the report path to canary analysis.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, deployment is a pipeline stage that runs on demand or
+automatically, using the same tested package for every environment, with
+smoke tests, audit records and environment dashboards. Releases are
+controlled by toggles with central management and stable percentage
+rollouts. Production changes go out as canaries with automated analysis
+and rollback. Schema changes follow expand and contract. Heavy features
+are dark-launched. Deployments happen in working hours, many times a week
+or day, and are boring.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that a deployment should be a non-event and a release a
+deliberate, reversible decision. I would rather deploy small changes often
+than large ones rarely, because small deployments are easier to check,
+diagnose and undo. When a deployment frightens me, I treat the fear as a
+signal that something in the process needs to change, not as a reason to
+deploy less.
+
+An example of the mindset: after a painful deployment, the team's question
+is "how do we make this boring next time?", not "how do we avoid doing this
+often?".
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, low-risk releases need systems that can run two
+versions at once: stateless services behind routable load balancers,
+backward-compatible interfaces and schemas, clients tolerant of old and new
+servers, and configuration-driven toggles. These requirements push
+architecture toward loose coupling, which chapter 13 develops. A system
+that can only run one version at a time can only be deployed with
+downtime and risk.
+
+An example: designing an API so new fields are optional and old fields are
+kept for a period lets old and new clients and servers mix safely during a
+rollout.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to climb the ladder. Automate the deployment, simplifying
+first. Put it in the pipeline with smoke tests and records. Make it
+self-service with controls built into the process. Separate release from
+deployment with toggles. Add environment-based patterns, blue-green or
+canary, with expand and contract for data. Automate canary analysis. Then
+choose continuous delivery or continuous deployment according to context.
+
+Done when deployments run from the pipeline on demand or automatically,
+in working hours, without drama; releases are toggled and reversible in
+seconds; schema changes never block rollback; and the team can say, for any
+feature, who can see it and how to turn it off.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Is it safe to deploy on a Friday?</summary>
+
+The book's argument suggests the question itself is a symptom. If
+deployments are small, automated, observed and easy to roll back, the day
+matters less. If they are large and risky, they are risky any day; the fix
+is the process, not the calendar.
+
+</details>
+
+<details>
+<summary>Do we need blue-green and canary and toggles?</summary>
+
+Not necessarily all three. Many teams use toggles plus either blue-green or
+canary. The goal is low-risk deployment and reversible release; choose the
+simplest combination that gives both.
+
+</details>
+
+<details>
+<summary>How do toggles affect testing?</summary>
+
+Each toggle state is a code path that needs testing. Test both states of
+each release toggle and the combinations that can occur in production,
+and remove toggles promptly to keep the number small.
+
+</details>
+
+<details>
+<summary>What if our database cannot support expand and contract?</summary>
+
+Most can, with care: add before you remove, backfill, and drop only when
+nothing uses the old structure. Where a change truly cannot be done that
+way, it needs a planned, rehearsed migration, and the book's advice is to
+make such cases rare.
+
+</details>
+
+<details>
+<summary>Who decides when a feature is released?</summary>
+
+With deployment and release decoupled, release is a business decision,
+often taken by the product owner, while the engineering team keeps
+deployments routine. The two no longer pull against each other.
+
+</details>
+
+<details>
+<summary>Does self-service deployment remove the need for operations?</summary>
+
+No. Operations work shifts from performing deployments to building and
+running the platform, pipeline and monitoring that make self-service safe.
+
+</details>
+
+<details>
+<summary>How big should a canary be?</summary>
+
+Small enough to limit harm, large enough to give a meaningful comparison.
+Low-traffic services may need a longer canary period or synthetic traffic.
+
+</details>
+
+<details>
+<summary>How does this chapter connect to the next?</summary>
+
+Chapter 13 looks at architecture: how loosely coupled systems make
+low-risk releases easier, and how to evolve an architecture safely.
+
+</details>
+
+<details>
+<summary>What is the first thing to automate if we can only do one?</summary>
+
+The steps that most often go wrong or wait the longest, usually
+configuration changes and database migrations, followed by smoke tests so
+problems are seen immediately after deploying.
+
+</details>
+
+<details>
+<summary>Is rolling back always better than fixing forward?</summary>
+
+Not always. Rolling back is usually faster and safer when the cause is
+unclear. Fixing forward can be reasonable for a small, well-understood
+problem when the pipeline is fast. What matters is that both are quick,
+practised options, not emergencies.
+
+</details>
+
+<details>
+<summary>Can a small project with one server use these patterns?</summary>
+
+Yes, in simple forms. Two copies of the application on one machine behind
+a local proxy give a basic blue-green switch. A toggle in a configuration
+file gives release control. Smoke tests after deploying cost almost
+nothing. The patterns scale down well; what matters is that deploying and
+releasing are separate, quick and reversible, not how big the
+infrastructure is.
+
+</details>
+
+<details>
+<summary>How long should a release toggle live?</summary>
+
+As short as practical: typically until the feature has been fully
+released and stable for a short period, then it is removed along with the
+old code path. Long-lived toggles should be a deliberate choice, such as a
+kill switch, not an accident.
+
+</details>
+
+## Key takeaways
+
+- Map, simplify, then automate deployment; use one package and one process for every environment.
+- Smoke tests after every deployment catch problems at once.
+- Self-service deployment is safe when controls live in the process: review, gates, audit, monitoring, rollback.
+- Deployment and release are different events; separate them.
+- Blue-green switches all traffic between two environments; canary grows a small share; the cluster immune system automates the canary's rollback.
+- Expand and contract keeps schema changes compatible with rollback.
+- Feature toggles and dark launches release features independently of deployment; manage toggles as a lifecycle.
+- Continuous delivery deploys on demand; continuous deployment deploys every passing change.
+
+## Glossary
+
+- **Deployment**: installing a specific version of software in an environment.
+- **Release**: making a feature available to all or some users.
+- **Smoke test**: a quick check after deploying that the system is up and key functions work.
+- **Self-service deployment**: authorised people deploy through an automated process themselves.
+- **Separation of duties**: a control in which the author of a change is not the only one approving it into production.
+- **Blue-green deployment**: two identical production environments; traffic switches from one to the other.
+- **Canary release**: a new version receives a small, growing share of production traffic.
+- **Cluster immune system**: automated comparison and rollback of canary releases.
+- **Expand and contract**: adding new schema structures before removing old ones, so old and new code both work.
+- **Feature toggle**: a switch in the application that turns a feature on or off without a deployment.
+- **Percentage rollout**: turning a feature on for a stable share of users.
+- **Dark launch**: running a feature on real production traffic with results hidden from users.
+- **Kill switch**: an operational toggle that turns a feature off quickly.
+- **Continuous delivery**: trunk always deployable; deploy to production on demand.
+- **Continuous deployment**: every change that passes the pipeline deploys automatically.
+
+## Exercises and self-check
+
+**Warm-up.** Write down every step of how I deploy one of my projects
+today. Mark which steps could be removed and which could be scripted.
+
+**Build.** Automate the deployment as a pipeline stage with a smoke test,
+and add a feature toggle that hides a new feature from everyone except me.
+Run the blue-green and expand-and-contract scripts and change them to
+model a failed smoke test.
+
+**Stretch.** Implement a percentage rollout with stable bucketing, release a
+feature to ten percent, then all, and delete the toggle. Plan an expand
+and contract change for a real schema, as a list of separate deployments.
+
+### Self-check
+
+<details>
+<summary>1. Name three qualities of a good automated deployment.</summary>
+
+Any three of: same process for every environment, smoke tests, fast,
+recorded, and consistent environments.
+
+</details>
+
+<details>
+<summary>2. In the canary script, why was the measured canary error rate 6.64 percent when the true rate was 5?</summary>
+
+Random noise from a small sample of about a thousand requests; a canary
+needs enough traffic for the comparison to be meaningful.
+
+</details>
+
+<details>
+<summary>3. When is the contract step of expand and contract safe to run?</summary>
+
+Only after the old version is retired everywhere, so nothing still uses
+the old structure.
+
+</details>
+
+<details>
+<summary>4. Why does a user already in a 10 percent rollout stay in at 50 percent?</summary>
+
+Their bucket is fixed by the hash; any bucket below 10 is also below 50.
+
+</details>
+
+<details>
+<summary>5. Why is continuous delivery a prerequisite for continuous deployment?</summary>
+
+Automatic deployment of every change is only safe if trunk is always
+deployable and deployment is automated, tested and reversible.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter by shipping something small many times. Each concept
+here, smoke tests, toggles, blue-green, canary, is easiest to understand
+after doing it once on a real, low-stakes project.
+
+<Timeline caption="Three sessions and a habit for chapter 12." items={[
+  { when: "Session 1", what: "Read the chapter. Map my current deployment. Run the four scripts." },
+  { when: "Session 2", what: "Make deployment a pipeline stage with a smoke test. Add one toggle." },
+  { when: "Session 3", what: "Do a staged rollout with stable bucketing. Plan one expand-and-contract change." },
+  { when: "Every release", what: "Deploy dark, release by toggle, delete the toggle after." },
+]} />
+
+This chapter is part of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+The next chapter looks at the architecture that makes low-risk releases
+easy.
+
+Done when my project deploys from its pipeline with a smoke test, new
+features ship behind toggles I can turn off in seconds, and I can plan a
+schema change that never blocks rollback.
