@@ -1,0 +1,1531 @@
+---
+book: the-devops-handbook
+number: 10
+title: "Enable Fast and Reliable Automated Testing"
+description: "Fast, reliable automated testing in the deployment pipeline: the test pyramid, parallel runs, test-first development, flaky tests, non-functional checks and the andon cord."
+part: "Part III, The First Way: The Technical Practices of Flow"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+With environments, version control and a stricter definition of done in
+place, the deployment pipeline needs its engine: automated tests that tell
+a team, within minutes of every change, whether the system still works.
+This chapter explains how to build that engine. It covers running the
+build and tests continuously, designing a test suite that is fast and
+reliable, catching errors as early and cheaply as possible, running tests
+in parallel, writing tests before code, automating manual tests, checking
+performance and other non-functional requirements, and, most importantly,
+stopping everything to fix the pipeline when it breaks.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- describe the stages of a deployment pipeline and what each one checks;
+- distinguish unit, acceptance and integration tests, and explain the ideal test pyramid;
+- calculate how test portfolio shape and parallelism affect feedback time;
+- practise test-first development in small red, green, refactor steps;
+- detect and deal with flaky tests, and decide which manual tests to automate;
+- add performance and other non-functional checks to the pipeline;
+- explain why the whole team stops to fix a broken pipeline, and how to make that work.
+
+What I should already know: the foundations in
+<a href={withBase('/books/the-devops-handbook/09-create-the-foundations-of-our-deployment-pipeline/')}>chapter 9</a>,
+the andon cord and swarming from
+<a href={withBase('/books/the-devops-handbook/03-the-second-way-the-principles-of-feedback/')}>chapter 3</a>,
+and how to write and run a basic test in some language. All code examples
+on this page are JavaScript run with node.
+
+Reading time: about 75 minutes. Section headings are descriptive and follow
+the book's order; case studies are summarised as ideas only.
+
+## Chapter map
+
+<Flow caption="The chapter as a path. Read left to right: build a pipeline that runs tests on every change, make the tests fast and reliable, then protect the pipeline by stopping to fix it when it breaks." steps={[
+  "Build and test every change",
+  "A fast, reliable test suite",
+  "Catch errors early: the pyramid",
+  "Run tests in parallel",
+  "Write tests first",
+  "Automate manual tests",
+  "Test non-functional requirements",
+  "Pull the andon cord",
+]} />
+
+## Continuously build, test and integrate code and environments
+
+### In one sentence
+
+Every change to version control should automatically trigger a build and
+a series of tests, in a deployment pipeline that tells the team quickly
+whether the change is safe to release.
+
+### The idea
+
+The book describes the deployment pipeline, following Jez Humble and
+David Farley's *Continuous Delivery*, as the automated path every change
+takes from commit to production. Its job is to give fast feedback and to
+ensure that only changes which pass every check can reach production.
+
+A typical pipeline has stages, each more thorough and slower than the one
+before:
+
+- **Commit stage**: triggered by every commit. It builds the code, runs unit tests and fast checks such as static analysis, and produces a **package**, the built artefact that will be deployed. This stage should take minutes.
+- **Acceptance stage**: deploys the package to a production-like environment and runs automated acceptance tests that check the system from the user's point of view.
+- **Further stages**, depending on the system: performance tests, security scans, exploratory testing by people, and finally deployment to production.
+
+Two principles run through the design. First, **build once, deploy many**:
+the package produced at the commit stage is the one tested in every later
+stage and deployed to production. It is never rebuilt, because a rebuilt
+package might differ from the one that was tested. Second, **every stage is
+a gate**: a change that fails a stage does not proceed. The pipeline
+therefore produces, at any moment, a set of packages known to be good, any
+of which could be deployed.
+
+The book adds that the pipeline should also build and test environments,
+not only application code, since environment definitions are in version
+control too. A change to a container definition or infrastructure code goes
+through the pipeline like any other change.
+
+The result is that the team always knows whether trunk is in a deployable
+state, and that knowledge comes within minutes of each change, while the
+author still remembers what they did.
+
+<Figure caption="A deployment pipeline. Read left to right: each stage is slower and more thorough; one package is built at the commit stage and promoted through every later stage unchanged." art={`
+  commit
+    |
+    v
+ +-------------+    +----------------+    +----------------+    +------------+
+ | Commit      |--->| Acceptance     |--->| Performance /  |--->| Production |
+ | stage       |    | stage          |    | security /     |    | deploy     |
+ | build       |    | deploy package |    | exploratory    |    |            |
+ | unit tests  |    | to prod-like   |    |                |    |            |
+ | static      |    | env; run       |    |                |    |            |
+ | analysis    |    | acceptance     |    |                |    |            |
+ | -> PACKAGE  |    | tests          |    |                |    |            |
+ +-------------+    +----------------+    +----------------+    +------------+
+   minutes            tens of minutes       longer               on demand
+   the same package moves right; it is never rebuilt
+`} />
+
+#### Why "build once" matters
+
+It is tempting to rebuild the application for each environment, for
+example to bake in environment-specific settings. The problem is that a
+rebuild can pick up a different dependency version, a different compiler
+behaviour or a changed base image, so the thing deployed to production is
+not quite the thing that was tested. The book's approach is to build one
+package and supply environment-specific configuration at deploy time from
+version control. Then "it passed the tests" really means "this exact
+artefact passed the tests".
+
+<Compare left="Rebuild per environment" right="Build once, deploy many" caption="Two ways to move a change through environments. Read across each row: building once guarantees that what was tested is what is deployed." rows={[
+  ["Package rebuilt for test, staging, production", "One package built at the commit stage"],
+  ["Dependencies may differ between builds", "Identical contents everywhere"],
+  ["Settings baked into each build", "Settings supplied at deploy time"],
+  ["Tested artefact is not the deployed one", "Tested artefact is the deployed one"],
+]} />
+
+### Worked example
+
+**Simple.** I set up a workflow on my project: every push builds the site,
+runs the checks and produces a build artefact. A second job deploys that
+same artefact to a preview environment and runs a link checker against
+it. If either fails, nothing is published. Before, I built and published
+from my laptop, and twice published a build that had never been checked.
+
+**Realistic.** A team's builds happen on a developer's machine before
+release, and testing happens on a separately built copy. A release fails
+because the tested build and the released build used different library
+versions. The team creates a pipeline: the commit stage builds a container
+image once and stores it with a unique version; the acceptance stage
+deploys that image to a production-like environment and runs acceptance
+tests; production deploys the same image. Version mismatches between
+tested and deployed code become impossible.
+
+**In production: a pipeline for infrastructure changes.** A platform team
+puts its infrastructure definitions through a pipeline too. Every change
+to the network or cluster configuration is validated, applied to a test
+environment, checked with automated tests that confirm services can still
+reach each other, and only then applied to production. A change that
+would have blocked traffic between two services fails in the test stage,
+not in production.
+
+<Trace columns={["Stage", "What runs", "Typical time", "If it fails"]} rows={[
+  ["Commit", "build, unit tests, static analysis; produce package", "under 10 minutes", "author fixes immediately"],
+  ["Acceptance", "deploy package to prod-like env; acceptance tests", "tens of minutes", "change does not proceed"],
+  ["Non-functional", "performance, security scans", "longer, sometimes nightly", "change does not proceed"],
+  ["Production", "deploy the same package", "minutes", "roll back to previous package"],
+]} caption="One change moving through the pipeline. Read top to bottom: each stage is a gate, and the same package moves from one to the next." />
+
+### Step by step
+
+1. **Trigger a build on every commit** to version control.
+2. **Run fast checks first**: compile, unit tests, static analysis.
+3. **Produce one versioned package** and store it.
+4. **Deploy that package** to a production-like environment and run
+   acceptance tests.
+5. **Add later stages** as needed: performance, security, manual
+   exploration.
+6. **Gate every stage**: failures stop the change.
+7. **Deploy the same package to production**, with configuration from
+   version control.
+
+### Common mistake
+
+The common mistake is to treat the pipeline as a build server that runs
+"some tests" while the real checking happens by hand later. Then the
+pipeline's green signal means little and nobody trusts it. The fix is to
+put the checks that decide whether a change can be released into the
+pipeline, so green means releasable.
+
+### In real systems
+
+Most teams use a hosted or self-run CI/CD system with pipeline definitions
+stored in the repository. Artefact registries store versioned packages or
+container images, and deployment tools promote the same artefact through
+environments.
+
+### Check yourself
+
+<details>
+<summary>1. What does the commit stage produce, and why does it matter?</summary>
+
+A package, the built artefact. It is the one tested in every later stage and
+deployed to production, so what was tested is what is deployed.
+
+</details>
+
+<details>
+<summary>2. Why is rebuilding per environment risky?</summary>
+
+A rebuild can pick up different dependencies or tools, so the deployed
+artefact may differ from the tested one.
+
+</details>
+
+<details>
+<summary>3. What does it mean that every stage is a gate?</summary>
+
+A change that fails a stage does not proceed to the next, so only changes
+that pass every check can reach production.
+
+</details>
+
+## Build a fast and reliable automated validation test suite
+
+### In one sentence
+
+The pipeline is only as good as its tests, which must be fast enough to
+run on every change and reliable enough that a failure always means a
+real problem.
+
+### The idea
+
+The book describes several kinds of automated test, each with a role.
+
+**Unit tests** check a single function, class or module in isolation,
+usually by replacing its dependencies, such as databases or other
+services, with simple stand-ins. They are fast, many thousands can run in
+minutes, and when one fails it points directly to the problem.
+
+**Acceptance tests** check the application as a whole against what users
+and the business need, typically through its public interfaces such as an
+API or user interface. They answer "does it do what it is supposed to do?"
+rather than "does this function return the right value?". They run in the
+acceptance stage, against the deployed package in a production-like
+environment.
+
+**Integration tests** check that the application works with the real
+external systems it depends on: databases, other services, third-party
+APIs. They are slower and more fragile, because those systems may be slow,
+unavailable or changing.
+
+The book stresses two properties of the suite as a whole. It must be
+**fast**, because slow feedback means developers move on to other work
+before results arrive, batch their changes, and stop running tests
+locally. And it must be **reliable**: a failing test must mean a real
+problem. Tests that fail randomly, or that fail when nothing is wrong,
+teach people to ignore failures, which destroys the value of the whole
+suite.
+
+The book also makes a point about where confidence comes from. When an
+acceptance test fails, it is worth asking whether a unit test should have
+caught the problem earlier; if so, the team adds that unit test. Over time,
+this pushes detection of each kind of error to the fastest, cheapest test
+that can find it.
+
+<Layers caption="The three main kinds of automated test. Read top to bottom: tests get broader, slower and more fragile, and each layer answers a different question." layers={[
+  { name: "Unit tests", note: "does this piece of code do the right thing? milliseconds each" },
+  { name: "Acceptance tests", note: "does the application do what users need? seconds each" },
+  { name: "Integration tests", note: "does it work with the real systems around it? slower, more fragile" },
+]} />
+
+#### What makes a test reliable
+
+A reliable test produces the same result every time it is run on the same
+code. The common causes of unreliability are well known: tests that
+depend on timing, such as waiting a fixed number of milliseconds for
+something to happen; tests that share data and interfere with each other;
+tests that depend on the order they run in; tests that call real external
+services that are sometimes slow or down; and tests that depend on the
+current date or random values without controlling them. Each has a
+standard remedy: wait for a condition rather than a time, give each test
+its own data, make tests independent of order, replace external services
+with controlled stand-ins in most tests, and inject clocks and random
+seeds.
+
+<Trace columns={["Cause of unreliability", "Example", "Remedy"]} rows={[
+  ["Timing", "sleep 50 ms, then check", "wait until the condition is true, with a timeout"],
+  ["Shared data", "two tests edit the same record", "each test creates its own data"],
+  ["Order dependence", "test B relies on test A's leftovers", "set up everything a test needs inside it"],
+  ["External services", "real payment API is slow", "use a stand-in; test the real one separately"],
+  ["Time and randomness", "test fails on the 31st", "inject the clock and seed random values"],
+]} caption="Common causes of unreliable tests. Read across each row: each cause has a standard remedy that makes the test give the same result every run." />
+
+### Worked example
+
+**Simple.** I had one test for my site's date formatting that failed every
+January because it compared against the current year. I changed the
+function to take the date as a parameter, and the test passes a fixed
+date. The test has not failed falsely since.
+
+**Realistic.** A team's suite has a few hundred acceptance tests through
+the browser and very few unit tests. It takes two hours and fails randomly
+about one run in five. Developers stop waiting for it and merge anyway. The
+team sets two goals: commit stage under ten minutes, and zero tolerance for
+unreliable tests. It moves most checks into unit tests, keeps a small set of
+critical browser tests, and quarantines any test that fails without a
+code change until it is fixed. Within a quarter, the suite is fast and its
+failures are trusted again.
+
+**In production: a test that caught a real regression.** A team adds a
+unit test whenever an acceptance test finds a bug, asking "what is the
+smallest test that would have caught this?". Months later, a refactoring
+breaks rounding in currency conversion. The unit test added after an
+earlier, similar bug fails in the commit stage within three minutes, and
+the developer fixes it before lunch. Without it, the problem would have
+surfaced in the acceptance stage an hour later, or in production.
+
+### Step by step
+
+1. **Classify existing tests** as unit, acceptance or integration.
+2. **Measure suite time** per stage.
+3. **Find unreliable tests** by rerunning the suite on unchanged code.
+4. **Fix or quarantine** each unreliable test.
+5. **When a slow test catches a bug, add a fast one** that would have caught
+   it.
+6. **Set time budgets**: for example, commit stage in minutes.
+
+### Common mistake
+
+The common mistake is to tolerate a few unreliable tests, rerunning the
+pipeline until it goes green. Soon nobody knows which failures are real,
+and genuine regressions are rerun away. The fix is to treat an unreliable
+test as a broken test: fix it or remove it from the gating suite now.
+
+### In real systems
+
+Most test frameworks support tagging tests by type and running them in
+separate stages. Many CI systems report flaky tests automatically by
+tracking tests that pass and fail on the same commit.
+
+### Check yourself
+
+<details>
+<summary>1. What is the difference between a unit test and an acceptance test?</summary>
+
+A unit test checks a small piece of code in isolation; an acceptance test
+checks that the whole application does what users and the business need.
+
+</details>
+
+<details>
+<summary>2. Why is an unreliable test harmful even if most of its runs are fine?</summary>
+
+It teaches people to ignore failures, so real regressions get dismissed as
+noise.
+
+</details>
+
+## Catch errors as early in the testing as possible
+
+### In one sentence
+
+Most errors should be caught by fast, cheap unit tests, fewer by
+acceptance tests and fewest by slow end-to-end and manual tests, giving
+the shape of a pyramid rather than an upside-down cone.
+
+### The idea
+
+The book uses the **ideal testing pyramid**, an idea associated with Mike
+Cohn and others. At the base is a large number of unit tests: fast,
+precise and cheap to run. Above them, fewer acceptance and service-level
+tests. Above those, a small number of end-to-end tests through the user
+interface. At the top, a little manual and exploratory testing.
+
+The opposite shape, which the book calls the **inverted pyramid** and others
+nickname the ice cream cone, is common in organisations that started with
+manual testing: a few unit tests, some service tests, and a large number of
+slow user-interface tests and manual test scripts. The cone gives slow
+feedback, because its tests are slow, and poor diagnosis, because when a
+broad test fails it can be anywhere in the stack.
+
+The reasoning is about cost and speed. An error caught by a unit test is
+found seconds after it is made, by the person who made it, with the
+failing line identified. The same error caught by an end-to-end test is
+found tens of minutes or hours later, and someone has to investigate which
+of many components caused it. Caught in production, it costs far more. So
+the aim is to catch each error with the fastest test that can catch it.
+
+<Figure caption="The ideal testing pyramid and the inverted cone. Read each shape top to bottom: the pyramid has most tests at the fast base; the cone has most at the slow top." art={`
+       Ideal pyramid                     Inverted cone
+                                     ______________________
+          /\\                         \\   manual tests    /
+         /  \\   manual                \\_________________/
+        /____\\                         \\  UI / end-to-end /
+       /      \\  UI / end-to-end        \\_______________/
+      /________\\                          \\  service    /
+     /          \\  service / acceptance     \\_________/
+    /____________\\                           \\  unit /
+   /              \\  unit tests                \\___/
+  /________________\\
+  fast, precise, cheap at the base     slow, vague, costly at the top
+`} />
+
+#### The arithmetic of shape
+
+The difference in feedback time between the two shapes is large even with
+rough numbers. Here is a calculation, run with node, with invented but
+plausible per-test durations: a hundredth of a second for a unit test, half
+a second for a service test, twenty seconds for a user-interface test.
+
+```js
+// Feedback time for two test portfolios: a pyramid and an inverted "ice cream cone".
+const secs = { unit: 0.01, service: 0.5, ui: 20 };
+const pyramid = { unit: 2000, service: 200, ui: 20 };
+const cone = { unit: 100, service: 100, ui: 400 };
+const minutes = (p) => (p.unit * secs.unit + p.service * secs.service + p.ui * secs.ui) / 60;
+console.log(`pyramid: ${pyramid.unit + pyramid.service + pyramid.ui} tests, ${minutes(pyramid).toFixed(1)} min`);
+console.log(`cone:    ${cone.unit + cone.service + cone.ui} tests, ${minutes(cone).toFixed(1)} min`);
+```
+
+It prints:
+
+```text
+pyramid: 2220 tests, 8.7 min
+cone:    600 tests, 134.2 min
+```
+
+The pyramid has nearly four times as many tests and runs in under ten
+minutes. The cone has far fewer tests and takes over two hours. The
+pyramid also diagnoses better: most of its failures are unit tests that
+name the broken function. The lesson is not that user-interface tests are
+bad; a few are essential to check the whole system works together. It is
+that they are expensive, so each should test something only it can test.
+
+<Trace columns={["Portfolio", "Unit", "Service", "UI", "Total time"]} rows={[
+  ["Pyramid", "2000 x 0.01 s = 20 s", "200 x 0.5 s = 100 s", "20 x 20 s = 400 s", "520 s, about 8.7 min"],
+  ["Cone", "100 x 0.01 s = 1 s", "100 x 0.5 s = 50 s", "400 x 20 s = 8000 s", "8051 s, about 134 min"],
+]} caption="Where the time goes in each portfolio. Read across each row: in the cone, the user-interface tests alone account for almost all of the two hours." />
+
+#### Pushing a test down the pyramid
+
+When a broad test fails, the book's habit is to ask whether a narrower
+test could have caught the same problem, and if so to write it. Take a
+user-interface test that fails because a discount was calculated wrongly.
+The discount logic is a pure function; a unit test with the same inputs
+would have caught it in milliseconds. The team adds that unit test. The
+user-interface test may stay, to check the discount is displayed, but the
+logic is now protected at the base. Repeated over months, this habit turns
+a cone into a pyramid.
+
+### Worked example
+
+**Simple.** My site's only tests were a script that built the whole site
+and checked a few pages rendered. A bug in my reading-time function took
+the full build to detect. I added unit tests for that function and the
+date formatter. Now those bugs show up in under a second, and the full
+build check stays as a top-of-pyramid safety net.
+
+**Realistic.** A team's suite is a cone: four hundred browser tests and a
+handful of unit tests. It decides that every new feature needs unit tests
+for its logic, and that every time a browser test fails for a logic bug,
+someone writes the unit test that would have caught it. It also deletes
+browser tests that only check logic already covered below. After six
+months the suite has more tests but runs in a fraction of the time.
+
+**In production: a contract test in the middle.** Two services talk over an
+API. End-to-end tests that run both together are slow and fragile. The
+team adds contract tests in the middle of the pyramid: the consumer
+records the requests and responses it expects, and the provider's
+pipeline checks it still honours them. A breaking change to the API fails
+the provider's commit stage in minutes instead of an end-to-end run hours
+later.
+
+### Step by step
+
+1. **Count tests at each level** and how long each level takes.
+2. **Draw the shape**: pyramid or cone?
+3. **For each new feature**, write most tests at the unit level.
+4. **When a broad test fails, add a narrow test** that would have caught it.
+5. **Remove broad tests** that duplicate narrow ones.
+6. **Keep a small set of end-to-end tests** for critical user journeys.
+
+### Common mistake
+
+The common mistake is to automate manual test scripts one for one as
+user-interface tests. The result is an automated cone: slow, fragile and
+hard to diagnose. The fix is to ask, for each manual check, what is the
+cheapest automated test that verifies the same thing.
+
+### In real systems
+
+Teams commonly aim for many unit tests, a moderate number of service and
+contract tests, and a small number of end-to-end tests for critical
+journeys such as sign-up and checkout. Code coverage tools help find
+untested logic, though coverage alone does not guarantee good tests.
+
+### Check yourself
+
+<details>
+<summary>1. Why should most tests be unit tests?</summary>
+
+They are fast, cheap and precise, so errors are found seconds after they
+are made, with the failing code identified.
+
+</details>
+
+<details>
+<summary>2. What should a team do when a slow end-to-end test catches a logic bug?</summary>
+
+Add a unit test that would have caught it, so the bug is caught at the
+fastest level next time.
+
+</details>
+
+## Ensure tests run quickly, in parallel if necessary
+
+### In one sentence
+
+Feedback must arrive in minutes, so slow test stages should be split
+across many machines running in parallel, and the slowest individual
+tests should be made faster.
+
+### The idea
+
+The book is firm that fast feedback is a design goal, not a nice extra.
+If the commit stage takes an hour, developers will not wait for it; they
+will start other work and lose the context needed to fix a failure, and
+they will batch changes to avoid waiting, which makes failures harder to
+diagnose.
+
+When a suite is too slow even after reshaping it into a pyramid, the next
+tool is parallelism: dividing the tests among several machines or
+processes that run at the same time. Because tests in a well-designed suite
+are independent, they can run in any order on any machine. The book
+describes running different kinds of tests in parallel stages, too: for
+example, acceptance tests and security scans at the same time rather than
+one after the other.
+
+Parallelism has a limit that is easy to miss. The wall time of a parallel
+run can never be shorter than its longest single test, or the slowest
+chain of tests that must run in sequence. Beyond a certain number of
+workers, adding more does nothing; the only way forward is to make the
+longest tests faster or split them.
+
+#### Parallelism in numbers
+
+Here is a small simulation, run with node, that assigns a dozen tests to
+workers, longest first, each test going to the worker with the least work
+so far:
+
+```js
+// Splitting a slow suite across parallel workers, longest tests first.
+const tests = [300, 240, 200, 180, 120, 90, 60, 60, 45, 30, 20, 15]; // seconds
+const total = tests.reduce((a, b) => a + b, 0);
+for (const workers of [1, 2, 4, 8]) {
+  const load = Array(workers).fill(0);
+  for (const t of [...tests].sort((a, b) => b - a)) {
+    const i = load.indexOf(Math.min(...load));
+    load[i] += t;
+  }
+  console.log(`${workers} worker(s): wall time ${Math.max(...load)} s (total work ${total} s)`);
+}
+```
+
+It prints:
+
+```text
+1 worker(s): wall time 1360 s (total work 1360 s)
+2 worker(s): wall time 680 s (total work 1360 s)
+4 worker(s): wall time 350 s (total work 1360 s)
+8 worker(s): wall time 300 s (total work 1360 s)
+```
+
+Going from one to two workers halves the wall time; four workers nearly
+halve it again. But eight workers only reach 300 seconds, because one test
+alone takes 300 seconds. The total amount of work never changes; parallelism
+only spreads it. Once the longest test is the limit, the team has to look
+at that test: can it be split, made faster, or moved down the pyramid?
+
+<Trace columns={["Workers", "Wall time", "What limits it"]} rows={[
+  ["1", "1360 s", "total work"],
+  ["2", "680 s", "total work divided evenly"],
+  ["4", "350 s", "nearly even division"],
+  ["8", "300 s", "the single longest test (300 s)"],
+]} caption="Diminishing returns from parallelism. Read top to bottom: each doubling helps less, and at eight workers the longest single test sets the floor." />
+
+### Worked example
+
+**Simple.** My link checker ran through hundreds of pages one at a time.
+I made it check ten pages at once. The run went from several minutes to
+under one. Going to fifty at once barely helped, because a couple of slow
+external links took most of the time; I gave those a short timeout.
+
+**Realistic.** A team's acceptance stage takes forty minutes on one
+machine. It splits the tests across eight containers, each with its own
+fresh environment, and the stage drops to about seven minutes. Then it
+notices one test of a large import takes five minutes on its own; it
+splits that into three smaller tests, and the stage reaches five minutes.
+
+**In production: running stages side by side.** A team's pipeline ran
+acceptance tests, then a security scan, then performance tests, one after
+the other. None depends on the others' results, so it runs them in
+parallel after the commit stage. The time from commit to "ready to deploy"
+falls to the length of the slowest of the three rather than their sum.
+
+<Flow caption="Running independent stages in parallel. Read left to right: after the commit stage, three independent checks run at once, and the change is ready when the slowest finishes." steps={[
+  "Commit stage builds package",
+  "Acceptance, security and performance run at once",
+  "Slowest of the three finishes",
+  "Package marked ready to deploy",
+]} />
+
+### Step by step
+
+1. **Measure each stage's wall time** and each test's duration.
+2. **Make tests independent** so they can run in any order on any machine.
+3. **Split slow stages** across parallel workers with separate environments.
+4. **Run independent stages side by side.**
+5. **Find the longest tests** and split, speed up or push them down.
+6. **Set and watch time budgets** for each stage.
+
+### Common mistake
+
+The common mistake is to add workers without making tests independent.
+Tests that share a database or depend on order then interfere with each
+other in parallel, creating new flakiness. The fix is to give each worker
+its own environment and each test its own data.
+
+### In real systems
+
+Most CI systems can shard tests across machines, often using past run times
+to balance the shards. Ephemeral environments from chapter 9 make it easy
+to give each shard its own clean environment.
+
+### Check yourself
+
+<details>
+<summary>1. Why does adding more workers eventually stop helping?</summary>
+
+Wall time cannot be shorter than the longest single test or sequential
+chain, so once that is the limit, more workers do nothing.
+
+</details>
+
+<details>
+<summary>2. What must be true of tests before they can run in parallel?</summary>
+
+They must be independent of each other: own data, no order dependence,
+separate environments where needed.
+
+</details>
+
+## Write automated tests before writing the code
+
+### In one sentence
+
+Writing a failing test first, then just enough code to pass it, then
+cleaning up, produces code that is testable by design and a suite that
+grows with every change.
+
+### The idea
+
+The book recommends **test-driven development** (TDD), associated with Kent
+Beck. Its cycle has three steps:
+
+1. **Red**: write a small test for the next bit of behaviour, run it, and see it fail. The failure proves the test can detect the missing behaviour.
+2. **Green**: write just enough code to make the test pass, nothing more.
+3. **Refactor**: improve the code's structure while keeping all tests green.
+
+Then repeat with the next small behaviour. The cycle takes minutes.
+
+TDD has several effects the book values. Every behaviour has a test,
+because the test came first. Code is designed to be testable, which tends to
+mean small, decoupled units, the same property that makes systems easy to
+change. Developers get feedback every few minutes. And the suite grows in
+step with the code, so there is never a separate, postponed "write the
+tests" phase that gets cut under deadline pressure.
+
+#### A red, green, refactor session
+
+Here is a short TDD session, run with node, building a function that turns
+a title into a URL slug. Each step is shown with its real output.
+
+```js
+// Test first: write the test, watch it fail, write just enough code, watch it pass.
+function check(name, fn) {
+  try { fn(); console.log(`pass  ${name}`); } catch (e) { console.log(`FAIL  ${name}: ${e.message}`); }
+}
+const eq = (a, b) => { if (a !== b) throw new Error(`expected ${b}, got ${a}`); };
+
+let slugify = () => ""; // step 1: nothing implemented yet
+check("lowercases and joins words", () => eq(slugify("Hello World"), "hello-world"));
+
+slugify = (s) => s.toLowerCase().split(" ").join("-"); // step 2: just enough code
+check("lowercases and joins words", () => eq(slugify("Hello World"), "hello-world"));
+check("drops punctuation", () => eq(slugify("Hi, there!"), "hi-there")); // step 3: next test fails
+
+slugify = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim().split(/ +/).join("-");
+check("lowercases and joins words", () => eq(slugify("Hello World"), "hello-world"));
+check("drops punctuation", () => eq(slugify("Hi, there!"), "hi-there"));
+```
+
+It prints:
+
+```text
+FAIL  lowercases and joins words: expected hello-world, got 
+pass  lowercases and joins words
+FAIL  drops punctuation: expected hi-there, got hi,-there!
+pass  lowercases and joins words
+pass  drops punctuation
+```
+
+<Trace columns={["Step", "Test run", "Result", "Why"]} rows={[
+  ["1 red", "lowercases and joins words", "FAIL", "no implementation yet; the test can detect the gap"],
+  ["2 green", "lowercases and joins words", "pass", "simplest code that works"],
+  ["3 red", "drops punctuation", "FAIL", "new behaviour not yet supported"],
+  ["4 green", "both tests", "pass", "code extended; first test still guards old behaviour"],
+  ["5 refactor", "both tests", "pass", "structure can now be improved safely"],
+]} caption="The TDD session step by step. Read top to bottom: each new behaviour starts with a failing test, and earlier tests keep protecting what already works." />
+
+The rhythm matters more than the example. Each failing test is a small,
+precise specification. Each passing step is a safe point to commit. And by
+the end there is a test for every behaviour, written before anyone could
+be tempted to skip it.
+
+### Worked example
+
+**Simple.** I wrote my reading-time function test first: "200 words is
+one minute", "0 words is one minute, not zero", "450 words is three
+minutes". The second test caught an edge case I would not have thought of
+if I had written the code first.
+
+**Realistic.** A team adopts TDD for new code in a legacy service. It
+does not try to retrofit tests everywhere. Each new feature and each bug fix
+starts with a failing test. Over a year, the most-changed parts of the
+service, which are the parts where new features and bugs cluster, become
+well tested, while rarely-touched code stays as it was. Coverage grows where
+it matters most.
+
+**In production: a bug fix that starts with a test.** A production bug
+report says totals are wrong when an order contains a free item. Before
+touching the code, a developer writes a test reproducing it, with one free
+item and one paid item, and sees it fail with the wrong total. The fix
+makes it pass. The test stays in the suite, so the same bug cannot return
+silently.
+
+### Step by step
+
+1. **Pick the smallest next behaviour.**
+2. **Write a test for it** and run it; confirm it fails for the right
+   reason.
+3. **Write the simplest code** that makes it pass.
+4. **Run all tests.**
+5. **Refactor** while keeping them green.
+6. **Commit**, and repeat.
+
+### Common mistake
+
+The common mistake is to write the test after the code and call it TDD.
+The test then tends to confirm what the code does rather than specify what
+it should do, and the design benefits are lost. The fix is to keep the
+order: red first.
+
+A second mistake is steps that are too big: a test that needs an hour of
+code to pass. The fix is smaller behaviours, minutes each.
+
+### In real systems
+
+TDD is common for logic-heavy code and bug fixes. Teams that do not use
+it everywhere often still require a failing test before any bug fix, which
+gets much of the benefit.
+
+### Check yourself
+
+<details>
+<summary>1. Why watch the test fail before writing code?</summary>
+
+It proves the test can detect the missing behaviour; a test that passes
+before the code exists is not testing anything.
+
+</details>
+
+<details>
+<summary>2. Name two benefits of TDD the book values.</summary>
+
+Any two of: every behaviour is tested, code is testable and decoupled by
+design, feedback every few minutes, the suite grows with the code.
+
+</details>
+
+## Automate as many manual tests as possible
+
+### In one sentence
+
+Manual regression testing is slow and inconsistent, so repeated checks
+should be automated, leaving people free for exploratory testing that
+machines cannot do, while making sure the automated tests are reliable.
+
+### The idea
+
+Many organisations rely on people working through test scripts before
+each release: click here, enter this, check that. The book's argument is
+that this does not scale. Manual testing is slow, so it happens rarely,
+which forces large batches. It is inconsistent, because people tire and
+skip steps. And it ties the release schedule to the testers' capacity.
+
+The goal is to automate the repetitive checks, especially regression
+tests that confirm existing behaviour still works, so they run on every
+change. People then do what people are good at: exploratory testing,
+where a skilled tester investigates the system, tries unusual paths, and
+finds problems nobody thought to write a test for. Each problem found by
+exploration can then become an automated test.
+
+The book adds an important warning: automate only tests that will be
+reliable. An automated test that produces false alarms is worse than no
+test, because it wastes time and teaches people to ignore failures. The
+book suggests starting with a small number of reliable automated tests and
+growing the suite over time, rather than automating everything at once and
+drowning in flakiness.
+
+#### Finding flaky tests
+
+A **flaky test** passes and fails on the same code. The simplest way to
+find flaky tests is to run each test many times without changing anything
+and count failures. Here is a sketch, run with node, with one
+timing-dependent test simulated by a seeded random number:
+
+```js
+// Flaky test detection: rerun each test many times on the same code.
+let seed = 7;
+const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+const tests = {
+  "adds totals": () => true,
+  "waits for cache (sleep 50ms)": () => rand() > 0.15, // timing-dependent
+  "parses dates": () => true,
+};
+for (const [name, run] of Object.entries(tests)) {
+  let fails = 0;
+  for (let i = 0; i < 100; i++) if (!run()) fails++;
+  console.log(`${name.padEnd(30)} ${fails === 0 ? "stable" : `FLAKY: failed ${fails}/100`}`);
+}
+```
+
+It prints:
+
+```text
+adds totals                    stable
+waits for cache (sleep 50ms)   FLAKY: failed 14/100
+parses dates                   stable
+```
+
+A test that fails 14 times in 100 on unchanged code will fail roughly one
+pipeline run in seven. In a suite with several such tests, most runs will
+fail for no reason, and developers will learn to press "retry". The
+remedy is to quarantine it, taking it out of the gating suite so it no
+longer blocks anyone, and fix the cause, here a fixed sleep that should be
+a wait for a condition, before putting it back.
+
+<Trace columns={["Flaky tests in suite", "Chance one run is falsely red", "What developers learn"]} rows={[
+  ["0", "0", "red means a real problem"],
+  ["1 at 1-in-7", "about 14 percent", "occasionally retry"],
+  ["3 at 1-in-7", "about 37 percent", "retry before reading the failure"],
+  ["5 at 1-in-7", "about 54 percent", "ignore red; merge anyway"],
+]} caption="How a few flaky tests poison a suite. Read top to bottom: the chance of a false failure compounds, and with it the habit of ignoring failures. Each value is one minus 6/7 raised to the number of flaky tests." />
+
+#### Exploratory testing is not the leftover
+
+Automating regression checks does not make testers obsolete. The book's
+view is that it frees them for higher-value work. An exploratory tester
+asks questions a script cannot: what happens if I paste a whole document
+into this field, open the page in two tabs, lose the network halfway
+through payment, or use the feature in a way the designers did not
+imagine? Those sessions find the surprising problems, and each one found
+becomes a new automated test so it is never found the same way twice.
+
+<Compare left="Manual regression scripts" right="Automated regression plus exploration" caption="Two uses of testers' time. Read across each row: automating the repetitive checks frees people for the investigation only they can do." rows={[
+  ["Same script before every release", "Script runs automatically on every change"],
+  ["Testers tire and skip steps", "Machines run every step every time"],
+  ["Release waits for test capacity", "Release waits for the pipeline, minutes"],
+  ["Little time for exploration", "Testers spend their time exploring"],
+  ["New bugs found by luck", "New bugs found by skilled investigation, then automated"],
+]} />
+
+### Worked example
+
+**Simple.** Before publishing, I used to click through ten pages of my site
+to check nothing looked broken. I wrote a script that builds the site and
+checks those pages exist, have titles and have no broken links. It runs on
+every push. I still look at new pages myself, but I no longer repeat the
+same ten clicks.
+
+**Realistic.** A team's release requires three days of manual regression
+by two testers. The team automates the regression scripts in priority
+order, most-used journeys first, as unit and service tests where possible
+and a few browser tests where necessary. Within a few months, manual
+regression is down to a half-day of exploratory testing focused on the
+release's new features. The testers report finding more interesting bugs
+than before.
+
+**In production: quarantine done well.** A team's pipeline has a
+"quarantine" tag. Any test that fails without a related code change is
+tagged automatically and moved out of the gating suite, with a ticket
+assigned to the test's owner. The quarantine list is shown on the team's
+dashboard and kept short; a test cannot stay there longer than a week
+without a decision to fix or delete it. The gating suite stays trusted,
+and flaky tests do not linger forever.
+
+### Step by step
+
+1. **List the manual tests** run before each release.
+2. **Order them** by how often they find bugs and how often they are run.
+3. **Automate the top ones** at the lowest pyramid level that works.
+4. **Check reliability**: run each new automated test many times before
+   making it gate.
+5. **Quarantine flaky tests** and fix them quickly.
+6. **Redirect people** to exploratory testing, and automate what they find.
+
+### Common mistake
+
+The common mistake is to automate everything at once, producing a large,
+flaky suite that nobody trusts. The fix is to automate a few reliable tests
+first and grow from there, keeping the suite trustworthy at every step.
+
+### In real systems
+
+Most teams keep a small number of human-run exploratory sessions per
+release or per feature, and automate regression. Flaky test dashboards and
+automatic quarantine are common in larger codebases.
+
+### Check yourself
+
+<details>
+<summary>1. Why is an unreliable automated test worse than no test?</summary>
+
+It wastes time with false alarms and teaches people to ignore failures, so
+real problems get dismissed.
+
+</details>
+
+<details>
+<summary>2. What should testers do once regression checks are automated?</summary>
+
+Exploratory testing: investigating the system for unexpected problems, then
+turning what they find into automated tests.
+
+</details>
+
+## Integrate performance and non-functional testing into the suite
+
+### In one sentence
+
+Performance, capacity, security and other non-functional qualities should
+be tested automatically in the pipeline, so regressions are caught when the
+change that caused them is made.
+
+### The idea
+
+Functional tests check what the system does. **Non-functional
+requirements** describe how well it does it: how fast it responds, how
+much load it can handle, how secure it is, how it behaves when parts fail,
+how it uses resources. These qualities are often tested rarely, perhaps in
+a dedicated performance test before a major release, or not at all until
+production reveals a problem.
+
+The book argues that rare testing has the same weakness as rare
+integration: when a performance problem is finally found, it may be the
+result of many changes over weeks, and nobody knows which one caused it.
+Testing performance in the pipeline, on every change or at least daily,
+catches a regression close to the change that introduced it, when it is
+cheap to find and fix.
+
+The book's suggestions include: build performance tests that exercise the
+system under realistic load in a production-like environment; set
+thresholds, for example response times for key operations, that fail the
+pipeline if exceeded; watch trends over time, since slow drift is as
+dangerous as sudden regressions; and include other non-functional checks,
+such as security scanning of code and dependencies and checks that
+configuration meets standards. Some database performance problems, such as
+a query that is fast on small data and slow on large, only appear with
+realistic data volumes, so the environment matters.
+
+<Layers caption="Non-functional checks in the pipeline. Read top to bottom: each kind of check catches a different class of regression close to the change that caused it." layers={[
+  { name: "Performance", note: "response times of key operations against thresholds" },
+  { name: "Capacity and load", note: "behaviour under realistic and peak load" },
+  { name: "Security", note: "static analysis, dependency and secret scanning" },
+  { name: "Resilience", note: "behaviour when dependencies are slow or down" },
+  { name: "Configuration standards", note: "environments meet agreed rules" },
+]} />
+
+#### A threshold check
+
+A performance gate can start very simply: run the key operations a number
+of times, compute a percentile of their response time, and fail if it is
+above the agreed limit. Percentiles are better than averages for this,
+because users experience the slow requests, and an average can look fine
+while one request in twenty is painfully slow.
+
+<Trace columns={["Build", "p95 search time", "Threshold", "Result"]} rows={[
+  ["#101", "180 ms", "250 ms", "pass"],
+  ["#102", "185 ms", "250 ms", "pass"],
+  ["#103", "410 ms", "250 ms", "FAIL: new query without an index"],
+  ["#104", "190 ms", "250 ms", "pass after adding the index"],
+]} caption="A performance gate catching a regression. Read top to bottom: build 103 introduced a slow query, and the gate stopped it the same day instead of weeks later in production." />
+
+### Worked example
+
+**Simple.** My site got slower to build over months without my noticing,
+until it took several minutes. I added a check that fails if the build
+takes more than twice its usual time, and a note of build time on every
+run. The next time a change doubled it, a plugin that re-processed every
+image, I saw it the same day.
+
+**Realistic.** A team runs a short load test on every merge to trunk
+against a production-like environment with realistic data volumes, and a
+longer one nightly. Each checks the 95th percentile response time of the
+five most important operations. One afternoon, a change that adds a query
+in a loop pushes checkout time well past its threshold. The pipeline fails,
+the author sees the alert within the hour, and the fix lands before the end
+of the day.
+
+**In production: dependency scanning.** A team adds a dependency scan to
+its commit stage. When a widely used library announces a serious
+vulnerability, every pipeline using that version fails its scan the same
+day, giving teams a precise list of which services need updating rather
+than an organisation-wide hunt.
+
+### Step by step
+
+1. **List the non-functional qualities** that matter: speed, capacity,
+   security, resilience.
+2. **Pick key operations** and measure their current performance.
+3. **Set thresholds** using percentiles, with some headroom.
+4. **Add short checks to every run** and longer ones on a schedule.
+5. **Track trends** so slow drift is visible.
+6. **Add security and configuration scans** to the commit stage.
+
+### Common mistake
+
+The common mistake is to test performance only before big releases, in a
+special environment, by a special team. Problems found then are hard to
+trace to a cause. The fix is to test continuously, close to each change.
+
+A second mistake is using averages, which hide slow outliers. Percentiles
+give a truer picture.
+
+### In real systems
+
+Load testing tools, application performance monitoring and dependency
+scanners are commonly wired into pipelines. Many teams run quick smoke-load
+tests per change and heavier tests nightly.
+
+### Check yourself
+
+<details>
+<summary>1. Why test performance on every change rather than before releases?</summary>
+
+So a regression is caught close to the change that caused it, when it is
+easy to find and fix, rather than weeks later among many changes.
+
+</details>
+
+<details>
+<summary>2. Why prefer a percentile to an average for performance thresholds?</summary>
+
+Averages hide slow outliers; a percentile shows how slow the slower
+requests are, which is what users notice.
+
+</details>
+
+## Pull the andon cord when the deployment pipeline breaks
+
+### In one sentence
+
+When the pipeline goes red, the team stops new work and swarms to fix it,
+because a broken pipeline means nobody can safely release and every new
+change makes the problem harder to fix.
+
+### The idea
+
+Chapter 3 described the andon cord from the Toyota Production System:
+any worker can stop the line when they see a problem, and the team swarms
+to fix it. The book applies this directly to the deployment pipeline. When
+a build or test fails on trunk, nobody should commit unrelated changes;
+the priority is to get the pipeline green again, either by fixing the
+problem quickly or by reverting the change that caused it.
+
+The book explains why this matters so much. While the pipeline is red,
+the team has lost its ability to release safely; it no longer knows
+whether trunk works. If people keep committing, new changes pile on top of
+the broken one. Each new change might add another failure, and when the
+pipeline finally runs, there are several problems tangled together. The
+longer it stays red, the harder and slower the fix, and the more tempting
+it becomes to accept red as normal, at which point the pipeline stops
+being useful at all.
+
+The book also notes the cultural side. Stopping work feels expensive in
+the moment, but it is cheap compared with the alternative. And it
+reinforces the Second Way: problems are swarmed and fixed when they are
+small, and the organisation learns from each one.
+
+<Figure caption="Why a red pipeline gets worse over time. Read left to right: each unrelated commit lands on a broken trunk, and the problems tangle together until fixing them takes far longer." art={`
+ time --->
+  commit A breaks the build
+     |
+     v
+  [RED]--commit B--[RED]--commit C--[RED]--commit D--[RED]
+            |                |                |
+        unknown if       unknown if       unknown if
+        B is safe        C is safe        D is safe
+
+  stop and fix at A:   one problem, author remembers, minutes
+  fix after D:         up to four problems tangled, nobody remembers, hours
+`} />
+
+#### Revert first, investigate second
+
+A useful rule is that the fastest path to green is often to revert the
+change that broke the pipeline, then fix it calmly on a branch or locally.
+Reverting takes minutes and restores everyone's ability to work; fixing
+forward under pressure can take much longer and may introduce new
+problems. Teams often set a timebox: if the author cannot fix a red build
+within, say, ten minutes, the change is reverted.
+
+<Trace columns={["Minute", "What happens", "Pipeline"]} rows={[
+  ["0", "commit lands; acceptance tests fail", "red"],
+  ["1", "chat alert names the commit and author", "red"],
+  ["2", "team stops merging; author looks", "red"],
+  ["10", "no quick fix found; author reverts", "running"],
+  ["18", "pipeline green on the revert", "green"],
+  ["Later", "author fixes on a branch; resubmits with a new test", "green"],
+]} caption="Pulling the andon cord on a red build. Read top to bottom: the team stops, the timebox expires, the revert restores green, and the fix arrives later without pressure." />
+
+### Worked example
+
+**Simple.** When my site's build broke after a dependency update, I used to
+keep writing posts and plan to fix it later. Then I had three posts stuck
+behind a broken build and no idea which change caused which error. Now a
+red build is the first thing I fix, even if it means reverting the update.
+
+**Realistic.** A team adopts a rule: when trunk is red, the whole team stops
+merging, and the person whose change broke it has ten minutes to fix it or
+revert. A chat bot posts the failure and the suspected commit. In the first
+weeks, the rule is uncomfortable, but red periods drop from hours to
+minutes, and people start running tests locally before pushing to avoid
+being the one who stops the team.
+
+**In production: a release saved by stopping.** On a busy day, a team's
+pipeline goes red just before an important release. The temptation is to
+skip the failing test and release anyway. The team stops and looks: the
+failing test has caught a change that would have broken payments for a
+subset of customers. The fix takes twenty minutes and the release goes out
+an hour late, but working.
+
+### Step by step
+
+1. **Make red visible to everyone**: dashboards, chat alerts.
+2. **Agree the rule**: when trunk is red, no unrelated merges.
+3. **Set a timebox** for the author to fix it, then revert.
+4. **Swarm if needed**: others help find the cause.
+5. **Add a test or check** that would catch the problem earlier next time.
+6. **Review red periods** occasionally to find patterns.
+
+### Common mistake
+
+The common mistake is to let a red pipeline stay red because "it is
+probably a flaky test" or "someone is looking at it". The pipeline then
+becomes background noise. The fix is to treat every red as a stop, and to
+fix flaky tests so that red always means something.
+
+A second mistake is blaming the person who broke it. That makes people
+afraid to commit, which leads to larger, riskier batches. The fix is a
+blameless culture: breaking the build is normal; leaving it broken is not.
+
+### In real systems
+
+Many teams have a "build cop" or rotating role that watches the pipeline
+and coordinates fixes. Some use automatic revert bots that undo a change
+which breaks trunk. Merge queues, which test changes before they land on
+trunk, reduce how often trunk goes red at all.
+
+### Check yourself
+
+<details>
+<summary>1. Why should a team stop merging when the pipeline is red?</summary>
+
+Because new changes pile onto the broken one, nobody knows whether they are
+safe, and the problems tangle together, making the fix harder and slower.
+
+</details>
+
+<details>
+<summary>2. Why is reverting often better than fixing forward?</summary>
+
+Reverting restores green in minutes and removes pressure; the real fix can
+then be made calmly, with a new test.
+
+</details>
+
+<details>
+<summary>3. How should a team treat the person who broke the build?</summary>
+
+Blamelessly: breaking the build is normal; leaving it broken is the
+problem.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 10, Enable Fast and Reliable Automated Testing">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the lesson is that every change should be checked
+automatically, quickly, by the same tests every time. I learn the three
+kinds of test, unit, acceptance and integration, and that most of my tests
+should be fast unit tests. I set up a pipeline that builds and tests every
+push, and I fix a red build before doing anything else.
+
+An example: I add a workflow to a small project that runs its tests on
+every push, then deliberately break a function and watch the pipeline go
+red within a minute. Seeing the feedback arrive that fast is what makes the
+habit stick.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I shape the suite as a pyramid and can show,
+with arithmetic, why a cone is slow. I write tests first for new logic and
+bug fixes. I find flaky tests by rerunning them and remove them from the
+gating suite until fixed. I know the common causes of unreliability,
+timing, shared data, order, external services, time and randomness, and
+their remedies.
+
+An example: I take a slow browser test that checks a calculation, write a
+unit test for the calculation, and delete the logic check from the browser
+test, keeping only what the browser test alone can verify.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level, I design the pipeline as stages with time budgets,
+build one package and promote it, run independent stages in parallel and
+shard slow ones, and understand that the longest test sets the floor. I add
+performance thresholds using percentiles, dependency and security scans,
+and contract tests between services. I run the team's andon cord practice:
+red stops merging, a timebox, then revert.
+
+An example: I set the commit stage budget at ten minutes, measure it on
+every run, and when it creeps over, find the slowest tests and push them
+down the pyramid or split them.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases include: code that is hard to unit test because it is tangled
+with infrastructure, which needs refactoring before tests can be fast;
+tests that need realistic data volumes, which cannot run in seconds and
+belong in a later stage; external systems with no sandbox, which need
+simulators and contract tests; and user interfaces whose behaviour depends
+on timing, where waiting for conditions instead of fixed delays is
+essential.
+
+An example: a module that reads the clock and the database directly cannot
+be unit tested. Passing the clock and a data source in as parameters makes
+it testable in milliseconds.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases include: a test that is flaky only under parallel execution,
+revealing hidden shared state; a performance threshold that fails because
+the test environment itself was slow that day, which needs stable
+environments or comparison with a baseline run; a revert that cannot be
+clean because a schema migration already ran, which is why chapter 12
+favours migrations that are backward compatible; and tests that pass
+because they assert nothing useful, which code review and occasional
+mutation testing can catch.
+
+An example: a test passes even when the function is deleted, because it
+only checks that no error was thrown. Mutation testing, which changes the
+code and expects tests to fail, exposes it.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, every commit runs a commit stage within its time
+budget and an acceptance stage against a production-like environment with
+the same package. Tests are sharded across ephemeral environments.
+Non-functional checks run on every merge, with heavier runs nightly.
+Flaky tests are detected and quarantined automatically with owners and
+deadlines. Red trunk triggers alerts, a stop to merging and a revert after
+a short timebox; a merge queue keeps trunk green most of the time. Stage
+times, flake rates and red durations are tracked on a dashboard.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that tests are the pipeline's eyes, and a pipeline with
+unreliable eyes is worse than none. I value speed and trust over test
+count. I would rather have a smaller suite that is always right than a large
+one that sometimes lies. A red build is everyone's problem and the first
+thing to fix. And every bug found late is a question: what faster test
+would have found it?
+
+An example of the mindset: when a bug reaches production, the first
+change in the fix is a failing test that reproduces it.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design terms, testability is an architectural property. Code
+with clear boundaries, injected dependencies and pure logic separated from
+side effects can be tested quickly at the unit level. Services with
+explicit contracts can be tested in isolation with contract tests instead
+of slow end-to-end runs. Designing for testability is the same as designing
+for loose coupling, which links this chapter to chapter 7 and chapter 13.
+
+An example: separating a pricing engine into pure functions with no
+database access lets thousands of pricing tests run in a second, while one
+integration test checks that it is wired to the database correctly.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to make the pipeline trustworthy first and fast second,
+then keep it both. Start with a commit stage that builds once and runs
+reliable unit tests in minutes. Add an acceptance stage against
+production-like environments. Reshape the suite toward a pyramid by pushing
+tests down whenever a broad one catches a narrow bug. Adopt test-first for
+new logic and every bug fix. Automate manual regression in priority order,
+keeping every new test reliable. Add non-functional gates. And enforce the
+andon cord so red never becomes normal.
+
+Done when every change gets trusted feedback from the commit stage in
+minutes, the suite is pyramid-shaped with no tolerated flaky tests, key
+non-functional qualities are gated, and the team stops to fix red within
+minutes.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>How fast should the commit stage be?</summary>
+
+Fast enough that developers wait for it rather than switching to other
+work. Many teams aim for under ten minutes; the book's point is that fast
+feedback is a design goal to protect.
+
+</details>
+
+<details>
+<summary>Is 100 percent code coverage the goal?</summary>
+
+No. Coverage shows untested code, which is useful, but high coverage with
+weak assertions proves little. Aim for meaningful tests of important
+behaviour, especially frequently changed code.
+
+</details>
+
+<details>
+<summary>Should every team practise TDD all the time?</summary>
+
+The book recommends it. In practice, many teams use it for logic and bug
+fixes and are more flexible for exploratory code. A failing test before
+every bug fix captures much of the value.
+
+</details>
+
+<details>
+<summary>What do testers do in a team with heavy automation?</summary>
+
+They design test strategy, build test tooling, coach developers, and do
+exploratory testing, finding the unexpected problems that scripts cannot.
+
+</details>
+
+<details>
+<summary>What if a flaky test covers something important?</summary>
+
+Quarantine it from the gating suite so it stops blocking, but fix it
+quickly, and consider whether a more reliable test at a lower level can
+cover the same behaviour in the meantime.
+
+</details>
+
+<details>
+<summary>Can performance tests run in a shared test environment?</summary>
+
+They can, but results will be noisy. A dedicated, production-like
+environment, or comparison against a baseline run in the same
+environment, gives more trustworthy thresholds.
+
+</details>
+
+<details>
+<summary>Who fixes a red build?</summary>
+
+The author of the breaking change first, within a short timebox; if they
+cannot, it is reverted, and the team swarms if the cause is unclear.
+
+</details>
+
+<details>
+<summary>How does this chapter connect to continuous integration?</summary>
+
+Continuous integration, in chapter 11, depends on a fast, reliable suite:
+merging to trunk many times a day is only safe if every merge gets trusted
+feedback within minutes.
+
+</details>
+
+## Key takeaways
+
+- The deployment pipeline builds one package per change and promotes it through gated stages; build once, deploy many.
+- Unit tests are fast and precise, acceptance tests check user needs, integration tests check real dependencies.
+- A test suite must be fast and reliable; unreliable tests teach people to ignore failures.
+- Shape tests as a pyramid; when a broad test catches a narrow bug, add the narrow test.
+- Parallelism cuts wall time until the longest test sets the floor.
+- Write tests first: red, green, refactor, in minutes.
+- Automate manual regression in priority order, keep every automated test reliable, and use people for exploration.
+- Gate performance and other non-functional qualities, using percentiles and trends.
+- When the pipeline breaks, stop, fix within a timebox or revert, and add a test.
+
+## Glossary
+
+- **Deployment pipeline**: the automated, staged path from commit to production.
+- **Commit stage**: the first pipeline stage: build, unit tests, fast checks, package.
+- **Acceptance stage**: deploys the package to a production-like environment and runs acceptance tests.
+- **Package**: the built artefact produced once and promoted through every stage.
+- **Unit test**: a fast test of a small piece of code in isolation.
+- **Acceptance test**: a test that the application meets user and business needs.
+- **Integration test**: a test that the application works with real external systems.
+- **Contract test**: a test that a provider still honours what a consumer expects from its interface.
+- **Testing pyramid**: many unit tests, fewer acceptance tests, fewest end-to-end and manual tests.
+- **Inverted pyramid (ice cream cone)**: the opposite shape, slow and hard to diagnose.
+- **Test-driven development**: red (failing test), green (just enough code), refactor, repeated.
+- **Flaky test**: a test that passes and fails on the same code.
+- **Quarantine**: removing a flaky test from the gating suite until it is fixed.
+- **Exploratory testing**: skilled, unscripted investigation of a system for unexpected problems.
+- **Percentile**: the value below which a given share of measurements fall, such as the 95th percentile response time.
+- **Andon cord**: the practice of stopping work to fix a problem as soon as it is seen.
+
+## Exercises and self-check
+
+**Warm-up.** Count the tests in one of my projects by level and time each
+level. Draw the shape: pyramid or cone?
+
+**Build.** Set up a pipeline with a commit stage that builds once, runs unit
+tests and produces an artefact, and a second stage that deploys the
+artefact to a preview environment and runs a smoke test. Write the next
+feature test first, recording each red and green step.
+
+**Stretch.** Run my suite twenty times on unchanged code to find flaky
+tests, fix the worst one, add a simple performance threshold for one key
+operation, and write my team's or my own red-build rule with a timebox.
+
+### Self-check
+
+<details>
+<summary>1. A suite has 1000 unit tests at 0.01 s, 100 service tests at 0.5 s and 50 UI tests at 20 s. How long does it take, and where does the time go?</summary>
+
+10 s plus 50 s plus 1000 s, about 1060 s or 18 minutes. Nearly all of it is
+the UI tests.
+
+</details>
+
+<details>
+<summary>2. Tests total 1200 s and the longest is 400 s. What is the best wall time with unlimited workers?</summary>
+
+400 s, the longest single test, unless it is split or made faster.
+
+</details>
+
+<details>
+<summary>3. What are the three steps of TDD?</summary>
+
+Red: write a failing test. Green: write just enough code to pass. Refactor:
+improve the structure with tests green.
+
+</details>
+
+<details>
+<summary>4. Two tests each fail one run in ten on unchanged code. What is the chance a run is falsely red?</summary>
+
+One minus 0.9 squared, which is 0.19, about 19 percent.
+
+</details>
+
+<details>
+<summary>5. Why stop merging when trunk is red?</summary>
+
+New changes pile on a broken trunk, their safety is unknown, and problems
+tangle, so fixing takes far longer.
+
+</details>
+
+## How I'd study this chapter
+
+I study this chapter with a real project and a stopwatch. Every number on
+this page, suite time, parallel speed-up, flake rate, is something I can
+measure in my own pipeline, and measuring is what turns the ideas into
+habits.
+
+<Timeline caption="Three sessions and a habit for chapter 10." items={[
+  { when: "Session 1", what: "Read the chapter. Run the four scripts. Count and time my tests by level." },
+  { when: "Session 2", what: "Build the two-stage pipeline with one artefact. TDD the next feature." },
+  { when: "Session 3", what: "Hunt flaky tests by rerunning; add a performance threshold; write my red-build rule." },
+  { when: "Every bug", what: "Start the fix with a failing test at the lowest level that reproduces it." },
+]} />
+
+This chapter is the testing core of my
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+The next chapter builds on it with continuous integration: merging small
+changes to trunk many times a day.
+
+Done when my project has a pipeline that builds once and gives trusted
+feedback in minutes, a pyramid-shaped suite with no tolerated flaky tests,
+one performance threshold, and a red-build rule I follow.
