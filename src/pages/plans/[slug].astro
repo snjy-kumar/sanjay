@@ -1,9 +1,13 @@
 ---
 import { getCollection, getEntry, render } from 'astro:content';
 import SiteLayout from '../../layouts/SiteLayout.astro';
+import PhaseTable from '../../components/PhaseTable.astro';
+import PlannedNotes from '../../components/PlannedNotes.astro';
 import { series } from '../../data/series';
+import { roadmap } from '../../data/roadmap';
+import { planById, planGroups } from '../../data/plans';
 import { withBase } from '../../utils/base';
-import { publishedIn } from '../../utils/notes';
+import { noteHref, publishedIn, seriesName, shortDate } from '../../utils/notes';
 
 export async function getStaticPaths() {
   const plans = await getCollection('plans');
@@ -14,6 +18,12 @@ const plan = await getEntry('plans', Astro.params.slug!);
 const { Content } = await render(plan);
 
 const posts = await getCollection('blog');
+const entries = await getCollection('plans');
+
+// The wiring from src/data/plans.ts: the plan's group, its phases and where
+// each phase's notes go. The plans index checks that every plan has one.
+const meta = planById(plan.id)!;
+const group = planGroups.find((g) => g.id === meta.group)!;
 
 const related = plan.data.series
   ? series.find((s) => s.id === plan.data.series)
@@ -22,6 +32,35 @@ const related = plan.data.series
 // A series page only exists once the series has a published note. Until
 // then the plan links nowhere, so it does not link there.
 const relatedHasPage = related ? publishedIn(posts, related.id) > 0 : false;
+
+// The series this plan feeds, in series.ts order.
+const fedIds = new Set(meta.phases.flatMap((phase) => phase.series));
+const fed = series
+  .filter((s) => fedIds.has(s.id))
+  .map((s) => {
+    const published = publishedIn(posts, s.id);
+    const fromHere = (s.planned ?? []).filter((note) => note.plan === meta.id).length;
+    return {
+      series: s,
+      published,
+      fromHere,
+      href: published > 0 ? withBase(`/posts/${s.id}/`) : undefined,
+    };
+  });
+
+// The roadmap tracks it feeds, for the phases no series slot holds.
+const trackIds = new Set(meta.phases.flatMap((phase) => phase.tracks));
+const tracks = roadmap.filter((track) => trackIds.has(track.id));
+
+// The published notes that already cover part of a phase, in reading order.
+const covering = [...new Set(meta.phases.flatMap((phase) => phase.notes))]
+  .map((id) => posts.find((post) => post.id === id))
+  .filter((note): note is (typeof posts)[number] => Boolean(note))
+  .sort((a, b) => a.data.date.valueOf() - b.data.date.valueOf());
+
+const relatedPlans = meta.related
+  .map((id) => ({ meta: planById(id)!, entry: entries.find((entry) => entry.id === id)! }))
+  .filter(({ entry }) => Boolean(entry));
 
 const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
 const pageUrl = new URL(withBase(`/plans/${plan.id}/`), siteOrigin).href;
@@ -34,6 +73,11 @@ const jsonLd = {
   url: pageUrl,
   inLanguage: 'en',
   ...(plan.data.date ? { datePublished: plan.data.date.toISOString() } : {}),
+  isPartOf: {
+    '@type': 'CollectionPage',
+    name: 'The plans',
+    url: new URL(withBase('/plans/'), siteOrigin).href,
+  },
   author: {
     '@type': 'Person',
     name: 'Sanjay Kumar Thakur',
@@ -45,28 +89,125 @@ const jsonLd = {
 <SiteLayout
   title={plan.data.title}
   description={plan.data.description}
-  ogImage={new URL(withBase('/og/path.png'), siteOrigin).href}
-  ogImageAlt={plan.data.title}
+  ogImage={new URL(withBase(`/og/plans/${plan.id}.png`), siteOrigin).href}
+  ogImageAlt={meta.label}
   jsonLd={jsonLd}
 >
   <p class="crumb">
     <a href={withBase('/')}>Home</a> /
-    {related && relatedHasPage ? (
-      <a href={withBase(`/posts/${related.id}/`)}>{related.name}</a>
-    ) : (
-      <span>{related ? related.name : 'Plans'}</span>
-    )}
-    / <span>The plan</span>
+    <a href={withBase('/plans/')}>Plans</a> /
+    <span>{meta.label}</span>
   </p>
   <h1>{plan.data.title}</h1>
   <p class="lead">{plan.data.description}</p>
-  {related && (
+  {related ? (
     <p class="span">
-      The plan behind the {related.name} series · {related.dateRange}
+      The plan behind the{' '}
+      {relatedHasPage ? (
+        <a href={withBase(`/posts/${related.id}/`)}>{related.name}</a>
+      ) : (
+        related.name
+      )}{' '}
+      series · {related.dateRange}
     </p>
+  ) : (
+    <p class="span">{group.name} · {meta.length} · {meta.question}</p>
   )}
 
   <div class="entry plan">
     <Content />
   </div>
+
+  <h2 id="on-this-site">Where this plan lands on the site</h2>
+  <p class="series-note">
+    Every {meta.unit === 'Week' ? 'week' : meta.group === 'books' ? 'book' : 'phase'} of
+    this plan, what it has to produce, and where its notes go. A series
+    without a page yet links to its planned list on the{' '}
+    <a href={withBase('/path/')}>learning path</a>; a note appears in the
+    last column on the day it is published.
+  </p>
+  <PhaseTable plan={meta} posts={posts} />
+
+  {fed.length > 0 && (
+    <>
+      <h2 id="series">Series this plan feeds</h2>
+      <ul class="roadmap-list">
+        {fed.map(({ series: s, published, fromHere, href }) => (
+          <li>
+            <h3>{href ? <a href={href}>{s.name}</a> : s.name}</h3>
+            <p class="meta">
+              {s.dateRange}
+              {s.posts.length > 0 && <> · {published} of {s.posts.length} published</>}
+              {fromHere > 0 && <> · {fromHere} of {s.planned!.length} planned notes come from this plan</>}
+            </p>
+            <p>{s.description}</p>
+            {fromHere > 0 && <PlannedNotes series={s} plan={meta.id} />}
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+
+  {tracks.length > 0 && (
+    <>
+      <h2 id="tracks">Roadmap tracks from this plan</h2>
+      <p class="series-note">
+        The parts of the plan no series slot holds yet. They are intentions,
+        not scheduled notes.
+      </p>
+      <ul class="roadmap-list">
+        {tracks.map((track) => (
+          <li>
+            <h3><a href={withBase(`/path/#track-${track.id}`)}>{track.name}</a></h3>
+            <p class="meta">{track.size}</p>
+            <p>{track.why}</p>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+
+  {covering.length > 0 && (
+    <>
+      <h2 id="notes">Published notes on this plan</h2>
+      <p class="series-note">
+        Notes already written that cover part of a phase, in the order they
+        were published.
+      </p>
+      <ul class="journey">
+        {covering.map((note) => (
+          <li class="past">
+            <p class="when">
+              <time datetime={note.data.date.toISOString().slice(0, 10)}>{shortDate(note.data.date)}</time>
+              <span class="state">{seriesName(note.data.series)}</span>
+            </p>
+            <p class="post"><a href={noteHref(note)}>{note.data.title}</a></p>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+
+  {relatedPlans.length > 0 && (
+    <>
+      <h2 id="related">Related plans</h2>
+      <ul class="roadmap-list">
+        {relatedPlans.map(({ meta: other, entry }) => (
+          <li>
+            <h3><a href={withBase(`/plans/${other.id}/`)}>{entry.data.title}</a></h3>
+            <p class="meta">
+              {planGroups.find((g) => g.id === other.group)!.name} · {other.length}
+            </p>
+            <p>{other.question}</p>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+
+  <p class="series-note">
+    <a href={withBase('/plans/')}>All plans</a> ·
+    <a href={withBase('/path/#strategy')}>how the roadmaps compare</a> ·
+    <a href={withBase('/log/')}>the log</a>
+  </p>
 </SiteLayout>
