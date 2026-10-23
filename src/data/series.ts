@@ -18,12 +18,16 @@ export interface Series {
   topics: string[];
   /** Where the code behind the series lives. */
   repo?: string;
+  /** The dated notes. Empty means the series is planned: it has a slot and a
+   *  description, but nothing is written or scheduled yet. */
   posts: SeriesPost[];
 }
 
-// Dates and titles for the home timeline. A row is linked only when a note
-// file exists in the blog collection at the same series and seriesOrder
-// (1-based position in this list). Publishing a note is adding that file.
+// Dates and titles for the home timeline. A series with no posts is a planned
+// slot: it has a name and a description, but no dates or titles yet. A row is
+// linked only when a note file exists in the blog collection at the same
+// series and seriesOrder (1-based position in this list). Publishing a note is
+// adding that file.
 export const series: Series[] = [
   {
     id: 'typescript',
@@ -163,6 +167,105 @@ export const series: Series[] = [
       { date: '2026-12-17', dateShort: '17 Dec', title: 'useSelector, useDispatch, createSelector' },
       { date: '2026-12-18', dateShort: '18 Dec', title: 'Migrating legacy Redux to RTK, one feature at a time' },
     ],
+  },
+  {
+    id: 'ui',
+    name: 'UI and design systems',
+    dateRange: 'Not scheduled',
+    description:
+      'The interface layer: design tokens, component APIs, loading, error and empty states, forms, accessibility, and the line between a component library and a design system.',
+    blurb:
+      'The React series is about how components work. This one is about what makes them usable: the tokens, states and accessibility rules that decide whether a screen survives a real user. It starts once the React series has enough components to extract.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'backend',
+    name: 'Backend and data',
+    dateRange: 'Not scheduled',
+    description:
+      'The other half of the stack: Node, HTTP, APIs, Postgres, schema design, auth, validation, queues, caching, and the failures that only appear under real load.',
+    blurb:
+      'The notes so far are frontend; the work is full-stack. This series follows one request from the browser to the database and back: routing, validation, auth, transactions, and the errors a demo never shows.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'craft',
+    name: 'Craft and architecture',
+    dateRange: 'Not scheduled',
+    description:
+      'The judgment layer: testing, security, performance, observability, migration, debugging, and the architectural decisions that are expensive to reverse.',
+    blurb:
+      'This is what separates a working demo from a system you can operate. The notes start from incidents, performance numbers and migrations rather than from definitions.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'tools',
+    name: 'Tools and delivery',
+    dateRange: 'Not scheduled',
+    description:
+      'The build, the checks and the deploy: Git, Vite, Vitest, Playwright, GitHub Actions, Lighthouse, observability, and the scripts that make a site shippable.',
+    blurb:
+      'Nobody sees this work in a screenshot, and it is most of what shipping feels like. These notes document the tools around the code: the build, the gate, the deploy, and the failure that made each one necessary.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'packages',
+    name: 'Packages and supply chain',
+    dateRange: 'Not scheduled',
+    description:
+      'How code is distributed and trusted: npm, semver, lockfiles, dependency graphs, bundle size, licences, audits, publishing, and the supply chain behind every install.',
+    blurb:
+      'Every project is mostly code other people wrote. This series learns the package layer properly: what a version range means, how a lockfile protects a build, and what it takes to publish something small and keep it maintainable.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'ai',
+    name: 'AI engineering',
+    dateRange: 'Not scheduled',
+    description:
+      'LLM APIs, prompting as specification, structured output, embeddings, retrieval, RAG, evals, cost, privacy, and the difference between a demo and a feature you can keep.',
+    blurb:
+      'Every app now has a model in it somewhere. The useful skill is not the API call; it is retrieval, evaluation, cost, and knowing when a model makes the product worse. This series builds one feature and measures it.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'agents',
+    name: 'Agents and automation',
+    dateRange: 'Not scheduled',
+    description:
+      'Tool calling, MCP, planning loops, memory, sandboxing, guardrails, traces, agent evals, and the discipline of giving a model a bounded job with an approval gate.',
+    blurb:
+      'An agent is a loop with tools, a budget and a stop condition. This series builds one for this repository — read, check, propose, never merge — and explains why most jobs should stay deterministic scripts.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'use-cases',
+    name: 'Use cases and products',
+    dateRange: 'Not scheduled',
+    description:
+      'The product layer: problem framing, user interviews, scope, analytics, SEO, onboarding, billing, support, and the iterations that turn a demo into something people use.',
+    blurb:
+      'A use case is the top of the stack; it chooses the technologies. This series takes one small product from a problem to ten users, and writes down what the users changed.',
+    topics: [],
+    posts: [],
+  },
+  {
+    id: 'bugs',
+    name: 'Bugs I fixed',
+    dateRange: 'Ongoing',
+    description:
+      'One or two notes a month: the symptom, the cause, the fix, and the rule that keeps the bug from coming back.',
+    blurb:
+      'A note that starts from a real failure teaches more than one that starts from documentation. These are short, specific, and written while the fix is still fresh.',
+    topics: [],
+    posts: [],
   },
 ];
 
