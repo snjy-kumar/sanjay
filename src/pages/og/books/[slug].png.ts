@@ -2,10 +2,12 @@ import { getCollection } from 'astro:content';
 import type { APIRoute, GetStaticPaths } from 'astro';
 import { renderOgCard } from '../../../utils/og';
 import { bookBySlug } from '../../../data/books';
+import { bookPageSlugs } from '../../../utils/chapters';
 
 export const getStaticPaths: GetStaticPaths = async () => {
   const pages = await getCollection('books');
-  return pages.map((page) => ({ params: { slug: page.id } }));
+  const chapters = await getCollection('chapters');
+  return [...bookPageSlugs(pages, chapters)].map((slug) => ({ params: { slug } }));
 };
 
 // The share card for one book page: the title, the author, and that it is
