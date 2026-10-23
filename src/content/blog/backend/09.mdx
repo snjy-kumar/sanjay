@@ -1,0 +1,969 @@
+---
+title: "Transactions, isolation levels and anomalies"
+series: "backend"
+seriesOrder: 9
+undated: true
+readTime: "about 25 min"
+description: "What a transaction promises, how concurrent requests lose updates, what each isolation level prevents, and how to retry safely, all run on real Postgres."
+tags: ['databases', 'async', 'debugging']
+related: ['backend/08', 'backend/07']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+Two withdrawals of 10 and 20 from a balance of 100 left the balance at 80.
+Both requests succeeded, both returned 200, and 20 units of money vanished
+from the record of what happened. No error, no log line, no crash. That is
+what concurrency bugs in databases look like: every single request is
+correct on its own, and the combination is wrong. This note explains what
+a transaction actually promises, which concurrent anomalies each isolation
+level allows, and the handful of patterns that make concurrent writes
+correct.
+
+Everything here ran on Postgres 17 from Node 22 with the `pg` driver. The
+concurrency is real: two connections, interleaved on purpose with short
+sleeps so the timing is the same on every run.
+
+Reading time: about 25 minutes.
+
+## Before you start
+
+You need SQL from note 6 and constraints from note 7. The examples use two
+small tables:
+
+```sql
+create table accounts (
+  id      int primary key,
+  owner   text not null,
+  balance int  not null check (balance >= 0),
+  version int  not null default 0
+);
+insert into accounts (id, owner, balance) values (1, 'Asha', 100), (2, 'Ravi', 50);
+
+create table oncall (doctor text primary key, on_call boolean not null);
+insert into oncall values ('Meera', true), ('Kabir', true);
+```
+
+In the TypeScript, `pool` is a `pg.Pool`, and `client()` checks one
+connection out of it. That distinction turns out to matter a great deal.
+
+## Note map
+
+<Flow steps={[
+  "What a transaction promises, and the one-connection rule",
+  "The lost update, and four ways to prevent it",
+  "Isolation levels: what each read is allowed to see",
+  "Write skew, serializable, and retrying",
+  "Locks, deadlocks, and keeping transactions short",
+  "From beginner to strategy, questions, takeaways, glossary, practice",
+]} caption="The order of this note. Each part is a real concurrent run on the same two tables." />
+
+## What a transaction promises
+
+### In one sentence
+
+A transaction groups statements so that they all take effect or none do,
+and so that concurrent transactions see each other in controlled ways.
+
+### The idea
+
+The promises are usually listed as **ACID**:
+
+- **Atomicity**: all the statements in the transaction take effect, or
+  none do. A failure halfway through leaves no half-done work.
+- **Consistency**: constraints hold at the end of every committed
+  transaction. A transaction that would break one is rolled back.
+- **Isolation**: concurrent transactions do not see each other's
+  uncommitted work, and see each other's committed work only in ways the
+  isolation level allows.
+- **Durability**: once `commit` returns, the change survives a crash,
+  because it was written to the write-ahead log on disk first.
+
+In SQL a transaction is `begin`, statements, then `commit` or `rollback`.
+Every statement outside an explicit transaction runs in its own one-
+statement transaction, so a single `update` is always atomic on its own.
+
+The rule that catches people in application code is that a transaction
+belongs to **one connection**. `begin` on one connection and `insert` on
+another are unrelated. A connection pool hands out a different connection
+for each `pool.query` call, so a transaction must check out one client,
+run everything on it, and release it.
+
+### Worked example
+
+The simple case is a transfer, written in the order that makes atomicity
+visible: credit first, then debit.
+
+```ts
+async function transfer(from: number, to: number, amount: number) {
+  const c = await pool.connect();
+  try {
+    await c.query('begin');
+    await c.query('update accounts set balance = balance + $1 where id = $2', [amount, to]);
+    await c.query('update accounts set balance = balance - $1 where id = $2', [amount, from]);
+    await c.query('commit');
+    return 'committed';
+  } catch (e: any) {
+    await c.query('rollback');
+    return `rolled back: ${e.message}`;
+  } finally {
+    c.release();
+  }
+}
+```
+
+```text
+transfer 30 Asha->Ravi: committed | Asha=70 Ravi=80
+transfer 500 Asha->Ravi: rolled back: new row for relation "accounts" violates check constraint "accounts_balance_check" | Asha=70 Ravi=80
+```
+
+In the second transfer, Ravi's credit of 500 succeeded, then Asha's debit
+broke the `balance >= 0` check. The rollback undid the credit too. Without
+the transaction, Ravi would have gained 500 from nowhere.
+
+The realistic case is the one-connection rule broken. This is code I have
+seen in real handlers: `begin`, work and `rollback` sent through the pool.
+
+```ts
+await Promise.all([
+  pool.query('begin'),
+  pool.query('insert into t values (1)'),
+  pool.query('select pg_backend_pid()'),
+]);
+await pool.query('rollback');
+```
+
+```text
+rows after "rollback": 1
+backend pids used by three pool.query calls: 3 distinct
+```
+
+The `begin` opened a transaction on one connection, the `insert` ran and
+committed by itself on another, and the `rollback` went to whichever
+connection was free. The row stayed. Worse, the connection that received
+`begin` went back to the pool with an open transaction, and the next
+request to borrow it would run inside it.
+
+### Step by step
+
+<Trace
+  columns={["step", "Ravi", "Asha", "visible to others?"]}
+  rows={[
+    ["begin", "80", "70", "80 / 70"],
+    ["credit Ravi 500", "580", "70", "80 / 70 (uncommitted)"],
+    ["debit Asha 500", "580", "check fails", "80 / 70"],
+    ["rollback", "80", "70", "80 / 70"],
+  ]}
+  caption="The failed transfer. Other connections never saw Ravi at 580, and the rollback removed it for this connection too."
+/>
+
+<Layers layers={[
+  { name: "Handler", note: "decides what one unit of work is" },
+  { name: "Client checked out of the pool", note: "one connection for the whole transaction" },
+  { name: "begin ... commit / rollback", note: "the boundary the database enforces" },
+  { name: "Write-ahead log", note: "commit returns after the change is durable" },
+]} caption="Where a transaction lives. The connection is part of the transaction, which is why the pool must not be used directly inside one." />
+
+### Common mistake
+
+Besides the pool mistake, the common one is forgetting `rollback` in the
+error path. Postgres rejects every statement after an error in a
+transaction with "current transaction is aborted, commands ignored until
+end of transaction block". If the client is released without `rollback`,
+the next user of that connection hits that error on a request that did
+nothing wrong. A helper that wraps `begin`, `commit`, `rollback` and
+`release` in one place removes the whole class of bug.
+
+### In real systems
+
+Most data layers provide a transaction helper, such as a callback that
+receives a transaction-bound client. The useful habit is to grep for raw
+`begin` strings in application code: each one is a place where the
+one-connection rule and the rollback path have to be right by hand.
+
+### Check yourself
+
+<details>
+<summary>1. A single update statement with no begin: is it atomic?</summary>
+
+Yes. Every statement runs in a transaction; without `begin` it is an
+implicit one-statement transaction that commits when the statement
+finishes.
+
+</details>
+
+<details>
+<summary>2. Why is sending begin through pool.query worse than just having no transaction?</summary>
+
+Because it leaves a connection in the pool with an open transaction. A
+later, unrelated request borrows it and runs inside that transaction,
+holding locks and seeing an old snapshot, and its writes may never be
+committed.
+
+</details>
+
+## The lost update
+
+### In one sentence
+
+When two transactions read a value, compute a new one in the application,
+and write it back, the second write silently overwrites the first, and
+transactions at the default isolation level do not prevent it.
+
+### The idea
+
+The pattern is **read-modify-write**: `select balance`, compute `balance -
+amount` in JavaScript, `update ... set balance = $1`. Two requests can
+both read 100. One writes 90, the other writes 80, and the second
+overwrites the first. That is a **lost update**. Wrapping each request in
+`begin` and `commit` does not help at `read committed`, Postgres's default
+level, because each transaction's read is perfectly legal and each write
+is perfectly legal; nothing says the value read must still be current at
+write time.
+
+There are four standard fixes:
+
+1. **Atomic update.** Do the arithmetic in the database: `set balance =
+   balance - $1`. The row lock taken by `update` serialises the two
+   writes, and the second one recomputes from the committed value.
+2. **Pessimistic lock.** `select ... for update` locks the row when it is
+   read, so the second transaction waits at its read until the first
+   commits, then reads the new value.
+3. **Optimistic concurrency.** Keep a `version` column. Write with `where
+   version = $read_version` and increment it. If `rowCount` is 0, someone
+   else wrote first: reread and retry, or report a conflict. This is the
+   database form of the ETag check from note 2.
+4. **A stricter isolation level**, which makes the database detect the
+   conflict and fail one transaction. The next part shows it.
+
+### Worked example
+
+The simple case is the bug, with a 30 millisecond gap between the read
+and the write standing in for the work a handler does:
+
+```ts
+async function withdrawReadModifyWrite(amount: number) {
+  const c = await pool.connect();
+  try {
+    await c.query('begin');
+    const { rows } = await c.query('select balance from accounts where id = 1');
+    await sleep(30);
+    await c.query('update accounts set balance = $1 where id = 1', [rows[0].balance - amount]);
+    await c.query('commit');
+  } finally { c.release(); }
+}
+await Promise.all([withdrawReadModifyWrite(10), withdrawReadModifyWrite(20)]);
+```
+
+```text
+read-modify-write, two withdrawals of 10 and 20 from 100: Asha=80 Ravi=50
+```
+
+It should be 70. The withdrawal of 10 was lost.
+
+The realistic case is the three fixes, each run with the same two
+concurrent withdrawals from 100:
+
+```ts
+// 1. atomic update
+await pool.query('update accounts set balance = balance - $1 where id = 1', [amount]);
+
+// 2. pessimistic: lock at read time
+const { rows } = await c.query('select balance from accounts where id = 1 for update');
+
+// 3. optimistic: write only if nobody else did
+const r = await pool.query(
+  'update accounts set balance = $1, version = version + 1 where id = 1 and version = $2',
+  [rows[0].balance - amount, rows[0].version],
+);
+if (r.rowCount === 0) { /* someone else wrote first: reread and retry */ }
+```
+
+```text
+atomic update: Asha=70 Ravi=50
+select for update: Asha=70 Ravi=50 (63 ms, second waited)
+optimistic w10 attempt 1: version 0, rowCount 1
+optimistic w20 attempt 1: version 0, rowCount 0
+optimistic w20 attempt 2: version 1, rowCount 1
+optimistic: Asha=70 Ravi=50
+```
+
+All three give 70. The lock version took 63 ms because the second
+transaction waited for the first's 30 ms of work. The optimistic version
+shows the conflict being detected: both read version 0, the first write
+matched, the second found `rowCount 0`, reread version 1 and succeeded.
+
+### Step by step
+
+<Trace
+  columns={["time", "request A (withdraw 10)", "request B (withdraw 20)", "balance in table"]}
+  rows={[
+    ["t1", "begin; select balance -> 100", "", "100"],
+    ["t2", "", "begin; select balance -> 100", "100"],
+    ["t3", "update set balance = 90; commit", "", "90"],
+    ["t4", "", "update set balance = 80 (row lock waits for A, then proceeds)", "80"],
+    ["t5", "", "commit", "80: A's withdrawal lost"],
+  ]}
+  caption="The lost update. B's update did wait for A's row lock, but it then wrote a value computed from a stale read."
+/>
+
+<Compare left="Fix" right="Trade-off" caption="Four ways to stop a lost update. The atomic update is the first choice whenever the change can be written as an expression." rows={[
+  ["set balance = balance - $1", "simplest; works only when the new value is an expression"],
+  ["select ... for update", "correct; holds a lock while the application works"],
+  ["version column, where version = $v", "no locks held; caller must retry or report a conflict"],
+  ["repeatable read or serializable", "database detects it; caller must retry on 40001"],
+]} />
+
+### Common mistake
+
+The common mistake is believing the transaction fixed it. `begin` and
+`commit` around a read-modify-write at `read committed` change nothing
+about the lost update. The tell is application code that reads a value,
+does arithmetic on it, and writes the result back. Each instance needs one
+of the four fixes.
+
+### In real systems
+
+Counters, balances, stock levels and seat counts are written as atomic
+updates with a guard: `update stock set qty = qty - 1 where sku = $1 and
+qty > 0`, and `rowCount` 0 means sold out. Documents edited by people use
+optimistic concurrency with a version, surfaced to the client as an ETag
+and `If-Match`. Pessimistic locks are kept for short, critical sections.
+
+### Check yourself
+
+<details>
+<summary>1. Why does the atomic update not lose either withdrawal?</summary>
+
+The second `update` waits for the first's row lock. When the first
+commits, Postgres re-evaluates the second update against the newly
+committed row, so `balance - 20` is computed from 90, not from 100.
+
+</details>
+
+<details>
+<summary>2. In the optimistic version, what should a web request do when rowCount is 0 and retrying is not appropriate?</summary>
+
+Return a conflict, 409 or 412 if the client sent `If-Match`, so the user
+can see the newer state and decide again, instead of overwriting it.
+
+</details>
+
+## Isolation levels: what each read sees
+
+### In one sentence
+
+An isolation level decides which other transactions' committed changes a
+transaction can see while it runs, and so which anomalies can happen.
+
+### The idea
+
+Postgres never shows one transaction another's uncommitted changes. That
+anomaly, a **dirty read**, is impossible at every level. The question is
+what happens with changes other transactions commit while yours is still
+running. Postgres implements three levels (the SQL standard's fourth, `read
+uncommitted`, behaves like `read committed`):
+
+- **Read committed**, the default. Each statement sees a fresh **snapshot**
+  of everything committed before that statement began. Two `select`s in
+  the same transaction can return different values if someone committed in
+  between: a **non-repeatable read**.
+- **Repeatable read**. The whole transaction sees one snapshot, taken at
+  its first statement. Reads are stable. If the transaction tries to
+  update a row that another transaction changed and committed after the
+  snapshot, Postgres refuses with a **serialization failure**, error code
+  `40001`, rather than overwrite a change it never saw.
+- **Serializable**. Like repeatable read, plus Postgres tracks which rows
+  each transaction read and wrote, and fails one transaction if the
+  combination could not have happened in any one-at-a-time order. This
+  catches anomalies the other levels miss, covered in the next part.
+
+These are implemented with **MVCC**, multi-version concurrency control:
+an update writes a new version of the row instead of changing it in place,
+and each snapshot decides which version it sees. Readers do not block
+writers and writers do not block readers. Only writers to the same row
+wait for each other.
+
+### Worked example
+
+The simple case is reading the same row twice while another connection
+commits a change in between:
+
+```ts
+await a.query(`begin isolation level ${level}`);
+const first = (await a.query('select balance from accounts where id = 1')).rows[0].balance;
+await pool.query('update accounts set balance = 70 where id = 1'); // another connection
+const second = (await a.query('select balance from accounts where id = 1')).rows[0].balance;
+```
+
+```text
+read committed: first read 100, after another commit 70
+repeatable read: first read 100, after another commit 100
+```
+
+At `read committed`, the second statement took a new snapshot and saw 70.
+At `repeatable read`, both reads came from the snapshot taken at the first
+one.
+
+The realistic case is the lost update from the last part, now at
+`repeatable read`. Both transactions read 100. A updates and commits. B
+then tries to update the same row:
+
+```ts
+await a.query('update accounts set balance = balance - 10 where id = 1');
+const pb = b.query('update accounts set balance = balance - 20 where id = 1');
+await a.query('commit');
+```
+
+```text
+repeatable read, second updater: 40001 could not serialize access due to concurrent update
+balances: Asha=90 Ravi=50
+```
+
+B's update waited for A's lock, saw that A had committed a change to a row
+B's snapshot predates, and failed instead of losing it. The balance is 90,
+A's withdrawal only. B must roll back and retry from the beginning, at
+which point it will read 90 and write 70.
+
+### Step by step
+
+<Timeline items={[
+  { when: "t1", what: "A and B begin at repeatable read; both read balance 100" },
+  { when: "t2", what: "A updates the row, taking its lock (new version 90, uncommitted)" },
+  { when: "t3", what: "B tries to update the same row and waits for A's lock" },
+  { when: "t4", what: "A commits; the row's latest version is now 90" },
+  { when: "t5", what: "B wakes, sees the row changed after its snapshot: 40001" },
+  { when: "t6", what: "B rolls back; a retry starts a fresh snapshot and reads 90" },
+]} caption="The repeatable read conflict, step by step. The failure is how the database protects a change B never saw." />
+
+<Compare left="Level" right="Each read sees" caption="Postgres's isolation levels. Dirty reads never happen in Postgres." rows={[
+  ["read committed (default)", "everything committed before this statement started"],
+  ["repeatable read", "everything committed before the transaction's first statement"],
+  ["serializable", "the same snapshot, plus a check that the result matches some serial order"],
+]} />
+
+<Figure art={`
+  row id=1 versions (MVCC)
+
+  v1  balance=100   created by setup     ended by A
+  v2  balance= 90   created by A         still current
+
+  B's snapshot (taken before A committed):
+      sees v1 (100), cannot see v2
+      B wants to update -> the current version is v2,
+      which B cannot see -> 40001 at repeatable read
+`} caption="Why the conflict exists. Each update makes a new row version; a snapshot sees the versions committed before it began." />
+
+### Common mistake
+
+The common mistake is raising the isolation level without adding a
+retry. At `repeatable read` and `serializable`, serialization failures are
+normal, expected outcomes under concurrency, not bugs. Code that treats
+`40001` as a 500 turns a correct database decision into user-visible
+errors.
+
+### In real systems
+
+Most applications run at `read committed` and use atomic updates, locks
+or versions for the specific read-modify-write paths. Reports that run
+several queries and need them to agree run at `repeatable read`, often
+`read only`, so the whole report reflects one moment. Paths with complex
+invariants across rows use `serializable` with a retry loop.
+
+### Check yourself
+
+<details>
+<summary>1. A monthly report runs five queries and the totals do not add up across them. What changed between queries, and what fixes it?</summary>
+
+At `read committed` each query took its own snapshot, so orders committed
+between queries appear in some totals and not others. Run the report in
+one `repeatable read read only` transaction so all five see the same
+snapshot.
+
+</details>
+
+## Write skew and serializable
+
+### In one sentence
+
+Write skew happens when two transactions each check a condition that
+involves several rows, then each change a different row, and together
+they break the condition that each one checked.
+
+### The idea
+
+The lost update involves two writes to the same row, which every level
+from `repeatable read` up detects. **Write skew** involves writes to
+different rows, so no row-level conflict exists. The classic example is
+an on-call rota with the rule "at least one doctor must be on call". Meera
+and Kabir are both on call. Each opens a transaction, counts on-call
+doctors, sees 2, and takes themselves off. Each wrote only their own row.
+At `repeatable read` both commit, and nobody is on call.
+
+`serializable` is the level that catches this. Postgres's implementation,
+**serializable snapshot isolation**, records which rows (or ranges)
+each transaction read, and detects the dangerous pattern: A read
+something B wrote, and B read something A wrote. It then fails one of
+them with `40001` at a statement or at commit.
+
+The cost is retries, and some false positives: Postgres sometimes aborts
+a transaction that would actually have been fine, because it tracks reads
+at a coarser granularity than individual rows when there are many. The
+contract is simple, though. If every transaction runs at `serializable`
+and retries on `40001`, the result is as if they had run one at a time.
+
+### Worked example
+
+The simple case is the rota at both levels:
+
+```ts
+const goOff = async (c: pg.PoolClient, who: string) => {
+  const { rows } = await c.query('select count(*)::int as n from oncall where on_call');
+  if (rows[0].n < 2) return `${who}: refused, only ${rows[0].n} on call`;
+  await c.query('update oncall set on_call = false where doctor = $1', [who]);
+  return `${who}: saw ${rows[0].n} on call, went off`;
+};
+```
+
+```text
+repeatable read: Meera: saw 2 on call, went off; Kabir: saw 2 on call, went off;
+  Meera commit ok; Kabir commit ok; on call now: 0
+serializable: Meera: saw 2 on call, went off; Kabir: saw 2 on call, went off;
+  Meera commit ok; Kabir commit failed 40001: could not serialize access due to
+  read/write dependencies among transactions; on call now: 1
+```
+
+At `repeatable read`, the invariant broke. At `serializable`, Kabir's
+commit failed and the rota kept one doctor.
+
+The realistic case is the same operation inside a retry helper, so the
+failed transaction is replayed from the start and makes a fresh decision:
+
+```ts
+async function inTx<T>(level: string, fn: (c: pg.PoolClient) => Promise<T>, max = 5): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const c = await pool.connect();
+    try {
+      await c.query(`begin isolation level ${level}`);
+      const out = await fn(c);
+      await c.query('commit');
+      return out;
+    } catch (e: any) {
+      await c.query('rollback').catch(() => {});
+      if ((e.code === '40001' || e.code === '40P01') && attempt < max) {
+        await sleep(10 * 2 ** attempt * Math.random()); // jittered backoff
+        continue;
+      }
+      throw e;
+    } finally {
+      c.release();
+    }
+  }
+}
+```
+
+```text
+attempt 1 failed with 40001, retrying
+succeeded on attempt 2
+results: [ 'Meera went off', 'Kabir refused (1 on call)' ]
+on call now: Kabir
+```
+
+Kabir's retry read the new state, 1 on call, and refused. Both requests
+returned a sensible answer, and the invariant held.
+
+### Step by step
+
+<Trace
+  columns={["time", "Meera's transaction", "Kabir's transaction", "on call"]}
+  rows={[
+    ["t1", "count on call -> 2", "", "Meera, Kabir"],
+    ["t2", "", "count on call -> 2", "Meera, Kabir"],
+    ["t3", "set Meera off", "", "(uncommitted)"],
+    ["t4", "", "set Kabir off", "(uncommitted)"],
+    ["t5", "commit ok", "", "Kabir"],
+    ["t6 (repeatable read)", "", "commit ok", "nobody"],
+    ["t6 (serializable)", "", "commit fails 40001", "Kabir"],
+    ["t7 (retry)", "", "count -> 1, refuse", "Kabir"],
+  ]}
+  caption="Write skew. Neither transaction wrote a row the other wrote; the conflict is between what each read and what the other wrote."
+/>
+
+There is also a non-serializable fix for this specific case: make the
+check take locks on the rows it depends on, with `select ... from oncall
+where on_call for update`. Both transactions then try to lock the same
+rows, and the second waits and rereads after the first commits. That
+works when you can name the rows the decision depends on. When the rule is
+"no row exists that matches", there is nothing to lock yet, and
+`serializable` or a constraint (such as the exclusion constraint in note
+7) is the clean answer.
+
+### Common mistake
+
+The common mistake is the retry helper retrying things that are not safe
+to repeat. The transaction body may run more than once, so it must not
+send emails, charge cards or call other services. Do those after the
+commit, or through an outbox table written inside the transaction and
+processed by a job (note 13).
+
+### In real systems
+
+Teams that use `serializable` typically use it for a small set of
+operations with cross-row invariants, through one helper that sets the
+level, retries `40001` and `40P01` with jitter, caps attempts, and records
+a metric for retries so a hot spot is visible.
+
+### Check yourself
+
+<details>
+<summary>1. Why did repeatable read not catch the rota bug when it caught the lost update?</summary>
+
+Repeatable read detects two transactions updating the same row. In the
+rota, each transaction updated a different row. The conflict was between
+one transaction's read and the other's write, which only serializable
+tracks.
+
+</details>
+
+<details>
+<summary>2. Why must the transaction body be safe to run twice?</summary>
+
+Because the retry helper reruns the whole body after a serialization
+failure. Anything with effects outside the database would happen twice.
+
+</details>
+
+## Locks, deadlocks and short transactions
+
+### In one sentence
+
+Writes take row locks that are held until the transaction ends, so two
+transactions that lock the same rows in different orders can deadlock,
+and a long transaction makes everyone else wait.
+
+### The idea
+
+An `update`, `delete` or `select ... for update` locks each row it
+touches until the transaction commits or rolls back. Another transaction
+that wants the same row waits. That is the mechanism behind the atomic
+update and `for update` fixes.
+
+A **deadlock** is a cycle of waiting: A holds row 1 and wants row 2, B
+holds row 2 and wants row 1. Neither can proceed. Postgres checks for
+cycles after a transaction has waited for `deadlock_timeout` (one second
+by default), picks one transaction, and fails it with `40P01 deadlock
+detected`, which releases its locks so the other can finish.
+
+The prevention is **lock ordering**: if every transaction locks rows in
+the same order, for example by ascending id, no cycle can form. The other
+rule is keeping transactions short. Locks are held for the whole
+transaction, so a transaction that calls a payment provider, waits for a
+user, or sits **idle in transaction** because of a forgotten commit holds
+its locks for all that time, and every request touching those rows queues
+behind it.
+
+### Worked example
+
+The simple case is a deadlock made on purpose. Transaction A moves 1 from
+account 1 to account 2, while B moves 1 from account 2 to account 1, each
+updating its source first:
+
+```ts
+await a.query('begin'); await b.query('begin');
+await a.query('update accounts set balance = balance - 1 where id = 1'); // A locks 1
+await b.query('update accounts set balance = balance - 1 where id = 2'); // B locks 2
+const pa = a.query('update accounts set balance = balance + 1 where id = 2'); // A waits for 2
+const pb = b.query('update accounts set balance = balance + 1 where id = 1'); // B waits for 1
+```
+
+```text
+A: 40P01 deadlock detected
+B: ok
+```
+
+After about a second, Postgres found the cycle, failed A, and B's update
+went through. A's caller can retry, which is why the helper above retries
+`40P01` as well as `40001`.
+
+The realistic case is the fix: the transfer function sorts the two
+account ids and locks them in that order before doing anything else.
+
+```ts
+const [first, second] = from < to ? [from, to] : [to, from];
+await c.query('select id from accounts where id in ($1, $2) order by id for update', [first, second]);
+// now update from and to in any order; both rows are already locked
+```
+
+Both transfers now try to lock account 1 first. One gets it and the other
+waits at the very first step, holding nothing, so no cycle can form.
+
+I ran twenty of these at once, alternating directions (ten from 1 to 2,
+ten from 2 to 1), each with a 20 millisecond pause between its two
+updates:
+
+```text
+20 of 20 ok; 468 ms
+[ { id: 1, balance: 100 }, { id: 2, balance: 100 } ]
+```
+
+No deadlocks, and the balances net out exactly. The 468 ms is the price:
+transfers touching the same pair of accounts ran one after another.
+
+### Step by step
+
+<Figure art={`
+  without ordering                 with ordering (lowest id first)
+
+  A: lock 1 ----> wants 2          A: lock 1 -> lock 2 -> commit
+        ^            |             B: wants 1 ...waits...
+        |            v                        -> lock 1 -> lock 2
+  B: wants 1 <---- lock 2
+                                   no cycle: B holds nothing
+  cycle: Postgres kills one        while it waits
+`} caption="A deadlock is a cycle of waits. Locking in one global order makes the cycle impossible." />
+
+<Flow steps={[
+  "Read what you need, outside the transaction if it does not have to be locked",
+  "Call slow external services before begin, or after commit",
+  "begin; lock rows in a fixed order; write; commit",
+  "Set statement_timeout and idle_in_transaction_session_timeout as guards",
+  "Retry 40001 and 40P01 with jitter, a few times",
+]} caption="A shape for transactions that stay short and do not deadlock." />
+
+### Common mistake
+
+The common mistake is calling another service inside a transaction:
+`begin`, lock the order row, call the payment provider (two seconds, or
+thirty when it is having a bad day), update the order, `commit`. Every
+other request for that order waits for the provider. Under load, the
+connection pool fills with waiting transactions and the whole service
+stalls. Record the intent in a short transaction, call the provider
+outside it, and record the result in another short transaction, with
+idempotency keys (note 2) making the call safe to retry.
+
+### In real systems
+
+Production databases set `idle_in_transaction_session_timeout` so a
+forgotten transaction is terminated instead of holding locks forever, and
+`lock_timeout` so a migration waiting for a lock gives up instead of
+queueing every other query behind it. `pg_stat_activity` shows sessions in
+the `idle in transaction` state and how long they have been there.
+
+### Check yourself
+
+<details>
+<summary>1. Postgres failed transaction A with a deadlock. Was A's work lost?</summary>
+
+A was rolled back, so none of its changes were applied. Its caller should
+retry it from the start. B completed normally.
+
+</details>
+
+<details>
+<summary>2. Why does sorting the ids prevent deadlock?</summary>
+
+A cycle needs one transaction to hold a lower id while waiting for a
+higher one, and another to hold the higher while waiting for the lower.
+If every transaction locks lower ids first, the second situation cannot
+happen.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Transactions, isolation levels and anomalies">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, wrap multi-statement changes in a transaction on
+one checked-out client, with `rollback` on every error path and `release`
+in `finally`.
+
+A worked example: the transfer function above. The failed transfer of 500
+left both balances untouched.
+
+The mistake at this level is `pool.query('begin')`. The fix is a
+transaction helper that takes a callback and owns the client.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, find every read-modify-write and fix it with an
+atomic update, a lock, or a version.
+
+A worked example: stock decrement as `update stock set qty = qty - 1 where
+sku = $1 and qty > 0`, with `rowCount` 0 meaning sold out.
+
+The mistake is assuming `begin` and `commit` prevent lost updates at the
+default level. The fix is the concurrent test: two requests at once,
+assert the final value.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, choose isolation levels per operation and handle
+serialization failures with a retry helper.
+
+A worked example: the rota change runs at `serializable` through `inTx`;
+the retry makes the second request refuse correctly.
+
+The mistake is raising the level globally without retries. The fix is
+retries in the helper, plus a metric for how often they happen.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: a retry that hits the attempt limit, a deadlock
+between a transaction and a migration, a transaction that only reads.
+
+A worked example: after five attempts the helper rethrows; the handler
+maps it to 503 with `Retry-After`, because the conflict is temporary.
+
+The mistake is unbounded retries, which turn contention into a retry
+storm. The fix is a cap and jittered backoff.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a serializable transaction that also sends an
+email, retried after a 40001, sends it twice.
+
+A worked example: the transaction writes an `outbox` row instead of
+sending; a job sends emails from committed outbox rows exactly once per
+row.
+
+The mistake is side effects inside retried code. The fix is the outbox
+pattern.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, watch lock waits, deadlocks, serialization failures and
+long transactions, and set timeouts as guard rails.
+
+A worked example: an alert on any session `idle in transaction` for more
+than a minute finds a code path that returned early without committing.
+
+The mistake is discovering lock problems as a site-wide slowdown. The fix
+is `pg_stat_activity` dashboards and timeouts.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is to always ask "what if two of these run at once?" for every
+write path, and to test it with two concurrent calls rather than reason
+about it.
+
+A worked example: every handler that changes shared state gets a test
+that runs it twice with `Promise.all` and checks the result, the same way
+this note found the lost update.
+
+The mistake is testing concurrency-sensitive code only sequentially. The
+fix is concurrent tests with deliberate gaps.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, keep invariants inside one database transaction where
+possible. Across services there is no shared transaction, so invariants
+become sagas: steps with compensating actions and idempotent retries.
+
+A worked example: an order reserves stock in one service and charges in
+another. Each step is idempotent, a failure triggers a compensating
+release, and a reconciliation job catches anything left in between.
+
+The mistake is pretending a distributed workflow is atomic. The fix is
+designing each step and its undo explicitly.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is a short written policy: default level, which operations
+use stricter levels, the one transaction helper everyone uses, the retry
+rules, and the timeouts.
+
+A worked example: "read committed by default; atomic updates for
+counters; versions for user-edited records; serializable via inTx for
+rota and booking rules; no network calls inside transactions".
+
+Done when: you can look at any write path, name the anomaly it is exposed
+to, choose the fix, and prove it with a concurrent test.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Why not run everything at serializable?** You can, if every transaction
+goes through a retry helper and the retry rate stays low. The costs are
+retries under contention and some extra tracking overhead. Many teams
+reserve it for the operations that need it.
+
+**Does `select ... for update` block plain reads?** No. Under MVCC, plain
+`select`s read a snapshot and never wait for row locks. Only other writers
+and other `for update` reads wait.
+
+**Are ORMs' transactions different?** They are the same database
+transactions underneath. Check that the ORM uses one connection for the
+whole block, what level it uses, and whether it retries.
+
+**What is `40001` versus `40P01`?** `40001` is a serialization failure
+(repeatable read or serializable detected a conflict). `40P01` is a
+deadlock. Both mean the transaction was rolled back and is safe to retry
+from the start.
+
+## Key takeaways
+
+- A transaction is all-or-nothing and belongs to one connection; never
+  send `begin` through a pool.
+- Read-modify-write loses updates at the default level, transaction or
+  not.
+- Fix lost updates with atomic updates, `for update`, version checks, or
+  a stricter level plus retries.
+- Read committed takes a snapshot per statement; repeatable read, one per
+  transaction.
+- Write skew needs serializable, or locks on the rows the decision depends
+  on.
+- Serialization failures and deadlocks are expected; retry them with a
+  cap and jitter.
+- Lock rows in a fixed order and keep network calls out of transactions.
+
+## Glossary
+
+- **Transaction**: a group of statements applied all-or-nothing.
+- **ACID**: atomicity, consistency, isolation, durability.
+- **Snapshot**: the set of committed changes a statement or transaction
+  can see.
+- **MVCC**: keeping multiple row versions so readers and writers do not
+  block each other.
+- **Dirty read**: seeing uncommitted changes; impossible in Postgres.
+- **Non-repeatable read**: the same read returning different values in
+  one transaction.
+- **Lost update**: a write overwriting another based on a stale read.
+- **Write skew**: two transactions breaking a multi-row rule by writing
+  different rows.
+- **Serialization failure**: error `40001`, a conflict the level forbids.
+- **Deadlock**: a cycle of transactions waiting for each other's locks.
+- **Optimistic concurrency**: detecting conflicting writes with a
+  version check.
+- **Outbox**: a table of side effects written in the transaction and
+  processed after commit.
+
+## Practice
+
+**Warm-up.** Reproduce the lost update with two concurrent calls, then fix
+it with an atomic update. Confirm the final balance is 70.
+
+**Build.** Write `inTx` with retries and use it for a seat-booking
+function where a show has a capacity and bookings must never exceed it.
+Run 50 concurrent bookings for 40 seats and assert exactly 40 succeed.
+
+**Stretch.** Implement the same booking with `select ... for update` on
+the show row, and compare throughput and retry counts with the
+serializable version under the same load.
