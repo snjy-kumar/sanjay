@@ -1,0 +1,2724 @@
+---
+book: the-c-programming-language
+number: 9
+label: "Appendix A"
+title: "Reference Manual"
+description: "K&R appendix A in depth: tokens, conversions, expressions, declarations, statements, linkage, the preprocessor and grammar, plus appendix C's changes."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Appendix A is the part of the book that stops teaching and starts
+**defining**. The eight chapters before it show C by example; this
+appendix says, rule by rule, what a C program means: how source text is
+cut into tokens, what an object and an lvalue are, how values convert,
+how every operator behaves, how a declaration is read, and what the
+preprocessor does before the compiler sees anything. It is short for a
+language definition, and it is the reason the rest of the book can be
+short too. This page also folds in appendix C, the book's brief list of
+what changed between the first edition's C and the ANSI standard, because
+those changes only make sense against the rules they changed.
+
+## Before you start
+
+After this page you will be able to:
+
+- explain the phases a source file goes through, from characters to tokens to a translation unit;
+- say why `x+++y` parses the way it does, why `sizeof 'a'` is 4 and why `2147483648` is not an `int`;
+- predict the result of mixed signed, unsigned and floating arithmetic from the usual arithmetic conversions;
+- read any declarator, including a function returning a pointer to a function, by the inside-out rule;
+- tell scope from linkage from storage duration, and fix a "multiple definition" link error;
+- write macros that survive being called with expressions, and use `#` and `##` deliberately;
+- use the grammar at the end of the appendix to answer "how does this parse?" questions without guessing.
+
+What you should already know: everything in
+<a href={withBase('/books/the-c-programming-language/02-types-operators-and-expressions/')}>chapter 2</a>
+(types and operators),
+<a href={withBase('/books/the-c-programming-language/04-functions-and-program-structure/')}>chapter 4</a>
+(scope, `static`, the preprocessor) and
+<a href={withBase('/books/the-c-programming-language/05-pointers-and-arrays/')}>chapter 5</a>
+(pointers and complicated declarations). The appendix assumes you have
+written C; it is the rulebook you check your intuitions against.
+
+Reading time: the appendix itself is dense and best read in four or five
+sittings, one or two sections at a time, with a compiler open. Every
+claim here that has an output next to it was compiled with GCC 14 on
+64-bit Linux and run; sizes such as 4 for an `int` are that machine's,
+not the language's.
+
+## Chapter map
+
+<Layers caption="Appendix A follows the order a compiler works in: characters become tokens, tokens become expressions and declarations, those become statements and external definitions, and the preprocessor and grammar close the book." layers={[
+  { name: "A1 to A3: Introduction, lexical conventions, syntax notation", note: "how text becomes tokens and how the rules are written" },
+  { name: "A4 to A6: Identifiers, objects and lvalues, conversions", note: "what a name means, what an object is, how values change type" },
+  { name: "A7: Expressions", note: "every operator, its precedence, and what it requires" },
+  { name: "A8: Declarations", note: "specifiers, declarators, initialisers, typedef, type names" },
+  { name: "A9 to A11: Statements, external declarations, scope and linkage", note: "how a program is assembled from files" },
+  { name: "A12 and A13: Preprocessing and grammar", note: "the text-level pass, and the whole syntax in one place" },
+  { name: "Appendix C: Summary of changes", note: "what ANSI C changed from the first edition's language" },
+]} />
+
+<Flow caption="The translation phases in the order they happen. Each later section of the appendix belongs to one of these stages, and most surprises come from forgetting that an earlier stage has already run." steps={[
+  "Characters: trigraphs replaced, backslash-newline lines joined (A12)",
+  "Preprocessing tokens: comments become spaces, text cut into tokens (A2)",
+  "Directives and macros: #include, #define and #if carried out (A12)",
+  "Tokens: escapes decoded, adjacent strings joined (A2.6)",
+  "Translation unit: parsed and type-checked by the grammar (A7 to A10, A13)",
+  "Linked program: external names from all units matched up (A11)",
+]} />
+
+A note on names: the section titles below follow the book's appendix.
+The book describes the 1989 ANSI standard. Where later standards (C99,
+C11, C23) changed something that matters in practice, I say so, because
+the compiler on your machine follows a newer one by default.
+
+## A1 Introduction
+
+### In one sentence
+
+The reference manual is a precise but compact description of ANSI C,
+written to be read by programmers rather than by compiler writers, and it
+defers to the standard itself wherever the two differ.
+
+### The idea
+
+Every language needs two descriptions. One teaches: it picks examples,
+skips edge cases and builds intuition. The other defines: it says exactly
+what every construct means, including the cases nobody writes on purpose.
+Chapters 1 to 8 are the first kind. Appendix A is the second.
+
+The book is honest about what the appendix is and is not. It is an
+interpretation of the standard, not the standard. It keeps the same
+structure, mostly the same order, and the same rules, but it leaves out
+material aimed at people building compilers and it rephrases the rest
+for working programmers. When the standard and the appendix disagree, the
+standard wins.
+
+Three words recur through the whole appendix and are worth fixing early:
+
+- **Undefined behaviour**: the language makes no promise at all. The
+  program may crash, may appear to work, or may do something different
+  once optimised. Signed overflow and reading past an array are examples.
+- **Implementation-defined**: each compiler must pick a behaviour and
+  document it. The size of `int` and whether plain `char` is signed are
+  examples.
+- **Unspecified**: the compiler picks among allowed behaviours and need
+  not say which, and may pick differently each time. The order in which
+  function arguments are evaluated is the classic case.
+
+Most of the arguments people have about C come from mixing these up. An
+implementation-defined choice is stable and you can look it up; an
+undefined one is a bug even when it seems to work.
+
+### Worked example
+
+The fastest way to see the three categories is to ask the compiler about
+each. This program prints implementation-defined facts and contains no
+undefined behaviour:
+
+```c
+/* facts.c: implementation-defined choices on this machine */
+#include <limits.h>
+#include <stdio.h>
+
+int main(void)
+{
+    printf("int %zu bytes, long %zu, pointer %zu\n",
+           sizeof(int), sizeof(long), sizeof(void *));
+    printf("plain char is %s\n", CHAR_MIN < 0 ? "signed" : "unsigned");
+    printf("-7 >> 1 = %d\n", -7 >> 1);
+    return 0;
+}
+```
+
+```text
+int 4 bytes, long 8, pointer 8
+plain char is signed
+-7 >> 1 = -4
+```
+
+On 64-bit Linux with GCC, `long` is 8 bytes and `char` is signed; on
+64-bit Windows `long` is 4 bytes, and on ARM Linux plain `char` is
+unsigned. Right-shifting a negative number is implementation-defined in
+ANSI C, and GCC documents that it shifts in copies of the sign bit, so
+-7 becomes -4 (rounding towards minus infinity, not towards zero).
+
+### Step by step
+
+<Trace columns={["question", "category", "where to find the answer"]} rows={[
+  ["How many bytes is an int?", "implementation-defined", "limits.h, the compiler manual"],
+  ["Is plain char signed?", "implementation-defined", "CHAR_MIN in limits.h"],
+  ["What is INT_MAX + 1?", "undefined", "nowhere; it is a bug"],
+  ["Which argument of f(a(), b()) runs first?", "unspecified", "nowhere; do not depend on it"],
+  ["What does -7 >> 1 give?", "implementation-defined", "the compiler manual (GCC: -4)"],
+  ["What does i = i++ do?", "undefined", "nowhere; it is a bug"],
+]} />
+
+### Common mistake
+
+Treating "it worked when I tried it" as evidence about undefined
+behaviour. An implementation-defined answer is the same every time on a
+given compiler, so testing is a fair way to learn it. An undefined
+answer is not: the same source can print one thing at `-O0` and another
+at `-O2`, because the optimiser is allowed to assume the undefined case
+never happens. Chapter 7's `printf("%s\n", NULL)` example, which printed
+`(null)` in one form and crashed in another, is exactly this.
+
+### In real systems
+
+Large C code bases keep a short list of the implementation-defined
+choices they rely on (8-bit bytes, two's complement, 32-bit `int`) and
+check them at build time with `_Static_assert` or a configure script.
+Undefined behaviour is hunted with sanitizers:
+`-fsanitize=undefined` reports signed overflow, bad shifts and
+misaligned access as the program runs, which is how most of it is found
+in practice.
+
+### Check yourself
+
+**Is the result of `sizeof(long)` undefined, unspecified or
+implementation-defined?**
+
+<details>
+<summary>Answer</summary>
+
+Implementation-defined. Each compiler picks a size (at least 32 bits)
+and documents it; it does not change between runs.
+
+</details>
+
+**Why is "unspecified" not the same as "undefined"?**
+
+<details>
+<summary>Answer</summary>
+
+Unspecified behaviour is one of a set of allowed outcomes, and the
+program is still correct whichever is chosen, as long as it does not
+depend on the choice. Undefined behaviour has no allowed outcomes; the
+program is wrong.
+
+</details>
+
+## A2 Lexical Conventions
+
+### In one sentence
+
+Before any grammar applies, the compiler cuts the source into tokens,
+taking the longest possible token at each point, and the six kinds of
+token (identifiers, keywords, constants, string literals, operators and
+other separators) each have exact spelling rules.
+
+### The idea
+
+A **translation unit** is one source file after `#include` has pulled in
+its headers. The compiler reads it as a stream of characters and cuts
+that stream into tokens. Blanks, tabs, newlines and comments separate
+tokens but are otherwise ignored; a comment counts as one space.
+
+The rule that decides where one token ends is **maximal munch**: at each
+point the compiler takes the longest sequence of characters that could
+be a token. That is why `x+++y` is `x ++ + y` and not `x + ++y`, and why
+`a---b` is `a -- - b`. Maximal munch knows nothing about whether the
+result will make sense later.
+
+Each kind of token has its own rules:
+
+- **Identifiers** are letters, digits and underscores, not starting
+  with a digit. Case matters. ANSI C guaranteed at least 31 significant
+  characters for internal names but only 6, in a single case, for
+  external ones, because old linkers were that limited; C99 raised the
+  external minimum to 31.
+- **Keywords** are reserved identifiers. ANSI C added `const`, `enum`,
+  `signed`, `void` and `volatile` to the first edition's set and dropped
+  `entry`.
+- **Integer constants** are decimal, octal (a leading `0`) or hex
+  (`0x`), with optional `u` and `l` suffixes. Their type is the first of
+  a list that can hold the value, and the list differs for decimal and
+  for octal or hex, which matters at the edges.
+- **Character constants** like `'a'` have type `int`, not `char`.
+- **Floating constants** need a dot or an exponent and are `double`
+  unless suffixed with `f` (float) or `l` (long double).
+- **String literals** are arrays of `char` with a terminating `'\0'`;
+  adjacent literals are joined into one at compile time.
+- **Escape sequences** like `\n`, `\x41` and `\102` name characters
+  that are awkward to type.
+
+### Worked example
+
+```c
+/* tokens.c: how the compiler cuts source into tokens */
+#include <stdio.h>
+
+int main(void)
+{
+    int x = 5, y = 10, z;
+    z = x+++y;                       /* longest token first: (x++) + y */
+    printf("x=%d y=%d z=%d\n", x, y, z);
+    printf("sizeof 'a' = %zu, sizeof \"ab\" = %zu\n", sizeof 'a', sizeof "ab");
+    printf("%s|%s\n", "con" "cat" "enated", "\x41\102");
+    printf("2147483647 is %zu bytes, 2147483648 is %zu bytes\n",
+           sizeof 2147483647, sizeof 2147483648);
+    printf("0x7fffffff: %zu, 0x80000000: %zu, its value > 0? %d\n",
+           sizeof 0x7fffffff, sizeof 0x80000000, 0x80000000 > 0);
+    printf("010 = %d, 0x10 = %d, 10u / 3 = %u, 1e3 = %g\n", 010, 0x10, 10u / 3, 1e3);
+    return 0;
+}
+```
+
+```text
+x=6 y=10 z=15
+sizeof 'a' = 4, sizeof "ab" = 3
+concatenated|AB
+2147483647 is 4 bytes, 2147483648 is 8 bytes
+0x7fffffff: 4, 0x80000000: 4, its value > 0? 1
+010 = 8, 0x10 = 16, 10u / 3 = 3, 1e3 = 1000
+```
+
+Line by line:
+
+- `x+++y` munched to `x++ + y`: z is 5 + 10 and x is then 6.
+- `'a'` is an `int`, 4 bytes here. `"ab"` is a 3-byte array: two
+  letters and the terminator.
+- The three literals `"con" "cat" "enated"` became one string before
+  the program ran. `\x41` is hex 41 and `\102` is octal 102, both
+  spelling a capital letter.
+- `2147483647` fits an `int`; one more does not, so the decimal
+  constant moves to `long`, 8 bytes.
+- The hex constant `0x80000000` does not fit an `int` either, but hex
+  constants try `unsigned int` before `long`, so it stays 4 bytes and is
+  unsigned. The same value written two ways has two different types.
+- `010` is octal, eight. That leading zero has surprised everyone who
+  ever tried to line up numbers in a table.
+
+Maximal munch can also produce a program that does not compile at all:
+
+```text
+$ cat munch.c
+int main(void){int x=1,y=2,z; z = x+++++y; return z;}
+$ gcc -c munch.c 2>&1 | grep error
+munch.c:1:36: error: lvalue required as increment operand
+```
+
+`x+++++y` munches to `x ++ ++ + y`. The second `++` is applied to
+`x++`, which is a value, not an object, so the compiler refuses. Writing
+`x++ + ++y` with spaces gives the meaning a human probably intended.
+
+### Step by step
+
+<Trace columns={["input left", "longest token", "why not shorter"]} rows={[
+  ["x+++y", "x", "identifier stops at +"],
+  ["+++y", "++", "++ is a token and + + is longer to reach"],
+  ["+y", "+", "+y is not a token"],
+  ["y", "y", "end of identifier"],
+  ["0x80000000", "0x80000000", "one constant; its type is decided after"],
+  ["\"con\" \"cat\"", "two string literals", "joined later, in the phase after macros"],
+]} />
+
+<Figure art={`
+  decimal constant:   int  ->  long  ->  unsigned long        (ANSI C list)
+  octal / hex:        int  ->  unsigned int  ->  long  ->  unsigned long
+  with u suffix:      unsigned int  ->  unsigned long
+  with l suffix:      long  ->  unsigned long
+
+  2147483648      : too big for int, so long        (8 bytes here)
+  0x80000000      : too big for int, fits unsigned  (4 bytes, unsigned)
+`} caption="The type of an integer constant is the first type in its list that can hold the value. Decimal and hex lists differ, which is why the same number can be signed or unsigned depending on how it is written. C99 added long long to the ends of these lists and dropped unsigned long from the decimal one." />
+
+### Common mistake
+
+Padding numbers with zeros to line them up:
+
+```c
+int codes[] = { 100, 042, 007 };    /* 042 is 34 and 007 is 7, both octal */
+```
+
+The middle value is octal thirty-four, not forty-two, and the compiler
+says nothing because it is perfectly valid. A related one: `'ab'` (two
+characters in single quotes) is a multi-character constant with an
+implementation-defined value, not a string; GCC warns about it with
+`-Wmultichar`, on by default.
+
+### In real systems
+
+Maximal munch is why style guides want spaces around binary operators:
+`a - -b` is clear, `a--b` is a decrement followed by a syntax error.
+String concatenation is used constantly in real code, to split a long
+message across lines, or to glue a macro's text into a format, as in
+`printf("value: %" PRId64 "\n", v)` from `inttypes.h`, where the macro
+expands to a string literal that joins its neighbours.
+
+### Check yourself
+
+**What does `a---b` mean, and what is its value when a is 5 and b is
+2?**
+
+<details>
+<summary>Answer</summary>
+
+`a-- - b`: the value is 5 - 2 = 3, and a becomes 4 afterwards.
+
+</details>
+
+**Why is `sizeof 'a'` 4 in C but 1 in C++?**
+
+<details>
+<summary>Answer</summary>
+
+In C a character constant has type `int`; C++ changed it to `char` so
+that overloading on `char` would work. The value is the same; only the
+type differs.
+
+</details>
+
+## A3 Syntax Notation
+
+### In one sentence
+
+The appendix writes grammar rules with syntactic categories in italics,
+literal words and symbols in plain type, alternatives on separate lines,
+and a subscript "opt" for anything optional.
+
+### The idea
+
+A grammar is a set of rules that say how bigger phrases are made of
+smaller ones. Each rule names a **category** (expression, declarator,
+statement), followed by its possible forms. The book's convention is the
+same one most language references use, and it is worth learning because
+every later section is written in it.
+
+In plain text I write a category in hyphenated lowercase, a literal
+token in code style, `|` between alternatives, `[ ]` for optional parts
+and `{ }` for "zero or more". That is close to the classic Backus-Naur
+form. The book prints alternatives on separate lines instead of using a
+bar, and marks optional pieces with a small "opt" after them rather than
+with brackets.
+
+A rule such as
+
+```text
+expression-statement:
+    expression(opt) ;
+```
+
+says an expression statement is an optional expression followed by a
+semicolon. With the expression left out, the result is the null
+statement, a lone `;`, which is where that construct comes from.
+
+### Worked example
+
+The grammar for a list of comma-separated expressions is written
+recursively:
+
+```text
+argument-expression-list:
+    assignment-expression
+    argument-expression-list , assignment-expression
+```
+
+Read it aloud: an argument list is one assignment expression, or an
+argument list followed by a comma and another assignment expression.
+`f(a, b, c)` matches it by peeling from the right: `a, b` is an argument
+list, so `a, b, c` is too.
+
+Note the category on each item: **assignment-expression**, not
+**expression**. That single word is why the comma between arguments is
+a separator, not the comma operator. If you want the comma operator
+inside an argument, you have to bracket it, `f((a, b), c)`, which passes
+two arguments, b and c.
+
+### Step by step
+
+<Trace columns={["text", "rule used", "category built"]} rows={[
+  ["a", "argument-expression-list: assignment-expression", "argument-expression-list"],
+  ["a , b", "argument-expression-list , assignment-expression", "argument-expression-list"],
+  ["a , b , c", "same rule again", "argument-expression-list"],
+  ["f ( a , b , c )", "postfix-expression ( argument-expression-list(opt) )", "postfix-expression"],
+]} />
+
+### Common mistake
+
+Reading a grammar as if it decided meaning. The grammar decides only
+**shape**: which tokens group with which. Whether the result is legal
+(types match, the left side of `=` is an lvalue) is decided by the
+constraint text next to each rule. `5 = x` is grammatical, because the
+left side of an assignment is a unary expression and `5` is one; it is
+rejected by the rule that requires a modifiable lvalue there.
+
+### In real systems
+
+Parser generators such as yacc and bison take grammars written almost
+exactly in this notation. The C grammar in A13 was in fact designed to
+be fed to yacc, with one well-known problem (typedef names, covered in
+A13) that every C parser solves with a hack. Reading the notation fluently
+also pays off for SQL, HTTP and protocol specifications, which use the
+same style.
+
+### Check yourself
+
+**Why does `f(a, b)` pass two arguments while `f((a, b))` passes one?**
+
+<details>
+<summary>Answer</summary>
+
+Each argument must be an assignment expression, which cannot contain a
+bare comma operator. Brackets turn `(a, b)` into a primary expression,
+so it fits as one argument, and its value is b.
+
+</details>
+
+**In the notation, what does "opt" after a category mean?**
+
+<details>
+<summary>Answer</summary>
+
+That item may be left out. `expression(opt) ;` allows the null statement
+`;`.
+
+</details>
+
+## A4 Meaning of Identifiers
+
+### In one sentence
+
+Every identifier has a **storage class** that decides how long its
+object lives and a **type** that decides what its bits mean, and the
+basic types, their derived types and the qualifiers `const` and
+`volatile` together make up the whole type system.
+
+### The idea
+
+An identifier can name many things: a function, an object, a structure
+or union or enum tag, a member, an enumeration constant, a typedef name
+or a label. When it names an object, two attributes matter.
+
+**Storage class** decides the object's lifetime. There are two:
+
+- **Automatic** objects are local to a block and come into existence
+  when the block is entered and disappear when it is left. Their initial
+  value, if none is given, is indeterminate (garbage). Locals are
+  automatic unless declared otherwise; `register` is a hint that also
+  makes it illegal to take the object's address.
+- **Static** objects exist for the whole run of the program and keep
+  their values between calls. Anything declared outside every function
+  is static, and so is a local declared with `static`. If not
+  initialised they start at zero.
+
+**Type** decides how the bits are interpreted. The basic types are
+`char`, the signed and unsigned integer types (`short`, `int`, `long`),
+the floating types (`float`, `double`, `long double`), and enumerations.
+From those, **derived types** are built without limit: arrays of things,
+functions returning things, pointers to things, structures and unions
+of things.
+
+The **qualifiers** add properties. `const` says the program promises not
+to change the object, so the compiler can reject attempts to and may put
+it in read-only memory. `volatile` says the object may change in ways
+the compiler cannot see (a hardware register, a variable changed by a
+signal handler), so every read and write in the source must really
+happen.
+
+The appendix distinguishes the **integral types** (`char`, the integer
+types, enums) from the **arithmetic types** (integral plus floating), and
+calls `void` the type with no values: a function returning `void` returns
+nothing, and `void *` is the generic pointer.
+
+### Worked example
+
+```c
+/* storage.c: automatic versus static lifetime */
+#include <stdio.h>
+
+static int next_id(void)
+{
+    static int id = 0;          /* initialised once, lives for the program */
+    int calls_this_time = 0;    /* automatic: fresh on every call */
+    calls_this_time++;
+    return ++id * 10 + calls_this_time;
+}
+
+int main(void)
+{
+    for (int i = 0; i < 3; i++) printf("%d ", next_id());
+    printf("\n");
+    return 0;
+}
+```
+
+```text
+11 21 31 
+```
+
+`id` is static: it is set to 0 once, before the program starts, and each
+call adds one to the same object, giving 1, 2 and 3 in the tens place.
+`calls_this_time` is automatic: every call creates a new one, sets it to
+0, adds one, and loses it on return, so the units digit is always 1. The
+same `= 0` means "once, at program start" for a static and "every time
+the block is entered" for an automatic object.
+
+### Step by step
+
+<Trace columns={["call", "id before", "id after", "calls_this_time", "returns"]} rows={[
+  ["1", "0", "1", "1 (new object)", "11"],
+  ["2", "1", "2", "1 (new object)", "21"],
+  ["3", "2", "3", "1 (new object)", "31"],
+]} />
+
+<Compare left="Automatic" right="Static" caption="The two storage classes side by side. The same declaration syntax inside a function gives one or the other depending on the single word static." rows={[
+  ["created on entry to the block, destroyed on exit", "exists for the whole program"],
+  ["no initialiser means garbage", "no initialiser means zero"],
+  ["an initialiser runs every time the block is entered", "an initialiser is applied once, before main runs"],
+  ["each recursive call has its own copy", "one copy shared by every call"],
+  ["usually lives on the stack", "lives in the data or bss segment"],
+]} />
+
+### Common mistake
+
+Returning the address of an automatic object:
+
+```c
+char *label(int n)
+{
+    char buf[16];
+    sprintf(buf, "item %d", n);
+    return buf;                 /* buf dies here; the pointer dangles */
+}
+```
+
+GCC warns ("function returns address of local variable"), and the
+caller may see the right text for a while, until the next call reuses
+the stack. The fixes are to make `buf` static (one shared buffer, not
+reentrant), to take the buffer as a parameter, or to `malloc` it.
+
+### In real systems
+
+`static` locals are the cheapest form of memoisation and the source of
+many thread-safety bugs, which is why functions like `strtok` and
+`localtime` have reentrant twins (`strtok_r`, `localtime_r`) that take
+the state from the caller. `volatile` is right for memory-mapped device
+registers and for `sig_atomic_t` flags set in signal handlers; it is not
+a substitute for atomics between threads, which C11 provides in
+`stdatomic.h`.
+
+### Check yourself
+
+**A function has `static int n;` and `int m;` inside it, neither
+initialised. What are their values on the first call?**
+
+<details>
+<summary>Answer</summary>
+
+n is 0, because static objects are zero-initialised. m is
+indeterminate; reading it before assigning is a bug.
+
+</details>
+
+**Why can you not take the address of a `register` variable?**
+
+<details>
+<summary>Answer</summary>
+
+The keyword asks for the object to live in a machine register, which has
+no memory address, so the language forbids `&` on it whether or not the
+compiler honours the hint.
+
+</details>
+
+## A5 Objects and Lvalues
+
+### In one sentence
+
+An **object** is a named region of storage and an **lvalue** is an
+expression that refers to one; only lvalues can have their address
+taken, and only modifiable lvalues can stand on the left of an
+assignment.
+
+### The idea
+
+The name comes from the left side of `E1 = E2`: the left operand must
+designate a place to store into. A plain variable name is the simplest
+lvalue. So is `*p` when p points to an object, `a[i]`, `s.m` and `p->m`.
+A bracketed lvalue is still an lvalue.
+
+Many expressions are not lvalues. The result of `x + 1`, a constant, a
+function call returning a non-pointer value and the result of a cast are
+values only; they have no storage you can name.
+
+Some lvalues are not **modifiable**. An array name designates the whole
+array, which is an object, but you cannot assign to it. An object
+declared `const` cannot be assigned. A structure with a `const` member
+cannot be assigned as a whole.
+
+Every operator in A7 says whether it needs an lvalue and whether it
+yields one. Those two lines in each description answer a large share of
+"why does this not compile?" questions.
+
+### Worked example
+
+```c
+/* lval.c: which expressions name an object */
+#include <stdio.h>
+
+int main(void)
+{
+    int a[3] = {1, 2, 3}, *p = a, x = 0;
+    *p = 10;              /* *p is an lvalue: it names a[0] */
+    p[2] = 30;            /* so is p[2] */
+    *(a + 1) = 20;        /* and *(a + 1) */
+    (x) = 5;              /* brackets keep an lvalue an lvalue */
+    int *q = &a[1];       /* & needs an lvalue */
+    printf("%d %d %d, x = %d, *q = %d\n", a[0], a[1], a[2], x, *q);
+    return 0;
+}
+```
+
+```text
+10 20 30, x = 5, *q = 20
+```
+
+And three that are not, each rejected with a message naming the rule it
+breaks:
+
+```text
+$ cat badlval.c
+int main(void)
+{
+    int a[3], b[3], x = 1;
+    const int k = 2;
+    a = b;          /* an array is not a modifiable lvalue */
+    k = 3;          /* nor is a const object */
+    x + 1 = 4;      /* nor is the result of + */
+    return 0;
+}
+$ gcc -c badlval.c 2>&1 | grep error
+badlval.c:5:7: error: assignment to expression with array type
+badlval.c:6:7: error: assignment of read-only variable ‘k’
+badlval.c:7:11: error: lvalue required as left operand of assignment
+```
+
+### Step by step
+
+<Trace columns={["expression", "lvalue?", "modifiable?", "why"]} rows={[
+  ["x", "yes", "yes", "names an int object"],
+  ["*p", "yes", "yes, if p points to a non-const int", "names what p points to"],
+  ["a[1]", "yes", "yes", "same as *(a + 1)"],
+  ["a", "yes", "no", "names a whole array"],
+  ["k (const int)", "yes", "no", "the const promise"],
+  ["x + 1", "no", "no", "a value with no storage"],
+  ["(x)", "yes", "yes", "brackets do not change the category"],
+]} />
+
+### Common mistake
+
+Expecting a cast to give an lvalue. `(long)x = 5` is rejected: a cast
+produces a new value of the new type, not a reinterpretation of x's
+storage. Old compilers accepted it as an extension, and code that relied
+on it broke when they stopped. To store through a different type you
+need a pointer, `*(long *)&x`, and that brings aliasing rules (A7 and the
+standard's effective-type rules) into play, so the right answer is
+almost always `memcpy`.
+
+### In real systems
+
+C++ grew the idea into lvalues, rvalues, xvalues and prvalues, which
+underlie move semantics. In C the two-way split is enough, and compiler
+messages use it directly: "lvalue required as left operand of
+assignment" and "lvalue required as unary '&' operand" are among the
+most common errors a C programmer sees, and both point straight at this
+section.
+
+### Check yourself
+
+**Is `*p++` an lvalue?**
+
+<details>
+<summary>Answer</summary>
+
+Yes. It parses as `*(p++)`: the increment yields the old pointer value,
+and `*` applied to a pointer always yields an lvalue, so `*p++ = c` is
+legal and common.
+
+</details>
+
+**Why can a struct be assigned but an array cannot?**
+
+<details>
+<summary>Answer</summary>
+
+An array name in most expressions converts to a pointer to its first
+element (A7.1), so there is no array value to assign. Structures have no
+such conversion, so ANSI C allowed whole-structure assignment.
+
+</details>
+
+## A6 Conversions
+
+### In one sentence
+
+When operands of different types meet, C converts them by fixed rules:
+small integers are first promoted to `int`, then the **usual arithmetic
+conversions** bring both operands to a common type, and a few other
+rules govern pointers, `void` and assignment.
+
+### The idea
+
+The appendix lists the conversions one by one. Grouped by purpose:
+
+- **Integral promotion.** A `char`, `short`, bit-field or enum used in an
+  expression is converted to `int` if `int` can hold all its values,
+  otherwise to `unsigned int`. Arithmetic never happens in anything
+  narrower than `int`.
+- **Integral conversions.** Converting to an unsigned type reduces the
+  value modulo one more than the type's maximum, so -1 becomes the
+  largest unsigned value. Converting a value that does not fit to a
+  signed type is implementation-defined.
+- **Integer and floating.** A floating value converted to an integer
+  drops its fractional part (truncation towards zero); if the result
+  does not fit, the behaviour is undefined. An integer converted to
+  floating keeps its value if it can and rounds to a neighbour if not.
+- **Floating types.** A wider floating value converted to a narrower one
+  rounds if it is in range and is undefined if it is not.
+- **Usual arithmetic conversions.** For most binary operators: if either
+  operand is `long double`, the other becomes `long double`; else if
+  either is `double`, `double`; else `float`; else promote both and, if
+  either is `unsigned long`, use that; and so on down through `long` and
+  `unsigned int`. The general shape is "the wider type wins, and
+  unsigned wins a tie of the same width".
+- **Pointers and integers.** A constant expression with value 0 becomes
+  the null pointer when assigned to or compared with a pointer. Other
+  pointer and integer mixes need a cast and are implementation-defined.
+- **Void.** The value of a `void` expression cannot be used; casting to
+  `void` explicitly discards a value. Any object pointer converts to
+  `void *` and back without loss.
+
+### Worked example
+
+```c
+/* conv.c: the usual arithmetic conversions at work */
+#include <stdio.h>
+
+int main(void)
+{
+    unsigned u = 0;
+    unsigned char uc = 200;
+    signed char sc = -1;
+    printf("-1 < 0u: %d\n", -1 < u);                 /* -1 becomes UINT_MAX */
+    printf("-1 < (long)0u: %d\n", -1 < (long)u);     /* long holds every unsigned */
+    printf("uc + uc = %d (int, no wrap)\n", uc + uc);
+    printf("sc == 255? %d, (unsigned char)sc = %d\n", sc == 255, (unsigned char)sc);
+    float f = 16777217;                               /* 2^24 + 1 */
+    printf("16777217 as float: %.1f\n", f);
+    printf("(int)-2.7 = %d, (int)2.7 = %d, 7 / 2 = %d, -7 / 2 = %d, -7 %% 2 = %d\n",
+           (int)-2.7, (int)2.7, 7 / 2, -7 / 2, -7 % 2);
+    printf("3 / 2 * 2.0 = %g, 3 / 2.0 * 2 = %g\n", 3 / 2 * 2.0, 3 / 2.0 * 2);
+    return 0;
+}
+```
+
+```text
+-1 < 0u: 0
+-1 < (long)0u: 1
+uc + uc = 400 (int, no wrap)
+sc == 255? 0, (unsigned char)sc = 255
+16777217 as float: 16777216.0
+(int)-2.7 = -2, (int)2.7 = 2, 7 / 2 = 3, -7 / 2 = -3, -7 % 2 = -1
+3 / 2 * 2.0 = 2, 3 / 2.0 * 2 = 3
+```
+
+Each line is one rule:
+
+- `-1 < u`: both are `int`-sized and one is unsigned, so -1 is
+  converted to `unsigned`, becoming 4294967295, which is not less than 0.
+  GCC with `-Wall -Wextra` warns about exactly this comparison
+  (`-Wsign-compare`).
+- Converting u to `long` first changes the outcome, because a `long`
+  (8 bytes here) can hold every `unsigned int`, so the comparison happens
+  in signed `long` and -1 really is less than 0.
+- `uc + uc`: both are promoted to `int` before adding, so the sum is 400,
+  not 400 mod 256.
+- `sc == 255`: sc is promoted to the `int` -1, which is not 255. Casting
+  to `unsigned char` reduces -1 modulo 256, giving 255.
+- A `float` has 24 bits of precision, so 2 to the 24th plus one cannot
+  be stored and rounds to its neighbour.
+- Conversion to `int` truncates towards zero; since C99 so does integer
+  division, and the remainder takes the sign of the dividend. (ANSI C let
+  negative division round either way; the appendix says so.)
+- `3 / 2 * 2.0` divides as integers first (giving 1), then converts.
+  Moving the `2.0` changes which operator sees a `double`.
+
+### Step by step
+
+<Flow caption="The usual arithmetic conversions as a decision list, checked from the top. The first rule that applies decides the common type; after the floating cases, both operands have been promoted to at least int." steps={[
+  "Either is long double?: convert the other to long double",
+  "Either is double?: convert the other to double",
+  "Either is float?: convert the other to float",
+  "Integral promotion: char, short, enum and bit-fields become int or unsigned int",
+  "Either is unsigned long?: convert the other to unsigned long",
+  "long and unsigned int?: long if it holds every unsigned value, else both unsigned long",
+  "Either is long, then either is unsigned: long; then unsigned int; otherwise both are int",
+]} />
+
+<Trace columns={["expression", "operand types", "common type", "result"]} rows={[
+  ["-1 < u", "int, unsigned", "unsigned", "0 (4294967295 < 0 is false)"],
+  ["-1 < (long)u", "int, long", "long", "1"],
+  ["uc + uc", "unsigned char twice", "int after promotion", "400"],
+  ["3 / 2 * 2.0", "int / int, then int * double", "int, then double", "2"],
+  ["3 / 2.0 * 2", "int / double, then double * int", "double", "3"],
+]} />
+
+### Common mistake
+
+Looping down to zero with an unsigned counter, or comparing a signed
+length with `strlen`:
+
+```c
+for (size_t i = n - 1; i >= 0; i--)      /* i >= 0 is always true */
+    use(a[i]);
+if (len - strlen(s) < 0)                 /* size_t: never negative */
+    too_long();
+```
+
+Both conditions can never be false (or never true), because the
+arithmetic happens in an unsigned type. The loop runs off the front of
+the array when i wraps to a huge value. GCC's `-Wextra` flags the first
+as `comparison of unsigned expression in '>= 0' is always true`. The
+usual fixes are `for (size_t i = n; i-- > 0; )` and comparing
+`strlen(s) > len` instead of subtracting.
+
+### In real systems
+
+Signed and unsigned mixing is among the most common sources of security
+bugs in C, because a negative length that becomes a huge `size_t` passed
+to `memcpy` copies far past a buffer. Projects build with
+`-Wconversion -Wsign-conversion` in their strictest configurations, and
+safe-integer helpers such as GCC's `__builtin_add_overflow` check
+arithmetic before it wraps. Floating-to-integer conversion of an
+out-of-range value is undefined, so code converting user-supplied
+doubles checks the range first.
+
+### Check yourself
+
+**What is `(unsigned char)-1 + 1` on a machine with 8-bit chars?**
+
+<details>
+<summary>Answer</summary>
+
+256. The cast gives 255 as an `unsigned char`, which is then promoted to
+`int` before the addition, so nothing wraps.
+
+</details>
+
+**Why does `if (-1 < sizeof(int))` take the false branch?**
+
+<details>
+<summary>Answer</summary>
+
+`sizeof` yields a `size_t`, an unsigned type at least as wide as `int`,
+so -1 is converted to the largest `size_t` value, which is not less than
+4.
+
+</details>
+
+## A7 Expressions
+
+### In one sentence
+
+The expressions section defines every operator in order of decreasing
+precedence, and for each one says what operand types it accepts, what
+conversions it applies, whether it needs or yields an lvalue, and,
+crucially, what it leaves unspecified about order of evaluation.
+
+### The idea
+
+The appendix arranges its subsections by precedence, highest first:
+primary expressions, then postfix, unary, casts, multiplicative,
+additive, shifts, relational, equality, bitwise AND, XOR, OR, logical
+AND, logical OR, the conditional, assignment, and the comma. That order
+*is* the precedence table: an operator in an earlier subsection binds
+tighter than one in a later subsection.
+
+A few rules sit above the individual operators:
+
+- **Array and function decay.** In most expressions an array of T is
+  converted to a pointer to its first element, and a function name to a
+  pointer to the function. The exceptions are the operand of `sizeof`,
+  of unary `&`, and a string literal used to initialise an array.
+- **Order of evaluation is mostly unspecified.** Precedence says how
+  operands group, not which is evaluated first. In `f() + g()` either
+  call may run first. Only `&&`, `||`, `?:` and the comma operator
+  promise an order, and each evaluates its left operand completely
+  before its right.
+- **Modifying an object twice, or reading it for another purpose while
+  modifying it, between two sequence points is undefined.** That is the
+  rule that `i = i++` and `a[i] = i++` break.
+- **Overflow** of signed integer arithmetic is undefined; unsigned
+  arithmetic wraps modulo its range.
+
+Some operators deserve a sentence each, because their details matter:
+
+- `sizeof` does not evaluate its operand (for ordinary types), so
+  `sizeof(i++)` leaves i alone. Its result is a `size_t`.
+- `&&` and `||` **short-circuit**: the right side runs only if the left
+  side has not decided the answer. They yield 0 or 1, as do `!` and the
+  relational and equality operators.
+- Shifting by a negative amount or by at least the width of the type is
+  undefined. Right-shifting a negative value is implementation-defined.
+- The comma operator evaluates its left operand, discards the value, then
+  evaluates the right, whose value and type are the result.
+- The conditional `c ? a : b` evaluates c, then exactly one of a and b,
+  and converts the chosen one to a common type of the two.
+- Assignment yields the value stored, converted to the left operand's
+  type, and is not itself an lvalue.
+
+### Worked example
+
+```c
+/* exprs.c: precedence, short-circuit, sizeof and the comma operator */
+#include <stdio.h>
+
+static int calls;
+static int touch(int v) { calls++; return v; }
+
+int main(void)
+{
+    int a = 6, b = 3, c = 2;
+    printf("a & b == c -> %d, (a & b) == c -> %d\n", a & b == c, (a & b) == c);
+    printf("0 && touch(1) -> %d, calls %d\n", 0 && touch(1), calls);
+    printf("1 || touch(1) -> %d, calls %d\n", 1 || touch(1), calls);
+    int i = 0;
+    size_t s = sizeof(i++);                     /* operand not evaluated */
+    printf("sizeof(i++) = %zu, i still %d\n", s, i);
+    int k = (touch(1), touch(2), 7);            /* evaluate left, keep right */
+    printf("comma: k = %d, calls %d\n", k, calls);
+    printf("1 << 3 + 1 = %d, -8 >> 1 = %d\n", 1 << 3 + 1, -8 >> 1);
+    printf("a > b ? a : b = %d, !!7 = %d, ~0 = %d\n", a > b ? a : b, !!7, ~0);
+    return 0;
+}
+```
+
+```text
+a & b == c -> 0, (a & b) == c -> 1
+0 && touch(1) -> 0, calls 0
+1 || touch(1) -> 1, calls 0
+sizeof(i++) = 4, i still 0
+comma: k = 7, calls 2
+1 << 3 + 1 = 16, -8 >> 1 = -4
+a > b ? a : b = 6, !!7 = 1, ~0 = -1
+```
+
+GCC with `-Wall` warns about two of these lines, suggesting brackets
+around the comparison inside `&` and around the `+` inside `<<`. Both
+warnings point at real precedence traps:
+
+- `==` binds tighter than `&`, so `a & b == c` is `a & (b == c)`, which
+  is `6 & 0`. The book itself calls this precedence a historical mistake:
+  `&` and `|` predate `&&` and `||` and once did both jobs.
+- `+` binds tighter than `<<`, so `1 << 3 + 1` is `1 << 4`.
+- The short-circuit lines never call `touch`, so `calls` stays 0 until
+  the comma expression calls it twice.
+- `sizeof(i++)` is computed from the type alone.
+- `~0` is all bits set, which is -1 in two's complement.
+
+The sequence-point rule is the one the compiler can only sometimes catch:
+
+```text
+$ cat seq.c
+#include <stdio.h>
+int main(void){int i = 1; i = i++ + 1; printf("%d\n", i); return 0;}
+$ gcc -Wall -o seq seq.c 2>&1 | grep warning
+seq.c:2:29: warning: operation on ‘i’ may be undefined [-Wsequence-point]
+$ ./seq
+2
+```
+
+It printed 2 here, but the program has no meaning: i is modified twice
+with no sequence point between, and another compiler, or this one with
+different flags, may print 3.
+
+### Step by step
+
+<Layers caption="Operator precedence from tightest (top) to loosest (bottom), in the order of A7's subsections. Operators on one row have equal precedence; all associate left to right except the unary, conditional and assignment rows, which associate right to left." layers={[
+  { name: "() [] -> .", note: "postfix: call, subscript, member; also postfix ++ --" },
+  { name: "! ~ ++ -- + - * & (type) sizeof", note: "unary, right to left" },
+  { name: "* / %", note: "multiplicative" },
+  { name: "+ -", note: "additive" },
+  { name: "<< >>", note: "shifts" },
+  { name: "< <= > >=", note: "relational" },
+  { name: "== !=", note: "equality" },
+  { name: "& then ^ then |", note: "bitwise AND, XOR, OR: three separate levels" },
+  { name: "&& then ||", note: "logical AND, then logical OR: short-circuit, ordered" },
+  { name: "?:", note: "conditional, right to left, ordered" },
+  { name: "= += -= *= /= %= &= ^= |= <<= >>=", note: "assignment, right to left" },
+  { name: ",", note: "comma operator, ordered" },
+]} />
+
+<Trace columns={["expression", "grouping by precedence", "value (a=6, b=3, c=2)"]} rows={[
+  ["a & b == c", "a & (b == c)", "6 & 0 = 0"],
+  ["(a & b) == c", "as written", "2 == 2 = 1"],
+  ["1 << 3 + 1", "1 << (3 + 1)", "16"],
+  ["a > b ? a : b", "(a > b) ? a : b", "6"],
+  ["*p++", "*(p++)", "the old *p, then p advances"],
+  ["x = y = 0", "x = (y = 0)", "both 0 (right to left)"],
+]} />
+
+### Common mistake
+
+Testing a bit flag without brackets: `if (flags & MASK == MASK)`. It
+reads naturally and is wrong, for the reason above. The habit that
+prevents it is simple: always bracket a bitwise operator inside a
+comparison, `if ((flags & MASK) == MASK)`, and build with `-Wall` so the
+compiler reminds you when you forget.
+
+The other classic is assuming left-to-right evaluation:
+`printf("%d %d\n", next(), next())` may print the values in either
+order. Put each call in its own statement when order matters.
+
+### In real systems
+
+Undefined behaviour in expressions is what optimisers exploit most. A
+check like `if (x + 1 < x)` meant to detect overflow can be deleted
+entirely, because signed overflow "cannot happen". Security-sensitive
+code checks before the operation (`if (x > INT_MAX - 1)`) or uses
+`__builtin_add_overflow`. Short-circuit evaluation is relied on
+everywhere for guard checks, as in `if (p != NULL && p->len > 0)`, and is
+one of the few ordering guarantees worth knowing cold.
+
+### Check yourself
+
+**What does `x = 5, 6;` store in x?**
+
+<details>
+<summary>Answer</summary>
+
+5. Assignment binds tighter than the comma, so it is `(x = 5), 6`; the
+6 is evaluated and discarded.
+
+</details>
+
+**Is `a[i] = i++;` well defined?**
+
+<details>
+<summary>Answer</summary>
+
+No. i is modified by `i++` and read for another purpose (to compute
+`a[i]`) with no sequence point between them, so the behaviour is
+undefined.
+
+</details>
+
+**Why is `sizeof arr / sizeof arr[0]` safe to use on an array but not on
+a pointer parameter?**
+
+<details>
+<summary>Answer</summary>
+
+`sizeof` is one of the places an array does not decay, so on a real
+array it gives the whole size. A parameter declared as an array is
+really a pointer, so `sizeof` gives the pointer's size.
+
+</details>
+
+## A8 Declarations
+
+### In one sentence
+
+A declaration is a list of **specifiers** (storage class, type,
+qualifiers) followed by **declarators** that each name one identifier and
+wrap its type in pointer, array and function layers, optionally with an
+initialiser.
+
+### The idea
+
+Every declaration has two halves. The specifiers say the base type and
+storage: `static const unsigned long`. Each declarator then says how a
+name relates to that base type, using the same operators the name will
+be used with in expressions: `*` for "pointer to", `[]` for "array of",
+`()` for "function returning". Declaration mirrors use. `int *p` says
+that `*p` is an int.
+
+The declarator rules give `[]` and `()` higher precedence than `*`,
+exactly as in expressions. That is why `int *ap[3]` is an array of
+pointers and `int (*pa)[3]` is a pointer to an array: the brackets in the
+second force the `*` to apply first.
+
+The rest of A8 covers the parts of declarations chapter 6 introduced:
+
+- **Structures and unions**: members laid out in order, with padding
+  the compiler may insert for alignment. A union's members all start at
+  the same address and it is as big as its largest member.
+- **Bit-fields**: integer members with a width in bits. Their layout,
+  including whether they fill from the high or low end, is
+  implementation-defined.
+- **Enumerations**: named `int` constants, numbered from 0 unless given
+  values, each one more than the last.
+- **Initialisation**: static objects take constant initialisers; missing
+  members or elements become zero; a character array can be initialised
+  by a string, and its size can come from the initialiser.
+- **Type names**: a declaration with the identifier removed, as used in
+  casts and `sizeof`: `(int (*)[3])` is "pointer to array of 3 int".
+- **typedef**: does not create a type, only a new name for one.
+- **Type equivalence**: two types are the same if their specifier lists
+  and abstract declarators match after typedefs are expanded.
+
+### Worked example
+
+```c
+/* decls.c: reading and using declarators */
+#include <stdio.h>
+
+static int twice(int n) { return 2 * n; }
+static int square(int n) { return n * n; }
+
+int (*pick(int which))(int)            /* function returning a pointer to function */
+{
+    return which ? square : twice;
+}
+
+int main(void)
+{
+    int *ap[3];                         /* array of 3 pointers to int */
+    int (*pa)[3];                       /* pointer to an array of 3 ints */
+    int grid[2][3] = {{1, 2, 3}, {4}};  /* missing initialisers become 0 */
+    pa = grid;
+    ap[0] = &grid[1][0];
+    printf("sizeof ap = %zu, sizeof pa = %zu, sizeof *pa = %zu\n",
+           sizeof ap, sizeof pa, sizeof *pa);
+    printf("pa[1][0] = %d, *ap[0] = %d, grid[1][2] = %d\n", pa[1][0], *ap[0], grid[1][2]);
+    int (*fp)(int) = pick(1);
+    printf("pick(1)(7) = %d, pick(0)(7) = %d\n", fp(7), pick(0)(7));
+    char s[] = "abc";                   /* size 4, taken from the initialiser */
+    const char *t = "abc";              /* pointer to a literal */
+    printf("sizeof s = %zu, sizeof t = %zu\n", sizeof s, sizeof t);
+    return 0;
+}
+```
+
+```text
+sizeof ap = 24, sizeof pa = 8, sizeof *pa = 12
+pa[1][0] = 4, *ap[0] = 4, grid[1][2] = 0
+pick(1)(7) = 49, pick(0)(7) = 14
+sizeof s = 4, sizeof t = 8
+```
+
+- `ap` is three 8-byte pointers, 24 bytes. `pa` is one pointer, 8 bytes,
+  and what it points to is a row of three ints, 12 bytes. So `pa + 1`
+  moves a whole row, which is why `pa[1][0]` is the first element of row
+  1.
+- The second row was initialised with only `{4}`, so its other elements
+  are 0.
+- `pick` is read inside out: `pick(int which)` is a function; `*` of its
+  result is a pointer; `(...)(int)` says the pointer is to a function
+  taking an int; and `int` is what that function returns.
+- `s` is an array sized by its initialiser; `t` is just a pointer.
+
+Structure layout is the other half of A8 that shows up in practice:
+
+```c
+/* layout.c: what struct, union, enum and bit-fields cost */
+#include <stdio.h>
+#include <stddef.h>
+
+struct rec { char tag; int value; char flag; };
+struct packed { char tag; char flag; int value; };
+union num { int i; float f; unsigned char b[4]; };
+struct perm { unsigned r : 1, w : 1, x : 1; unsigned spare : 5; };
+enum colour { RED, GREEN = 5, BLUE };
+
+int main(void)
+{
+    printf("rec %zu (value at %zu), packed %zu\n",
+           sizeof(struct rec), offsetof(struct rec, value), sizeof(struct packed));
+    union num n = { .f = 1.0f };
+    printf("union %zu, 1.0f bytes %02x %02x %02x %02x\n",
+           sizeof n, n.b[0], n.b[1], n.b[2], n.b[3]);
+    struct perm p = { 1, 1, 0, 0 };
+    printf("perm %zu byte(s), r%d w%d x%d\n", sizeof p, p.r, p.w, p.x);
+    printf("RED %d GREEN %d BLUE %d\n", RED, GREEN, BLUE);
+    return 0;
+}
+```
+
+```text
+rec 12 (value at 4), packed 8
+union 4, 1.0f bytes 00 00 80 3f
+perm 4 byte(s), r1 w1 x0
+RED 0 GREEN 5 BLUE 6
+```
+
+The same three members cost 12 bytes in one order and 8 in another,
+because the `int` must start at a multiple of 4. The union shows the
+bytes of a `float` 1.0 in little-endian order (`.f =` is a C99
+designated initialiser; ANSI C could initialise only a union's first
+member). Eight bits of bit-fields still occupy a whole `unsigned int`
+here. `BLUE` follows `GREEN` and is 6.
+
+### Step by step
+
+<Flow caption="Reading a declarator inside out, applied to int (*pick(int which))(int). Start at the name, go right while you can, then left, and step out of each bracket." steps={[
+  "pick: start at the identifier",
+  "(int which): right: pick is a function taking an int",
+  "*: left: returning a pointer",
+  "( ... )(int): step out, right: to a function taking an int",
+  "int: left: returning int",
+]} />
+
+<Figure art={`
+  struct rec { char tag; int value; char flag; }        12 bytes
+  offset  0     1     2     3     4     5     6     7     8     9    10    11
+        [tag ][ pad][ pad][ pad][ value                 ][flag][ pad][ pad][ pad]
+
+  struct packed { char tag; char flag; int value; }       8 bytes
+  offset  0     1     2     3     4     5     6     7
+        [tag ][flag][ pad][ pad][ value                 ]
+`} caption="Padding in practice. Each member starts at a multiple of its alignment and the whole struct is padded to a multiple of its strictest member, so ordering members from largest to smallest usually wastes the least space." />
+
+### Common mistake
+
+Believing `int* a, b;` declares two pointers. The `*` belongs to the
+declarator `*a`, not to the type, so b is a plain `int`. Writing the
+star next to the name, `int *a, *b;`, makes the grammar visible, and
+many style guides insist on one declarator per line for exactly this
+reason.
+
+A second one: `typedef char *string; const string s;` makes s a
+**const pointer to char**, not a pointer to const char, because the
+qualifier applies to the whole typedef'd type. Textual substitution
+would suggest otherwise; typedef is not a macro.
+
+### In real systems
+
+The inside-out rule is what the `cdecl` tool automates, and it is
+needed for real signatures: the C library's `signal` is declared
+`void (*signal(int sig, void (*func)(int)))(int)`, and every C code base
+gives that type a typedef before using it. Struct layout matters for
+binary file formats, network headers and cache-line use; engineers check
+it with `offsetof`, `_Static_assert(sizeof(struct hdr) == 20, "...")`
+and `pahole`, rather than guessing.
+
+### Check yourself
+
+**What is `char (*(*x[3])())[5]`?**
+
+<details>
+<summary>Answer</summary>
+
+x is an array of 3 pointers to functions returning a pointer to an array
+of 5 chars. Start at x, go right ([3], array of 3), left (*, pointers),
+out and right ((), to functions), left (*, returning a pointer), out and
+right ([5], to array of 5), left (char).
+
+</details>
+
+**Does `typedef int length;` create a type that the compiler keeps
+separate from `int`?**
+
+<details>
+<summary>Answer</summary>
+
+No. A typedef name is a synonym; a `length` and an `int` can be mixed
+freely without a warning. It documents intent and eases change, but it
+gives no type checking.
+
+</details>
+
+## A9 Statements
+
+### In one sentence
+
+Statements run in sequence and are of six kinds, labelled, expression,
+compound, selection (`if`, `switch`), iteration (`while`, `do`, `for`)
+and jump (`goto`, `continue`, `break`, `return`), and the appendix pins
+down exactly how each transfers control.
+
+### The idea
+
+Most of this section confirms what chapter 3 taught, but with the edges
+filled in:
+
+- **Labelled statements.** A `case` label needs an integral constant
+  expression; no two in one `switch` may have the same value; there is at
+  most one `default`. Ordinary labels (for `goto`) have function scope
+  and their own name space, so a label can share a name with a variable.
+- **Expression statements.** Any expression followed by `;`, evaluated
+  for its side effects. The null statement is `;` alone.
+- **Compound statements.** A block in braces. In ANSI C its declarations
+  had to come first; C99 lets declarations and statements mix. Each
+  block starts a new scope, and automatic objects declared in it are
+  initialised each time control enters the block from the top.
+- **Selection.** The `if` controlling expression must have arithmetic or
+  pointer type and is compared with 0. An `else` binds to the nearest
+  unmatched `if`. In `switch`, the controlling expression gets the
+  integral promotions, and control jumps to the matching `case` and then
+  **falls through** all following statements until a `break`.
+- **Iteration.** `while` tests first; `do` tests after the body, so the
+  body runs at least once; `for (e1; e2; e3)` is equivalent to a `while`
+  except that a `continue` still runs e3. Any of the three may be
+  omitted, and an omitted e2 means "forever".
+- **Jumps.** `continue` goes to the end of the innermost loop's body;
+  `break` leaves the innermost loop or `switch`; `return` with an
+  expression converts the value to the function's return type as if by
+  assignment; `goto` jumps to a label in the same function.
+
+### Worked example
+
+```c
+/* sw.c: switch falls through unless told not to */
+#include <stdio.h>
+
+static const char *kind(int c)
+{
+    switch (c) {
+    case 'a': case 'e': case 'i': case 'o': case 'u':
+        return "vowel";
+    case ' ':
+    case '\t':
+        return "blank";
+    default:
+        if (c >= '0' && c <= '9') return "digit";
+        return "other";
+    }
+}
+
+int main(void)
+{
+    for (const char *p = "a 7z"; *p; p++) printf("'%c' %s\n", *p, kind(*p));
+    return 0;
+}
+```
+
+```text
+'a' vowel
+' ' blank
+'7' digit
+'z' other
+```
+
+Stacked `case` labels are fall-through used on purpose: five labels share
+one statement. Each group ends in a `return`, which leaves the `switch`
+as well as the function, so no `break` is needed.
+
+And the one use of `goto` that most experienced C programmers accept, a
+single cleanup path:
+
+```c
+/* cleanup.c: the one common use of goto, a single exit path */
+#include <stdio.h>
+#include <stdlib.h>
+
+static int load(const char *path)
+{
+    int rc = -1;
+    char *buf = NULL;
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) goto out;
+    if ((buf = malloc(4096)) == NULL) goto out;
+    size_t n = fread(buf, 1, 4096, fp);
+    printf("%s: read %zu bytes\n", path, n);
+    rc = 0;
+out:
+    free(buf);                      /* free(NULL) is allowed */
+    if (fp) fclose(fp);
+    return rc;
+}
+
+int main(void)
+{
+    int a = load("cleanup.c"), b = load("missing.txt");
+    printf("results %d %d\n", a, b);
+    return 0;
+}
+```
+
+```text
+cleanup.c: read 624 bytes
+results 0 -1
+```
+
+Every failure jumps to the same label, which releases whatever was
+acquired. Because `buf` and `fp` start as null, the cleanup is correct
+whichever step failed.
+
+### Step by step
+
+<Trace columns={["c", "label matched", "statements run", "result"]} rows={[
+  ["'a'", "case 'a'", "return \"vowel\"", "vowel"],
+  ["' '", "case ' '", "falls to the next label's return", "blank"],
+  ["'7'", "none, so default", "the if, true", "digit"],
+  ["'z'", "none, so default", "the if, false, then return", "other"],
+]} />
+
+<Compare left="for (e1; e2; e3) body" right="e1; while (e2) { body e3; }" caption="for and while are interchangeable except at continue. The rewrite on the right is what the appendix says a for loop means, with the one difference marked." rows={[
+  ["e1 runs once", "e1 runs once"],
+  ["e2 tested before each pass; omitted means true", "e2 tested before each pass; cannot be omitted"],
+  ["body runs", "body runs"],
+  ["e3 runs after each pass", "e3 runs at the end of the body"],
+  ["continue jumps to e3, then e2", "continue skips e3 and goes straight to e2"],
+]} />
+
+### Common mistake
+
+The dangling `else`:
+
+```c
+if (n > 0)
+    if (a > b)
+        z = a;
+else                    /* belongs to the inner if, despite the indent */
+    z = b;
+```
+
+The `else` binds to the nearest `if` without one, so when n is 0 nothing
+at all happens. GCC's `-Wall` warns "suggest explicit braces to avoid
+ambiguous 'else'". The cure is braces whenever an `if` contains another
+`if`.
+
+Forgetting `break` is the other: one missing line in a `switch` and two
+cases run. Modern GCC warns with `-Wimplicit-fallthrough` (in `-Wextra`)
+and accepts a `/* fall through */` comment, or C23's `[[fallthrough]]`,
+to mark the intentional ones.
+
+### In real systems
+
+The Linux kernel and most large C projects use the `goto out` pattern
+for error handling; it is the C counterpart of a destructor or a
+`finally` block. `switch` over an enum is the usual state-machine
+shape, and `-Wswitch` (in `-Wall`) warns when an enum value has no case
+label, which is why many projects deliberately leave out `default` in
+such switches.
+
+### Check yourself
+
+**In `for (i = 0; i < 5; i++) { if (i == 2) continue; printf("%d", i); }`,
+is `i++` skipped when i is 2?**
+
+<details>
+<summary>Answer</summary>
+
+No. `continue` in a `for` goes to the increment expression, then the
+test. The loop prints 0134.
+
+</details>
+
+**May a `goto` jump into a block, past a declaration with an
+initialiser?**
+
+<details>
+<summary>Answer</summary>
+
+It may in C (not in C++), but the object's initialiser does not run, so
+its value is indeterminate. Jumping past a variable-length array's
+declaration is forbidden.
+
+</details>
+
+## A10 External Declarations
+
+### In one sentence
+
+A translation unit is a sequence of external declarations, each either
+a function definition or a declaration of objects and functions at file
+level, and the appendix sets out how definitions, tentative definitions
+and plain declarations relate.
+
+### The idea
+
+At file level there are no statements, only declarations. Two kinds:
+
+- **Function definitions.** A declarator for a function, then its body.
+  ANSI C allows two forms: the new style with parameter types in the
+  brackets (a **prototype**), and the old style with only parameter names
+  in the brackets and their declarations after. In a definition with a
+  prototype, arguments are converted to the parameter types; in the old
+  style only the default promotions (float to double, small integers to
+  int) are applied, and nothing is checked.
+- **External declarations of objects.** With an initialiser, they are
+  **definitions**. Without an initialiser and without `extern`, they are
+  **tentative definitions**: if no real definition appears in the unit,
+  the tentative one becomes a definition initialised to zero. With
+  `extern` and no initialiser, they only declare, and storage must be
+  defined somewhere else.
+
+The old-style form is the main thing appendix C lists as kept "only for
+compatibility", and it is why prototypes mattered so much.
+
+### Worked example
+
+```c
+/* oldstyle.c: a pre-standard definition next to a prototype */
+#include <stdio.h>
+
+double half_old();               /* old declaration: says nothing about parameters */
+double half_new(double x);       /* prototype: argument converted to double */
+
+double half_old(x) double x; { return x / 2; }
+double half_new(double x) { return x / 2; }
+
+int main(void)
+{
+    printf("half_new(3) = %g\n", half_new(3));      /* 3 converted to 3.0 */
+    printf("half_old(3) = %g\n", half_old(3));      /* int passed where double expected */
+    return 0;
+}
+```
+
+Built with GCC 14's default dialect, this compiles silently and runs:
+
+```text
+half_new(3) = 1.5
+half_old(3) = 2.33835e-310
+```
+
+The second number is garbage and changes between runs. With no
+prototype, the caller passed the `int` 3 as an `int`, in an integer
+register, while `half_old` read a `double` from a floating register that
+held whatever was left there. The prototype version converted 3 to 3.0
+before the call. C23 finally removed old-style definitions and made `()`
+mean "no parameters":
+
+```text
+$ gcc -std=c23 -c oldstyle.c 2>&1 | grep error
+oldstyle.c:7:1: error: number of arguments doesn’t match prototype
+oldstyle.c:4:8: error: prototype declaration
+oldstyle.c:13:34: error: too many arguments to function ‘half_old’
+```
+
+### Step by step
+
+<Trace columns={["file-level declaration", "kind", "storage"]} rows={[
+  ["int n = 5;", "definition", "here, initialised to 5"],
+  ["int n;", "tentative definition", "here, zero, unless a real definition follows"],
+  ["extern int n;", "declaration only", "somewhere else"],
+  ["double half(double);", "function declaration (prototype)", "none"],
+  ["double half(double x) { ... }", "function definition", "the code"],
+  ["static int n;", "tentative definition, internal linkage", "here, private to the file"],
+]} />
+
+### Common mistake
+
+Writing `int f();` and thinking it declares a function with no
+parameters. Before C23 it declares a function with **unknown**
+parameters, so `f(1, 2, 3)` compiles without complaint. Write
+`int f(void);`. The same applies to `main`: `int main(void)` is the
+correct prototype for a `main` that takes no arguments.
+
+### In real systems
+
+Old-style definitions survive in very old code (some of the original Unix
+tools, early GNU sources), and `-Wold-style-definition` and
+`-Wstrict-prototypes` find them. Tentative definitions in headers used to
+work across files because Unix linkers merged them as "common" symbols;
+GCC 10 changed the default to `-fno-common`, and a lot of old code
+suddenly failed to link, which is the subject of the next section.
+
+### Check yourself
+
+**Is `int count;` at file scope a declaration or a definition?**
+
+<details>
+<summary>Answer</summary>
+
+A tentative definition. If the file has no other definition of count, it
+becomes a definition initialised to zero by the end of the unit.
+
+</details>
+
+**Why did prototypes fix the half_old bug?**
+
+<details>
+<summary>Answer</summary>
+
+With a prototype in scope the compiler knows the parameter type and
+converts the argument to it (3 to 3.0). Without one it only applies the
+default promotions and passes an `int`.
+
+</details>
+
+## A11 Scope and Linkage
+
+### In one sentence
+
+**Scope** is the region of source in which a name is visible, and
+**linkage** decides whether the same name in different scopes or files
+refers to the same object or function: external linkage shares it across
+the whole program, internal linkage within one file, and no linkage not
+at all.
+
+### The idea
+
+Scope is a compile-time, one-file idea:
+
+- A name declared at file level is visible from its declaration to the
+  end of the file.
+- A name declared in a block (including a function's parameters) is
+  visible to the end of that block and hides any outer name with the
+  same spelling.
+- Labels have function scope.
+- There are separate **name spaces**: one for objects, functions,
+  typedef names and enum constants; one for labels; one for tags
+  (struct, union, enum); and one for the members of each structure or
+  union. So `struct point point;` is legal.
+
+Linkage is a whole-program idea:
+
+- Names at file level have **external** linkage by default, so every
+  file that declares them refers to one shared object or function.
+- `static` at file level gives **internal** linkage: the name is private
+  to the translation unit, and another file can use the same name for
+  something else.
+- Block-scope names have **no** linkage unless declared `extern`.
+
+The program must have exactly one definition of each externally linked
+object it uses. Every other file declares it with `extern`, normally via
+a header.
+
+### Worked example
+
+Two files. `counter.c` owns two objects:
+
+```c
+/* counter.c: one object with external linkage, one with internal */
+static int hits;                 /* internal: invisible outside this file */
+int total;                       /* external: one object for the program */
+
+void count(void) { hits++; total++; }
+int hits_here(void) { return hits; }
+```
+
+`main11.c` uses `total` and has its own, unrelated `hits`:
+
+```c
+/* main11.c */
+#include <stdio.h>
+extern int total;                /* declaration: defined in counter.c */
+void count(void);
+int hits_here(void);
+static int hits = 100;           /* a different object from counter.c's */
+
+int main(void)
+{
+    for (int i = 0; i < 3; i++) count();
+    printf("total %d, counter.c hits %d, main11.c hits %d\n", total, hits_here(), hits);
+    return 0;
+}
+```
+
+```text
+$ gcc -c counter.c main11.c && gcc -o link11 counter.o main11.o && ./link11
+total 3, counter.c hits 3, main11.c hits 100
+```
+
+The two `hits` never meet, because each has internal linkage. Now two
+files that both **define** the same external name:
+
+```text
+$ cat dup1.c dup2.c
+int shared = 1;
+int shared = 2;
+int main(void){return 0;}
+$ gcc dup1.c dup2.c -o dup 2>&1 | grep -o "multiple definition of .shared.\|collect2.*"
+multiple definition of `shared'
+collect2: error: ld returned 1 exit status
+```
+
+The compiler accepted each file on its own; only the linker, seeing the
+whole program, can find the clash.
+
+### Step by step
+
+<Layers caption="Where a name lives, from the narrowest reach to the widest. Each layer is a separate idea: scope is about visibility in the source, linkage about identity across files, and storage duration (A4) about lifetime." layers={[
+  { name: "Block scope, no linkage", note: "a local variable: visible to the closing brace, one per call unless static" },
+  { name: "Function scope", note: "goto labels: visible throughout the function" },
+  { name: "File scope, internal linkage", note: "static at file level: one object, private to the file" },
+  { name: "File scope, external linkage", note: "a plain global: one object for the whole program" },
+  { name: "The linked program", note: "every external name defined exactly once" },
+]} />
+
+<Figure art={`
+   counter.c                             main11.c
+  +---------------------------+         +---------------------------+
+  | static int hits;  (A)     |         | static int hits = 100; (B)|
+  | int total;        (T) ----+----+----+-- extern int total;       |
+  | void count(void)  (F) ----+----+----+-- void count(void);       |
+  +---------------------------+    |    +---------------------------+
+                                   v
+                       linker: T and F resolved once;
+                       A and B never leave their files
+`} caption="Linkage across two files. External names are matched by the linker; internal ones are invisible to it." />
+
+### Common mistake
+
+Defining a variable in a header: `int verbose = 0;` in `config.h`, which
+three `.c` files include. That is three definitions and a "multiple
+definition" link error. Without the initialiser, `int verbose;`, it was
+three tentative definitions, which older toolchains silently merged and
+GCC 10 onwards rejects by default. The rule: a header says
+`extern int verbose;`, and exactly one `.c` file says `int verbose = 0;`.
+
+### In real systems
+
+Making every file-level helper `static` is standard practice: it keeps
+the global namespace clean, lets the compiler inline or remove unused
+functions, and makes link errors impossible for those names. Shared
+libraries add visibility on top (`-fvisibility=hidden`, export maps), but
+the C-level split between internal and external linkage is still the
+foundation.
+
+### Check yourself
+
+**Two files each have `static int n;` at file level. How many objects
+called n exist?**
+
+<details>
+<summary>Answer</summary>
+
+Two. Internal linkage makes each one private to its file.
+
+</details>
+
+**What does `extern` do on a declaration inside a function?**
+
+<details>
+<summary>Answer</summary>
+
+It declares that the name refers to an object with linkage defined
+elsewhere (usually external), rather than creating a new automatic
+variable. The name is visible only within the block.
+
+</details>
+
+## A12 Preprocessing
+
+### In one sentence
+
+The preprocessor is a separate text-level pass that joins continued
+lines, removes comments, includes files, expands macros and keeps or
+drops lines under `#if`, all before the compiler proper sees a single
+declaration.
+
+### The idea
+
+The appendix describes the preprocessor in its own phases, and the
+order matters:
+
+1. **Trigraphs** (three-character spellings like `??=` for `#`, for
+   keyboards that lacked some characters) are replaced. GCC ignores them
+   unless you ask for a strict standard, and C23 removed them.
+2. **Line splicing**: a backslash at the end of a line joins it to the
+   next, which is how long macros are written.
+3. **Tokenising**: the text is cut into preprocessing tokens; comments
+   become single spaces.
+4. **Directives and macro expansion** are carried out.
+5. **Escapes** in character constants and strings are decoded, and
+   adjacent string literals are joined.
+
+The directives:
+
+- `#define name replacement` and `#define name(params) replacement`
+  define object-like and function-like macros. A function-like macro's
+  `(` must touch its name. `#undef` removes a definition.
+- In a replacement, `#param` turns the argument into a string literal
+  (**stringising**) and `a ## b` joins two tokens into one (**token
+  pasting**). Arguments next to `#` or `##` are not macro-expanded first;
+  all others are.
+- A macro is not re-expanded inside its own expansion, so recursion is
+  impossible and `#define foo foo` is harmless.
+- `#include "file"` searches the current directory first, then the
+  standard places; `#include <file>` searches only the standard places.
+- `#if`, `#elif`, `#else`, `#endif`, `#ifdef` and `#ifndef` select
+  lines. `#if` takes an integer constant expression, in which
+  `defined(name)` is 1 or 0 and any other unknown identifier is 0.
+- `#line` changes the reported line number and file name, `#error`
+  stops compilation with a message, `#pragma` passes an
+  implementation-specific request, and a lone `#` does nothing.
+- The predefined names `__LINE__`, `__FILE__`, `__DATE__`, `__TIME__`
+  and `__STDC__` are always available.
+
+### Worked example
+
+```c
+/* macros.c: what the preprocessor really does */
+#include <stdio.h>
+
+#define SQUARE_BAD(x) x * x
+#define SQUARE(x) ((x) * (x))
+#define STR(x) #x                       /* turn the argument into a string */
+#define XSTR(x) STR(x)                  /* expand first, then stringise */
+#define CAT(a, b) a##b                  /* paste two tokens into one */
+#define VERSION 3
+
+int main(void)
+{
+    int var1 = 11, n = 3;
+    printf("SQUARE_BAD(n + 1) = %d, SQUARE(n + 1) = %d\n", SQUARE_BAD(n + 1), SQUARE(n + 1));
+    printf("STR(VERSION) = %s, XSTR(VERSION) = %s\n", STR(VERSION), XSTR(VERSION));
+    printf("CAT(var, 1) = %d, line %d of %s\n", CAT(var, 1), __LINE__, __FILE__);
+#if VERSION >= 3 && defined(SQUARE)
+    printf("new code path\n");
+#else
+    printf("old code path\n");
+#endif
+    return 0;
+}
+```
+
+```text
+SQUARE_BAD(n + 1) = 7, SQUARE(n + 1) = 16
+STR(VERSION) = VERSION, XSTR(VERSION) = 3
+CAT(var, 1) = 11, line 16 of macros.c
+new code path
+```
+
+`gcc -E` shows the program the compiler actually received, and the first
+bug becomes obvious:
+
+```text
+$ gcc -E macros.c | grep "SQUARE_BAD(n + 1) ="
+    printf("SQUARE_BAD(n + 1) = %d, SQUARE(n + 1) = %d\n", n + 1 * n + 1, ((n + 1) * (n + 1)));
+```
+
+- `SQUARE_BAD(n + 1)` became `n + 1 * n + 1`, which is 3 + 3 + 1 = 7.
+  Bracketing each parameter and the whole body fixes it.
+- `STR(VERSION)` stringised the argument as written, because arguments
+  of `#` are not expanded. The two-level `XSTR` expands `VERSION` to 3
+  while passing it to `STR`, and only then stringises.
+- `CAT(var, 1)` pasted `var` and `1` into the single identifier `var1`.
+- The `#if` was evaluated by the preprocessor; the "old code path" line
+  never reached the compiler.
+
+### Step by step
+
+<Trace columns={["macro call", "after argument substitution", "after rescanning", "compiler sees"]} rows={[
+  ["SQUARE_BAD(n + 1)", "n + 1 * n + 1", "no macros left", "n + (1 * n) + 1"],
+  ["SQUARE(n + 1)", "((n + 1) * (n + 1))", "no macros left", "16 when n is 3"],
+  ["STR(VERSION)", "#VERSION, argument not expanded", "\"VERSION\"", "a string"],
+  ["XSTR(VERSION)", "STR(3), argument expanded first", "\"3\"", "a string"],
+  ["CAT(var, 1)", "var ## 1", "var1", "an identifier"],
+]} />
+
+### Common mistake
+
+Passing an expression with a side effect to a macro that uses its
+parameter twice: `SQUARE(i++)` becomes `((i++) * (i++))`, which modifies
+i twice with no sequence point, which is undefined (A7). Brackets cannot
+fix that; only a function can. That is why C99 added `inline`
+functions, which have a function's evaluation rules and a macro's speed.
+
+The other one: a multi-statement macro used after an `if`. The usual
+cure is to wrap its body in `do { ... } while (0)`, so it behaves like a
+single statement and still needs its semicolon.
+
+### In real systems
+
+Include guards (`#ifndef CONFIG_H` / `#define CONFIG_H` / `#endif`) or
+`#pragma once` stop a header being processed twice. Build systems pass
+`-DNAME=value` to steer `#if` blocks, which is how one source tree builds
+for many platforms. Stringising and pasting power assertion macros
+(`assert` prints its own expression text using `#`) and the
+"X-macro" trick, where one list of names generates an enum and its
+matching string table so they can never drift apart.
+
+### Check yourself
+
+**Why does `#define MAX(a, b) ((a) > (b) ? (a) : (b))` still misbehave
+for `MAX(x++, y)`?**
+
+<details>
+<summary>Answer</summary>
+
+The argument that wins appears twice in the expansion, so x may be
+incremented twice. Brackets fix precedence, not repeated evaluation.
+
+</details>
+
+**What does `#if FOO == 1` do when FOO was never defined?**
+
+<details>
+<summary>Answer</summary>
+
+An unknown identifier in `#if` is replaced by 0, so the test is false
+without any error. GCC warns about it with `-Wundef`.
+
+</details>
+
+## A13 Grammar
+
+### In one sentence
+
+The appendix ends with the whole C grammar collected in one place, in
+the A3 notation, in a form that a parser generator could accept with one
+adjustment for typedef names.
+
+### The idea
+
+The grammar repeats, in compact form, every rule given piece by piece
+through A7 to A10: translation unit, external declarations, declarations
+and declarators, statements, and expressions from the comma operator
+down to primary expressions. Its two great uses for a working programmer
+are settling arguments ("is `a = b ? c : d = e` legal?") and showing how
+precedence is really encoded.
+
+There is no precedence table in the grammar. Precedence comes from
+**nesting**: an additive expression is built from multiplicative
+expressions, which are built from cast expressions, and so on down. An
+operator lower in the chain binds tighter because its expressions are
+complete before the higher rule combines them. Left associativity comes
+from rules written as "additive-expression + multiplicative-expression":
+the left operand may itself be a sum, the right may not.
+
+The one wrinkle is typedef. Whether `T * x;` is a declaration of a
+pointer x or a multiplication of T by x depends on whether T is a
+typedef name, which the grammar alone cannot know. Every C compiler
+solves this by having the parser tell the tokeniser which names are
+currently typedefs, the so-called "lexer hack". The appendix notes that
+with typedef names recognised by the tokeniser, the grammar can be fed
+to yacc, the familiar `if`-`else` ambiguity being the one conflict
+left.
+
+### Worked example
+
+A grammar maps almost line for line onto a **recursive-descent** parser,
+one function per category. Here is a calculator for `+ - * /`, unary
+minus and brackets, written straight from a three-rule grammar. The
+first part reads primaries:
+
+```c
+/* calc.c: a parser written straight from a grammar */
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static const char *s;                 /* the input still to read */
+static long expr(void);
+
+static void skip(void) { while (isspace((unsigned char)*s)) s++; }
+
+static long primary(void)             /* primary: number | ( expr ) | - primary */
+{
+    skip();
+    if (*s == '(') { s++; long v = expr(); skip(); s++; return v; }
+    if (*s == '-') { s++; return -primary(); }
+    return strtol(s, (char **)&s, 10);
+}
+```
+
+The next two functions are the multiplicative and additive levels, each
+looping to get left associativity:
+
+```c
+/* calc.c, continued */
+static long term(void)                /* term: primary { (* | /) primary } */
+{
+    long v = primary();
+    for (skip(); *s == '*' || *s == '/'; skip()) {
+        char op = *s++;
+        long r = primary();
+        v = op == '*' ? v * r : v / r;
+    }
+    return v;
+}
+
+static long expr(void)                /* expr: term { (+ | -) term } */
+{
+    long v = term();
+    for (skip(); *s == '+' || *s == '-'; skip()) {
+        char op = *s++;
+        long r = term();
+        v = op == '+' ? v + r : v - r;
+    }
+    return v;
+}
+```
+
+And a driver with five test inputs:
+
+```c
+/* calc.c, continued */
+int main(void)
+{
+    const char *tests[] = { "1 + 2 * 3", "(1 + 2) * 3", "10 - 4 - 3", "-(2 + 3) * 4", "7 / 2" };
+    for (int i = 0; i < 5; i++) { s = tests[i]; printf("%-14s = %ld\n", tests[i], expr()); }
+    return 0;
+}
+```
+
+```text
+1 + 2 * 3      = 7
+(1 + 2) * 3    = 9
+10 - 4 - 3     = 3
+-(2 + 3) * 4   = -20
+7 / 2          = 3
+```
+
+Multiplication binds tighter because `expr` calls `term`, which finishes
+`2 * 3` before `expr` sees the `+`. `10 - 4 - 3` is 3, not 9, because the
+loop folds from the left, exactly like the grammar's left-recursive
+rule. Brackets work because `primary` calls back up to `expr`, the
+grammar's one loop back to the top.
+
+### Step by step
+
+<Trace columns={["call", "input left", "returns", "note"]} rows={[
+  ["expr", "1 + 2 * 3", "", "calls term"],
+  ["term, then primary", "1 + 2 * 3", "1", "no * or / follows"],
+  ["expr sees +", "2 * 3", "", "calls term for the right side"],
+  ["term, then primary", "2 * 3", "2", "sees *"],
+  ["primary", "3", "3", "term returns 2 * 3 = 6"],
+  ["expr", "(empty)", "7", "1 + 6"],
+]} />
+
+<Layers caption="How the grammar encodes precedence by nesting. Each category is made of the one below it, so the lower a category, the tighter its operator binds. The chain from A13, shortened." layers={[
+  { name: "expression", note: "assignment expressions separated by commas" },
+  { name: "assignment-expression", note: "conditional, or unary-expression op= assignment-expression (right recursive: right to left)" },
+  { name: "conditional-expression", note: "logical-OR ? expression : conditional" },
+  { name: "logical-OR down to equality", note: "one level per operator group, each left recursive" },
+  { name: "relational, shift, additive, multiplicative", note: "additive-expression + multiplicative-expression, and so on" },
+  { name: "cast-expression", note: "( type-name ) cast-expression" },
+  { name: "unary-expression", note: "++, --, unary operators, sizeof" },
+  { name: "postfix-expression", note: "calls, subscripts, members, postfix ++ --" },
+  { name: "primary-expression", note: "identifier, constant, string, ( expression ): back to the top" },
+]} />
+
+### Common mistake
+
+Thinking `a ? b : c = d` assigns to the result of the conditional. In C
+the conditional's third operand is a conditional expression, not an
+assignment, so the parse fails and GCC reports "lvalue required as left
+operand of assignment" (the whole conditional ends up on the left of the
+`=`, and it is not an lvalue). C++ has a different grammar here and
+accepts it. If you mean to assign in one branch, bracket it:
+`a ? b : (c = d)`.
+
+### In real systems
+
+GCC and Clang both use hand-written recursive-descent parsers for C
+rather than yacc-generated ones (GCC switched years ago), because
+error messages and recovery are easier to control, but the structure
+follows this grammar closely. The same recursive-descent pattern is how
+most configuration-file parsers, query languages and template engines
+are written; once you can write `calc.c`, you can write those.
+
+### Check yourself
+
+**How would you make `^` (power) bind tighter than `*` and associate
+right to left in calc.c?**
+
+<details>
+<summary>Answer</summary>
+
+Add a level between `term` and `primary`: `power: primary [ ^ power ]`.
+The function parses a primary, and if it sees `^`, calls itself
+recursively for the right operand. Recursion on the right gives right
+associativity.
+
+</details>
+
+**Why can the parser not decide `T * x;` without help?**
+
+<details>
+<summary>Answer</summary>
+
+Both readings fit the grammar: a declaration if T is a typedef name, an
+expression statement if T is a variable. Only the symbol table knows
+which, so the tokeniser must ask it.
+
+</details>
+
+## Appendix C: Summary of Changes
+
+### In one sentence
+
+Appendix C lists, briefly, how the C of the ANSI standard differs from
+the language described in the book's first edition: a stronger type
+system around functions, a few new types and qualifiers, a more capable
+preprocessor, tightened rules in a few dark corners, and a defined
+standard library.
+
+### The idea
+
+The book groups the changes loosely; by theme they are these.
+
+**The preprocessor got more precise and more powerful.** Its behaviour
+was specified much more carefully. New were `#elif` and `#pragma`, the
+`defined` operator, the `#` and `##` operators, adjacent string literal
+concatenation, and trigraphs. Macro arguments are now handled by tokens,
+not by text inside strings.
+
+**Functions got prototypes.** The biggest change by far. A declaration
+can state the parameter types, and calls are then checked and arguments
+converted. Old-style declarations and definitions remained legal for
+compatibility, and the book recommends against them in new code.
+Variable-length argument lists got a portable form (`...` and
+`stdarg.h`).
+
+**New types and qualifiers.** `void` (for functions without a value and
+for the generic pointer `void *`), `signed` (so `signed char` exists),
+`long double`, `unsigned` forms of every integer type, enumerations,
+and the qualifiers `const` and `volatile`. Integer constants gained the
+`u` and `l` suffixes and floating constants `f` and `l`; character
+constants got `\a`, `\v`, `\?` and hex `\x` escapes.
+
+**Structures became values.** They can be assigned, passed to and
+returned from functions, and automatic arrays, structures and unions can
+be initialised.
+
+**Several rules were tightened or clarified.**
+
+- Arithmetic on `float` may be done in single precision, where the
+  first edition said all floating arithmetic was double.
+- The old `=+` style of compound assignment is gone; `x=-1` now means
+  `x = -1`.
+- 8 and 9 are no longer accepted as octal digits.
+- Promotion of small unsigned types became **value-preserving**:
+  `unsigned char` and `unsigned short` promote to `int` when `int` can
+  hold them, where many earlier compilers promoted them to `unsigned`.
+- String literals may not be modified, and identical literals may share
+  storage.
+- Pointer and integer mixing, and mixing pointer types, need explicit
+  casts.
+- Names have explicitly defined scopes and the external-declaration rules
+  (definition, tentative definition, `extern`) were clarified.
+- The keyword `entry` was dropped.
+
+**The library became part of the language.** Appendix B describes it:
+the headers and functions every hosted implementation must provide.
+
+### Worked example
+
+The value-preserving rule is the change that silently altered existing
+programs, so it is worth seeing:
+
+```c
+/* promote.c: value-preserving promotion of unsigned char */
+#include <stdio.h>
+
+int main(void)
+{
+    unsigned char uc = 1;
+    int n = -2;
+    printf("uc + n = %d, uc + n < 0? %d\n", uc + n, uc + n < 0);
+    unsigned int ui = 1;
+    printf("ui + n < 0? %d\n", ui + n < 0);
+    return 0;
+}
+```
+
+```text
+uc + n = -1, uc + n < 0? 1
+ui + n < 0? 0
+```
+
+`uc` is promoted to `int`, because `int` holds every `unsigned char`
+value, so `uc + n` is a signed -1. Under the older unsigned-preserving
+rule it would have been promoted to `unsigned`, and the sum would have
+been a huge positive number. A real `unsigned int` still behaves the old
+way: `ui + n` is unsigned, never negative (GCC's `-Wextra` warns that the
+comparison is always false).
+
+### Step by step
+
+<Timeline caption="The language this appendix describes, set in its history. Appendix C covers only the first step; the later standards are summarised here because the compiler on your machine follows one of them." items={[
+  { when: "1978", what: "The first edition of the book is the informal definition of C." },
+  { when: "1988", what: "The second edition, written against the draft ANSI standard. Appendix C lists the differences from the first edition's language." },
+  { when: "1989 to 1990", what: "C89, the ANSI standard, adopted by ISO as C90. Prototypes, void, const, the standard library." },
+  { when: "1999", what: "C99: // comments, long long, mixed declarations and code, designated initialisers, inline, variable-length arrays, stdint.h, bool." },
+  { when: "2011", what: "C11: _Static_assert, _Generic, anonymous structs and unions, threads and atomics; gets removed." },
+  { when: "2018", what: "C17: a bug-fix revision of C11, no new features. GCC 14's default dialect, gnu17, is based on it." },
+  { when: "2024", what: "C23: old-style definitions and trigraphs removed, () means no parameters, bool, true and false become keywords, [[attributes]], nullptr, typeof." },
+]} />
+
+<Compare left="First edition style" right="ANSI prototype style" caption="One function declared both ways. The left column is the first edition's style, still legal in ANSI C; the right is the prototype style appendix C introduces." rows={[
+  ["double half();  says nothing about parameters", "double half(double x);  states the parameter type"],
+  ["double half(x) double x; { ... }", "double half(double x) { ... }"],
+  ["half(3) passes an int, and the result is garbage", "half(3) converts 3 to 3.0 first"],
+  ["no check on number or type of arguments", "wrong number of arguments is a compile error"],
+  ["removed in C23", "the only style in C23"],
+]} />
+
+### Common mistake
+
+Reading older code as if it were modern C. Code written for the first
+edition's language may depend on unsigned-preserving promotion, on
+writable string literals (`char *s = "abc"; s[0] = 'x';` now crashes
+on most systems, because literals live in read-only memory), or on
+calling functions without declarations. When maintaining such code,
+compile it with `-Wall -Wextra -Wstrict-prototypes` first and read every
+warning.
+
+### In real systems
+
+C has always changed slowly and conservatively, and appendix C shows the
+pattern that every later standard followed: keep old programs compiling
+where possible, deprecate rather than delete, and standardise what good
+compilers already did. That is why a modern compiler still accepts most
+1988 code and why the book's ANSI C is still a solid foundation: almost
+everything it teaches is still true, and the additions since are
+extensions, not replacements.
+
+### Check yourself
+
+**Under ANSI C, what type does `unsigned short` promote to on a machine
+where `short` is 16 bits and `int` is 32?**
+
+<details>
+<summary>Answer</summary>
+
+`int`, because `int` can represent every `unsigned short` value. That is
+the value-preserving rule.
+
+</details>
+
+**Why does `char *s = "abc"; s[0] = 'x';` crash today when it may have
+worked in 1978?**
+
+<details>
+<summary>Answer</summary>
+
+ANSI C made modifying a string literal undefined so that compilers could
+place literals in read-only memory and share identical ones. Most
+systems now do exactly that, so the write faults.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Appendix A, Reference Manual">
+<Level name="Beginner" depth={3}>
+
+The beginner's job with a reference manual is to learn how to look
+things up, not to memorise it. Four facts give most of the value:
+
+- Tokens are cut greedily, so spaces around operators matter.
+- Small integers become `int` before arithmetic, and mixing signed with
+  unsigned of the same width makes everything unsigned.
+- Precedence decides grouping, not order of evaluation; bracket bitwise
+  operators inside comparisons.
+- Declarations read inside out, from the name.
+
+A beginner's worked example is to take one surprising line and explain
+it entirely from the manual. Take `if (-1 < sizeof(int))`, which is
+false. A7 says `<` applies the usual arithmetic conversions; A6 says
+that with an `int` and an unsigned type at least as wide, the `int`
+becomes unsigned; A6 also says -1 converted to unsigned is the largest
+value. Three sections, one line explained, and the fix,
+`if (-1 < (long)sizeof(int))` or simply not mixing the types, follows
+from the same rules.
+
+The beginner's mistake is reading the appendix front to back in one
+sitting and retaining nothing. Read A2, A6 and A7 first, each with a
+compiler open, and come back to the rest when a question sends you
+there.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate step is building every declaration and every
+conversion yourself, and predicting compiler warnings before you see
+them. That means reading `-Wall -Wextra` output as rule citations:
+`-Wsign-compare` is A6, `-Wparentheses` is A7's precedence table,
+`-Wsequence-point` is A7's evaluation rule, `-Wimplicit-fallthrough` is
+A9's `switch`, "multiple definition" is A11.
+
+An intermediate exercise that pays off: write the declarations of
+`signal`, `qsort` and `bsearch` from their descriptions alone, then
+compare with the headers. `qsort` takes a `void *` base, two `size_t`
+values and a pointer to a function taking two `const void *` and
+returning `int`; writing that out by the inside-out rule, without
+looking, is the real test of A8.
+
+The intermediate mistake is to treat GCC's behaviour as the language.
+GCC is one implementation; build the same file with Clang and with
+`-std=c11 -pedantic` and see what changes. Anything that changes is
+implementation-defined, unspecified, undefined or an extension, and the
+manual tells you which.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level the manual becomes a tool for reasoning about
+optimisers. The compiler is allowed to assume that no undefined
+behaviour happens, and it uses that assumption to delete code. A loop
+`for (int i = 0; i <= n; i++)` cannot overflow i, so the compiler may
+assume it terminates; a pointer that was dereferenced cannot be null
+afterwards, so a later null check may be removed.
+
+Two advanced topics sit just past the book's edge but grow directly out
+of A5 and A7. **Aliasing**: the standard lets the compiler assume that
+pointers to different types do not point to the same object (with
+exceptions for character types), so reading a `float` through an
+`int *` is undefined, and `memcpy` is the correct way to reinterpret
+bits. **Sequence points**, renamed "sequenced before" in C11, are the
+formal basis of the rule that `i = i++` is undefined, and of the newer
+memory model for threads.
+
+The advanced practice is to build test programs with
+`-fsanitize=undefined,address` and with `-O0` and `-O2`, and to treat any
+difference in output between optimisation levels as proof of undefined
+behaviour somewhere.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases in the reference manual are values at the boundaries of
+types. The program below runs without complaint and prints numbers that
+look plausible; both are undefined:
+
+```c
+/* ub.c: undefined behaviour that runs "fine" until checked */
+#include <limits.h>
+#include <stdio.h>
+
+int main(int argc, char *argv[])
+{
+    (void)argv;
+    int big = INT_MAX - 1 + argc;       /* INT_MAX when run with no arguments */
+    int next = big + 1;                 /* signed overflow: undefined */
+    int shift = 1 << (31 + argc - 1);   /* 1 << 31 does not fit an int */
+    printf("next = %d, shift = %d\n", next, shift);
+    return 0;
+}
+```
+
+```text
+$ gcc -fsanitize=undefined -o ubs ub.c && ./ubs
+ub.c:9:9: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+ub.c:10:19: runtime error: left shift of 1 by 31 places cannot be represented in type 'int'
+next = -2147483648, shift = -2147483648
+```
+
+The values are computed from `argc` so the compiler cannot fold them at
+compile time and warn. Without the sanitizer, the program prints the
+same last line and says nothing. Other boundary cases worth testing
+once: `INT_MIN / -1` (overflow, usually a crash), `INT_MIN % -1`
+(likewise), `abs(INT_MIN)` (overflow), shifting by the width of the type,
+and converting a `double` like 1e20 to `int`.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases are where two rules meet. A few that the appendix
+settles if you read it closely:
+
+- `sizeof` of a parameter declared as an array gives the size of a
+  pointer, because A8 says array parameters are adjusted to pointers.
+- `char c = 200;` on a signed-char machine gives an
+  implementation-defined value (usually -56), and `c == 200` is then
+  false because of promotion.
+- A bit-field declared plain `int` may be signed or unsigned, at the
+  implementation's choice, so a 1-bit `int` field may only hold 0 and -1.
+  Always declare bit-fields `unsigned` or `signed` explicitly.
+- `struct s;` at block scope declares a new, incomplete struct type that
+  hides any outer one with the same tag, which is how mutually
+  referring structures can be set up.
+- A string literal used to initialise a `char` array of exactly its
+  length without the terminator (`char s[3] = "abc";`) is legal in C and
+  leaves s unterminated; C++ rejects it.
+- An enumeration constant is an `int`, but the enum type itself may be
+  any integer type the compiler chooses that can hold all the values.
+
+None of these is common, and each is a real bug report somewhere.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production the reference manual turns into policy. A typical C
+project's build adds:
+
+- `-std=c11` (or c17) explicitly, so a compiler upgrade does not change
+  the dialect.
+- `-Wall -Wextra -Werror` in CI, plus `-Wconversion` and
+  `-Wstrict-prototypes` for the strictest modules.
+- `_Static_assert` checks on the implementation-defined facts the code
+  relies on: `CHAR_BIT == 8`, `sizeof(int) == 4`, struct sizes that match
+  file formats.
+- Sanitizer builds (`address`, `undefined`) run on the test suite.
+- A rule that every file-level name is `static` unless it is in a
+  header, and that headers declare with `extern` but never define.
+
+The production mistake is turning warnings off to make the build pass.
+Each warning in this appendix's territory cites a rule; suppressing it
+leaves the bug in place with nothing to point at it.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset this appendix teaches is that C is a contract with three
+kinds of clause: things it guarantees, things each compiler must
+document, and things you must never do. A working C programmer keeps
+those apart and knows which one a line of code relies on.
+
+It also teaches humility about intuition. The rules for conversions,
+precedence and declarations are small, but they compose in ways that
+surprise everyone; the professional response is to check, with the
+manual and a compiler, rather than to argue from what seems natural. A
+two-line test program settles most questions faster than a discussion.
+
+And it teaches that the definition is a feature. A language small enough
+to describe in one appendix is a language you can know completely,
+which is what makes C a good language for learning how machines work.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, A10 and A11 are about how a program is divided
+into parts. Linkage is C's only module system: a header is a module's
+interface, `static` is its private section, and the linker is the module
+loader. Good C systems design is mostly the discipline of using that
+small system well:
+
+- one header per module, declaring only what other modules need;
+- every other function and object `static`;
+- opaque types (`struct parser;` in the header, its members only in the
+  `.c` file) so callers cannot depend on the layout;
+- no global variables shared across modules except, rarely, through a
+  getter function.
+
+The other system-design lesson is about binary interfaces. Struct
+layout (A8), integer sizes (A4) and calling conventions are what two
+separately compiled pieces must agree on. Shared libraries, network
+protocols and file formats all fix those explicitly, with fixed-width
+types from `stdint.h`, explicit padding and byte-order conversion,
+rather than trusting whatever a compiler does by default.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy for this appendix is to use it as a lookup table you
+have walked through once, not as a book to finish. Read it once with a
+compiler, section by section, writing a test program for every rule that
+surprises you; keep those programs, because together they become a
+personal test suite of the language. After that, come back with
+questions: every confusing compiler message, every code review argument
+about evaluation order, every port to a new platform.
+
+This is also where to decide what comes next. C99 and C11 added enough
+(`stdint.h`, `bool`, designated initialisers, `_Static_assert`, atomics)
+that a modern reference is worth having alongside the book; a good
+second book covers those additions while keeping K&R's precision. The
+standard itself (the final drafts are freely available) is the last
+step, and after this appendix it reads far more easily than its size
+suggests.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Do I need to read appendix A to use C?** Not to start. Chapters 1 to 8
+are enough to write programs. You need it the first time a program
+behaves in a way the chapters do not explain, which usually happens
+within weeks.
+
+**Is appendix A the C standard?** No. It is the authors' condensed
+reading of the ANSI standard, for programmers. Where they differ, the
+standard is right.
+
+**Is the appendix still accurate for modern C?** Almost all of it, for
+the language it describes. Later standards added features (`long long`,
+`bool`, mixed declarations, `//` comments, designated initialisers) and
+removed a few things (old-style definitions, trigraphs in C23), but they
+rarely changed the meaning of existing rules.
+
+**Why are so many things undefined in C?** So that compilers can
+generate fast code for very different machines without checking for
+every possible error at run time. The cost is that the programmer must
+avoid those cases.
+
+**What is the best way to find undefined behaviour in my code?** Compile
+with `-Wall -Wextra`, run tests under `-fsanitize=undefined,address`, and
+compare outputs at `-O0` and `-O2`.
+
+**Why does `char` signedness differ between machines?** The standard
+leaves it to the implementation so each platform can pick what its
+hardware loads most efficiently; x86 compilers chose signed and most ARM
+compilers unsigned.
+
+**What should I use instead of old-style definitions?** Prototypes
+everywhere, including `(void)` for functions with no parameters, and
+`-Wstrict-prototypes` to enforce it.
+
+## Key takeaways
+
+- Source is processed in phases: line splicing, tokenising, preprocessing, string joining, parsing, linking.
+- Tokens are cut by maximal munch, and integer constants get the first type that holds their value, differently for decimal and hex.
+- Character constants are `int`; string literals are arrays with a terminator and are joined when adjacent.
+- Automatic objects live per block and start as garbage; static objects live for the program and start as zero.
+- An lvalue names an object; arrays and const objects are lvalues that cannot be assigned.
+- Small integer types are promoted to `int`; the usual arithmetic conversions pick a common type, and unsigned wins ties.
+- Precedence decides grouping; only `&&`, `||`, `?:` and the comma fix evaluation order; modifying an object twice without a sequence point is undefined.
+- Declarations mirror use and read inside out; typedef names a type, it does not create one.
+- Scope is visibility in a file, linkage is identity across files, and every external object needs exactly one definition.
+- Macros are text substitution with tokens: bracket parameters and bodies, and never pass side effects.
+- The grammar encodes precedence by nesting categories, and maps directly onto a recursive-descent parser.
+- ANSI C's main changes were prototypes, `void`, `const`, value-preserving promotion, a better preprocessor and a standard library.
+
+## Glossary
+
+- **Translation unit**: one source file together with everything it includes.
+- **Token**: the smallest meaningful unit of source: identifier, keyword, constant, string literal, operator or separator.
+- **Maximal munch**: the rule that the tokeniser always takes the longest possible token.
+- **Undefined behaviour**: a construct for which the language imposes no requirements.
+- **Implementation-defined**: behaviour each compiler must choose and document.
+- **Unspecified**: behaviour chosen from allowed options, possibly differently each time, without documentation.
+- **Storage class**: automatic or static; decides an object's lifetime.
+- **Qualifier**: `const` or `volatile`, adding properties to a type.
+- **Object**: a region of storage.
+- **Lvalue**: an expression that designates an object.
+- **Modifiable lvalue**: an lvalue that may be assigned to: not an array, not const.
+- **Integral promotion**: converting `char`, `short`, bit-fields and enums to `int` or `unsigned int` before arithmetic.
+- **Usual arithmetic conversions**: the rules that bring two operands to a common type.
+- **Decay**: the conversion of an array to a pointer to its first element, or a function to a pointer to it.
+- **Sequence point**: a point at which all side effects of earlier evaluation are complete, such as the end of a full expression or after `&&`.
+- **Short-circuit evaluation**: `&&` and `||` skipping their right operand when the left decides the result.
+- **Specifier**: the part of a declaration giving storage class, type and qualifiers.
+- **Declarator**: the part naming an identifier and wrapping its type in pointer, array and function layers.
+- **Abstract declarator / type name**: a declarator with the identifier removed, as in a cast.
+- **Prototype**: a function declaration that states its parameter types.
+- **Tentative definition**: a file-level object declaration without an initialiser or `extern`.
+- **Scope**: the region of program text in which a name is visible.
+- **Linkage**: whether names in different scopes or files refer to the same thing: external, internal or none.
+- **Name space**: a separate set of identifiers: ordinary names, labels, tags and members of each struct.
+- **Stringising**: the `#` operator turning a macro argument into a string literal.
+- **Token pasting**: the `##` operator joining two tokens into one.
+- **Recursive descent**: a parsing technique with one function per grammar category.
+- **Value-preserving promotion**: ANSI C's rule that small unsigned types promote to `int` when it can hold all their values.
+
+## Exercises and self-check
+
+These are my own exercises. The appendix has none, so these are the
+practice.
+
+**Warm-up (by hand)**
+
+1. Tokenise `a+++++b`, `a-->b`, `x/*p` and `y = x/ *p;`, and say which
+   compile.
+2. Give the type of each constant on a machine with 32-bit `int` and
+   64-bit `long`: `100`, `100u`, `3000000000`, `0xFFFFFFFF`, `'x'`,
+   `1.0f`, `1e3`.
+3. Write the common type and value of `-1 + 1u`, `(short)-1 * 2u`,
+   `'a' + 1.0f` and `7 / 2 * 2.0`.
+4. Read aloud: `int *(*f)(int *)`, `void (*t[4])(void)`,
+   `char *(*(*g)(void))[8]`.
+
+**Build (write and test)**
+
+5. Write a program that prints, for every integer type, its size, its
+   minimum and maximum, and whether plain `char` is signed, then run it
+   under `-m32` if your toolchain supports it.
+6. Write a `cdecl`-style program that reads a simple declaration (pointer,
+   array, function, base type) and prints it in English, using the
+   inside-out rule.
+7. Extend `calc.c` with `%`, a right-associative `^`, and error messages
+   for a missing bracket or an unexpected character, with the position.
+8. Split a small program into three files with one header, make every
+   non-interface name `static`, and confirm with `nm` that only the
+   interface names are external.
+
+**Stretch (change the problem)**
+
+9. Collect ten programs whose output changes between `-O0` and `-O2`
+   or between GCC and Clang, and for each one name the rule in this
+   appendix that makes it undefined, unspecified or
+   implementation-defined.
+10. Write a tokeniser for C itself that handles identifiers, numbers,
+    strings with escapes, comments and maximal munch for operators, and
+    test it on its own source.
+
+**Self-check**
+
+<details>
+<summary>Why is `x+++++y` a syntax error?</summary>
+
+Maximal munch cuts it into `x ++ ++ + y`, and the second `++` is applied
+to `x++`, which is not an lvalue.
+
+</details>
+
+<details>
+<summary>What is the type of `0x80000000` with 32-bit int?</summary>
+
+`unsigned int`. Hex constants try `unsigned int` before `long`, and the
+value fits.
+
+</details>
+
+<details>
+<summary>Why is `-1 < 0u` false?</summary>
+
+The usual arithmetic conversions make -1 an `unsigned int`, the largest
+value, which is not less than 0.
+
+</details>
+
+<details>
+<summary>What does `a & b == c` compute?</summary>
+
+`a & (b == c)`, because equality binds tighter than bitwise AND.
+
+</details>
+
+<details>
+<summary>What is the difference between `int *ap[3]` and `int (*pa)[3]`?</summary>
+
+The first is an array of three pointers to int; the second is one
+pointer to an array of three ints.
+
+</details>
+
+<details>
+<summary>Why does `static` at file level fix a "multiple definition" error?</summary>
+
+It gives the name internal linkage, so each file's object is private and
+the linker never sees two definitions of one external name.
+
+</details>
+
+<details>
+<summary>Why must a function-like macro bracket each use of its parameters?</summary>
+
+Arguments are substituted as tokens, so an argument like `n + 1` can
+regroup with the surrounding operators; brackets keep it one operand.
+
+</details>
+
+<details>
+<summary>What was the most important change appendix C describes?</summary>
+
+Function prototypes: declarations that state parameter types, so calls
+are checked and arguments converted.
+
+</details>
+
+## How I'd study this chapter
+
+This appendix belongs to
+<a href={withBase('/plans/traditional-software-developer/#phase-5--computer-architecture-and-c')}>phase 5</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, where C is the language for understanding the machine;
+the conversion and layout rules here are exactly what the architecture
+book in that phase explains from the hardware side. I give it four
+sessions and then use it as a reference.
+
+<Timeline caption="Four sessions for appendix A and appendix C, each ending with a folder of small programs that test the rules just read." items={[
+  { when: "Session 1", what: "A1 to A6. Write tokens.c, facts.c, storage.c, lval.c and conv.c. Predict each output before running, and keep a list of every prediction I got wrong." },
+  { when: "Session 2", what: "A7 and A8. Write exprs.c, decls.c and layout.c. Draw the precedence table from memory, then read ten declarations from real headers aloud." },
+  { when: "Session 3", what: "A9 to A12. Write sw.c, cleanup.c, the two-file linkage test and macros.c. Run gcc -E on a real program and read the output." },
+  { when: "Session 4", what: "A13 and appendix C. Write calc.c from the grammar, add ^ and %, then build oldstyle.c under -std=c89 and -std=c23 and explain the difference." },
+]} />
+
+Everything goes into `kr-appA/`, built with
+`-std=c11 -Wall -Wextra -fsanitize=address,undefined -g`, and each
+program also once at `-O2` without sanitizers to catch output that
+depends on undefined behaviour.
+
+Done when I can explain, from the rules and without running it, the
+output of every program on this page, and when every warning
+`-Wall -Wextra` gives me reads as a section number.
