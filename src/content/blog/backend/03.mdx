@@ -1,0 +1,913 @@
+---
+title: "A router and middleware without a framework"
+series: "backend"
+seriesOrder: 3
+undated: true
+readTime: "about 25 min"
+description: "Build a router with path parameters, 404 and 405, and a middleware chain with next(), in plain Node, to see exactly what Express, Koa and Hono do for you."
+tags: ['http', 'architecture', 'functions']
+related: ['backend/01', 'backend/02']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+The first time a framework's middleware ran in an order I did not expect,
+I had no way to reason about it, because I had never seen what
+"middleware" is underneath. It turns out to be about forty lines: a table
+of routes, a function that matches a path against it, and a function that
+calls a list of functions, each holding the next one. This note builds
+both in plain Node and runs them, so the framework stops being a black box.
+
+## Before you start
+
+After this note you will be able to:
+
+- write a router that matches a method and a path, extracts path
+  parameters, and tells 404 Not Found apart from 405 Method Not Allowed;
+- explain why route order and specificity matter, and where the classic
+  "`/notes/new` matched `/notes/:id`" bug comes from;
+- write `compose`, the function behind Koa-style middleware, and trace the
+  "onion" order in which code before and after `next()` runs;
+- put request ids, logging, error handling and auth into middleware in an
+  order that actually works;
+- spot the two classic middleware bugs: calling `next()` twice and
+  forgetting to `await` it.
+
+What you should already know: the request and response objects from
+[the first note](/sanjay/posts/backend/01/), status codes from
+[the second](/sanjay/posts/backend/02/), and `async`/`await`.
+
+Reading time: about 25 minutes.
+
+## Note map
+
+<Flow steps={[
+  "Request arrives: Node gives method, URL and headers",
+  "Router: match the method and path, collect params, or decide 404 or 405",
+  "Middleware chain: request id, logging, errors, auth, each wrapping the next",
+  "Handler: the one function that does this route's work",
+  "Unwind: each middleware's after-next code runs in reverse order",
+  "Tests: match and compose are pure functions, tested without a network",
+]} caption="Where the two pieces sit. The router picks the handler; the middleware chain decides what runs around it. Frameworks fuse these, but they are separate ideas." />
+
+## What a router is
+
+### In one sentence
+
+A router is a lookup from a method and a path to a function, plus the
+honest answers when the lookup fails.
+
+### The idea
+
+Without a router, a Node server is one function that receives every
+request. That function has to look at `req.method` and `req.url` and
+decide what to do, and with three endpoints that is a tidy `if` chain. With
+thirty endpoints, the chain becomes the most edited, most conflicted and
+least tested code in the project.
+
+A **route** is a triple: a method, a **path pattern**, and a **handler**.
+The pattern is a path with some segments marked as variables, such as
+`/notes/:id`, where `:id` matches any one segment and makes it available
+as a **path parameter**. A **router** stores routes and, for each request,
+finds the one whose method and pattern fit.
+
+The lookup has three possible outcomes, and a correct router
+distinguishes all of them. A route matches the path and the method: run
+it. Some route matches the path but not the method: answer 405 with an
+`Allow` header listing the methods that would work. No route matches the
+path at all: answer 404. Lumping the second case into the first-or-third
+is the most common router bug in hand-rolled servers.
+
+The URL also needs care before matching. The path is the part before `?`;
+the **query string** after it is not part of routing. And segments arrive
+**percent-encoded**: a space is `%20`, a slash inside a value is `%2F`. The
+router should split on real slashes first and decode each segment after,
+or `/files/a%2Fb` turns into three segments instead of two.
+
+### Worked example
+
+The simple case is the `if` chain I am replacing:
+
+```ts
+if (req.method === 'GET' && req.url === '/health') return health(req, res);
+if (req.method === 'GET' && req.url?.startsWith('/notes/')) return getNote(req, res);
+res.writeHead(404).end();
+```
+
+It already has two bugs. `req.url` includes the query string, so
+`/health?probe=1` falls through to 404. And `startsWith('/notes/')` also
+matches `/notes/42/comments/7`, sending a comments request into the note
+handler.
+
+The realistic case is a route table. Each route is stored with its path
+already split into segments, which is the shape the matcher wants:
+
+```ts
+type Route = { method: string; parts: string[]; handler: Handler };
+const routes: Route[] = [];
+const add = (method: string, path: string, handler: Handler) =>
+  routes.push({ method, parts: path.split('/').filter(Boolean), handler });
+
+add('GET', '/health', health);
+add('GET', '/notes/:id', getNote);
+add('DELETE', '/notes/:id', deleteNote);
+```
+
+`'/notes/:id'.split('/')` gives `['', 'notes', ':id']`, and
+`filter(Boolean)` drops the empty first piece, so the stored parts are
+`['notes', ':id']`. Splitting once at registration keeps the per-request
+work small.
+
+### Step by step
+
+<Trace
+  columns={["request", "path after URL parsing", "segments", "outcome"]}
+  rows={[
+    ["GET /health?probe=1", "/health", "health", "match: health"],
+    ["GET /notes/42", "/notes/42", "notes, 42", "match: getNote, id = 42"],
+    ["POST /notes/42", "/notes/42", "notes, 42", "path matches, method does not: 405, Allow: GET, DELETE"],
+    ["GET /notes/42/comments", "/notes/42/comments", "notes, 42, comments", "no pattern has three segments: 404"],
+    ["GET /notes/a%20b", "/notes/a%20b", "notes, a%20b", "match: getNote, id = a b after decoding"],
+  ]}
+  caption="Five requests through the table. Read the last column: the router has three distinct answers, and the 405 row is the one an if-chain usually gets wrong."
+/>
+
+### Common mistake
+
+The common mistake is matching on `req.url` directly. It contains the
+query string, it is still percent-encoded, and it can contain `..` or
+double slashes. The fix is to parse it first with
+`new URL(req.url, 'http://placeholder')` and route on `url.pathname`,
+reading parameters from `url.searchParams`.
+
+<Compare left="Matching req.url" right="Matching url.pathname" caption="The same three requests matched two ways. The right column treats the query string as data and decodes segments after splitting." rows={[
+  ["/health?probe=1 misses /health", "/health matches; probe is a search param"],
+  ["/notes/a%20b gives id a%20b", "id is decoded to a b"],
+  ["/files/a%2Fb split into a and b", "split first, then decode: one segment a/b"],
+]} />
+
+### In real systems
+
+Every framework router does these steps. Express walks a list of routes
+compiled to regular expressions, in registration order. Fastify and Hono
+build a **radix tree**, a tree keyed on shared path prefixes, so lookup
+cost depends on the path length rather than the number of routes. All of
+them parse the URL first, and most offer a 405 behaviour, sometimes behind
+an option.
+
+### Check yourself
+
+<details>
+<summary>1. Why is 405 better than 404 for POST /notes/42 when only GET and DELETE exist?</summary>
+
+404 says the resource does not exist, which is false and sends the
+developer hunting for a typo in the path. 405 with `Allow: GET, DELETE`
+says the path is right and lists the methods that work.
+
+</details>
+
+<details>
+<summary>2. Why split on slashes before percent-decoding?</summary>
+
+An encoded slash, `%2F`, is part of a value, not a separator. Decoding
+first would turn it into a real slash and split one parameter into two
+segments.
+
+</details>
+
+## Matching patterns and parameters
+
+### In one sentence
+
+Matching compares a request's segments with each pattern's segments one by
+one, where a literal must be equal and a `:name` matches anything and
+records it.
+
+### The idea
+
+With paths stored as segment arrays, matching is a loop. Two arrays of
+different lengths cannot match, so that check comes first and is cheap.
+For equal lengths, each pattern segment is either a **literal**, which must
+equal the request's segment exactly, or a **parameter**, which accepts any
+non-empty segment and stores it under its name.
+
+While scanning, the matcher also remembers every route whose path fitted
+but whose method did not. If no route fits both, that list decides between
+405 (the list is not empty) and 404 (it is empty). That one extra list is
+the whole difference between an honest router and a sloppy one.
+
+The last idea is **precedence**: when two patterns could match the same
+path, which wins? `/notes/new` and `/notes/:id` both fit `/notes/new`. A
+list-based router picks whichever was registered first. A tree-based router
+usually prefers the literal over the parameter, regardless of order. Either
+way, the rule must be known, because the wrong winner gives a confusing
+bug: the "new note" form handler never runs, and instead the note handler
+tries to load a note whose id is the word "new".
+
+### Worked example
+
+Here is the matcher I ran for this note. It returns the route and params,
+or the list of allowed methods:
+
+```ts
+function match(method: string, path: string) {
+  const segs = path.split('/').filter(Boolean);
+  const allowed: string[] = [];
+  for (const r of routes) {
+    if (r.parts.length !== segs.length) continue;
+    const params: Record<string, string> = {};
+    const ok = r.parts.every((p, i) => p.startsWith(':')
+      ? ((params[p.slice(1)] = decodeURIComponent(segs[i])), true)
+      : p === segs[i]);
+    if (!ok) continue;
+    if (r.method === method) return { route: r, params };
+    allowed.push(r.method);
+  }
+  return { route: null, params: {}, allowed };
+}
+```
+
+The comma expression inside `every` stores the parameter and returns
+`true`, so a parameter segment always passes. A literal passes only if it
+is equal. Each route gets a fresh `params` object, so a half-matched route
+cannot leak parameters into the result.
+
+Running the real server, these were the answers, as printed by the client:
+
+```text
+client got 200  {"id":"42","owner":"sanjay"}
+client got 200  {"id":"a b","owner":"sanjay"}
+client got 405 GET, DELETE {"error":"method not allowed"}
+client got 404  {"error":"not found"}
+```
+
+The realistic case is precedence. To make `/notes/new` work next to
+`/notes/:id` in this list-based router, register the literal first. A
+sturdier fix is to make the matcher score routes, with literals beating
+parameters, and pick the highest score, which is what tree routers do
+naturally.
+
+### Step by step
+
+<Trace
+  columns={["route checked", "length check", "segment 1", "segment 2", "result"]}
+  rows={[
+    ["GET /health", "1 vs 2: skip", "", "", "skip"],
+    ["GET /notes/:id", "2 vs 2: ok", "notes = notes", ":id takes 42", "path fits; method POST is not GET: remember GET"],
+    ["DELETE /notes/:id", "2 vs 2: ok", "notes = notes", ":id takes 42", "path fits; method not DELETE: remember DELETE"],
+    ["GET /boom", "1 vs 2: skip", "", "", "skip"],
+    ["end of table", "", "", "", "allowed = GET, DELETE: answer 405"],
+  ]}
+  caption="Matching POST /notes/42 against the table. Each fit-but-wrong-method route adds to the allowed list; only at the end does the router choose 405 over 404."
+/>
+
+<Figure art={`
+  radix tree for: /health  /notes/:id  /notes/new  /notes/:id/comments
+
+  (root)
+   +-- health ...................... GET
+   +-- notes
+        +-- new .................... GET     literal, tried first
+        +-- :id .................... GET, DELETE
+             +-- comments .......... GET
+`} caption="The same routes as a tree. Lookup walks one segment per level, so it never scans unrelated routes, and a literal child is tried before the parameter child." />
+
+### Common mistake
+
+The common mistake is a parameter that silently swallows routes, as with
+`/notes/new` above. A related one is trailing slashes: `/notes/42/` splits
+to the same segments as `/notes/42` with `filter(Boolean)`, which is what
+I want, but a regex-based router may treat them as different and 404 one
+of them. The fix is to decide a canonical form and redirect the other to
+it with a 308 (a permanent redirect that keeps the method).
+
+A security mistake hides here too: using a path parameter directly in a
+file path. `GET /files/..%2F..%2Fetc%2Fpasswd` decodes to
+`../../etc/passwd`. The fix is to never join user input into a filesystem
+path without resolving it and checking that the result is still inside the
+intended folder.
+
+### In real systems
+
+Production routers add typed parameters (`:id(\d+)`), wildcard segments
+for "everything after here", mounting a sub-router under a prefix, and
+generated OpenAPI documents from the route table. Under the hood they still
+do this loop or its tree form.
+
+### Check yourself
+
+<details>
+<summary>1. The table has GET /notes/:id registered before GET /notes/new. What happens to GET /notes/new in this router?</summary>
+
+The parameter route matches first, with `id = "new"`. The note handler runs
+and probably answers 404 or 400 for a non-numeric id. The new-note handler
+never runs. Register the literal first, or score literals higher.
+
+</details>
+
+## Middleware as an onion
+
+### In one sentence
+
+Middleware is a list of functions that each receive the request and a
+`next` function, so each one can run code before and after everything
+that comes after it.
+
+### The idea
+
+Some work belongs to every request: assigning a request id, logging,
+timing, catching errors, checking auth, parsing bodies. Copying that into
+every handler is how it gets forgotten in one of them. **Middleware** is
+the pattern that puts such work in one place and runs it around every
+handler.
+
+The Koa-style shape is `async (ctx, next) => { ... }`. `ctx` (the
+**context**) holds the request, the response and a `state` object that
+middleware can use to pass things down, such as the logged-in user.
+`next` is a function that runs the rest of the chain and returns a promise
+that resolves when the rest has finished. Code before `await next()` runs
+on the way in; code after it runs on the way out.
+
+That gives the **onion** picture: the first middleware is the outer layer,
+the handler is the core, and a request passes through each layer inwards
+and then back out in reverse order. A logger placed first sees the whole
+request, including the time all other layers took. An error catcher placed
+early wraps everything after it in one `try`.
+
+A middleware can also **short-circuit**: answer the request itself and not
+call `next` at all. That is how an auth check refuses a request before the
+handler ever runs.
+
+### Worked example
+
+The engine is `compose`. It takes the list and the final handler and
+returns one function:
+
+```ts
+function compose(mw: Middleware[], final: Handler) {
+  return (ctx: Ctx) => {
+    let last = -1;
+    const dispatch = async (i: number): Promise<void> => {
+      if (i <= last) throw new Error('next() called twice');
+      last = i;
+      if (i === mw.length) return final(ctx);
+      await mw[i](ctx, () => dispatch(i + 1));
+    };
+    return dispatch(0);
+  };
+}
+```
+
+`dispatch(i)` runs middleware number `i` and hands it `next`, which is just
+`dispatch(i + 1)`. When `i` reaches the end of the list, the final handler
+runs. The `last` counter catches a middleware that calls `next` twice,
+which would run the rest of the chain, including the handler, a second
+time.
+
+The simple test is two middleware that record when they run:
+
+```ts
+const a: Middleware = async (_c, next) => { order.push('a in'); await next(); order.push('a out'); };
+const b: Middleware = async (_c, next) => { order.push('b in'); await next(); order.push('b out'); };
+await compose([a, b], () => { order.push('handler'); })(ctx);
+```
+
+```text
+a in > b in > handler > b out > a out
+```
+
+### Step by step
+
+<Figure art={`
+   request
+     |
+  +--v-----------------------------------------------+
+  | a: before next()                                 |
+  |  +--v------------------------------------------+ |
+  |  | b: before next()                            | |
+  |  |  +--v------------------------------------+  | |
+  |  |  |            handler                    |  | |
+  |  |  +--+------------------------------------+  | |
+  |  | b: after next()                             | |
+  |  +--+------------------------------------------+ |
+  | a: after next()                                  |
+  +--+-----------------------------------------------+
+     v
+   response
+`} caption="The onion. Each layer's code before next() runs on the way in, outermost first; its code after next() runs on the way out, innermost first. That is why a logger placed first can time everything." />
+
+<Trace
+  columns={["call", "runs", "waiting on"]}
+  rows={[
+    ["dispatch(0)", "a: push 'a in', call next", "dispatch(1)"],
+    ["dispatch(1)", "b: push 'b in', call next", "dispatch(2)"],
+    ["dispatch(2)", "i equals length: run handler", "nothing"],
+    ["return to b", "push 'b out'", "b's promise resolves"],
+    ["return to a", "push 'a out'", "a's promise resolves; chain done"],
+  ]}
+  caption="The compose call stack for a, b and a handler. Each dispatch awaits the next, so the 'out' lines run only as the inner calls finish."
+/>
+
+### Common mistake
+
+There are two classic bugs, and I ran both. Calling `next` twice re-runs
+the handler; my `compose` catches it:
+
+```text
+caught: next() called twice
+```
+
+The quieter bug is calling `next()` without `await`. The middleware
+returns at once, its promise resolves, and anything waiting on the chain
+thinks the request is finished while the inner work is still running:
+
+```ts
+const forgot: Middleware = async (_c, next) => { log.push('forgot: calls next without await'); next(); log.push('forgot: returns'); };
+const slow: Middleware = async (_c, next) => { await sleep(10); log.push('slow: done waiting'); await next(); };
+```
+
+```text
+forgot: calls next without await
+forgot: returns
+--- chain promise resolved ---
+slow: done waiting
+handler runs
+```
+
+The chain "finished" before the handler ran. A logger outside it records a
+fast request with the wrong status; an error thrown by the handler escapes
+every `try`/`catch` and becomes an unhandled rejection. The fix is always
+`await next()`, or `return next()`, and a lint rule for floating promises.
+
+### In real systems
+
+Koa uses exactly this compose. Express predates promises: its middleware
+is `(req, res, next)`, `next` returns nothing, and code "after next" does
+not run after the handler in the same way, which is why timing in Express
+uses the response's `finish` event instead. Hono and newer frameworks
+follow the Koa shape. Knowing which model a framework uses explains most
+"why didn't my after-code run" questions.
+
+### Check yourself
+
+<details>
+<summary>1. In the order a, b, handler, which code runs last?</summary>
+
+The part of `a` after `await next()`. The outermost layer is first in and
+last out.
+
+</details>
+
+<details>
+<summary>2. Why does an auth middleware not call next() when the token is missing?</summary>
+
+It answers 401 itself and short-circuits the chain, so the handler and
+every inner middleware are skipped. Calling `next` would let the request
+through.
+
+</details>
+
+## Request ids, logging, errors and auth: order matters
+
+### In one sentence
+
+The useful middleware are small, and almost every bug is in their order,
+because each one can only see what the layers outside it have set up.
+
+### The idea
+
+Four middleware cover most needs. A **request id** middleware takes an
+incoming `x-request-id` header, or makes a new id, stores it in `ctx.state`
+and echoes it in the response, so a client's bug report and the server's
+logs can be joined. A **logger** times the request and prints one line per
+request when the inner chain is done. An **error** middleware wraps the
+rest in `try`/`catch` and turns any thrown error into a 500 with the
+request id and no stack trace. An **auth** middleware checks credentials
+and either sets `ctx.state.user` or answers 401.
+
+Order follows from what each needs. The request id must come first, so
+every other layer can log it. The logger must be outside the error
+catcher, so it logs the final status, 500 included. The error catcher must
+be outside auth and the handler, so it catches their throws. Auth must be
+before the handler, and only on routes that need it; the health check must
+stay open for the load balancer.
+
+### Worked example
+
+These are the four middleware I ran, each one line of real work:
+
+```ts
+const requestId: Middleware = async (ctx, next) => {
+  ctx.state.id = ctx.req.headers['x-request-id'] ?? randomUUID().slice(0, 8);
+  ctx.res.setHeader('x-request-id', String(ctx.state.id)); await next(); };
+const logger: Middleware = async (ctx, next) => {
+  const t = performance.now(); await next();
+  console.log(`[${ctx.state.id}] ${ctx.req.method} ${ctx.req.url} -> ${ctx.res.statusCode} ${(performance.now() - t).toFixed(1)}ms`); };
+const errors: Middleware = async (ctx, next) => {
+  try { await next(); } catch (e) {
+    console.log(`[${ctx.state.id}] error: ${(e as Error).message}`);
+    json(ctx, 500, { error: 'internal error', requestId: ctx.state.id }); } };
+```
+
+Auth short-circuits with 401 or sets the user. The chain is
+`[requestId, logger, errors, auth]` for API routes and
+`[requestId, logger, errors]` for `/health`. The real server log and
+client output for an unauthenticated read and a handler that throws:
+
+```text
+[r9G] GET /notes/42 -> 401 0.2ms
+  client got 401  {"error":"unauthorized"}
+[r5G] error: db exploded
+[r5G] GET /boom -> 500 0.4ms
+  client got 500  {"error":"internal error","requestId":"r5G"}
+```
+
+The error line and the access line share the request id, the client gets
+the id to quote in a bug report, and the internal message "db exploded"
+never reaches the client.
+
+### Step by step
+
+<Layers layers={[
+  { name: "requestId", note: "first: everything below can log the id" },
+  { name: "logger", note: "outside errors: it logs the final status, 500 included" },
+  { name: "errors", note: "outside auth and handler: catches their throws" },
+  { name: "auth", note: "API routes only; health stays open" },
+  { name: "handler", note: "the route's own work, with ctx.state.user set" },
+]} caption="The working order as a stack, outermost at the top. Swap any two adjacent layers and one guarantee breaks; the notes column says which." />
+
+<Compare left="Wrong order" right="What breaks" caption="Three tempting orders and their failure. Each one looks fine in a happy-path test and fails only on errors or unauthenticated requests." rows={[
+  ["errors before logger", "a 500 is logged as 200, or not at all, because the logger sits inside the catcher's response"],
+  ["auth before requestId", "401 responses carry no request id, so failed logins cannot be traced"],
+  ["auth on every route", "the load balancer's health check gets 401 and marks every instance down"],
+]} />
+
+### Common mistake
+
+The common mistake is leaking the error message: `json(ctx, 500, { error:
+e.message })`. Messages from database drivers contain table names,
+constraint names and sometimes values. The fix is a generic message plus
+the request id for the client, and the full error with the stack in the
+server log.
+
+### In real systems
+
+Production stacks add more layers in the same spirit: compression, CORS,
+body size limits, rate limiting, security headers, and tracing that creates
+a span per request. Frameworks often ship these as ready middleware. The
+order rules stay the same, and the framework documentation usually has a
+section on recommended order, because it is the most common support
+question.
+
+### Check yourself
+
+<details>
+<summary>1. Why must the logger sit outside the error middleware?</summary>
+
+The error middleware turns a throw into a 500 response. A logger outside
+it awaits that whole inner chain and then reads the final status code, 500.
+Inside it, the logger's `await next()` would throw and its log line would
+never run.
+
+</details>
+
+## Testing the router and the chain
+
+### In one sentence
+
+A router and a middleware chain are pure enough to test without a network:
+call `match` with a method and a path, call `compose` with fake
+middleware, and assert on what comes back.
+
+### The idea
+
+Most server tests start a server and send real requests. That is worth
+doing for a few end-to-end checks, but it is slow and it hides which piece
+failed. The router and `compose` are plain functions: `match` takes two
+strings and returns an object, and `compose` takes a list of functions.
+Both can be tested in microseconds with no port, no socket and no database.
+
+The useful tests are the rules this note has been building up: literals
+beat parameters, parameters are decoded per segment, a wrong method gives
+an allowed list, an unknown path gives an empty one, the onion runs in the
+right order, and bad input fails in a known way. Each rule is one test, and
+each test names the rule, so a failure message reads like a sentence about
+what broke.
+
+Node ships a test runner, `node:test`, and an assertion library,
+`node:assert/strict`, so none of this needs a dependency. With Node 22's
+type stripping, the tests can import the TypeScript router directly.
+
+### Worked example
+
+The simple case is the routing rules. I registered three routes under a
+`/t` prefix so they would not clash with the app's routes, then asserted:
+
+```ts
+add('GET', '/t/notes/new', () => {});
+add('GET', '/t/notes/:id', () => {});
+add('DELETE', '/t/notes/:id', () => {});
+
+test('literal registered first wins over the parameter', () => {
+  assert.equal(match('GET', '/t/notes/new').route?.parts.join('/'), 't/notes/new');
+});
+test('params are decoded per segment', () => {
+  assert.deepEqual(match('GET', '/t/notes/a%2Fb').params, { id: 'a/b' });
+});
+test('wrong method gives the allowed list', () => {
+  assert.deepEqual(match('PUT', '/t/notes/9').allowed, ['GET', 'DELETE']);
+});
+```
+
+The realistic case is the chain and the failure mode. Three middleware made
+by one factory record their in and out, and a malformed path must throw a
+known error class that the server can map to 400:
+
+```ts
+test('onion order', async () => {
+  const seen: string[] = [];
+  const mk = (n: string): Middleware => async (_c, next) => {
+    seen.push(n + '>'); await next(); seen.push('<' + n); };
+  await compose([mk('a'), mk('b'), mk('c')], () => { seen.push('h'); })({} as any);
+  assert.deepEqual(seen, ['a>', 'b>', 'c>', 'h', '<c', '<b', '<a']);
+});
+test('malformed percent-encoding throws URIError', () => {
+  assert.throws(() => match('GET', '/t/notes/%E0%A4'), URIError);
+});
+```
+
+Running `node --test` on the file printed, trimmed to the summary lines:
+
+```text
+ok 1 - literal registered first wins over the parameter
+ok 2 - params are decoded per segment
+ok 3 - wrong method gives the allowed list
+ok 4 - unknown path gives an empty allowed list
+ok 5 - onion order
+ok 6 - malformed percent-encoding throws URIError
+# tests 6
+# pass 6
+# fail 0
+```
+
+The last test documents a real gap: `match` lets `URIError` escape. That is
+fine as long as the server maps it, and the test pins down the contract so
+nobody "fixes" it into a silent 404 later.
+
+### Step by step
+
+<Flow steps={[
+  "Write the rule as a sentence: a wrong method gives the allowed list",
+  "Turn the sentence into a test name",
+  "Call the pure function with the smallest input that shows the rule",
+  "Assert on the returned value, not on a log line",
+  "Keep one end-to-end test that goes through a real socket",
+]} caption="How each test in this section was written. The first two steps matter most: a test named after a rule tells the next reader what broke without opening the file." />
+
+### Common mistake
+
+The common mistake is testing the router only through the HTTP server, and
+only on the happy path. Every test then needs a port, they run slowly, and
+the 405 and decode cases are never written because each feels expensive.
+The fix is to keep `match` and `compose` free of `http` objects so they can
+be called directly, and to save the network for one smoke test.
+
+A second mistake is sharing a global route table between tests that
+register different routes. One test's routes change another test's
+results. The fix is a `createRouter()` factory that returns a fresh table
+per test, which is also what makes sub-routers possible.
+
+### In real systems
+
+Framework routers have exactly these kinds of tests in their own suites,
+and well-run services add contract tests on top: for each route in the
+OpenAPI document, assert that the router has it, with the same method and
+parameters. That catches the endpoint that was documented and never wired
+up, and the one that was wired up and never documented.
+
+### Check yourself
+
+<details>
+<summary>1. Why test match directly instead of through a running server?</summary>
+
+It is a pure function, so tests run in microseconds, need no port, and
+point at the exact rule that broke. A running server is still worth one
+end-to-end test to prove the wiring.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="A router and middleware without a framework">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, see that a router is a table and middleware is a
+list of functions. Write the `if` chain, feel it get messy, then replace it
+with a table of `{ method, path, handler }` rows and a loop.
+
+A worked example: three routes, `GET /health`, `GET /notes/:id`, `DELETE
+/notes/:id`. A loop finds the route, an object holds the id, and anything
+else gets 404. Then add a single logging function called before every
+handler.
+
+The mistake at this level is routing on `req.url` with `startsWith`. The
+fix is to parse the URL and compare segment by segment.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, add the 405 case, decoding, query parameters,
+and the onion. Write `compose`, and move request ids, logging, error
+handling and auth into middleware.
+
+A worked example: a `json` helper, a request-id middleware, a logger and an
+error catcher, in that order, with auth only on `/api` routes. A test sends
+a request that throws and asserts a 500 with a request id and no stack
+trace in the body.
+
+The mistake is the floating `next()`. The fix is `await next()` and a lint
+rule, `no-floating-promises`, that catches it everywhere.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, think about performance and types. A list router
+checks every route per request; a radix tree checks one branch. Typed
+context lets a handler know that `ctx.state.user` exists because auth ran
+before it.
+
+A worked example: give each route its middleware list, and type the
+handler's context as the intersection of what those middleware add. A
+handler registered without auth then fails to compile when it reads
+`ctx.state.user`, instead of crashing at runtime.
+
+The mistake is a global `state: Record<string, unknown>` that every
+handler casts. The fix is typed context per route group.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: an empty path `/` splits to zero segments and must match
+a root route. A segment with malformed percent-encoding, such as `%E0%A4`,
+makes `decodeURIComponent` throw `URIError`; that should be 400, not 500.
+A `HEAD` request should match `GET` routes and send no body.
+
+A worked example: `GET /notes/%` crashes a naive router with an uncaught
+`URIError`. Wrap decoding in `try` and answer 400 "malformed path".
+
+The mistake is assuming the client sends valid URLs. The fix is a test
+table of odd paths.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a request that both fails auth and hits an unknown
+path. Should it get 401 or 404? If 404 comes first, an unauthenticated
+caller can map which paths exist. Many APIs authenticate before routing for
+everything under `/api`, so unknown paths also get 401 when no credentials
+are sent.
+
+Another: an error thrown after the response headers were already sent,
+such as during streaming. The error middleware cannot send a 500 any more.
+It must destroy the connection so the client sees a broken response rather
+than a truncated success.
+
+The mistake is writing headers twice, which throws `ERR_HTTP_HEADERS_SENT`.
+The fix is checking `res.headersSent` in the error middleware.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, the middleware stack is the place for cross-cutting policy:
+body limits, timeouts, CORS, security headers, rate limiting, tracing. Each
+belongs at a specific depth, and the stack is documented and tested as one
+unit.
+
+A worked example: a per-request timeout middleware starts a timer and, if
+the handler has not finished in 10 seconds, sends 503 and aborts the
+database query through an `AbortSignal` stored in `ctx`. Without the
+abort, the query keeps running after the user has gone.
+
+The mistake is a timeout that answers the client but leaves work running.
+The fix is cancellation passed down through the context.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that a framework is a convenience, not a mystery. When it
+misbehaves, ask which of the two pieces is involved: matching, or the
+chain. Then reproduce the issue with forty lines like these.
+
+A worked example: Express middleware after `next()` does not see the final
+status. That is not a bug; Express's `next` does not return a promise. Use
+`res.on('finish')` for after-the-response logging there.
+
+The mistake is cargo-culting middleware order from a blog post. The fix is
+reasoning from what each layer needs from the layers outside it.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, the same onion appears at larger scale. An API gateway
+does routing, auth and rate limiting before services see requests; a
+service mesh adds retries and tracing between services. Deciding which
+policy lives at the gateway and which in the service is the same ordering
+question.
+
+A worked example: auth at the gateway verifies the token and forwards the
+user id in a header. Each service still checks ownership, because the
+gateway knows who the user is but not which rows they own.
+
+The mistake is trusting a forwarded user header from any caller. The fix
+is to accept it only from the gateway, over an authenticated internal
+connection.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is to choose a framework knowingly. For most services a
+framework is the right call, because its router, parsers and middleware are
+tested by thousands of users. Knowing the forty lines underneath is what
+lets you pick one, debug it, and replace it if you must.
+
+A worked example: before adopting a framework, write down the middleware
+order you need, the router features you need (405, typed params,
+precedence), and check that the framework gives you each.
+
+Done when: you can write a router with 404, 405 and params and a compose
+function from memory, and explain the order of any middleware stack you
+own by what each layer needs.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I really skip the framework in production?** Usually not. Build
+this once to understand it, then use a framework with a good router and
+error handling. The point is to know what it does.
+
+**Why does Express not support code after next() for timing?** Its
+middleware model predates promises: `next()` returns nothing, so the
+calling middleware cannot wait for the rest. Express 5 handles rejected
+promises from handlers, but timing still uses the `finish` event.
+
+**Is a regex router slower than a tree?** For a few dozen routes the
+difference is tiny compared with any database call. Trees matter for
+hundreds of routes or very hot paths.
+
+**Where do body parsing and validation go?** As middleware on the routes
+that need a body, after auth so unauthenticated requests are refused
+before the server reads a large body.
+
+## Key takeaways
+
+- A router maps a method and a path to a handler, and must answer 404 and
+  405 honestly.
+- Route on the parsed pathname; split on slashes, then decode each segment.
+- Literal routes must beat parameter routes, by order or by score.
+- Middleware is a list of functions each wrapping the next; `compose` is
+  about ten lines.
+- Code before `await next()` runs on the way in, code after runs on the
+  way out in reverse order.
+- Always `await next()`; a floating `next()` ends the chain early.
+- Order: request id, logger, error catcher, auth, handler.
+- Never send internal error messages to the client; send a request id.
+
+## Glossary
+
+- **Route**: a method, a path pattern and a handler.
+- **Path parameter**: a variable segment of a pattern, such as `:id`.
+- **Query string**: the part of a URL after `?`, not used for routing.
+- **Percent-encoding**: writing special characters as `%` and two hex
+  digits.
+- **405 Method Not Allowed**: the path exists but not for this method.
+- **Precedence**: which route wins when two could match.
+- **Radix tree**: a tree keyed on shared prefixes, used for fast routing.
+- **Middleware**: a function that runs around every handler.
+- **Context (ctx)**: the object holding request, response and state.
+- **next**: the function that runs the rest of the chain.
+- **Short-circuit**: answering without calling `next`.
+- **Onion model**: in-order on the way in, reverse order on the way out.
+- **Request id**: an id that joins a client's report with server logs.
+
+## Practice
+
+**Warm-up.** Take the route table in this note and write, by hand, the
+outcome for ten odd requests: trailing slashes, query strings, encoded
+slashes, wrong methods, unknown paths.
+
+**Build.** Implement the router and `compose` from memory, add a JSON body
+parser middleware with a size limit, and write tests for 404, 405, 413,
+401 and 500, each asserting the request id header.
+
+**Stretch.** Replace the list with a radix tree that prefers literals over
+parameters, and add typed route groups so a handler registered without
+auth cannot read the user at compile time.
