@@ -1,0 +1,2308 @@
+---
+book: the-c-programming-language
+number: 7
+title: "Input and Output"
+description: "K&R chapter 7 in depth: standard streams, printf and scanf in full, variadic functions, files, stderr and exit, line I/O, and the string, ctype, ungetc, system, malloc, math and rand utilities, with their traps."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Chapter 7 is about the **standard library**'s input and output: the
+functions every C program uses to read and write text, open files and
+report errors. Input and output are not part of the C language itself;
+they come from a library of functions declared in headers, which is what
+makes C programs portable between systems with very different I/O.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- use the standard streams `stdin`, `stdout` and `stderr`, and redirect them;
+- write any `printf` format, including widths, precisions and the `*` forms;
+- write your own function that takes a variable number of arguments;
+- read input safely with `scanf`, `fgets` and `sscanf`, and check every result;
+- open, read, write and close files, and report errors properly;
+- use the string, character-class, memory, math and random-number utilities.
+
+What you should already know: <a href={withBase('/books/the-c-programming-language/05-pointers-and-arrays/')}>chapter 5</a>
+for pointers and `argv`, and <a href={withBase('/books/the-c-programming-language/06-structures/')}>chapter 6</a>
+for structures, since `FILE` is one.
+
+Reading time: about 90 minutes, plus two evenings for the programs.
+
+## Chapter map
+
+<Layers caption="Chapter 7 from the three standard streams up to the utility functions of the library." layers={[
+  { name: "7.1 Streams", note: "getchar, putchar, redirection and pipes" },
+  { name: "7.2 to 7.4 Formatting", note: "printf, variadic functions, scanf" },
+  { name: "7.5 to 7.7 Files", note: "fopen, stderr, exit, fgets and fputs" },
+  { name: "7.8 Utilities", note: "strings, ctype, ungetc, system, malloc, math, rand" },
+]} />
+
+<Flow caption="The path of one printf call. The program formats into a buffer in its own memory, and the library hands the buffer to the operating system only when it fills, at a newline on a terminal, or at fflush or exit." steps={[
+  "printf formats the arguments into text",
+  "The text is copied into the stdout buffer",
+  "The buffer is flushed when full, at a newline (terminals), or on fflush",
+  "The library calls the system's write on the file descriptor",
+  "The kernel delivers the bytes to a terminal, file or pipe",
+]} />
+
+## 7.1 Standard Input and Output
+
+### In one sentence
+
+Every C program starts with three open streams, standard input, output and
+error, and reads and writes them a character at a time with `getchar` and
+`putchar`.
+
+### The idea
+
+A **stream** is a source or destination of data, treated as a sequence of
+lines, each ending in a newline. The library hides how the system really
+stores text: on Windows a line ends in carriage return plus line feed on
+disk, and a text stream converts that to a single `'\n'` for the program.
+
+The simplest input is `getchar()`, which returns the next character from
+standard input, or `EOF` at the end. Standard input is normally the
+keyboard, but the shell can **redirect** it: `prog < infile` reads from a
+file, and `otherprog | prog` reads from another program's output through a
+**pipe**. The program does not know or care which.
+
+Output is the mirror image: `putchar(c)` writes a character to standard
+output, and `prog > outfile` or `prog | other` redirects it. Every source
+file using these must include `<stdio.h>`, which declares them (some are
+macros, which is why `getchar` is fast).
+
+### Worked example
+
+The book's example is a filter that lowercases its input. A **filter** is a
+program that reads standard input, transforms it and writes standard
+output, so it can be combined with others in a pipeline.
+
+```c
+/* lower.c */
+#include <ctype.h>
+#include <stdio.h>
+
+int main(void)
+{
+    int c;                               /* int, so it can hold EOF */
+    while ((c = getchar()) != EOF)
+        putchar(tolower(c));
+    return 0;
+}
+```
+
+```text
+$ printf 'Hello, World\nC IS FUN\n' | ./lower
+hello, world
+c is fun
+```
+
+### Step by step
+
+`getchar` returns an `int`: either a character value converted to
+`unsigned char` and then to `int` (0 to 255 on common machines), or `EOF`,
+which is negative (-1 with glibc). The loop stops at `EOF`. `tolower`
+returns its argument unchanged if it is not an upper-case letter.
+
+### Common mistake
+
+Storing `getchar`'s result in a `char`. If `char` is signed, the byte 255
+becomes -1 and looks like `EOF`, ending the loop early on binary or
+Latin-1 input; if `char` is unsigned, `EOF` becomes 255 and the loop never
+ends. Always use `int`.
+
+```c
+/* charbug.c */
+#include <stdio.h>
+
+int main(void)
+{
+    char c;                              /* wrong type */
+    int n = 0;
+    while ((c = getchar()) != EOF) n++;
+    printf("%d\n", n);
+    return 0;
+}
+```
+
+```text
+$ printf 'ab\377cd' | ./charbug
+2
+```
+
+With signed `char` (x86-64), the byte 0377 compares equal to `EOF`, so the
+loop counts two characters out of five and stops.
+
+### In real systems
+
+The Unix toolset (`tr`, `sort`, `grep`, `wc`) is built from filters like
+this, combined with pipes. Writing small programs that read `stdin` and
+write `stdout` makes them composable for free, which is the most valuable
+design habit this section teaches.
+
+### Check yourself
+
+**Why can't `lower.c` tell whether its input comes from a file or a
+pipe?**
+
+<details>
+<summary>Answer</summary>
+
+The shell connects standard input before the program starts. The program
+just reads a stream; redirection is invisible to it.
+
+</details>
+
+## 7.2 Formatted Output—Printf
+
+### In one sentence
+
+`printf` converts its arguments to text under the control of a format
+string, and each `%` conversion must match its argument's type.
+
+### The idea
+
+`printf(format, arg1, arg2, ...)` copies ordinary characters of the format
+to the output and replaces each **conversion specification**, a `%`
+followed by optional modifiers and a conversion character, with the next
+argument converted to text. It returns the number of characters written,
+or a negative value on error.
+
+Between the `%` and the conversion character can come, in order: **flags**
+(`-` left-justify, `+` always show a sign, space, `0` pad with zeros, `#`
+alternate form), a minimum **field width**, a period and a **precision**,
+and a **length modifier** (`h`, `l`, `ll`, `z`, `L` and others) giving the
+argument's size. Width or precision can be `*`, which takes the value from
+the next `int` argument.
+
+The precision means different things for different conversions: the
+maximum characters of a string for `%s`, digits after the point for `%f`,
+significant digits for `%g`, and minimum digits for integers.
+
+### Worked example
+
+```c
+/* formats.c */
+#include <stdio.h>
+
+int main(void)
+{
+    const char *s = "hello, world";
+    printf("[%s]\n[%15s]\n[%-15s]|\n[%.5s]\n[%-15.5s]|\n", s, s, s, s, s);
+    printf("[%6d] [%-6d] [%06d] [%+d] [%.3d]\n", 42, 42, 42, 42, 7);
+    printf("[%x] [%#x] [%o] [%#o] [%X]\n", 255, 255, 8, 8, 255);
+    printf("[%f] [%.2f] [%e] [%g] [%g]\n", 3.14159, 3.14159, 31415.9,
+           0.0001, 1e-5);
+    printf("[%*d] [%.*s] [%c] [%%] [%zu]\n", 5, 9, 3, s, 'A', sizeof s);
+    return 0;
+}
+```
+
+```text
+[hello, world]
+[   hello, world]
+[hello, world   ]|
+[hello]
+[hello          ]|
+[    42] [42    ] [000042] [+42] [007]
+[ff] [0xff] [10] [010] [FF]
+[3.141590] [3.14] [3.141590e+04] [0.0001] [1e-05]
+[    9] [hel] [A] [%] [8]
+```
+
+### Step by step
+
+`%15s` right-justifies in 15 columns; `%-15s` left-justifies. `%.5s`
+prints at most 5 characters, which is safe for strings without a
+terminator only if they have at least 5 characters. `%g` chooses between
+`%f` and `%e` style and drops trailing zeros: it uses `%e` when the
+exponent is below -4, which is why 0.0001 prints plainly and 1e-5 does
+not. `%*d` takes 5 as the width and prints 9 in it.
+
+<Figure art={`
+     %   -   0   15  .5   l    d
+     |   |       |    |   |    |
+     |   flags   |    |   |    conversion: d i u o x X c s f e g p %
+     |           |    |   length modifier: hh h l ll z t L
+     |           |    precision (or .*)
+     |           minimum field width (or *)
+     starts a conversion
+`} caption="The parts of a printf conversion specification, in the order they must appear. Only the % and the conversion character are required." />
+
+### Common mistake
+
+A mismatch between conversion and argument is undefined behaviour.
+`printf("%d\n", 3.5)` passes a `double` where an `int` is expected; on
+x86-64 the double goes in a floating-point register and `%d` reads an
+unrelated integer register, so the output is garbage. gcc catches it with
+`-Wall`: "format '%d' expects argument of type 'int', but argument 2 has
+type 'double'". Equally dangerous is `printf(s)` with a string that may
+contain `%`: always write `printf("%s", s)`.
+
+### In real systems
+
+Format-string mismatches and `printf(user_input)` are classic security
+bugs; the `%n` conversion, which writes the number of characters printed
+so far through a pointer, made the second one exploitable. Modern code
+keeps format strings literal so the compiler can check them, and marks
+its own printf-like functions with `__attribute__((format(printf, 1,
+2)))`.
+
+### Check yourself
+
+**What does `printf("%.0f %.0f\n", 0.5, 1.5)` print with glibc?**
+
+<details>
+<summary>Answer</summary>
+
+`0 2`. Rounding is to the nearest value, with ties going to the even
+digit, so 0.5 rounds to 0 and 1.5 to 2.
+
+</details>
+
+**What does `printf("%5.2s|", "abc")` print?**
+
+<details>
+<summary>Answer</summary>
+
+Three spaces then `ab|`: at most 2 characters, right-justified in a field
+of 5.
+
+</details>
+
+## 7.3 Variable-length Argument Lists
+
+### In one sentence
+
+A function like `printf` takes a variable number of arguments by declaring
+`...` and walking them with the `va_` macros from `<stdarg.h>`.
+
+### The idea
+
+A **variadic function** is declared with at least one named parameter
+followed by `...`, as in `int minprintf(const char *fmt, ...)`. Inside, a
+`va_list` variable steps through the unnamed arguments. `va_start(ap,
+fmt)` initialises it after the last named parameter; each `va_arg(ap,
+type)` returns the next argument as that type; `va_end(ap)` cleans up
+before returning.
+
+The function cannot discover how many arguments there are or what types
+they have. Something must tell it: a format string, as with `printf`, a
+count argument, or a terminating sentinel such as a null pointer. Getting
+that wrong is undefined behaviour, with no diagnostic.
+
+Unnamed arguments undergo the **default argument promotions**: `char` and
+`short` become `int`, and `float` becomes `double`. So `va_arg(ap, char)`
+and `va_arg(ap, float)` are wrong; ask for `int` and `double`.
+
+### Worked example
+
+The book builds a small `printf` that handles `%d`, `%f` and `%s` by
+calling the real `printf` for each piece. Mine does the same and returns
+the count of conversions.
+
+```c
+/* minprintf.c */
+#include <stdarg.h>
+#include <stdio.h>
+
+static int minprintf(const char *fmt, ...)
+{
+    va_list ap;
+    int n = 0;
+    va_start(ap, fmt);                   /* ap starts after fmt */
+    for (const char *p = fmt; *p; p++) {
+        if (*p != '%') { putchar(*p); continue; }
+        switch (*++p) {
+        case 'd': printf("%d", va_arg(ap, int)); n++; break;
+        case 'f': printf("%f", va_arg(ap, double)); n++; break;
+        case 's': fputs(va_arg(ap, char *), stdout); n++; break;
+        case '\0': p--; break;           /* lone % at the end */
+        default:  putchar(*p); break;
+        }
+    }
+    va_end(ap);
+    return n;
+}
+```
+
+A test with each conversion:
+
+```c
+/* minprintf.c, continued */
+int main(void)
+{
+    char grade = 'A';                    /* promoted to int */
+    int n = minprintf("%s scored %d (%f), 100%%\n", "Ada", grade, 2.5f);
+    printf("%d conversions\n", n);
+    return 0;
+}
+```
+
+```text
+Ada scored 65 (2.500000), 100%
+3 conversions
+```
+
+### Step by step
+
+The `char` 'A' arrives as an `int` 65 and the `float` 2.5f as a `double`,
+because of the promotions, so `va_arg(ap, int)` and `va_arg(ap, double)`
+read them correctly. `%%` reaches the `default` case and prints one `%`.
+
+A second pattern is a sum with an explicit count:
+
+```c
+/* vsum.c */
+#include <stdarg.h>
+#include <stdio.h>
+
+static long sum(int count, ...)
+{
+    va_list ap;
+    long total = 0;
+    va_start(ap, count);
+    while (count-- > 0) total += va_arg(ap, int);
+    va_end(ap);
+    return total;
+}
+
+int main(void)
+{
+    printf("%ld %ld\n", sum(3, 1, 2, 3), sum(0));
+    return 0;
+}
+```
+
+```text
+6 0
+```
+
+### Common mistake
+
+Passing an argument whose type differs from what `va_arg` asks for. The
+classic is a sentinel: `concat("a", "b", 0)` passes an `int` zero where the
+function reads `char *`. On x86-64 that often works by accident, because
+both travel in 64-bit registers, but on a platform where `int` and pointers
+differ in size it reads garbage. Write `(char *)NULL`, and use gcc's
+`__attribute__((sentinel))` to check.
+
+### In real systems
+
+Every logging function is variadic, and is usually written as a thin
+wrapper that passes its `va_list` to `vfprintf`, the version of `fprintf`
+that takes a `va_list` instead of `...`. That pattern, shown in 7.6, is how
+you build printf-like functions without rewriting formatting.
+
+### Check yourself
+
+**Why is `va_arg(ap, float)` wrong?**
+
+<details>
+<summary>Answer</summary>
+
+A `float` passed through `...` is promoted to `double`, so the argument
+really is a `double`. gcc warns that "'float' is promoted to 'double' when
+passed through '...'", and the program would abort if it reached the call.
+
+</details>
+
+## 7.4 Formatted Input—Scanf
+
+### In one sentence
+
+`scanf` reads input under control of a format, storing through pointer
+arguments, and returns how many items it converted, which must always be
+checked.
+
+### The idea
+
+`scanf(format, &a, &b, ...)` is the input counterpart of `printf`. Its
+arguments must be **pointers**, because it stores into them. It returns the
+number of input items successfully matched and assigned, which may be fewer
+than requested, or `EOF` if input ends before the first conversion.
+
+The format is interpreted differently from `printf`'s. White space in the
+format matches any amount of white space, including none. Most conversions
+(`%d`, `%f`, `%s`) skip leading white space first; `%c` does not. Ordinary
+characters must match the input exactly. `%s` reads a word up to white
+space, `%[abc]` reads characters from a set, and `*` (as in `%*d`) reads
+and discards.
+
+A key difference: for `scanf`, `%f` means `float *` and `%lf` means
+`double *`, whereas `printf` uses `%f` for both because of the promotions.
+`sscanf` reads from a string instead of standard input, which is the safer
+way to parse.
+
+### Worked example
+
+Reading dates in two formats, using `sscanf` on a line read with `fgets`,
+the pattern the book recommends:
+
+```c
+/* dates.c */
+#include <stdio.h>
+
+int main(void)
+{
+    char line[100], month[20];
+    int day, year, mon;
+    while (fgets(line, sizeof line, stdin) != NULL) {
+        if (sscanf(line, "%d %19s %d", &day, month, &year) == 3)
+            printf("valid: %d %s %d\n", day, month, year);
+        else if (sscanf(line, "%d/%d/%d", &mon, &day, &year) == 3)
+            printf("valid: %d/%d/%d\n", mon, day, year);
+        else
+            printf("invalid: %s", line);
+    }
+    return 0;
+}
+```
+
+```text
+$ printf '25 Dec 1988\n12/25/1988\nnext Tuesday\n' | ./dates
+valid: 25 Dec 1988
+valid: 12/25/1988
+invalid: next Tuesday
+```
+
+### Step by step
+
+<Trace columns={["input line", "first sscanf", "second sscanf", "result"]} rows={[
+  ["25 Dec 1988", "3", "not tried", "first format"],
+  ["12/25/1988", "1 (stops at /)", "3", "second format"],
+  ["next Tuesday", "0", "0", "invalid"],
+]} caption="Trying two formats on each line. Because the line is already in a buffer, a failed attempt costs nothing and the next format starts again from the beginning." />
+
+`%19s` limits the word to 19 characters plus the terminator, matching the
+20-byte `month`. Reading a whole line first means a bad line can be
+reported and skipped, instead of leaving `scanf` stuck on it.
+
+### Common mistake
+
+Calling `scanf("%d", &n)` in a loop without checking the result. On input
+like `abc`, the conversion fails, returns 0, and leaves `abc` unread, so
+the next call fails on it again, forever, and `n` keeps its old (perhaps
+uninitialised) value.
+
+```c
+/* scanloop.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int n, total = 0, r;
+    while ((r = scanf("%d", &n)) == 1) total += n;
+    printf("total %d, stopped with %d\n", total, r);
+    return 0;
+}
+```
+
+```text
+$ printf '1 2 x 3\n' | ./scanloop
+total 3, stopped with 0
+```
+
+Checking `== 1` stops the loop at the `x`. The other classic mistake is an
+unbounded `%s`, which overflows the buffer on a long word exactly like the
+old `gets`; always give a width.
+
+### In real systems
+
+Production parsers rarely use `scanf` on standard input: they read lines
+or blocks, then parse with `sscanf`, `strtol` or a hand-written scanner,
+because those give control over errors. `strtol` in particular reports
+where parsing stopped and whether the value overflowed, which `%d` cannot:
+overflow in `scanf("%d")` is undefined behaviour.
+
+### Check yourself
+
+**After `scanf("%d", &n)` on input `42\n`, what is left in the input?**
+
+<details>
+<summary>Answer</summary>
+
+The newline. A following `scanf("%c", &c)` would read it, which is why
+`" %c"` with a leading space, to skip white space, is the usual fix.
+
+</details>
+
+## 7.5 File Access
+
+### In one sentence
+
+`fopen` connects a named file to a `FILE *` stream, which the same I/O
+functions then read and write, and `fclose` disconnects it.
+
+### The idea
+
+To read a named file, a program asks the library to open it:
+`FILE *fp = fopen(name, mode);`. `FILE` is a structure, defined in
+`<stdio.h>`, that holds the buffer, its position and error flags; the
+program only ever holds a pointer to it. The **mode** is `"r"` read, `"w"`
+write (creating or truncating), `"a"` append, with `+` for update and `b`
+for binary on systems that distinguish text from binary.
+
+`fopen` returns `NULL` if it fails, for example when the file does not
+exist or permission is denied, and that must be checked. `getc(fp)` and
+`putc(c, fp)` are the stream versions of `getchar` and `putchar`;
+`fprintf(fp, ...)` and `fscanf(fp, ...)` are the stream versions of
+`printf` and `scanf`. `stdin`, `stdout` and `stderr` are simply three
+`FILE *` constants opened for you.
+
+`fclose(fp)` flushes the buffer and frees the `FILE`. A program can only
+have a limited number of files open at once, so long-running programs must
+close what they open. At normal exit every open file is closed
+automatically.
+
+### Worked example
+
+The book's `cat` concatenates the named files, or copies standard input if
+there are none:
+
+```c
+/* mycat.c */
+#include <stdio.h>
+
+static void filecopy(FILE *in, FILE *out)
+{
+    int c;
+    while ((c = getc(in)) != EOF) putc(c, out);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc == 1) { filecopy(stdin, stdout); return 0; }
+    int status = 0;
+    for (int i = 1; i < argc; i++) {
+        FILE *fp = fopen(argv[i], "r");
+        if (fp == NULL) {
+            fprintf(stderr, "%s: can't open %s\n", argv[0], argv[i]);
+            status = 1;
+            continue;
+        }
+        filecopy(fp, stdout);
+        fclose(fp);
+    }
+    return status;
+}
+```
+
+```text
+$ printf 'one\n' > a.txt && printf 'two\n' > b.txt
+$ ./mycat a.txt missing.txt b.txt 2>&1 | cat
+./mycat: can't open missing.txt
+one
+two
+```
+
+The error comes first even though `a.txt` was copied first. When standard
+output is a pipe it is **fully buffered**: "one" waits in the buffer until
+exit, while standard error is written at once. Run on a terminal, where
+output is line-buffered, the three lines appear in file order.
+
+### Step by step
+
+`filecopy` works on any two streams, so the same function copies standard
+input or a named file. A missing file is reported on standard error and
+the loop continues, but the exit status records the failure, which is
+what real `cat` does.
+
+### Common mistake
+
+Not checking `fopen`'s result. Passing `NULL` to `getc` is undefined
+behaviour, and on glibc it crashes with a segmentation fault, far from the
+real problem. A related mistake is leaking `FILE`s in a loop: after about a
+thousand unclosed files (the default per-process limit on Linux), every
+`fopen` fails.
+
+### In real systems
+
+`fopen`'s failure is explained by `errno`, and `perror` or
+`strerror(errno)` turns that into a message such as "No such file or
+directory". Real tools always include the file name and that reason:
+`mycat: missing.txt: No such file or directory`.
+
+### Check yourself
+
+**What happens to an existing file opened with `"w"`?**
+
+<details>
+<summary>Answer</summary>
+
+It is truncated to zero length. Use `"a"` to add to the end, or `"r+"` to
+update in place.
+
+</details>
+
+## 7.6 Error Handling—Stderr and Exit
+
+### In one sentence
+
+Error messages go to `stderr` so they are not lost in redirected output,
+and `exit` ends the program with a status that tells the caller whether it
+succeeded.
+
+### The idea
+
+If `mycat`'s errors went to `stdout`, then `mycat a b > out` would put
+"can't open" into the output file, where nobody would see it. Standard
+error is a separate stream, normally the terminal even when output is
+redirected, and it is **unbuffered**, so messages appear immediately.
+
+`exit(status)` ends the program from anywhere, not just `main`. It flushes
+and closes all open streams, runs functions registered with `atexit`, and
+returns the status to the parent process. By convention 0 means success,
+and the portable values are `EXIT_SUCCESS` and `EXIT_FAILURE` from
+`<stdlib.h>`. In `main`, `return expr;` is equivalent to `exit(expr)`.
+
+Errors on output are easy to miss. `ferror(fp)` reports whether an error
+occurred on a stream, and `fclose` and `fflush` return `EOF` if the final
+write failed, such as on a full disk.
+
+### Worked example
+
+A small error-reporting helper, written with `vfprintf` so it takes a
+format like `printf`:
+
+```c
+/* die.c */
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void die(const char *fmt, ...)
+{
+    int saved = errno;                   /* fprintf may change errno */
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("die: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, ": %s\n", strerror(saved));
+    exit(EXIT_FAILURE);
+}
+
+int main(void)
+{
+    FILE *fp = fopen("/no/such/file", "r");
+    if (fp == NULL) die("can't open %s", "/no/such/file");
+    return 0;
+}
+```
+
+```text
+$ ./die 2>&1; echo "status $?"
+die: can't open /no/such/file: No such file or directory
+status 1
+```
+
+### Step by step
+
+`errno` is saved at once, because any library call may change it.
+`vfprintf` does the formatting with the caller's arguments, and `strerror`
+turns the error number into text. `exit(EXIT_FAILURE)` gives status 1,
+which the shell's `$?` shows.
+
+### Common mistake
+
+Ignoring output errors. A program that writes its results and exits with 0
+after the disk filled up has silently lost data. Checking `fclose` (and,
+for `stdout`, `fflush` or `ferror` before exiting) is the fix:
+
+```c
+/* fullcheck.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    FILE *fp = fopen("/dev/full", "w");    /* Linux: always "disk full" */
+    if (fp == NULL) return EXIT_FAILURE;
+    fprintf(fp, "important data\n");       /* buffered: no error yet */
+    if (fclose(fp) == EOF) {
+        perror("fclose");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+```
+
+```text
+$ ./fullcheck 2>&1; echo "status $?"
+fclose: No space left on device
+status 1
+```
+
+The `fprintf` succeeds because it only fills the buffer; the error
+appears when `fclose` flushes it. Without that check the program would
+report success.
+
+### In real systems
+
+Shell scripts, `make` and CI pipelines all decide what to do next by exit
+status, so a tool that exits 0 on failure breaks every pipeline that uses
+it. Long-running servers do not call `exit` on errors in a request; they
+log to standard error (which a supervisor like systemd collects) and carry
+on.
+
+### Check yourself
+
+**Why is `stderr` unbuffered while `stdout` is usually buffered?**
+
+<details>
+<summary>Answer</summary>
+
+Errors must appear at once, even if the program then crashes. Normal
+output is buffered for speed, because one system call per character would
+be slow.
+
+</details>
+
+## 7.7 Line Input and Output
+
+### In one sentence
+
+`fgets` reads a line into a buffer of a given size and `fputs` writes a
+string, which together are the safe, everyday way to handle text by lines.
+
+### The idea
+
+`fgets(line, maxline, fp)` reads characters until it has stored a newline
+or `maxline - 1` characters, whichever comes first, and then a `'\0'`. So
+the line keeps its newline if it fitted, and lacks one if it was too long
+(or was the last line of a file without a final newline). It returns
+`line`, or `NULL` at end of file or on error.
+
+`fputs(s, fp)` writes a string without adding anything, and returns `EOF`
+on error. The older `gets` and `puts` work on the standard streams, but
+behave differently: `puts` adds a newline, and `gets` removes it, and has
+no size limit at all. `gets` could not be used safely and was removed from
+the language in C11.
+
+The book shows that `fgets` and `fputs` are short loops over `getc` and
+`putc`, and rewrites its earlier `getline` on top of `fgets` to return the
+line length.
+
+### Worked example
+
+```c
+/* lines.c */
+#include <stdio.h>
+#include <string.h>
+
+/* read a line into s, at most lim-1 chars; return its length, 0 at EOF */
+static size_t readline(char *s, int lim, FILE *fp)
+{
+    if (fgets(s, lim, fp) == NULL) return 0;
+    return strlen(s);
+}
+
+int main(void)
+{
+    char buf[8];
+    size_t n;
+    while ((n = readline(buf, sizeof buf, stdin)) > 0) {
+        int whole = buf[n - 1] == '\n';
+        if (whole) buf[--n] = '\0';      /* strip the newline */
+        printf("%zu %s [%s]\n", n, whole ? "line" : "part", buf);
+    }
+    return 0;
+}
+```
+
+```text
+$ printf 'short\nmuch longer line\nend' | ./lines
+5 line [short]
+7 part [much lo]
+7 part [nger li]
+2 line [ne]
+3 part [end]
+```
+
+### Step by step
+
+<Trace columns={["call", "buffer after fgets", "ends in newline?"]} rows={[
+  ["1", "short\\n", "yes: a whole line"],
+  ["2", "much lo", "no: buffer full (7 chars)"],
+  ["3", "nger li", "no: still the same line"],
+  ["4", "ne\\n", "yes: end of the long line"],
+  ["5", "end", "no: last line had no newline"],
+]} caption="fgets on an 8-byte buffer. A line longer than the buffer arrives in pieces, and only the piece ending in a newline finishes the line." />
+
+### Common mistake
+
+Assuming every `fgets` result ends in a newline, and stripping the last
+character unconditionally. That deletes real data from a long or final
+line. Check, as above, or use `s[strcspn(s, "\n")] = '\0'`, which removes
+a newline only if there is one.
+
+### In real systems
+
+POSIX adds `getline(&buf, &cap, fp)`, which grows a heap buffer to fit
+any line and returns its length, removing the fixed-limit problem. Most
+Unix tools use it or an equivalent. Fixed `fgets` buffers remain right
+when a line limit is part of the format, as in many network protocols.
+
+### Check yourself
+
+**How many bytes can `fgets(buf, 8, fp)` store, counting the
+terminator?**
+
+<details>
+<summary>Answer</summary>
+
+Eight: at most seven characters, then `'\0'`.
+
+</details>
+
+## 7.8.1 String Operations
+
+### In one sentence
+
+`<string.h>` provides copying, joining, comparing, searching and measuring
+of strings, and none of them check buffer sizes for you.
+
+### The idea
+
+The main functions, where `s` and `t` are strings and `n` a count:
+`strcat(s, t)` appends `t` to `s`; `strncat(s, t, n)` appends at most `n`
+characters; `strcmp(s, t)` returns negative, zero or positive by
+comparison, and `strncmp` compares at most `n`; `strcpy(s, t)` and
+`strncpy(s, t, n)` copy; `strlen(s)` measures; `strchr(s, c)` and
+`strrchr(s, c)` find the first and last `c`, returning `NULL` if absent.
+
+The header also has the memory functions, which work on bytes regardless
+of terminators: `memcpy`, `memmove` (which allows overlapping regions),
+`memcmp`, `memchr` and `memset`. Searching functions include `strstr` for
+substrings, `strspn` and `strcspn` for spans of a character set, and
+`strtok` for splitting.
+
+Every writing function trusts the caller to have enough room. `strncpy` in
+particular is a trap: it does not add a terminator when the source is too
+long, and pads with zeros when it is short.
+
+### Worked example
+
+```c
+/* strops.c */
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    char path[32] = "/usr";
+    strcat(path, "/local");
+    strncat(path, "/binaries", 4);       /* appends "/bin" */
+    const char *slash = strrchr(path, '/');
+    printf("%s len %zu base %s\n", path, strlen(path), slash + 1);
+    printf("%d %d\n", strcmp("apple", "apricot") < 0, strncmp("apple", "apricot", 2));
+    printf("%s %zu %zu\n", strstr(path, "local"), strspn("2026-10", "0123456789"),
+           strcspn("key=value", "="));
+    char buf[4];
+    strncpy(buf, "toolong", sizeof buf); /* no terminator! */
+    printf("%.4s\n", buf);               /* safe: bounded print */
+    return 0;
+}
+```
+
+```text
+/usr/local/bin len 14 base bin
+1 0
+local/bin 4 3
+tool
+```
+
+### Step by step
+
+`strncat(path, "/binaries", 4)` appends four characters and then always a
+terminator, unlike `strncpy`. `strspn` counts the leading digits of
+"2026-10", 4; `strcspn` counts characters before the first `=`, 3. The
+`strncpy` fills all four bytes of `buf` with "tool" and no `'\0'`, so it
+can only be printed with a precision.
+
+### Common mistake
+
+Overlapping copies. `strcpy(s, s + 1)` to delete the first character, or
+`memcpy` between overlapping regions, is undefined behaviour; glibc's
+optimised versions really do corrupt data for some sizes. Use `memmove`
+when regions may overlap:
+
+```c
+/* overlap.c */
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    char s[] = "xhello";
+    memmove(s, s + 1, strlen(s + 1) + 1);   /* include the '\0' */
+    printf("%s\n", s);
+    return 0;
+}
+```
+
+```text
+hello
+```
+
+### In real systems
+
+Unbounded `strcpy` and `strcat` are behind a large share of historical
+buffer overflows, so many codebases ban them. Common replacements are
+`snprintf(dst, size, "%s", src)`, which always terminates and reports
+truncation, and the BSD `strlcpy` and `strlcat`, which glibc added in
+version 2.38.
+
+### Check yourself
+
+**What does `strchr(s, '\0')` return?**
+
+<details>
+<summary>Answer</summary>
+
+A pointer to the terminator of `s`. The terminator counts as part of the
+string for `strchr`, so this is a quick way to find the end.
+
+</details>
+
+## 7.8.2 Character Class Testing and Conversion
+
+### In one sentence
+
+`<ctype.h>` classifies characters (letter, digit, space, and so on) and
+converts case, and its arguments must be `unsigned char` values or `EOF`.
+
+### The idea
+
+The test functions return non-zero for true and zero for false:
+`isalpha(c)`, `isupper(c)`, `islower(c)`, `isdigit(c)`, `isalnum(c)`,
+`isspace(c)` (blank, tab, newline, return, form feed, vertical tab),
+`ispunct(c)`, `isxdigit(c)`, `iscntrl(c)` and `isprint(c)`. The converters
+`toupper(c)` and `tolower(c)` return the other case of a letter and
+anything else unchanged.
+
+These functions follow the current **locale**, the set of language
+conventions a program runs under. In the default "C" locale they match
+ASCII. They are faster and clearer than writing `c >= 'a' && c <= 'z'`,
+and correct on character sets where letters are not contiguous.
+
+The one rule: the argument must be representable as an `unsigned char`, or
+equal `EOF`. Passing a negative `char` (any byte above 127 when `char` is
+signed) is undefined behaviour.
+
+### Worked example
+
+```c
+/* classify.c */
+#include <ctype.h>
+#include <stdio.h>
+
+int main(void)
+{
+    const char *s = "Hi 42!\t";
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;     /* the safe conversion */
+        printf("%-2s alpha=%d digit=%d space=%d punct=%d upper->%c\n",
+               c == '\t' ? "\\t" : (char[]){(char)c, 0},
+               !!isalpha(c), !!isdigit(c), !!isspace(c), !!ispunct(c),
+               isprint(c) ? toupper(c) : '?');
+    }
+    return 0;
+}
+```
+
+```text
+H  alpha=1 digit=0 space=0 punct=0 upper->H
+i  alpha=1 digit=0 space=0 punct=0 upper->I
+   alpha=0 digit=0 space=1 punct=0 upper->
+4  alpha=0 digit=1 space=0 punct=0 upper->4
+2  alpha=0 digit=1 space=0 punct=0 upper->2
+!  alpha=0 digit=0 space=0 punct=1 upper->!
+\t alpha=0 digit=0 space=1 punct=0 upper->?
+```
+
+### Step by step
+
+`!!` turns any non-zero result into 1; the functions only promise
+non-zero, and glibc returns values like 1024. The compound literal
+`(char[]){(char)c, 0}` makes a one-character string for `%s`. The space is
+printable, so its "upper case" is itself, a space.
+
+### Common mistake
+
+Passing a plain `char` directly: `isupper(*p)` when `*p` is the byte 0xE9
+(é in Latin-1) passes -23 on x86-64. glibc happens to tolerate small
+negative values, but other libraries index a table with it and read
+outside, and it is undefined behaviour everywhere. Cast to
+`unsigned char` first.
+
+### In real systems
+
+Locale-dependence surprises people: `toupper` and `isalpha` can change
+behaviour after `setlocale(LC_ALL, "")`, and they never handle multibyte
+UTF-8 characters, only single bytes. Parsers of fixed formats (JSON, HTTP
+headers) therefore often write their own ASCII-only tests.
+
+### Check yourself
+
+**Does `isdigit` return 1 for true?**
+
+<details>
+<summary>Answer</summary>
+
+Not necessarily. It returns some non-zero value; compare with 0, never
+with 1.
+
+</details>
+
+
+## 7.8.3 Ungetc
+
+### In one sentence
+
+`ungetc(c, fp)` pushes one character back onto an input stream, so the
+next read returns it again, which lets a reader look one character ahead
+without consuming it.
+
+### The idea
+
+Many readers only know a token has ended when they have read one
+character too many. A number ends at the first non-digit, a word at the
+first space, an identifier at the first character that cannot be part of
+it. The reader has now consumed a character that belongs to whatever comes
+next. It needs a way to give it back.
+
+Chapter 4 solved this with its own `getch` and `ungetch` over a small
+buffer. The library provides the same service for any stream: `ungetc(c,
+fp)` pushes `c` back, and the next `getc(fp)` returns it. It returns `c`,
+or `EOF` if it could not push it back.
+
+Only one character of pushback is guaranteed. Some libraries allow more,
+but portable code never relies on it. Pushing back `EOF` is not allowed
+and does nothing. `ungetc` also clears the stream's end-of-file flag, and
+the pushed-back character is forgotten by a later `fseek`.
+
+<Flow caption="Lookahead with one pushback. The reader always consumes one character too many, and ungetc returns that character to the stream for the next reader." steps={[
+  "Read characters while they belong to the token",
+  "The first character that does not belong ends the token",
+  "ungetc pushes that character back onto the stream",
+  "The next read, by any function, sees it first",
+]} />
+
+### Worked example
+
+The book's example is `getint`, the chapter 4 function rewritten to use
+`ungetc`. Mine reads an optional sign and digits, and returns 1 for a
+number, 0 when the next thing is not a number (leaving it unread), and
+`EOF` at the end.
+
+```c
+/* getint.c: read an integer, pushing back the character that ends it */
+#include <ctype.h>
+#include <stdio.h>
+
+/* read the next integer from fp into *out; 1 if found, 0 if not, EOF at end */
+static int getint(FILE *fp, int *out)
+{
+    int c, sign = 1, n = 0;
+    while (isspace(c = getc(fp))) ;          /* skip white space */
+    if (c == EOF) return EOF;
+    if (c == '-' || c == '+') { sign = (c == '-') ? -1 : 1; c = getc(fp); }
+    if (!isdigit(c)) { ungetc(c, fp); return 0; }   /* not a number: leave it */
+    for (; isdigit(c); c = getc(fp)) n = 10 * n + (c - '0');
+    ungetc(c, fp);                           /* one too far: give it back */
+    *out = sign * n;
+    return 1;
+}
+```
+
+A driver that prints each number and the character after it:
+
+```c
+/* getint.c, continued */
+int main(void)
+{
+    int v, r;
+    while ((r = getint(stdin, &v)) != EOF) {
+        if (r == 1) printf("int %d, next char '%c'\n", v, (char)getc(stdin));
+        else printf("skip '%c'\n", (char)getc(stdin));
+    }
+    return 0;
+}
+```
+
+```text
+$ printf '12,-7 x 42;' | ./getint
+int 12, next char ','
+int -7, next char ' '
+skip 'x'
+int 42, next char ';'
+```
+
+The comma after 12 was read by `getint`, pushed back, and read again by
+`main`. The `x` is never consumed by `getint` at all: it sees that `x` is
+not a digit, pushes it back and returns 0, and `main` skips it.
+
+### Step by step
+
+<Trace columns={["getc returns", "state", "action", "stream after"]} rows={[
+  ["'1'", "digits", "n = 1", ",-7 x 42;"],
+  ["'2'", "digits", "n = 12", "..."],
+  ["','", "token ended", "ungetc(',')", "',' is next again"],
+  ["(main) ','", "-", "printed as next char", "-7 x 42;"],
+  ["'-'", "sign", "sign = -1", "7 x 42;"],
+  ["'7'", "digits", "n = 7", " x 42;"],
+  ["' '", "token ended", "ungetc(' '); value -7", "' ' is next again"],
+]} caption="getint on 12,-7. Look at the ungetc rows: each number costs one extra read, which is immediately given back." />
+
+### Common mistake
+
+Pushing back two characters. A reader that sees `-` and then a letter
+might want to push back both, so that `-x` is read as two tokens later.
+Only one pushback is guaranteed, so the second `ungetc` may fail and the
+`-` is lost. The fix is to keep a small pushback buffer of your own, as
+chapter 4's `ungetch` did, or to restructure so only one character is
+ever returned.
+
+A subtler mistake: `getint` above, given `-x`, consumes the `-` and pushes
+back only the `x`. The sign is silently lost. The book's version has the
+same limitation and leaves it as an exercise; a careful fix pushes back
+the `x` and returns the `-` as a separate token.
+
+### In real systems
+
+Every hand-written lexer, from a JSON parser to a compiler front end, has
+a "peek" operation, and one character of lookahead is enough for most
+languages' tokens. Production lexers usually work on a buffer in memory
+and move an index back rather than calling `ungetc`, because it is faster
+and allows arbitrary lookahead, but the idea is the same.
+
+### Check yourself
+
+**After `ungetc('x', fp)`, what do `getc(fp)` and then another `getc(fp)`
+return?**
+
+<details>
+<summary>Answer</summary>
+
+First `'x'`, then whatever character was next in the stream before the
+pushback.
+
+</details>
+
+## 7.8.4 Command Execution
+
+### In one sentence
+
+`system(s)` hands the string `s` to the command processor (the shell on
+Unix), waits for it to finish, and returns its status.
+
+### The idea
+
+Sometimes the simplest way to do something is to run an existing program.
+`system("date")` runs the `date` command as if it had been typed at the
+shell, and the current program resumes when it finishes. The command's
+output goes to the same standard output as the program's, because the
+child inherits the descriptors.
+
+The return value is implementation-dependent, which the book points out.
+On Unix it is the wait status from `waitpid`, which packs the exit code
+and other information into one integer; the macros `WIFEXITED` and
+`WEXITSTATUS` from `<sys/wait.h>` decode it. `system(NULL)` asks whether a
+command processor exists at all. A return of -1 means the child could not
+be created.
+
+Because a shell interprets the string, everything the shell does applies:
+redirection, pipes, variables and, dangerously, any special characters
+that come from user input.
+
+### Worked example
+
+A small runner that prints each command's exit code:
+
+```c
+/* sys.c: run a shell command and decode its status */
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+
+static void run(const char *cmd)
+{
+    fflush(stdout);                      /* our buffered text goes first */
+    int st = system(cmd);
+    if (st == -1) perror("system");
+    else if (WIFEXITED(st)) printf("[%s] exited with %d\n", cmd, WEXITSTATUS(st));
+    else printf("[%s] ended abnormally\n", cmd);
+}
+
+int main(void)
+{
+    printf("shell available? %s\n", system(NULL) ? "yes" : "no");
+    run("echo hello from the shell");
+    run("exit 3");
+    run("no-such-command-xyz 2>/dev/null");
+    return 0;
+}
+```
+
+```text
+$ ./sys | cat
+shell available? yes
+hello from the shell
+[echo hello from the shell] exited with 0
+[exit 3] exited with 3
+[no-such-command-xyz 2>/dev/null] exited with 127
+```
+
+127 is the shell's convention for "command not found". The `fflush`
+matters: without it, when output is a pipe, the program's own buffered
+lines would appear after the child's output, out of order.
+
+### Step by step
+
+<Flow caption="What system does on Unix. The program is blocked in the middle step until the shell, and whatever it ran, has exited." steps={[
+  "fork a child process",
+  "the child runs /bin/sh -c with the command string",
+  "the parent waits for the child to exit",
+  "system returns the wait status; WEXITSTATUS extracts the exit code",
+]} />
+
+### Common mistake
+
+Building a command from untrusted input: `snprintf(cmd, sizeof cmd, "ls %s", name)`
+followed by `system(cmd)`. A name such as `x; rm -rf ~` runs a second
+command. This is **command injection**, and it is a serious security bug.
+The fix is not to quote cleverly but to avoid the shell: use `fork` and
+`execvp` (or `posix_spawn`), which pass arguments as an array and never
+interpret them.
+
+### In real systems
+
+`system` is fine for fixed commands in small tools and scripts. Larger
+programs use `posix_spawn` or `fork` plus `exec`, with pipes to capture
+output, and `popen` when they want to read a command's output as a
+stream. Node's `child_process.exec` has the same shell-injection risk as
+`system`, and `execFile` and `spawn` are the safe equivalents for the same
+reason.
+
+### Check yourself
+
+**Why does `system("exit 3")` not return 3 directly on Unix?**
+
+<details>
+<summary>Answer</summary>
+
+It returns a wait status, which encodes the exit code together with how
+the process ended. `WEXITSTATUS` extracts the 3.
+
+</details>
+
+## 7.8.5 Storage Management
+
+### In one sentence
+
+`malloc` and `calloc` obtain blocks of memory at run time, `free` returns
+them, and every block must be freed exactly once and never used after.
+
+### The idea
+
+Arrays declared in a program have a size fixed when it is compiled.
+Programs whose data size is known only at run time, such as a list of
+lines read from input, need memory on demand. `malloc(n)` returns a
+pointer to `n` bytes of uninitialised storage, or `NULL` if none is
+available. `calloc(n, size)` returns space for an array of `n` objects of
+`size` bytes, all bits set to zero, or `NULL`.
+
+The pointer returned is suitably **aligned** for any object type, so it can
+be converted to any object pointer type. In C a `void *` converts
+implicitly, so `int *a = malloc(n * sizeof *a);` needs no cast; the book's
+casts were needed before `void *` existed. Writing `sizeof *a` rather than
+`sizeof(int)` keeps the size right if the type of `a` changes.
+
+`free(p)` returns the block to the allocator. After that the memory may be
+reused for anything, so using it, reading or writing, is undefined
+behaviour. Freeing something not obtained from `malloc`, `calloc` or
+`realloc`, or freeing it twice, is also undefined. `free(NULL)` does
+nothing, which simplifies clean-up code. `realloc(p, n)` resizes a block,
+possibly moving it, and keeps the old contents up to the smaller size.
+
+### Worked example
+
+The simple part: allocate, grow and zero-fill arrays, checking each
+result.
+
+```c
+/* mem.c: malloc, calloc, realloc and free, checked */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct node { int val; struct node *next; };
+
+int main(void)
+{
+    int *a = malloc(5 * sizeof *a);          /* contents indeterminate */
+    int *z = calloc(5, sizeof *z);           /* contents all zero */
+    if (a == NULL || z == NULL) return 1;
+    for (int i = 0; i < 5; i++) a[i] = i * i;
+    int *bigger = realloc(a, 10 * sizeof *a);
+    if (bigger == NULL) { free(a); free(z); return 1; }
+    a = bigger;                              /* old values kept, rest new */
+    printf("a[4]=%d z[4]=%d\n", a[4], z[4]);
+```
+
+The realistic part, a linked list built and then freed correctly, which is
+the book's own warning example:
+
+```c
+/* mem.c, continued */
+    struct node *head = NULL;
+    for (int i = 1; i <= 3; i++) {
+        struct node *n = malloc(sizeof *n);
+        if (n == NULL) return 1;
+        n->val = i; n->next = head; head = n;
+    }
+    for (struct node *p = head, *q; p != NULL; p = q) {
+        q = p->next;                         /* save before freeing */
+        printf("free %d\n", p->val);
+        free(p);
+    }
+    free(a); free(z);
+    return 0;
+}
+```
+
+```text
+$ ./mem
+a[4]=16 z[4]=0
+free 3
+free 2
+free 1
+```
+
+Built with `-fsanitize=address`, this runs with no reports: every block is
+freed once and nothing is touched after it is freed.
+
+### Step by step
+
+<Trace columns={["iteration", "p", "q = p->next", "after free(p)"]} rows={[
+  ["1", "node 3", "node 2", "node 3 gone; q still valid"],
+  ["2", "node 2", "node 1", "node 2 gone"],
+  ["3", "node 1", "NULL", "node 1 gone"],
+  ["4", "NULL", "-", "loop ends"],
+]} caption="Freeing a list safely. Look at the q column: the next pointer is copied out of each node before that node is freed." />
+
+### Common mistake
+
+The book's warning is exactly this loop written the obvious way:
+
+```c
+for (p = head; p != NULL; p = p->next)   /* WRONG */
+    free(p);
+```
+
+After `free(p)`, the step `p = p->next` reads from freed memory. It often
+seems to work, because the bytes have not been reused yet, which is what
+makes it dangerous. AddressSanitizer catches it at once:
+
+```text
+==252179==ERROR: AddressSanitizer: heap-use-after-free on address ...
+READ of size 8 at ... thread T0
+```
+
+The fix is to save `p->next` before freeing, as in the realistic example.
+The other classic is `p = realloc(p, n)`: if `realloc` fails it returns
+`NULL`, the assignment loses the only pointer to the old block, and that
+block leaks. Assign to a temporary first.
+
+### In real systems
+
+Memory bugs (use after free, double free, overflow) are behind a large
+share of serious security vulnerabilities in C and C++ software, which is
+why sanitizers in tests, fuzzing, and hardened allocators are standard in
+large C codebases, and why newer systems languages make ownership explicit.
+Long-running C programs also watch for leaks with tools like Valgrind or
+LeakSanitizer, because a few bytes lost per request add up over weeks.
+
+### Check yourself
+
+**Is it safe to call `free(NULL)`?**
+
+<details>
+<summary>Answer</summary>
+
+Yes. The standard says it does nothing, so clean-up code can free
+pointers that may never have been allocated.
+
+</details>
+
+**What is wrong with `p = realloc(p, 2 * n);`?**
+
+<details>
+<summary>Answer</summary>
+
+If `realloc` fails it returns `NULL` and leaves the old block allocated;
+assigning to `p` loses the only pointer to it, so it leaks. Use a
+temporary and check it.
+
+</details>
+
+## 7.8.6 Mathematical Functions
+
+### In one sentence
+
+`<math.h>` declares over twenty functions on `double`, including the
+trigonometric, exponential, logarithmic and power functions, and reports
+domain and range errors through `errno`.
+
+### The idea
+
+The functions take and return `double`. The main ones are `sin`, `cos`,
+`tan`, `atan` and `atan2(y, x)` (angles in radians); `exp`, `log`
+(natural) and `log10`; `pow(x, y)`; `sqrt`; `fabs` (absolute value);
+`floor` and `ceil` (round down and up); and `fmod` (floating remainder).
+`atan2` is the useful one for angles, because it uses the signs of both
+arguments to choose the correct quadrant.
+
+Errors are reported in two ways. A **domain error** means the argument is
+outside where the function is defined, such as `sqrt(-1)`; the result is
+an implementation-defined value (NaN on IEEE systems) and `errno` may be
+set to `EDOM`. A **range error** means the result cannot be represented,
+such as `exp(1000)`; the result is `HUGE_VAL` and `errno` may be set to
+`ERANGE`. To use `errno`, set it to 0 before the call and test it after.
+
+On many Unix systems the math functions live in a separate library, so
+programs using them must be linked with `-lm`.
+
+### Worked example
+
+```c
+/* m.c: a tour of math.h, including its error reporting */
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+
+int main(void)
+{
+    printf("sqrt(2)=%.6f pow(2,10)=%g exp(1)=%.6f log(M_E)=%g\n",
+           sqrt(2), pow(2, 10), exp(1), log(M_E));
+    printf("atan2(1,1)*4=%.6f fabs(-3.5)=%g floor(-2.5)=%g ceil(-2.5)=%g\n",
+           atan2(1, 1) * 4, fabs(-3.5), floor(-2.5), ceil(-2.5));
+    printf("fmod(7.5,2)=%g log10(1000)=%g sin(M_PI/6)=%.6f\n",
+           fmod(7.5, 2), log10(1000), sin(M_PI / 6));
+    errno = 0;
+    double r = sqrt(-1);
+    printf("sqrt(-1)=%f errno EDOM? %d\n", r, errno == EDOM);
+    errno = 0;
+    r = exp(1000);
+    printf("exp(1000)=%f errno ERANGE? %d, == HUGE_VAL? %d\n", r, errno == ERANGE, r == HUGE_VAL);
+    printf("0.1 + 0.2 == 0.3? %d, difference %.3g\n", 0.1 + 0.2 == 0.3, 0.1 + 0.2 - 0.3);
+    return 0;
+}
+```
+
+```text
+$ cc m.c -lm -o m && ./m
+sqrt(2)=1.414214 pow(2,10)=1024 exp(1)=2.718282 log(M_E)=1
+atan2(1,1)*4=3.141593 fabs(-3.5)=3.5 floor(-2.5)=-3 ceil(-2.5)=-2
+fmod(7.5,2)=1.5 log10(1000)=3 sin(M_PI/6)=0.500000
+sqrt(-1)=-nan errno EDOM? 1
+exp(1000)=inf errno ERANGE? 1, == HUGE_VAL? 1
+0.1 + 0.2 == 0.3? 0, difference 5.55e-17
+```
+
+`floor(-2.5)` is -3, not -2: it rounds toward minus infinity, not toward
+zero. `M_PI` and `M_E` are POSIX additions, not standard C, so strictly
+portable code defines its own constants (or computes pi as
+`4 * atan(1)`, as the second line does).
+
+### Step by step
+
+<Trace columns={["x", "floor(x)", "ceil(x)", "(int)x", "fmod(x, 2)"]} rows={[
+  ["2.5", "2", "3", "2", "0.5"],
+  ["-2.5", "-3", "-2", "-2", "-0.5"],
+  ["7.5", "7", "8", "7", "1.5"],
+  ["-7.5", "-8", "-7", "-7", "-1.5"],
+]} caption="Four ways to drop a fraction. Look at the negative rows: floor and the cast differ, and fmod keeps the sign of x." />
+
+### Common mistake
+
+Forgetting `-lm`, or forgetting the header. Without `-lm` on many systems
+the link fails:
+
+```text
+$ cc nolm.c -o nolm
+nolm.c:(.text+0x32): undefined reference to `sqrt'
+```
+
+Without `#include <math.h>`, an old compiler assumed `sqrt` returned
+`int`, and the result was garbage; modern compilers refuse or warn about
+the implicit declaration. The third mistake is comparing floating results
+with `==`, as the last line shows: compare with a tolerance suited to the
+magnitudes involved.
+
+### In real systems
+
+Numerical code cares about precision and special values: NaN propagates
+silently through calculations, infinities appear after overflow, and
+results can differ in the last bits between libraries and compiler flags
+(`-ffast-math` trades exactness for speed). Code that must be
+reproducible, such as financial or scientific code, pins the library and
+flags or avoids floating point altogether for money, using integers of the
+smallest unit.
+
+### Check yourself
+
+**What does `atan2(-1, -1)` return, and why not use `atan(-1 / -1)`?**
+
+<details>
+<summary>Answer</summary>
+
+About -2.356 (minus three quarters of pi), the angle in the third
+quadrant. `atan(1)` gives pi over four, the first quadrant, because the
+division throws away both signs.
+
+</details>
+
+## 7.8.7 Random Number Generation
+
+### In one sentence
+
+`rand()` returns a pseudo-random integer from 0 to `RAND_MAX`, and
+`srand(seed)` sets the starting point, so the same seed always gives the
+same sequence.
+
+### The idea
+
+A **pseudo-random** generator is a deterministic formula: each number is
+computed from internal state, which is then updated. The numbers look
+random but are completely determined by the **seed**, the starting state.
+That is a feature for testing, since a run can be repeated exactly, and a
+problem for anything that must be unpredictable.
+
+`rand()` returns an `int` from 0 to `RAND_MAX`, which is at least 32,767
+and is 2,147,483,647 on glibc. Without a call to `srand`, the program
+behaves as if `srand(1)` had been called, so every run gives the same
+numbers. The book shows a floating-point value in the range zero up to but
+not including one, made by dividing by `RAND_MAX + 1.0`.
+
+To get an integer from 0 to `n - 1`, people write `rand() % n`. That is
+slightly **biased** whenever `n` does not divide `RAND_MAX + 1` evenly:
+the low values appear a little more often. For small `n` and a large
+`RAND_MAX` the bias is tiny, but it is real, and it grows as `n` grows.
+
+### Worked example
+
+```c
+/* rnd.c: rand, srand, and two ways to get a range */
+#include <stdio.h>
+#include <stdlib.h>
+
+static double frand(void) { return (double)rand() / ((double)RAND_MAX + 1.0); }
+
+/* uniform integer in [0, n): reject the uneven top slice of rand's range */
+static int uniform(int n)
+{
+    int limit = RAND_MAX - (RAND_MAX % n);     /* largest multiple of n */
+    int r;
+    while ((r = rand()) >= limit) ;
+    return r % n;
+}
+```
+
+```c
+/* rnd.c, continued */
+int main(void)
+{
+    printf("RAND_MAX = %d\n", RAND_MAX);
+    srand(1);
+    printf("seed 1:"); for (int i = 0; i < 3; i++) printf(" %d", rand()); printf("\n");
+    srand(1);
+    printf("seed 1 again:"); for (int i = 0; i < 3; i++) printf(" %d", rand()); printf("\n");
+    srand(42);
+    printf("dice:"); for (int i = 0; i < 8; i++) printf(" %d", 1 + uniform(6)); printf("\n");
+    printf("frand: %.4f %.4f\n", frand(), frand());
+    return 0;
+}
+```
+
+```text
+$ ./rnd       (glibc)
+RAND_MAX = 2147483647
+seed 1: 1804289383 846930886 1681692777
+seed 1 again: 1804289383 846930886 1681692777
+dice: 1 1 6 4 5 5 2 1
+frand: 0.0249 0.3017
+```
+
+The two seed-1 lines are identical, which is the point of a seed. Another
+C library would print different numbers for the same seed, because the
+algorithm is not specified by the standard.
+
+### Step by step
+
+The bias is easiest to see with a toy generator that returns 0 to 9, used
+to pick one of 4 values with `% 4`:
+
+<Trace columns={["value % 4", "generator outputs that give it", "count out of 10"]} rows={[
+  ["0", "0, 4, 8", "3"],
+  ["1", "1, 5, 9", "3"],
+  ["2", "2, 6", "2"],
+  ["3", "3, 7", "2"],
+]} caption="Modulo bias with a range of 10 and n of 4. The top slice, 8 and 9, spills into 0 and 1; uniform() fixes it by rejecting values from that slice and drawing again." />
+
+`uniform` throws away any draw at or above the largest multiple of `n`
+that fits, so every remainder has the same number of draws behind it. The
+loop almost never repeats, because the rejected slice is tiny.
+
+### Common mistake
+
+Seeding inside a loop with the time: `srand(time(NULL))` before every
+`rand()`. Within one second the seed is the same, so every "random" number
+in that second is identical. Seed once, at start-up. The second mistake is
+using `rand` for anything secret, such as tokens or passwords: its output
+is predictable from a few samples. Use the operating system's generator
+(`getrandom` on Linux, `arc4random` on BSD and macOS).
+
+### In real systems
+
+Simulations and games use better generators than `rand` (PCG, xoshiro,
+Mersenne Twister) and keep explicit state, so each thread or test has its
+own reproducible stream. Security code uses the kernel's
+cryptographically secure source. In JavaScript the split is the same:
+`Math.random()` for simulations and `crypto.getRandomValues()` for
+anything an attacker must not guess.
+
+### Check yourself
+
+**Why does a program that never calls `srand` print the same numbers every
+run?**
+
+<details>
+<summary>Answer</summary>
+
+Without `srand`, the generator starts as if seeded with 1, so the sequence
+is the same each time.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 7, Input and Output">
+<Level name="Beginner" depth={3}>
+
+The beginner's core is three streams and a handful of functions. Read
+with `getchar`, `fgets` or `scanf`; write with `putchar`, `fputs` or
+`printf`; open other files with `fopen` and close them with `fclose`;
+send errors to `stderr`. Every input function signals the end in its
+return value (`EOF` or `NULL`), and every loop is driven by that return
+value.
+
+A beginner's worked example: number the lines of each file named on the
+command line, or of standard input if there are none, which combines
+`fopen`, `fgets`, `printf` and `perror`.
+
+```c
+/* numlines.c: number the lines of each file, or of standard input */
+#include <stdio.h>
+
+static void number(FILE *fp, const char *name)
+{
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof line, fp) != NULL)
+        printf("%s:%3d  %s", name, ++n, line);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc == 1) number(stdin, "-");
+    for (int i = 1; i < argc; i++) {
+        FILE *fp = fopen(argv[i], "r");
+        if (fp == NULL) { perror(argv[i]); continue; }
+        number(fp, argv[i]);
+        fclose(fp);
+    }
+    return 0;
+}
+```
+
+```text
+$ ./numlines two.txt
+two.txt:  1  alpha
+two.txt:  2  beta
+$ printf 'x\n' | ./numlines
+-:  1  x
+```
+
+The same `number` function serves a named file and standard input,
+because both are just `FILE *`. The `printf` has no `\n` of its own,
+because `fgets` keeps the line's newline.
+
+The beginner's mistake is a loop that tests `feof(fp)` before reading.
+`feof` only becomes true after a read has already failed, so the loop
+runs one extra time and processes the last line twice (or garbage). The
+fix is to test the read itself, as `number` does.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate step is a complete, well-behaved tool: read lines, parse
+each with `sscanf`, report bad input on `stderr` with its line number,
+write results to `stdout`, and set the exit status. That combination is
+what makes a program usable in scripts.
+
+```c
+/* report.c: parse "name,qty,price" lines; report totals and bad lines */
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    char line[200], name[32];
+    int qty, lineno = 0, bad = 0;
+    double price, total = 0;
+    while (fgets(line, sizeof line, stdin) != NULL) {
+        lineno++;
+        if (sscanf(line, "%31[^,],%d,%lf", name, &qty, &price) != 3) {
+            fprintf(stderr, "line %d: cannot parse: %s", lineno, line);
+            bad++;
+            continue;
+        }
+        printf("%-8s %4d x %7.2f = %9.2f\n", name, qty, price, qty * price);
+        total += qty * price;
+    }
+    printf("%-8s %25.2f\n", "TOTAL", total);
+    return bad ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+```
+
+```text
+$ printf 'pen,10,1.25\npaper,3,4.5\noops\nink,2,12\n' | ./report; echo "status $?"
+line 3: cannot parse: oops
+pen        10 x    1.25 =     12.50
+paper       3 x    4.50 =     13.50
+ink         2 x   12.00 =     24.00
+TOTAL                        50.00
+status 1
+```
+
+`%31[^,]` reads up to 31 characters that are not commas, which is how to
+read a field that may contain spaces. `%lf` reads a `double`. The bad line
+is reported and skipped, the good lines still produce a report, and the
+exit status says something went wrong.
+
+The intermediate mistake is to write `%d,%d` and expect it to skip spaces
+after the comma: it does, because `%d` skips leading white space, but
+`%c` and `%[` do not, so `" %c"` needs its explicit space. Knowing which
+conversions skip white space is the fix.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+The advanced level is buffering, precisely. A stream is **unbuffered**
+(each output goes straight to the system, like `stderr`), **line
+buffered** (flushed at each newline, the default for a terminal) or
+**fully buffered** (flushed when the buffer fills, the default for files
+and pipes). The buffer is also flushed by `fflush`, by `fclose`, by
+`exit` and by returning from `main`, and, for line-buffered output, when
+input is requested from a line-buffered stream.
+
+What is not flushed is anything still in the buffer when the process
+dies abnormally. Here the "crash" is `abort()`:
+
+```c
+/* lost.c: buffered output dies with the process */
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[])
+{
+    if (argc > 1) setvbuf(stdout, NULL, _IOLBF, 0);   /* flush at each newline */
+    printf("step 1 done\n");
+    printf("step 2 done\n");
+    abort();                                          /* simulated crash */
+}
+```
+
+```text
+$ ./lost | cat
+$ ./lost -l | cat
+step 1 done
+step 2 done
+```
+
+Through a pipe, the first run prints nothing: both lines were in the full
+buffer when the process died. `setvbuf` with `_IOLBF` makes the stream
+line buffered, and the lines survive. On a terminal both runs would show
+the lines, which is why this bug hides during development and appears in
+production logs.
+
+The exact rules of `printf` are the other advanced topic: the default
+argument promotions mean `%f` prints both `float` and `double`, `%c`
+receives an `int`, and `%hhd` exists to print a value converted back to
+`char`. `printf` returns the number of characters written, which
+`snprintf` uses to report how long the full output would have been.
+
+The advanced mistake is calling `setvbuf` after the first output on the
+stream: it must come before any I/O on that stream, or the behaviour is
+undefined.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Each of these is a single boundary.
+
+**Empty input.** `getchar` returns `EOF` at once, `fgets` returns `NULL`,
+`scanf` returns `EOF`. A loop driven by the return value does nothing; a
+loop driven by `feof` runs once on garbage.
+
+**A last line with no newline.** `fgets` returns it without a `'\n'`, as
+the `lines.c` trace in 7.7 showed. Code that strips the last character
+unconditionally deletes real data.
+
+**A line exactly as long as the buffer.** With `char buf[8]`, a 7-character
+line plus newline is 8 characters: `fgets` returns the 7 characters, and
+the newline arrives alone on the next call, as an apparently empty line.
+
+**A `NULL` string to `%s`.** Undefined behaviour. glibc prints `(null)`
+for `printf("[%s]\n", p)`, but when the format is exactly `"%s\n"` the
+compiler turns the call into `puts(p)`, which crashes:
+
+```text
+$ ./nullstr
+[(null)]
+$ ./nullputs
+Segmentation fault (exit status 139)
+```
+
+**`fopen` of an empty name or a directory.** `fopen("", "r")` fails with
+"No such file or directory"; `fopen("/tmp", "w")` fails with "Is a
+directory". Both return `NULL`, which the program must check.
+
+**The integer at the limit.** `scanf("%d")` on `99999999999` is undefined
+behaviour; `strtol` returns `LONG_MAX` and sets `errno` to `ERANGE`, which
+is why the production level below uses it.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two boundaries, or a boundary with a side effect.
+
+**`scanf` followed by `fgets`.** `scanf("%d")` stops at the newline after
+the number and leaves it in the input. The next `fgets` reads just that
+newline and returns an empty line:
+
+```c
+/* mixed.c: scanf leaves the newline that fgets then reads */
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    int age;
+    char name[32];
+    if (scanf("%d", &age) != 1) return 1;
+    fgets(name, sizeof name, stdin);           /* reads the rest of line 1 */
+    name[strcspn(name, "\n")] = '\0';
+    printf("age %d, name [%s]\n", age, name);
+    return 0;
+}
+```
+
+```text
+$ printf '42\nAda\n' | ./mixed
+age 42, name []
+```
+
+The fix is to read every line with `fgets` and parse it with `sscanf`, so
+the two functions never share a stream position.
+
+**Output and error to the same pipe.** `mycat` in 7.5 printed its error
+before the file it copied first, because `stdout` was fully buffered to
+the pipe and `stderr` unbuffered. Two correct streams, combined, reorder
+the story. Flushing `stdout` before writing to `stderr`, or making
+`stdout` line buffered, keeps them in order.
+
+**A `printf` before `fork` or `system`.** Buffered output not yet flushed
+is copied into the child by `fork`, so it can appear twice; with `system`
+it appears after the child's output. That is why `sys.c` calls `fflush`
+first.
+
+**`ungetc` then `fseek`.** The pushed-back character is discarded by the
+seek. A parser that peeks and then repositions loses its lookahead.
+
+**Reading and writing one stream without a seek between.** On a stream
+opened with `"r+"`, a write directly after a read (or the reverse) without
+an intervening `fseek` or `fflush` is undefined, and in practice writes
+land in surprising places.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, input is hostile and output can fail. Parse numbers with
+`strtol` and `strtod`, which report where they stopped and whether the
+value overflowed:
+
+```c
+/* parseint.c: strtol with every error checked */
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* parse all of s as a base-10 int; 0 on success, -1 on any problem */
+static int parse_int(const char *s, int *out)
+{
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s) return -1;                       /* no digits at all */
+    if (*end != '\0' && *end != '\n') return -1;   /* trailing junk */
+    if (errno == ERANGE || v < INT_MIN || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+```
+
+A driver feeding it seven strings:
+
+```text
+42           -> 42
+-17          -> -17
+             -> rejected
+12abc        -> rejected
+99999999999  -> rejected
+ 7           -> 7
+0x1F         -> rejected
+```
+
+Leading white space is accepted (that is `strtol`'s rule), trailing junk
+and overflow are not, and hexadecimal is rejected because the base is 10.
+`atoi` would have returned 12 for `12abc` and something meaningless for
+the overflow, with no way to tell.
+
+On the output side, production code checks the result of the final
+`fflush` or `fclose`, as `fullcheck.c` in 7.6 did, because a full disk or
+a closed pipe shows up only there. Logging goes to `stderr` or a log file
+with line buffering, so lines are whole and in order even if the process
+dies. Formatting into fixed buffers uses `snprintf`, whose return value
+reveals truncation.
+
+The production mistake is writing a log line with several `printf` calls.
+Under concurrency, another thread's output can land between them. The fix
+is to format the whole line first, then write it with one call.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to treat input as untrusted and output
+as fallible. Every read can return less than expected, every parse can
+fail, and every write can be lost in a buffer. Programs that check each
+return value are the ones that work when the input is strange and the
+disk is full.
+
+The second habit is composition. A program that reads standard input,
+writes standard output, sends errors to standard error and returns a
+meaningful status fits into pipelines and scripts with no extra work.
+That design, small tools joined by text streams, outlived the hardware it
+was invented on and is how shell scripts, CI jobs and data pipelines are
+still built.
+
+The same habits carry straight into TypeScript. Node's `readline` reads a
+stream line by line, `process.stderr.write` keeps errors out of the
+output, and `process.exitCode` sets the status:
+
+```ts
+// report.ts: the same tool, in Node
+import * as readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+let total = 0, n = 0;
+rl.on("line", (line) => {
+  n++;
+  const [name, qty, price] = line.split(",");
+  const q = Number(qty), p = Number(price);
+  if (!name || !Number.isFinite(q) || !Number.isFinite(p)) {
+    process.stderr.write(`line ${n}: cannot parse: ${line}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  total += q * p;
+});
+rl.on("close", () => console.log(`TOTAL ${total.toFixed(2)}`));
+```
+
+The mindset mistake is treating I/O code as boring glue and testing only
+the happy path. Most real failures happen at I/O boundaries, so I test a
+missing file, an empty file, a last line without a newline, and a full
+disk (`/dev/full`) for every tool I write.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In a larger system, this chapter's choices sit at every boundary between
+processes. Take a log pipeline: an application writes lines to `stderr`;
+a supervisor such as systemd or a container runtime captures them; a
+shipper reads them line by line and forwards them; a store indexes them.
+Each hop is a stream of text lines, and each hop has the same concerns as
+this chapter: buffering, partial lines, and what happens when the next
+stage is slow or gone.
+
+<Layers caption="A log pipeline as layers of streams. Each layer reads lines from the one below and writes lines to the one above, and each has to decide how much to buffer." layers={[
+  { name: "Search and dashboards", note: "query the indexed lines" },
+  { name: "Log store", note: "indexes lines by time and fields" },
+  { name: "Shipper", note: "reads lines, batches them, retries on failure" },
+  { name: "Supervisor", note: "captures stdout and stderr of each process" },
+  { name: "Application", note: "writes one whole line per event, line buffered" },
+]} />
+
+The design decisions are this chapter's at scale. Line buffering in the
+application means no event is lost on a crash, at the cost of one system
+call per line. Batching in the shipper trades latency for throughput,
+exactly as a full buffer does. Structured lines (one JSON object per
+line) are the modern version of `printf` with a fixed format: easy to
+write, easy to parse with a line reader.
+
+The design mistake is letting a slow consumer block the producer. If the
+application writes to a pipe whose reader has stalled, the pipe fills and
+`write` blocks, and the application stops serving requests. Production
+systems put a bounded buffer with a drop policy between them, so logging
+can never take the service down.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+I learn this chapter by writing small tools and breaking them. For each
+section I write one program from the examples above, then feed it the
+edge cases: empty input, no final newline, a huge line, a missing file,
+`/dev/full` as output, and a pipe instead of a terminal. Each surprise
+goes into a notes file with its explanation.
+
+I keep a one-page cheat sheet of my own: `printf` conversions and flags,
+which `scanf` conversions skip white space, the return values of `getc`,
+`fgets`, `scanf`, `fopen`, `fclose` and `system`, and the three buffering
+modes. Writing it from memory, then checking it against the manual pages,
+is the test.
+
+The strategy mistake is to rely on `scanf` for everything because it is
+the first input function taught. I practise the `fgets` plus `sscanf` or
+`strtol` pattern until it is my default.
+
+Done when I can write `report.c` from a blank file with every error
+checked, explain the output order of `mycat` and `lost.c` in a pipe, and
+predict the output of any `printf` format in the 7.2 table before running
+it.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Why is `getchar`'s result an `int` and not a `char`?** It must hold every
+possible byte value plus `EOF`, which is one more value than a `char` can
+hold.
+
+**Why does `printf` use `%f` for both `float` and `double` but `scanf`
+needs `%lf` for `double`?** `printf` receives values, and a `float` is
+promoted to `double` when passed through `...`. `scanf` receives pointers,
+and a pointer to `float` and a pointer to `double` point at different
+sizes, so it must be told which.
+
+**Should I ever use `scanf`?** For quick programs reading trusted input,
+it is fine if every return value is checked. For anything else, read lines
+with `fgets` and parse with `sscanf` or `strtol`.
+
+**What is the difference between `exit` and `return` in `main`?** In
+`main` they are equivalent. `exit` can be called from anywhere and still
+flushes and closes all streams. `_exit` (POSIX) leaves without flushing.
+
+**Why is my output missing when the program crashes?** It was in the
+`stdout` buffer. Use `stderr` for diagnostics, call `fflush` at important
+points, or make `stdout` line buffered with `setvbuf`.
+
+**Why is `gets` gone?** It writes an input line into a buffer with no
+size limit, so any long line overflows it. It was removed in C11; `fgets`
+replaces it.
+
+**Do I need `-lm`?** On many Unix systems, yes, for the functions in
+`<math.h>`; on some it is part of the main C library. Adding it is always
+safe.
+
+## Key takeaways
+
+- Input and output come from the standard library, not the language, which is what makes C programs portable.
+- Every program starts with `stdin`, `stdout` and `stderr`, and redirection is invisible to it.
+- Store `getchar` and `getc` results in an `int`, so `EOF` is distinct from every byte.
+- Every `printf` conversion must match its argument's promoted type; never pass user text as the format.
+- Variadic functions walk their arguments with `va_start`, `va_arg` and `va_end`, and need a format, count or sentinel.
+- `scanf` takes pointers and returns the number of items converted, which must be checked; `fgets` plus `sscanf` is safer.
+- `fopen` can fail and returns `NULL`; `fclose` and `fflush` can report write errors that earlier calls hid.
+- Errors go to `stderr`, and the exit status tells the caller whether the program succeeded.
+- `ungetc` gives back one character of lookahead; `system` runs a shell command and must never be fed untrusted text.
+- Every `malloc` needs exactly one `free`, never followed by a use, and `rand` is for simulations, not secrets.
+
+## Glossary
+
+- **Stream**: a source or destination of characters, represented by a `FILE *`.
+- **Standard input, output, error**: the three streams open when a program starts.
+- **Redirection**: the shell connecting a standard stream to a file instead of the terminal.
+- **Pipe**: a connection carrying one program's output to another's input.
+- **Filter**: a program that reads standard input, transforms it and writes standard output.
+- **`EOF`**: a negative `int` returned by input functions at end of file or on error.
+- **Conversion specification**: a `%` sequence in a format string describing one argument.
+- **Field width / precision**: the minimum columns of a conversion, and the digits or characters limit after the `.`.
+- **Variadic function**: a function declared with `...` that takes a variable number of arguments.
+- **`va_list`**: the type of the variable that steps through variadic arguments.
+- **Default argument promotions**: `char` and `short` become `int`, `float` becomes `double`, when passed through `...`.
+- **File pointer (`FILE *`)**: a pointer to the library's structure describing an open stream.
+- **Mode**: the string passed to `fopen` saying how the file will be used, such as `"r"` or `"a"`.
+- **Buffering**: collecting characters in memory and passing them to the system in blocks; unbuffered, line buffered or fully buffered.
+- **Flush**: passing a buffer's contents to the system now.
+- **Exit status**: the integer a program returns to its parent; 0 means success.
+- **`errno`**: a variable set by failing library functions to a number naming the reason.
+- **Locale**: the language and character conventions a program runs under, which affect `<ctype.h>`.
+- **Pushback**: returning a character to an input stream with `ungetc`.
+- **Command processor**: the program `system` runs commands with, the shell on Unix.
+- **Domain error / range error**: a math argument outside the function's domain, or a result too large to represent.
+- **Pseudo-random generator / seed**: a deterministic formula producing random-looking numbers, and the value it starts from.
+- **Modulo bias**: the unevenness of `rand() % n` when `n` does not divide the generator's range.
+
+## Exercises and self-check
+
+These are my own exercises. The book has its own at the end of each
+section; do a selection of those too.
+
+**Warm-up (by hand)**
+
+1. Write the exact output of `printf("[%-6.2f|%+5d|%05.1f|%.3s]\n", 3.14159, 42, 2.5, "abcdef")`, then run it.
+2. For the input `3 apples\n`, say what `scanf("%d %s", &n, word)` returns and what is left unread; then the same for `scanf("%d%c", &n, &c)`.
+3. Predict the output order of a program that prints "A" with `printf`, "B" with `fprintf(stderr, ...)` and "C" with `printf`, run on a terminal and then piped into `cat`.
+
+**Build (write and test)**
+
+4. Write `mytail` that prints the last `n` lines of its input using a
+   circular array of `fgets` buffers, handling lines longer than the buffer.
+5. Write `logf(level, fmt, ...)` that prefixes the time and level and
+   writes one whole line to `stderr` using `vsnprintf`, and mark it with
+   the `format` attribute so the compiler checks calls.
+6. Write a `wc` clone that counts lines, words and bytes of each named
+   file, reports unreadable files on `stderr`, and exits with status 1 if
+   any failed.
+7. Extend `getint` to `getfloat`, accepting a fraction and an exponent,
+   using `ungetc` for the one character of lookahead.
+
+**Stretch (change the problem)**
+
+8. Write your own `minprintf` that handles `%d`, `%s`, `%c`, `%x` and a
+   field width, formatting the numbers yourself instead of calling
+   `printf`.
+9. Write a program that copies standard input to standard output with
+   `getc` and `putc`, and time it with full, line and no buffering on a
+   large file, using `setvbuf`. Explain the differences you measure.
+
+**Self-check**
+
+<details>
+<summary>Why must the result of getchar be stored in an int?</summary>
+
+`EOF` is a value distinct from every character, and a `char` cannot hold
+all byte values plus `EOF`.
+
+</details>
+
+<details>
+<summary>What does scanf return, and why does it matter?</summary>
+
+The number of items converted and assigned, or `EOF` at end of input
+before any conversion. Without checking it, a failed conversion leaves
+variables unchanged and input unread.
+
+</details>
+
+<details>
+<summary>Which buffering does stdout use when it is a pipe?</summary>
+
+Full buffering: output is passed on when the buffer fills, or at
+`fflush`, `fclose` or exit.
+
+</details>
+
+<details>
+<summary>Why check the result of fclose?</summary>
+
+Buffered data is written at `fclose`, so errors such as a full disk
+appear only there.
+
+</details>
+
+<details>
+<summary>Why is va_arg(ap, char) wrong?</summary>
+
+A `char` passed through `...` is promoted to `int`, so the argument must
+be read as an `int`.
+
+</details>
+
+<details>
+<summary>How many characters of pushback does ungetc guarantee?</summary>
+
+One.
+
+</details>
+
+<details>
+<summary>Why is system dangerous with user input?</summary>
+
+The string is interpreted by a shell, so special characters in the input
+can run extra commands.
+
+</details>
+
+<details>
+<summary>How do you get an unbiased integer from 0 to n-1 with rand?</summary>
+
+Reject draws at or above the largest multiple of `n` that fits in the
+generator's range, then take the remainder.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to
+<a href={withBase('/plans/traditional-software-developer/#strategy-1')}>phase 1</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, in the input, output and exit codes topic. It is the
+chapter that turns exercises into tools, so I give it three sessions and
+keep the programs.
+
+<Timeline caption="Three sessions for chapter 7, each ending with tools that pass their edge-case tests." items={[
+  { when: "Session 1", what: "7.1 to 7.4. Write lower.c, formats.c, minprintf.c and dates.c. Predict every printf line before running it, and break scanf with bad input." },
+  { when: "Session 2", what: "7.5 to 7.7. Write mycat.c, die.c, fullcheck.c and lines.c, and test each with a missing file, an empty file, /dev/full and a pipe." },
+  { when: "Session 3", what: "7.8. Write getint.c, sys.c, mem.c, m.c and rnd.c, run mem.c under AddressSanitizer, then do exercises 4 to 6 and the self-check." },
+]} />
+
+Everything goes into `kr-ch07/`, built with
+`-Wall -Wextra -fsanitize=address,undefined -g`. The `die`, `parse_int`
+and `logf` helpers go into my small library of reusable C, because every
+later program needs them. <a href={withBase('/books/c-programming-a-modern-approach/')}>King's</a>
+chapters on formatted I/O and on the standard library are a good second
+explanation.
+
+Done when I can write `report.c` and a `wc` clone from a blank file with
+every return value checked, and explain the output order of any mix of
+`stdout`, `stderr` and a pipe.
