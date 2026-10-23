@@ -1,0 +1,2824 @@
+---
+title: "Operating Systems: Three Easy Pieces, chapter by chapter"
+description: "The free OS book by the Arpaci-Dusseaus, chapter by chapter from beginner to strategy: processes, scheduling, virtual memory, threads, locks, file systems and security."
+edition: "version 1.10 (Arpaci-Dusseau Books, November 2023), free online edition"
+tocVerified: true
+tocSources:
+  - "https://pages.cs.wisc.edu/~remzi/OSTEP/"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the primary book for phase 6 of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core</a>,
+operating systems. It is free online, chapter by chapter, and it is built around three ideas: virtualization,
+concurrency and persistence. Every chapter asks a question (how can the OS share one CPU among many
+programs?) and answers it with a mechanism and a policy, which is exactly the habit the phase wants.
+
+The chapter list below follows the authors' own site, which numbers the chapters and includes short
+dialogues at the start of each part. The dialogues and the part summaries are short framing pieces; they are
+named under each part but do not get their own levels.
+
+## How I would learn it
+
+I would read OSTEP with a Linux terminal open and the book's homework simulators cloned beside it. Each
+chapter gets the same rhythm: read it, run the matching simulator until I can predict its output, then build
+the smallest real version in C. The Linux Programming Interface is my lookup for the exact rules of a call;
+this book is for the why.
+
+<Timeline items={[
+  { when: 'week 29', what: 'Introduction and processes: chapters 2, 4, 5 and 6. The shell launcher, strace on everything.' },
+  { when: 'week 30', what: 'Scheduling and memory: chapters 7 to 10, then 13 to 23. The scheduler simulator and the allocator.' },
+  { when: 'week 31', what: 'Concurrency: chapters 26 to 33. The thread pool, the producer-consumer queue, a deadlock on purpose.' },
+  { when: 'week 32', what: 'Persistence: chapters 36 to 45. The atomic save, a crash test, fsck and journaling by hand.' },
+  { when: 'week 33', what: 'Distribution, security and the appendices: chapters 48 to 57, virtual machines. Then the gate.' },
+  { when: 'phase 10', what: 'Chapters 48 to 50 again, next to the distributed systems books.' },
+]} caption="When I read each part. Weeks are the plan's weeks for phase 6." />
+
+Every chapter below climbs the same nine levels: what it is, how it combines, what happens underneath,
+the edges, the corners where two edges meet, what changes in production, the habit of thought, where it
+sits in a larger system, and how I would learn it and know I have.
+
+## The book in its pieces
+
+<Layers layers={[
+  { name: 'Introduction', note: 'chapters 1 and 2: what an operating system is for' },
+  { name: 'Virtualization', note: 'chapters 3 to 24: the CPU and memory, shared so each program thinks it is alone' },
+  { name: 'Concurrency', note: 'chapters 25 to 34: threads, locks, condition variables, semaphores, bugs, events' },
+  { name: 'Persistence', note: 'chapters 35 to 51: devices, disks, RAID, files, file systems, crashes, distributed file systems' },
+  { name: 'Security', note: 'chapters 52 to 57: authentication, access control, cryptography, distributed security' },
+  { name: 'Appendices', note: 'virtual machines, monitors, a lab tutorial, systems labs and xv6 labs' },
+]} caption="The three easy pieces, plus the introduction, the security part and the appendices." />
+
+## Introduction
+
+Chapter 1 is a short dialogue that sets up the book's voice.
+
+### 2. Introduction
+**Covers:** What an operating system does: virtualizes the CPU and memory, runs things concurrently, keeps data persistent, and the design goals behind it.
+
+<Levels label="Chapter 2, Introduction">
+
+<Level name="Beginner">
+
+An operating system is the software that makes the hardware easy and safe to use: it runs many programs at once, gives each one memory, and stores files. The smallest thing to see is two copies of a program printing at the same time on one CPU.
+
+</Level>
+
+<Level name="Intermediate">
+
+The book's three ideas show up immediately: virtualization (each program sees its own CPU and memory), concurrency (many things happening at once, and the bugs that brings), persistence (data that survives a crash or a power cut). A system call is the door between a program and these services.
+
+</Level>
+
+<Level name="Advanced">
+
+The OS is a resource manager and a set of abstractions at once. Its goals pull against each other: low overhead, protection between programs and from the OS, reliability, energy efficiency and security.
+
+</Level>
+
+<Level name="Edge cases">
+
+A program that prints the address of a variable can show the same address in two running copies, which only makes sense if addresses are virtual. With address-space randomization on the addresses differ, which is the same lesson from the other side.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two threads incrementing a shared counter a million times each rarely reach two million: concurrency and a non-atomic operation meet. The trap is that it sometimes does reach it, which is why races hide.
+
+</Level>
+
+<Level name="Production level">
+
+Every production incident eventually touches one of the three pieces: a CPU starved by a noisy neighbour, a memory limit, a lost write after a crash. Knowing which piece is involved is the first step of triage.
+
+</Level>
+
+<Level name="Mindset">
+
+Treat the OS as a contract with a mechanism and a policy behind every promise. Ask what the mechanism and the policy are for anything that looks like magic.
+
+</Level>
+
+<Level name="System design">
+
+Containers, language runtimes and browsers all re-implement parts of the OS: their own schedulers, memory managers and sandboxes. The same three ideas organise them.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run small demonstration programs for the CPU, memory, threads and I/O and explain each output in a sentence. Done when I can say which of the three pieces each demo shows.
+
+</Level>
+</Levels>
+
+## Virtualization
+
+Chapter 3 is the dialogue that opens the part. Chapters 4 to 10 virtualize the CPU, chapters 13 to 23 virtualize memory, and chapters 11 and 24 are short summaries, with a dialogue at 12.
+
+### 4. Processes
+**Covers:** The process abstraction: what a running program is made of, its states, and the data structures the OS keeps for it.
+
+<Levels label="Chapter 4, Processes">
+
+<Level name="Beginner">
+
+A process is a running program. The OS keeps its memory (address space), its registers including the program counter, and its open files. A process can be running, ready to run, or blocked waiting for something.
+
+</Level>
+
+<Level name="Intermediate">
+
+Creating a process means loading code and static data into memory, setting up a stack and a heap, opening the three standard descriptors, and jumping to `main`. The OS keeps a process list with one entry per process.
+
+</Level>
+
+<Level name="Advanced">
+
+Loading can be lazy: pages of the program arrive only when touched. State changes happen on scheduling decisions (ready to running and back) and on I/O (running to blocked, then blocked to ready when the I/O completes).
+
+</Level>
+
+<Level name="Edge cases">
+
+A process that has finished but not been collected by its parent is a zombie; its entry stays so the parent can read the exit status. A process blocked on I/O uses no CPU however long it waits.
+
+</Level>
+
+<Level name="Corner cases">
+
+A process whose I/O completes while the CPU is busy goes to ready, not running; whether it runs next is policy, so I/O-heavy programs feel slow on a busy machine even with a fast disk.
+
+</Level>
+
+<Level name="Production level">
+
+`ps`, `top` and `/proc/PID/status` are views of the process list. A pile of zombies, or processes stuck in uninterruptible sleep (state D), is the classic production symptom.
+
+</Level>
+
+<Level name="Mindset">
+
+A process is data the OS keeps about a program. Asking what is in that record explains most process behaviour.
+
+</Level>
+
+<Level name="System design">
+
+Process boundaries are the cheapest strong isolation one machine offers; browsers put sites in separate processes for that reason.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run the chapter's process simulator, predicting each state change before it prints, then read `/proc/self/status` for my own shell. Done when I can draw the state diagram and name what moves a process along each arrow.
+
+</Level>
+</Levels>
+
+### 5. Process API
+**Covers:** Creating and controlling processes with fork, exec and wait, and why the API is split that way.
+
+<Levels label="Chapter 5, Process API">
+
+<Level name="Beginner">
+
+`fork()` creates a child that is a copy of the parent; it returns 0 in the child and the child's ID in the parent. `wait()` makes the parent wait for a child. `exec()` replaces the current program with another.
+
+</Level>
+
+<Level name="Intermediate">
+
+The shell runs a command by forking, exec-ing in the child, and waiting in the parent. Because fork and exec are separate, the child can rearrange its file descriptors in between, which is how `ls > out.txt` works.
+
+</Level>
+
+<Level name="Advanced">
+
+After fork, whether parent or child runs first is up to the scheduler, so output order is not guaranteed. Exec does not return on success; code after it runs only on failure. Descriptors survive exec unless marked close-on-exec.
+
+</Level>
+
+<Level name="Edge cases">
+
+A parent that never waits leaves zombies. If exec fails (a wrong path), the child carries on running the parent's code unless it exits explicitly.
+
+</Level>
+
+<Level name="Corner cases">
+
+Forking with unflushed stdio buffers duplicates the buffers, so text printed once before the fork can appear twice. In a multithreaded parent, only the forking thread exists in the child, and locks held by other threads stay held forever.
+
+</Level>
+
+<Level name="Production level">
+
+Supervisors, CI runners and container entrypoints all use this API; a forgotten wait or a leaked descriptor shows up as zombies and "address already in use".
+
+</Level>
+
+<Level name="Mindset">
+
+Small, composable primitives beat one big "create process" call. The odd split is the source of the shell's power.
+
+</Level>
+
+<Level name="System design">
+
+Pre-fork servers fork workers in advance; `posix_spawn` and `vfork` exist for when fork's copy is too costly. Knowing the trade lets me pick.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write a launcher that runs a command with redirection, then a two-command pipe, and test it against the real shell. Done when my pipe gives the same output as `ls | wc -l`.
+
+</Level>
+</Levels>
+
+### 6. Direct Execution
+**Covers:** Limited direct execution: running programs at full speed on the CPU while the OS keeps control, through user and kernel mode, traps and the timer interrupt.
+
+<Levels label="Chapter 6, Direct Execution">
+
+<Level name="Beginner">
+
+The fastest way to run a program is directly on the CPU. The problem is control: the program must not do anything harmful, and the OS must be able to take the CPU back.
+
+</Level>
+
+<Level name="Intermediate">
+
+The CPU has user mode and kernel mode. A program asks for privileged work with a system call, which traps into the kernel through a trap table set up at boot. A timer interrupt fires regularly so the OS regains control even from a program that never calls it.
+
+</Level>
+
+<Level name="Advanced">
+
+On a switch, the hardware saves user registers onto a kernel stack, and the OS saves the rest into the process structure before restoring another process's registers: a context switch. The trap table is the only way in, so a program cannot jump into arbitrary kernel code.
+
+</Level>
+
+<Level name="Edge cases">
+
+A program in an infinite loop with no system calls would own the CPU forever without the timer. A system call with a bad pointer argument must be checked by the kernel, never trusted.
+
+</Level>
+
+<Level name="Corner cases">
+
+An interrupt arriving while the kernel is already handling one needs care: interrupts are masked briefly or the kernel takes locks. Getting this wrong is where kernel races come from.
+
+</Level>
+
+<Level name="Production level">
+
+Context switches cost microseconds plus cache and TLB warm-up; `vmstat` shows the rate. A very high rate points at too many threads or lock thrashing.
+
+</Level>
+
+<Level name="Mindset">
+
+Performance and control are both possible when the hardware helps. Look for the mechanism that is fast by default and checked at the boundary.
+
+</Level>
+
+<Level name="System design">
+
+Sandboxes and runtimes have the same shape: run untrusted code fast, intercept only the dangerous operations, keep a watchdog timer.
+
+</Level>
+
+<Level name="Strategy">
+
+I would measure the cost of a system call (a tight loop of zero-byte reads) and of a context switch (two processes ping-ponging over pipes). Done when I have two numbers and can explain why they differ.
+
+</Level>
+</Levels>
+
+### 7. CPU Scheduling
+**Covers:** The basic policies (FIFO, shortest job first, shortest time-to-completion first, round robin), the metrics they optimise, and how I/O changes the picture.
+
+<Levels label="Chapter 7, CPU Scheduling">
+
+<Level name="Beginner">
+
+A scheduling policy decides which ready job runs next. FIFO runs jobs in arrival order; SJF runs the shortest first; round robin gives each job a short time slice in turn.
+
+</Level>
+
+<Level name="Intermediate">
+
+Turnaround time (finish minus arrival) and response time (first run minus arrival) are the two metrics. STCF, the preemptive SJF, is best for turnaround; round robin is best for response and poor for turnaround.
+
+</Level>
+
+<Level name="Advanced">
+
+Treating each CPU burst between I/O operations as a separate job lets an interactive process run while another waits on the disk, overlapping CPU and I/O.
+
+</Level>
+
+<Level name="Edge cases">
+
+The convoy effect: one long job ahead of short ones in FIFO makes everyone wait. A time slice smaller than the switch cost spends the CPU on switching.
+
+</Level>
+
+<Level name="Corner cases">
+
+SJF needs job lengths it cannot know, and with a stream of short arrivals a long job can wait forever unless something ages it.
+
+</Level>
+
+<Level name="Production level">
+
+Thread pools and request queues inherit these trade-offs: a FIFO queue suffers head-of-line blocking, and a separate lane for short jobs is a common fix.
+
+</Level>
+
+<Level name="Mindset">
+
+Pick the metric, then the policy. Arguing about policies without a metric goes nowhere.
+
+</Level>
+
+<Level name="System design">
+
+Load balancers (round robin, least connections) and priority job queues are scheduling problems in another place.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write a simulator for the four policies and check it against the homework's outputs. Done when I can predict average turnaround and response for a small workload by hand.
+
+</Level>
+</Levels>
+
+### 8. Multi-level Feedback
+**Covers:** The multi-level feedback queue: learning job behaviour from history to approximate shortest-job-first without knowing job lengths.
+
+<Levels label="Chapter 8, Multi-level Feedback">
+
+<Level name="Beginner">
+
+MLFQ has several queues with different priorities. Jobs in higher queues run first; jobs in the same queue take turns.
+
+</Level>
+
+<Level name="Intermediate">
+
+A new job starts at the top. If it uses its whole slice it moves down; if it gives up the CPU early to wait for I/O it stays. Interactive jobs stay high and CPU-bound jobs sink.
+
+</Level>
+
+<Level name="Advanced">
+
+To avoid starvation, and to let a job that changes behaviour come back, all jobs are periodically boosted to the top. To stop gaming, the scheduler counts total time used at a level, not time per slice.
+
+</Level>
+
+<Level name="Edge cases">
+
+Without the accounting rule, a program that yields just before its slice ends stays at the top forever. Too long a boost period starves; too short makes everything look interactive.
+
+</Level>
+
+<Level name="Corner cases">
+
+A job that is CPU-bound for an hour and then turns interactive stays low until the next boost, which feels like lag right when a person starts typing.
+
+</Level>
+
+<Level name="Production level">
+
+The knobs (number of queues, slice per queue, boost period) have no correct values; real systems tune them and expose some through nice values.
+
+</Level>
+
+<Level name="Mindset">
+
+When you cannot know the future, learn from the recent past and correct periodically.
+
+</Level>
+
+<Level name="System design">
+
+Adaptive policies with periodic resets show up in rate limiters, caches and autoscalers.
+
+</Level>
+
+<Level name="Strategy">
+
+I would add MLFQ to my simulator with configurable queues and a boost, then try to game it with a crafted job. Done when the accounting rule stops my gaming job.
+
+</Level>
+</Levels>
+
+### 9. Lottery Scheduling
+**Covers:** Proportional-share scheduling: lottery and stride scheduling, tickets, and the fair-share idea behind Linux's scheduler.
+
+<Levels label="Chapter 9, Lottery Scheduling">
+
+<Level name="Beginner">
+
+Instead of optimising turnaround, give each job a share of the CPU. Lottery scheduling holds a draw each time slice; a job with more tickets wins more often.
+
+</Level>
+
+<Level name="Intermediate">
+
+Tickets can be transferred (a client lends tickets to a server working for it), inflated, or issued in a per-user currency. Stride scheduling reaches the same shares deterministically with a pass value per job.
+
+</Level>
+
+<Level name="Advanced">
+
+Linux's Completely Fair Scheduler ran the job with the smallest weighted virtual runtime, kept in a red-black tree. Recent kernels replaced it with EEVDF, which keeps the fairness and adds latency deadlines.
+
+</Level>
+
+<Level name="Edge cases">
+
+Over a short window lottery can be unfair by chance; fairness holds only on average over many slices.
+
+</Level>
+
+<Level name="Corner cases">
+
+A new job joining a stride scheduler with pass value zero would monopolise the CPU; it must start at the current minimum. Virtual runtime needs the same care.
+
+</Level>
+
+<Level name="Production level">
+
+Container CPU shares and weights are proportional-share scheduling: when every container is busy, the shares decide who gets what.
+
+</Level>
+
+<Level name="Mindset">
+
+Randomness is a legitimate engineering tool: simple, nearly stateless and hard to game.
+
+</Level>
+
+<Level name="System design">
+
+Weighted fair queuing in networks and fair-share quotas in multi-tenant systems are the same idea.
+
+</Level>
+
+<Level name="Strategy">
+
+I would implement lottery and stride in my simulator and plot unfairness against run length. Done when the plot shows lottery converging and stride exact.
+
+</Level>
+</Levels>
+
+### 10. Multi-CPU Scheduling
+**Covers:** Scheduling on several CPUs: caches and affinity, single-queue versus multi-queue scheduling, and load imbalance.
+
+<Levels label="Chapter 10, Multi-CPU Scheduling">
+
+<Level name="Beginner">
+
+With more than one CPU, the scheduler also decides where a job runs. Each CPU has its own cache, so moving a job makes it start cold.
+
+</Level>
+
+<Level name="Intermediate">
+
+A single shared queue is simple but needs a lock and loses affinity. Per-CPU queues keep affinity and scale, but can become unbalanced.
+
+</Level>
+
+<Level name="Advanced">
+
+Multi-queue schedulers migrate jobs to fix imbalance, often by work stealing: an idle CPU peeks at a busy one's queue and takes a job.
+
+</Level>
+
+<Level name="Edge cases">
+
+With one job and two CPUs, a careless scheduler bounces the job between CPUs and it loses its cache each time.
+
+</Level>
+
+<Level name="Corner cases">
+
+Cache coherence makes shared data expensive even under a perfect scheduler: two CPUs writing the same cache line take turns owning it.
+
+</Level>
+
+<Level name="Production level">
+
+Pinning threads to cores, NUMA-aware allocation and cgroup CPU sets are the production tools; most services never need them, until they do.
+
+</Level>
+
+<Level name="Mindset">
+
+Locality is a scheduling input, not just a hardware detail.
+
+</Level>
+
+<Level name="System design">
+
+Work stealing is also how Go's runtime, Java's fork/join pool and Tokio schedule tasks.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run a CPU-bound benchmark with and without `taskset` pinning and compare `perf stat` cache misses. Done when I can explain the difference with those numbers.
+
+</Level>
+</Levels>
+
+### 13. Address Spaces
+**Covers:** Why memory is virtualized and what an address space holds: code, heap and stack, with transparency, efficiency and protection as goals.
+
+<Levels label="Chapter 13, Address Spaces">
+
+<Level name="Beginner">
+
+Every process gets its own address space: a private view of memory starting at zero, holding code, a heap that grows up and a stack that grows down.
+
+</Level>
+
+<Level name="Intermediate">
+
+Every address a program prints is virtual. The OS and hardware translate it to a physical address the program never sees.
+
+</Level>
+
+<Level name="Advanced">
+
+The goals are transparency (the program cannot tell), efficiency (translation must be fast and compact) and protection (one process cannot touch another's memory or the kernel's).
+
+</Level>
+
+<Level name="Edge cases">
+
+The gap between heap and stack is mostly unused; a design that backs all of it with physical memory wastes space, which motivates the next chapters.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two processes printing the same pointer value for different data is normal; passing a raw pointer to another process through a file or pipe is a bug.
+
+</Level>
+
+<Level name="Production level">
+
+Address-space layout randomization moves these regions on each run to make exploits harder.
+
+</Level>
+
+<Level name="Mindset">
+
+An address is a name, not a location. The name is resolved somewhere else.
+
+</Level>
+
+<Level name="System design">
+
+Virtual addresses are the first of many indirections: object IDs, URLs, DNS names. Each buys the freedom to move the thing behind it.
+
+</Level>
+
+<Level name="Strategy">
+
+I would print the addresses of a global, a heap block and a local in C, run it twice, and read `/proc/self/maps`. Done when I can map each address to a line in maps.
+
+</Level>
+</Levels>
+
+### 14. Memory API
+**Covers:** Using memory from C: stack versus heap, malloc and free, and the common mistakes.
+
+<Levels label="Chapter 14, Memory API">
+
+<Level name="Beginner">
+
+Local variables live on the stack and vanish when the function returns. Memory from `malloc` lives on the heap until `free`.
+
+</Level>
+
+<Level name="Intermediate">
+
+`malloc(n)` returns at least n bytes or NULL; `sizeof` gives the right size for a type; a string needs one extra byte for its terminator.
+
+</Level>
+
+<Level name="Advanced">
+
+`malloc` and `free` are library calls. The library asks the OS for memory with `brk` or `mmap` in large chunks and hands out pieces.
+
+</Level>
+
+<Level name="Edge cases">
+
+A missing terminator, a write one past the end, use after free and double free are the classic bugs; each may seem to work for a long time.
+
+</Level>
+
+<Level name="Corner cases">
+
+A leak in a short program is harmless because the OS reclaims everything at exit; the same leak in a long-running server grows until the process is killed.
+
+</Level>
+
+<Level name="Production level">
+
+AddressSanitizer and Valgrind catch most of these in testing. In garbage-collected languages, leaks become references kept by mistake: a growing map, a listener never removed.
+
+</Level>
+
+<Level name="Mindset">
+
+Every allocation has an owner and a lifetime. If I cannot name them, the code is not done.
+
+</Level>
+
+<Level name="System design">
+
+Arena and pool allocation, where many objects share one lifetime, avoid most of these bugs by design.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write each classic bug on purpose and catch it with ASan and Valgrind. Done when I can name the bug from each tool's report.
+
+</Level>
+</Levels>
+
+### 15. Address Translation
+**Covers:** Hardware address translation with base and bounds registers, and what the OS does to manage it.
+
+<Levels label="Chapter 15, Address Translation">
+
+<Level name="Beginner">
+
+The simplest translation adds a base register to every address and checks it against a bounds register. The process sees addresses from zero; the hardware relocates them.
+
+</Level>
+
+<Level name="Intermediate">
+
+The OS sets base and bounds on each context switch, tracks free physical memory, and handles the exception when a process goes out of bounds.
+
+</Level>
+
+<Level name="Advanced">
+
+The memory management unit does this on every access, so it must be hardware. Changing base and bounds is privileged, or a process could escape.
+
+</Level>
+
+<Level name="Edge cases">
+
+An access exactly at the bound is out of range; off-by-one errors here are protection bugs.
+
+</Level>
+
+<Level name="Corner cases">
+
+Moving a running process in memory means stopping it, copying, and updating its base, which works only because every address goes through the base.
+
+</Level>
+
+<Level name="Production level">
+
+Base and bounds wastes too much to use alone, but it explains the shape of every later design.
+
+</Level>
+
+<Level name="Mindset">
+
+Hardware support plus OS management is the pattern for every efficient virtualization.
+
+</Level>
+
+<Level name="System design">
+
+Relocation by offset is also how position-independent code and shared libraries load anywhere.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run the relocation simulator until I translate addresses faster than it does. Done when I can say which addresses fault for a given base and bounds.
+
+</Level>
+</Levels>
+
+### 16. Segmentation
+**Covers:** Base and bounds per segment (code, heap, stack), sharing, protection bits, and external fragmentation.
+
+<Levels label="Chapter 16, Segmentation">
+
+<Level name="Beginner">
+
+Segmentation gives each logical part of the address space its own base and bounds, so the empty space between heap and stack costs nothing.
+
+</Level>
+
+<Level name="Intermediate">
+
+The top bits of an address pick the segment; the rest is the offset. The stack grows downward, so its check runs the other way.
+
+</Level>
+
+<Level name="Advanced">
+
+Protection bits let read-only code be shared between processes. The OS must find variable-sized holes in physical memory for segments.
+
+</Level>
+
+<Level name="Edge cases">
+
+"Segmentation fault" originally meant an access outside a segment; the name stuck on systems that only page.
+
+</Level>
+
+<Level name="Corner cases">
+
+Variable-sized segments fragment physical memory into small holes; compaction fixes it at a large copying cost.
+
+</Level>
+
+<Level name="Production level">
+
+x86-64 has mostly abandoned segmentation, apart from registers used for thread-local storage.
+
+</Level>
+
+<Level name="Mindset">
+
+Matching the abstraction to the program's shape saves space, but variable sizes create fragmentation.
+
+</Level>
+
+<Level name="System design">
+
+Variable-size allocation versus fixed-size blocks returns in file systems, databases and allocators.
+
+</Level>
+
+<Level name="Strategy">
+
+I would use the segmentation simulator and translate stack addresses by hand. Done when negative-growth offsets stop confusing me.
+
+</Level>
+</Levels>
+
+### 17. Free Space Management
+**Covers:** How allocators track free memory: free lists, splitting and coalescing, and policies like best fit, worst fit, first fit, segregated lists and buddy allocation.
+
+<Levels label="Chapter 17, Free Space Management">
+
+<Level name="Beginner">
+
+An allocator keeps a list of free chunks. On a request it finds a chunk big enough, splits off what is needed and returns it.
+
+</Level>
+
+<Level name="Intermediate">
+
+Each allocated block carries a header with its size so `free` knows how much to return. On free, neighbouring free chunks are coalesced.
+
+</Level>
+
+<Level name="Advanced">
+
+Best fit picks the smallest chunk that fits, first fit the first one, worst fit the largest. Segregated lists keep separate lists for popular sizes; the buddy allocator splits by powers of two so coalescing is cheap.
+
+</Level>
+
+<Level name="Edge cases">
+
+A request larger than any free chunk makes the allocator ask the OS for more. `malloc(0)` is allowed and its result is implementation-defined.
+
+</Level>
+
+<Level name="Corner cases">
+
+Many tiny free chunks that add up to plenty of memory but none big enough: external fragmentation. Buddy allocation trades it for internal fragmentation.
+
+</Level>
+
+<Level name="Production level">
+
+Production allocators (jemalloc, tcmalloc, mimalloc) use per-thread caches and size classes to avoid locks; switching allocator can change memory use noticeably.
+
+</Level>
+
+<Level name="Mindset">
+
+There is no best policy, only a workload. Measure fragmentation on real traces.
+
+</Level>
+
+<Level name="System design">
+
+The same problems appear in disk block allocation, database page management and GPU memory.
+
+</Level>
+
+<Level name="Strategy">
+
+I would build a first-fit allocator with headers, splitting and coalescing, and fuzz it with random alloc and free sequences. Done when a long fuzz run leaves the heap fully coalesced.
+
+</Level>
+</Levels>
+
+<Figure art={`
+  heap: [hdr| used 24 ][hdr| free 40 ][hdr| used 16 ][hdr| free 8 ]
+                        ^                             ^
+  free list ------------+---------------------------->+
+`} caption="A free list threads through the free chunks; each chunk starts with a header holding its size." />
+
+### 18. Introduction to Paging
+**Covers:** Paging: fixed-size pages and frames, page tables, the virtual page number and offset, and the cost of translation.
+
+<Levels label="Chapter 18, Introduction to Paging">
+
+<Level name="Beginner">
+
+Paging splits virtual memory into fixed-size pages and physical memory into frames of the same size. A page table maps each virtual page to a frame.
+
+</Level>
+
+<Level name="Intermediate">
+
+A virtual address splits into a page number and an offset. The page table entry gives the frame number plus valid, protection, present, dirty and accessed bits.
+
+</Level>
+
+<Level name="Advanced">
+
+Each process has its own page table in memory. Without help, every access needs an extra memory access to read the table, doubling memory traffic.
+
+</Level>
+
+<Level name="Edge cases">
+
+Touching an invalid page faults and usually kills the process. A read-only page faults on write, which copy-on-write uses on purpose.
+
+</Level>
+
+<Level name="Corner cases">
+
+A linear page table for a 64-bit space would be enormous, with most entries describing unused space; chapter 20 solves it.
+
+</Level>
+
+<Level name="Production level">
+
+Page size is a real knob: huge pages cut translation cost for databases and VMs, at the cost of coarser memory use.
+
+</Level>
+
+<Level name="Mindset">
+
+Fixed-size units remove fragmentation and add bookkeeping. Pick which pain you want.
+
+</Level>
+
+<Level name="System design">
+
+Database pages, disk blocks and network packets are fixed-size for the same reason.
+
+</Level>
+
+<Level name="Strategy">
+
+I would translate a dozen addresses by hand with 4 KiB pages, then check with the paging simulator. Done when I can split an address into page number and offset in my head.
+
+</Level>
+</Levels>
+
+### 19. Translation Lookaside Buffers
+**Covers:** The TLB as a cache of translations: hits and misses, who handles a miss, context switches and replacement.
+
+<Levels label="Chapter 19, Translation Lookaside Buffers">
+
+<Level name="Beginner">
+
+The TLB is a small, fast cache of recent translations inside the CPU. A hit makes translation nearly free.
+
+</Level>
+
+<Level name="Intermediate">
+
+Code with good locality almost always hits; walking an array misses once per page and hits for the rest of it.
+
+</Level>
+
+<Level name="Advanced">
+
+On a miss, either the hardware walks the page table (x86) or the OS handles a trap (some RISC designs). On a context switch, entries belong to the old process, so they are flushed or tagged with an address-space ID.
+
+</Level>
+
+<Level name="Edge cases">
+
+A loop over a huge array with a stride of one page misses on every access, even when the data cache is fine.
+
+</Level>
+
+<Level name="Corner cases">
+
+When the TLB's reach (entries times page size) is smaller than the working set, performance falls off a cliff; huge pages extend the reach.
+
+</Level>
+
+<Level name="Production level">
+
+TLB misses show in `perf` counters; the Meltdown mitigation added TLB flushes and measurable slowdowns.
+
+</Level>
+
+<Level name="Mindset">
+
+Caches hide costs until the access pattern stops matching. Know what your cache assumes.
+
+</Level>
+
+<Level name="System design">
+
+Every caching layer (CPU, TLB, page cache, CDN) has a reach; capacity planning is checking that the working set fits.
+
+</Level>
+
+<Level name="Strategy">
+
+I would time accesses with increasing page strides and find where the cost jumps, as the chapter's homework suggests. Done when my graph shows the TLB size.
+
+</Level>
+</Levels>
+
+### 20. Advanced Page Tables
+**Covers:** Smaller page tables: bigger pages, hybrid paging and segmentation, multi-level page tables and inverted page tables.
+
+<Levels label="Chapter 20, Advanced Page Tables">
+
+<Level name="Beginner">
+
+A linear page table wastes space on unused memory. Multi-level page tables allocate only the parts in use.
+
+</Level>
+
+<Level name="Intermediate">
+
+A page directory points to pages of page-table entries; a page of entries that would all be invalid is simply not allocated. x86-64 uses four or five levels.
+
+</Level>
+
+<Level name="Advanced">
+
+The cost is one memory access per level on a TLB miss. Inverted page tables keep one entry per physical frame and look up through a hash, trading search for space.
+
+</Level>
+
+<Level name="Edge cases">
+
+A sparse address space (stack at the top, code at the bottom) costs only a few table pages.
+
+</Level>
+
+<Level name="Corner cases">
+
+A miss on a five-level table can need five memory accesses before the real one; caches for upper levels soften it.
+
+</Level>
+
+<Level name="Production level">
+
+Page-table memory is real at scale: many processes with large address spaces can spend gigabytes on tables.
+
+</Level>
+
+<Level name="Mindset">
+
+Trees beat arrays when the data is sparse, the same trade as a sparse matrix or a trie.
+
+</Level>
+
+<Level name="System design">
+
+Hierarchical lookup (DNS, file paths, B-trees) pays a few hops to save huge space.
+
+</Level>
+
+<Level name="Strategy">
+
+I would walk a two-level translation by hand with the homework simulator. Done when I can translate through a page directory without the tool.
+
+</Level>
+</Levels>
+
+### 21. Swapping: Mechanisms
+**Covers:** Going beyond physical memory: swap space, the present bit, page faults, and when pages move to disk.
+
+<Levels label="Chapter 21, Swapping: Mechanisms">
+
+<Level name="Beginner">
+
+When memory is full, the OS can move pages to disk (swap space) and bring them back on demand, so programs can use more memory than the machine has.
+
+</Level>
+
+<Level name="Intermediate">
+
+A page-table entry has a present bit. Touching a page that is not present causes a page fault; the OS reads the page into a free frame, updates the entry and retries the instruction.
+
+</Level>
+
+<Level name="Advanced">
+
+A background swap daemon keeps some frames free, evicting pages when free memory drops below a low watermark until it reaches a high one.
+
+</Level>
+
+<Level name="Edge cases">
+
+If no frame is free when a fault happens, a page must be evicted first, and written out if it is dirty, which makes that fault much slower.
+
+</Level>
+
+<Level name="Corner cases">
+
+The faulting process blocks during the disk read so others run; one fault on a spinning disk costs milliseconds, roughly a hundred thousand memory accesses.
+
+</Level>
+
+<Level name="Production level">
+
+Many servers run with little or no swap and rely on the OOM killer, because swapping a latency-sensitive service is worse than restarting it.
+
+</Level>
+
+<Level name="Mindset">
+
+Every fallback to a slower tier needs a plan for when the fallback becomes the common case.
+
+</Level>
+
+<Level name="System design">
+
+Tiered storage (memory, SSD, object storage) uses the same present-or-fetch idea.
+
+</Level>
+
+<Level name="Strategy">
+
+I would allocate past a cgroup memory limit with and without swap and watch `vmstat`. Done when I can explain the `si` and `so` columns.
+
+</Level>
+</Levels>
+
+### 22. Swapping: Policies
+**Covers:** Page replacement policies: optimal, FIFO, random, LRU, approximations like the clock algorithm, dirty pages and thrashing.
+
+<Levels label="Chapter 22, Swapping: Policies">
+
+<Level name="Beginner">
+
+When a page must go, the policy picks which. The optimal choice is the page used furthest in the future, which nobody can know.
+
+</Level>
+
+<Level name="Intermediate">
+
+FIFO and random are simple; LRU uses the past to predict the future and usually does better. Workloads with locality favour LRU; a loop slightly bigger than memory defeats it.
+
+</Level>
+
+<Level name="Advanced">
+
+Exact LRU is too costly, so the clock algorithm sweeps a hand over frames, clearing use bits and evicting the first page whose bit is already clear. Clean pages are cheaper to evict than dirty ones.
+
+</Level>
+
+<Level name="Edge cases">
+
+A loop one page larger than memory makes LRU miss on every access, worse than random.
+
+</Level>
+
+<Level name="Corner cases">
+
+Bélády's anomaly: under FIFO, adding frames can increase faults.
+
+</Level>
+
+<Level name="Production level">
+
+Thrashing, where processes spend their time faulting, is fixed by running fewer processes or adding memory, not a cleverer policy. Linux approximates LRU with active and inactive lists.
+
+</Level>
+
+<Level name="Mindset">
+
+The best policy depends on the access pattern. Know the pattern before choosing.
+
+</Level>
+
+<Level name="System design">
+
+Every cache eviction decision, from Redis to CDNs, is this chapter; scan resistance (a big scan must not flush the cache) is the production twist.
+
+</Level>
+
+<Level name="Strategy">
+
+I would implement FIFO, LRU, clock and optimal in the simulator and run a looping and a random trace. Done when I can predict which wins for each.
+
+</Level>
+</Levels>
+
+### 23. Complete VM Systems
+**Covers:** How real systems combine the mechanisms: the VAX/VMS and Linux designs, demand zeroing, copy-on-write, large pages, the page cache and security hardening.
+
+<Levels label="Chapter 23, Complete VM Systems">
+
+<Level name="Beginner">
+
+Real systems map the kernel into every address space, protected, so a system call does not need to switch page tables.
+
+</Level>
+
+<Level name="Intermediate">
+
+Demand zeroing hands out a page only when first touched; copy-on-write shares pages after fork until one side writes. Both skip work that is often wasted.
+
+</Level>
+
+<Level name="Advanced">
+
+Linux adds a page cache for file data, huge pages, non-executable stacks and randomized layouts. Meltdown forced kernel page-table isolation, separating kernel and user mappings again.
+
+</Level>
+
+<Level name="Edge cases">
+
+A process that forks and immediately execs copies almost nothing, thanks to copy-on-write.
+
+</Level>
+
+<Level name="Corner cases">
+
+Copy-on-write plus a large heap plus a forking snapshot (as some databases do for backups) can double memory use as both sides write.
+
+</Level>
+
+<Level name="Production level">
+
+The page cache is why a second read of a file is fast, and why free memory on Linux looks low; cached memory is reclaimable.
+
+</Level>
+
+<Level name="Mindset">
+
+Laziness is a performance strategy: do work only when someone needs the result.
+
+</Level>
+
+<Level name="System design">
+
+Copy-on-write appears in file systems, immutable data structures and database snapshots.
+
+</Level>
+
+<Level name="Strategy">
+
+I would fork a process with a large heap, write to part of it, and watch resident memory. Done when the growth matches the pages I wrote.
+
+</Level>
+</Levels>
+
+## Concurrency
+
+Chapter 25 is the dialogue that opens the part, and chapter 34 is its summary.
+
+### 26. Concurrency and Threads
+**Covers:** What a thread is, why threads are used, and how uncontrolled scheduling creates race conditions.
+
+<Levels label="Chapter 26, Concurrency and Threads">
+
+<Level name="Beginner">
+
+A thread is another point of execution inside the same process, with its own stack and registers but shared memory. Threads let a program use several CPUs and avoid blocking on I/O.
+
+</Level>
+
+<Level name="Intermediate">
+
+Two threads incrementing a shared counter can lose updates, because `counter++` is a load, an add and a store, and a switch can land between them.
+
+</Level>
+
+<Level name="Advanced">
+
+A critical section is code that touches shared data and must not run in two threads at once. Mutual exclusion is the property we need; atomicity is the illusion we want.
+
+</Level>
+
+<Level name="Edge cases">
+
+The bug may never show on one CPU with long slices and show constantly on many cores, so testing on a quiet laptop can hide it.
+
+</Level>
+
+<Level name="Corner cases">
+
+Compiler optimisations can keep the counter in a register and make the race worse or invisible; adding a print can change timing and hide it.
+
+</Level>
+
+<Level name="Production level">
+
+Races in production show up as rare, unreproducible wrong values. ThreadSanitizer finds them in testing.
+
+</Level>
+
+<Level name="Mindset">
+
+A program whose output depends on scheduling is wrong, even if it is usually right.
+
+</Level>
+
+<Level name="System design">
+
+Async JavaScript has no data races between instructions but has races between awaits; the same thinking applies at a coarser grain.
+
+</Level>
+
+<Level name="Strategy">
+
+I would reproduce the lost-update race with two threads and a big loop count, then catch it with ThreadSanitizer. Done when TSan points at the line I expected.
+
+</Level>
+</Levels>
+
+### 27. Thread API
+**Covers:** The POSIX thread API: creating and joining threads, mutexes and condition variables, and the rules for using them.
+
+<Levels label="Chapter 27, Thread API">
+
+<Level name="Beginner">
+
+`pthread_create` starts a thread running a function; `pthread_join` waits for it and collects its return value.
+
+</Level>
+
+<Level name="Intermediate">
+
+`pthread_mutex_lock` and `unlock` guard a critical section; `pthread_cond_wait` and `signal` let one thread wait for another to change something.
+
+</Level>
+
+<Level name="Advanced">
+
+A condition wait is called with the mutex held, releases it while sleeping, and reacquires it before returning. Arguments passed to a thread must stay alive while the thread uses them.
+
+</Level>
+
+<Level name="Edge cases">
+
+Returning a pointer to a local variable from a thread returns a pointer into a stack that no longer exists.
+
+</Level>
+
+<Level name="Corner cases">
+
+Checking a condition with `if` instead of `while` breaks on spurious wakeups, or when another thread consumes the change first.
+
+</Level>
+
+<Level name="Production level">
+
+Check return codes, compile with `-pthread`, and write down the invariant each mutex protects.
+
+</Level>
+
+<Level name="Mindset">
+
+Threads are easy to start and hard to stop correctly. Plan a thread's end when you start it.
+
+</Level>
+
+<Level name="System design">
+
+Thread pools, futures and channels wrap this API to make lifetimes and ownership clearer.
+
+</Level>
+
+<Level name="Strategy">
+
+I would start N workers, pass each a struct of arguments, and join them with results. Done when it is clean under ThreadSanitizer and Valgrind.
+
+</Level>
+</Levels>
+
+### 28. Locks
+**Covers:** Building locks: goals, disabling interrupts, test-and-set, compare-and-swap, load-linked and store-conditional, ticket locks with fetch-and-add, spinning versus sleeping, and Linux futexes.
+
+<Levels label="Chapter 28, Locks">
+
+<Level name="Beginner">
+
+A lock is a variable one thread at a time can hold. Lock and unlock surround a critical section.
+
+</Level>
+
+<Level name="Intermediate">
+
+A lock is judged on correctness (mutual exclusion), fairness (no starvation) and performance. Disabling interrupts works only on one CPU and only for trusted code.
+
+</Level>
+
+<Level name="Advanced">
+
+Atomic instructions make locks possible: test-and-set gives a spinlock; compare-and-swap and load-linked/store-conditional are more general; fetch-and-add gives a ticket lock that serves threads in order. Real locks spin briefly, then sleep; a futex keeps the uncontended case in user space.
+
+</Level>
+
+<Level name="Edge cases">
+
+A spinlock on one CPU with a preempted holder wastes every waiter's whole time slice.
+
+</Level>
+
+<Level name="Corner cases">
+
+Priority inversion: a low-priority holder is preempted by a medium-priority thread while a high-priority thread waits for the lock.
+
+</Level>
+
+<Level name="Production level">
+
+Uncontended locks are cheap; contention is the expense. Measure contention before reaching for lock-free code.
+
+</Level>
+
+<Level name="Mindset">
+
+Correct first, then fair, then fast. Lock-free is a last resort, not a style.
+
+</Level>
+
+<Level name="System design">
+
+Distributed locks have the same goals plus partial failure; leases and fencing tokens are the additions.
+
+</Level>
+
+<Level name="Strategy">
+
+I would implement a test-and-set spinlock and a ticket lock with C11 atomics and compare them under contention. Done when I can explain why the ticket lock is fair and the spinlock is not.
+
+</Level>
+</Levels>
+
+### 29. Locked Data Structures
+**Covers:** Making data structures thread-safe: counters, linked lists, queues and hash tables, and the trade between correctness and scalability.
+
+<Levels label="Chapter 29, Locked Data Structures">
+
+<Level name="Beginner">
+
+The simplest thread-safe structure wraps every operation in one big lock. It is correct and does not scale.
+
+</Level>
+
+<Level name="Intermediate">
+
+An approximate counter keeps per-CPU counts and folds them into a global count now and then, trading accuracy for speed. A concurrent queue can lock its head and tail separately.
+
+</Level>
+
+<Level name="Advanced">
+
+A hash table with a lock per bucket scales because operations on different buckets do not contend. Hand-over-hand locking in a list sounds scalable and usually is not, because of the locking overhead.
+
+</Level>
+
+<Level name="Edge cases">
+
+An approximate counter can read slightly behind; code that needs the exact value must flush first.
+
+</Level>
+
+<Level name="Corner cases">
+
+An error path that returns without unlocking deadlocks the next caller; structure code with one unlock path.
+
+</Level>
+
+<Level name="Production level">
+
+More concurrency is not always faster; measure before and after. A small structure under one lock is often fine.
+
+</Level>
+
+<Level name="Mindset">
+
+Start with a big lock and split it only where measurement says it hurts.
+
+</Level>
+
+<Level name="System design">
+
+Sharding a lock is the same idea as sharding a database: partition the state so independent work does not contend.
+
+</Level>
+
+<Level name="Strategy">
+
+I would build a hash table with one global lock and with per-bucket locks, and plot throughput against threads. Done when the plot shows where each stops scaling.
+
+</Level>
+</Levels>
+
+### 30. Condition Variables
+**Covers:** Waiting for a condition: wait and signal, the producer-consumer problem, why the while loop matters, and covering conditions.
+
+<Levels label="Chapter 30, Condition Variables">
+
+<Level name="Beginner">
+
+A condition variable is a queue threads sleep on until some state changes; another thread signals when it changes it.
+
+</Level>
+
+<Level name="Intermediate">
+
+The bounded buffer needs two condition variables, "not full" and "not empty", with the state checked in a `while` loop under a mutex.
+
+</Level>
+
+<Level name="Advanced">
+
+Signals carry no memory: a signal with no waiter is lost, so the state itself must be checked. Under Mesa semantics a woken thread rechecks, because another thread may run first.
+
+</Level>
+
+<Level name="Edge cases">
+
+With one condition variable shared by producers and consumers, a consumer can wake another consumer instead of a producer, and everyone ends up asleep.
+
+</Level>
+
+<Level name="Corner cases">
+
+A covering condition: when you cannot know which waiter to wake (an allocator with different request sizes), broadcast and let all of them recheck, accepting the cost.
+
+</Level>
+
+<Level name="Production level">
+
+Most production code uses queues and channels built from this; knowing the pattern makes their behaviour predictable.
+
+</Level>
+
+<Level name="Mindset">
+
+Always wait in a loop, and change state under the lock before signalling.
+
+</Level>
+
+<Level name="System design">
+
+Blocking queues are the backbone of thread pools, logging pipelines and back-pressure.
+
+</Level>
+
+<Level name="Strategy">
+
+I would build the bounded buffer, break it with `if`, then with a single condition variable, and watch each failure. Done when I can explain both.
+
+</Level>
+</Levels>
+
+<Flow steps={['lock', 'while buffer full: wait(not_full)', 'put item', 'signal(not_empty)', 'unlock']} caption="The producer half of a bounded buffer. The consumer mirrors it with the other condition variable." />
+
+### 31. Semaphores
+**Covers:** Semaphores as one primitive for locks and ordering: binary semaphores, ordering, the bounded buffer, reader-writer locks, dining philosophers, and building semaphores from locks and condition variables.
+
+<Levels label="Chapter 31, Semaphores">
+
+<Level name="Beginner">
+
+A semaphore is an integer with two operations: wait (decrement, sleeping if the value would go negative) and post (increment, waking a waiter).
+
+</Level>
+
+<Level name="Intermediate">
+
+Initialised to 1 it is a lock; initialised to 0 it orders events (wait until another thread posts). A bounded buffer uses an empty count, a full count and a mutex.
+
+</Level>
+
+<Level name="Advanced">
+
+Order matters: taking the mutex before waiting on the full or empty semaphore deadlocks. Reader-writer locks can starve writers. Dining philosophers deadlock unless one of them picks up forks in the other order.
+
+</Level>
+
+<Level name="Edge cases">
+
+Initialising a semaphore to the wrong value is the most common bug, and it compiles fine.
+
+</Level>
+
+<Level name="Corner cases">
+
+A reader-writer lock under a steady stream of readers never lets a writer in; fairness has to be designed.
+
+</Level>
+
+<Level name="Production level">
+
+Semaphores bound resources in production: connection limits, concurrent calls to a slow dependency (a bulkhead).
+
+</Level>
+
+<Level name="Mindset">
+
+One flexible primitive expresses many patterns, but the meaning lives in the initial value and the call order. Comment both.
+
+</Level>
+
+<Level name="System design">
+
+Rate limiting and admission control are counting semaphores at the service level.
+
+</Level>
+
+<Level name="Strategy">
+
+I would build a semaphore from a mutex and a condition variable, then solve the bounded buffer and dining philosophers with it. Done when both run a million iterations without deadlock.
+
+</Level>
+</Levels>
+
+### 32. Concurrency Bugs
+**Covers:** What real concurrency bugs look like: atomicity violations, order violations, and deadlock with its four conditions and its fixes.
+
+<Levels label="Chapter 32, Concurrency Bugs">
+
+<Level name="Beginner">
+
+Most concurrency bugs in real software are not deadlocks: they are atomicity violations (a check and an act that should be one step) and order violations (one thing assumed to happen before another).
+
+</Level>
+
+<Level name="Intermediate">
+
+An atomicity violation: check a pointer is not NULL, then use it, while another thread sets it to NULL in between. An order violation: a thread uses a variable before the thread that initialises it has run.
+
+</Level>
+
+<Level name="Advanced">
+
+Deadlock needs mutual exclusion, hold-and-wait, no preemption and circular wait. Break one: lock ordering breaks circular wait, try-lock with back-off breaks hold-and-wait, lock-free structures avoid mutual exclusion.
+
+</Level>
+
+<Level name="Edge cases">
+
+Ordering locks by address works until a function takes two locks its callers pass in either order.
+
+</Level>
+
+<Level name="Corner cases">
+
+Livelock: two threads using try-lock and back-off retry in perfect step forever; random back-off fixes it.
+
+</Level>
+
+<Level name="Production level">
+
+Databases detect deadlocks and abort a victim, so applications must retry. Production code needs timeouts on every lock and wait.
+
+</Level>
+
+<Level name="Mindset">
+
+Fix the bug class, not the instance: add and enforce a lock order, never a sleep that makes the race rarer.
+
+</Level>
+
+<Level name="System design">
+
+Distributed deadlocks (service A waits on B waits on A) are avoided with timeouts and call graphs without cycles.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write a deadlock on purpose, capture it with `gdb` and `thread apply all bt`, draw the wait-for graph and fix it with a lock order. Done when I can tell the story in two minutes, as the phase gate asks.
+
+</Level>
+</Levels>
+
+### 33. Event-based Concurrency
+**Covers:** Concurrency without threads: the event loop, select and poll, non-blocking I/O, asynchronous I/O, and the problems of state and blocking calls.
+
+<Levels label="Chapter 33, Event-based Concurrency">
+
+<Level name="Beginner">
+
+An event-based server runs one loop: wait for events, then handle each with a short handler. No threads means no locks.
+
+</Level>
+
+<Level name="Intermediate">
+
+`select` or `poll` reports which descriptors are ready; handlers must never block, so all I/O is non-blocking. This is the model behind Node.js.
+
+</Level>
+
+<Level name="Advanced">
+
+Disk I/O needs a separate asynchronous interface, or file reads block the loop. State that a thread would keep on its stack must be saved explicitly between events: continuations, closures, promises.
+
+</Level>
+
+<Level name="Edge cases">
+
+One handler doing heavy computation stalls every connection.
+
+</Level>
+
+<Level name="Corner cases">
+
+A page fault inside a handler blocks the loop like a blocking call, and user code cannot prevent it.
+
+</Level>
+
+<Level name="Production level">
+
+Node uses libuv: epoll or kqueue for sockets and a thread pool for files and DNS. Event-loop lag is the key production metric.
+
+</Level>
+
+<Level name="Mindset">
+
+Events trade lock bugs for state-management bugs. Pick the bugs you are better at.
+
+</Level>
+
+<Level name="System design">
+
+Most modern servers combine event loops for sockets with thread pools for blocking work.
+
+</Level>
+
+<Level name="Strategy">
+
+I would build an echo server with `poll` in C and the same in Node, then add a blocking computation to see the stall. Done when I can measure the stall and remove it with a worker.
+
+</Level>
+</Levels>
+
+## Persistence
+
+Chapter 35 is the dialogue that opens the part, chapter 46 summarises the single-machine chapters, and chapter 47 is a dialogue that leads into distribution. Chapter 51 summarises the distributed file systems.
+
+### 36. I/O Devices
+**Covers:** How devices connect and talk to the OS: buses, the canonical device interface, polling, interrupts, DMA and device drivers.
+
+<Levels label="Chapter 36, I/O Devices">
+
+<Level name="Beginner">
+
+A device exposes registers for status, command and data. The OS drives it by reading and writing those registers.
+
+</Level>
+
+<Level name="Intermediate">
+
+Polling wastes CPU while waiting; interrupts let the CPU do other work and be told when the device is done. DMA lets the device copy data to memory without the CPU moving each byte.
+
+</Level>
+
+<Level name="Advanced">
+
+Device registers are reached with special I/O instructions or memory-mapped I/O. Drivers hide each device behind a generic interface, so the file system does not care which disk it uses.
+
+</Level>
+
+<Level name="Edge cases">
+
+For a very fast device, interrupts cost more than polling; hybrids poll briefly, then fall back to interrupts.
+
+</Level>
+
+<Level name="Corner cases">
+
+Under a flood of network packets, constant interrupts can stop the system doing any real work (livelock); interrupt coalescing and switching to polling fix it.
+
+</Level>
+
+<Level name="Production level">
+
+Most kernel code is drivers, and so are most kernel bugs.
+
+</Level>
+
+<Level name="Mindset">
+
+The right interface depends on rate: notify when events are rare, poll when they are constant.
+
+</Level>
+
+<Level name="System design">
+
+Webhooks versus polling an API is the same trade at the service level.
+
+</Level>
+
+<Level name="Strategy">
+
+I would read `/proc/interrupts` during a large file copy and a download. Done when I can say which device raised which interrupts.
+
+</Level>
+</Levels>
+
+### 37. Hard Disk Drives
+**Covers:** How a hard disk works: sectors, tracks, rotation, seek time, transfer time, and disk scheduling.
+
+<Levels label="Chapter 37, Hard Disk Drives">
+
+<Level name="Beginner">
+
+A hard disk stores data in sectors on spinning platters, read by a head on an arm. Reading a sector means waiting for the arm to move and the platter to turn.
+
+</Level>
+
+<Level name="Intermediate">
+
+Access time is seek plus rotation plus transfer. Random reads are dominated by seek and rotation, sequential reads by transfer, which is why sequential is far faster.
+
+</Level>
+
+<Level name="Advanced">
+
+Disk schedulers reorder requests: shortest seek first, the elevator (SCAN) and its variants, shortest positioning time first. The drive also schedules internally.
+
+</Level>
+
+<Level name="Edge cases">
+
+A single sector write is atomic; a multi-sector write can be torn by a power cut.
+
+</Level>
+
+<Level name="Corner cases">
+
+Track skew lets the head catch the next track's first sector after a move; without it, sequential reads across tracks would wait almost a full rotation.
+
+</Level>
+
+<Level name="Production level">
+
+SSDs replaced HDDs for latency-sensitive work, but HDDs still hold bulk data, and their fast-sequential, slow-random shape still drives log-structured designs.
+
+</Level>
+
+<Level name="Mindset">
+
+Sequential access is the universal fast path. Lay data out to read and write in long runs.
+
+</Level>
+
+<Level name="System design">
+
+Kafka, LSM trees and write-ahead logs exist partly because sequential writes are cheap.
+
+</Level>
+
+<Level name="Strategy">
+
+I would compute access times for random and sequential workloads with the disk simulator. Done when I can estimate random 4 KiB throughput on a 7200 RPM disk.
+
+</Level>
+</Levels>
+
+### 38. Redundant Disk Arrays (RAID)
+**Covers:** Combining disks for capacity, performance and reliability: RAID 0, 1, 4 and 5, and how to evaluate them.
+
+<Levels label="Chapter 38, Redundant Disk Arrays (RAID)">
+
+<Level name="Beginner">
+
+RAID makes several disks look like one. RAID 0 stripes for speed with no redundancy; RAID 1 mirrors for safety.
+
+</Level>
+
+<Level name="Intermediate">
+
+RAID 4 adds a parity disk; RAID 5 rotates parity across all disks so parity writes do not bottleneck one disk.
+
+</Level>
+
+<Level name="Advanced">
+
+The small-write problem: updating one block in RAID 4 or 5 means reading old data and old parity and writing both, four I/Os for one write.
+
+</Level>
+
+<Level name="Edge cases">
+
+RAID 0 over N disks is roughly N times more likely to lose everything than one disk.
+
+</Level>
+
+<Level name="Corner cases">
+
+A second failure during a long rebuild of a large array loses data, which is why double parity and erasure coding exist.
+
+</Level>
+
+<Level name="Production level">
+
+RAID is not a backup: deleting a file deletes it on every mirror at once.
+
+</Level>
+
+<Level name="Mindset">
+
+Redundancy has a price in capacity and write cost. Compute it before choosing.
+
+</Level>
+
+<Level name="System design">
+
+Erasure coding in object stores and replication in databases are RAID ideas across machines.
+
+</Level>
+
+<Level name="Strategy">
+
+I would fill in capacity, reliability and throughput for each level from the chapter's model. Done when I can derive each entry instead of recalling it.
+
+</Level>
+</Levels>
+
+### 39. Files and Directories
+**Covers:** The file system API: files and inodes, descriptors, open, read, write, lseek, fsync, rename, stat, directories, hard and symbolic links, permissions and mounting.
+
+<Levels label="Chapter 39, Files and Directories">
+
+<Level name="Beginner">
+
+A file is an array of bytes with a low-level name, its inode number. A directory maps human names to inode numbers.
+
+</Level>
+
+<Level name="Intermediate">
+
+`open` returns a file descriptor; `read` and `write` move bytes and advance an offset; `lseek` moves the offset. `stat` returns the inode's metadata.
+
+</Level>
+
+<Level name="Advanced">
+
+Writes are buffered in memory; `fsync` forces them to disk. `rename` is atomic, which makes "write a temp file, fsync, rename" the safe way to replace a file. Hard links are extra names for one inode; symbolic links are small files holding a path.
+
+</Level>
+
+<Level name="Edge cases">
+
+`unlink` removes a name; the inode survives while other names or open descriptors remain.
+
+</Level>
+
+<Level name="Corner cases">
+
+After `fork`, parent and child share one open file entry and its offset, so their writes interleave instead of overwriting each other.
+
+</Level>
+
+<Level name="Production level">
+
+A missing `fsync` is how editors and databases lose data in a crash; atomic rename is how they avoid half-written files.
+
+</Level>
+
+<Level name="Mindset">
+
+The API is small but each call makes a precise promise. Read the promise, not the name.
+
+</Level>
+
+<Level name="System design">
+
+Object stores drop most of this API: no rename, no partial writes, whole objects only. Designs that assume POSIX break on them.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write `mystat`, a small `ls -l` and a safe-save function in C, then trace them with `strace`. Done when my safe-save survives a kill at every step.
+
+</Level>
+</Levels>
+
+### 40. File System Implementation
+**Covers:** A very simple file system: on-disk layout, superblock, bitmaps, the inode table, data blocks, directories, and the reads and writes behind each operation.
+
+<Levels label="Chapter 40, File System Implementation">
+
+<Level name="Beginner">
+
+A simple file system divides the disk into a superblock, an inode bitmap, a data bitmap, the inode table and data blocks.
+
+</Level>
+
+<Level name="Intermediate">
+
+An inode holds direct pointers to data blocks and indirect pointers to blocks of pointers for large files. A directory is a file whose data is a list of name and inode-number pairs.
+
+</Level>
+
+<Level name="Advanced">
+
+Opening `/foo/bar` reads the root inode, the root's data, foo's inode, foo's data, then bar's inode. Creating a file writes the inode bitmap, the new inode, the directory's data and the directory's inode.
+
+</Level>
+
+<Level name="Edge cases">
+
+Most files are small, so a few direct pointers serve most of them cheaply; huge files pay for indirect lookups.
+
+</Level>
+
+<Level name="Corner cases">
+
+A full inode table blocks new files even when data blocks are free.
+
+</Level>
+
+<Level name="Production level">
+
+Caching and write buffering hide most of these I/Os; a cold cache shows their real cost.
+
+</Level>
+
+<Level name="Mindset">
+
+Count the I/Os. Every operation is a sequence of block reads and writes, and the count predicts the speed.
+
+</Level>
+
+<Level name="System design">
+
+Database storage engines repeat this design: a header, a free-space map, an index and data pages.
+
+</Level>
+
+<Level name="Strategy">
+
+I would trace the block reads and writes for open, read, create and write by hand, then check with the file system simulator. Done when my counts match.
+
+</Level>
+</Levels>
+
+<Layers layers={[
+  { name: 'Superblock', note: 'sizes, counts, where everything else starts' },
+  { name: 'Inode bitmap', note: 'one bit per inode: free or used' },
+  { name: 'Data bitmap', note: 'one bit per data block' },
+  { name: 'Inode table', note: 'size, owner, permissions, block pointers' },
+  { name: 'Data blocks', note: 'file contents and directory entries' },
+]} caption="The on-disk layout of a very simple file system, from the start of the disk." />
+
+### 41. Fast File System (FFS)
+**Covers:** Why the original Unix file system was slow, and how FFS used cylinder groups, placement policies and larger blocks to be disk-aware.
+
+<Levels label="Chapter 41, Fast File System (FFS)">
+
+<Level name="Beginner">
+
+The first Unix file system ignored the disk's geometry and slowed down as files scattered across the platter.
+
+</Level>
+
+<Level name="Intermediate">
+
+FFS splits the disk into cylinder groups, each with its own inodes and data, and keeps related things close: a file's inode and data in one group, the files of a directory together.
+
+</Level>
+
+<Level name="Advanced">
+
+Large files are spread across groups in chunks so one file cannot fill a group. Sub-blocks cut waste for small files; layout parameters account for rotation.
+
+</Level>
+
+<Level name="Edge cases">
+
+A directory of many small files gains the most; one huge sequential file gains the least.
+
+</Level>
+
+<Level name="Corner cases">
+
+Putting new directories in groups with few directories and many free inodes spreads them out, which balances space but can split related trees.
+
+</Level>
+
+<Level name="Production level">
+
+ext2, ext3 and ext4 descend from these ideas through block groups.
+
+</Level>
+
+<Level name="Mindset">
+
+Make the software aware of the hardware's real costs.
+
+</Level>
+
+<Level name="System design">
+
+Locality-aware placement returns in databases (clustering) and distributed systems (rack-aware replicas).
+
+</Level>
+
+<Level name="Strategy">
+
+I would run the FFS allocation simulator and watch placement for small and large files. Done when I can predict where a file lands.
+
+</Level>
+</Levels>
+
+### 42. FSCK and Journaling
+**Covers:** Crash consistency: the crash scenarios, the file system checker, data and metadata journaling, ordered mode, and other approaches.
+
+<Levels label="Chapter 42, FSCK and Journaling">
+
+<Level name="Beginner">
+
+Appending to a file updates the inode, the bitmap and a data block. A crash after some but not all of them leaves the file system inconsistent.
+
+</Level>
+
+<Level name="Intermediate">
+
+`fsck` scans everything after a crash and repairs it, which is slow on big disks. Journaling writes the planned updates to a log, then a commit record, then the real locations (checkpointing).
+
+</Level>
+
+<Level name="Advanced">
+
+Ordered (metadata) journaling writes data blocks first and journals only metadata, so a committed inode never points at garbage. Recovery replays committed transactions and ignores the rest.
+
+</Level>
+
+<Level name="Edge cases">
+
+A crash before the commit record simply loses that transaction; the old state is intact.
+
+</Level>
+
+<Level name="Corner cases">
+
+Block reuse: a freed directory block reused for file data can be clobbered by replaying an old journal record; revoke records prevent it.
+
+</Level>
+
+<Level name="Production level">
+
+ext4 defaults to ordered mode; databases add their own write-ahead log on top and call `fsync` at the right moments.
+
+</Level>
+
+<Level name="Mindset">
+
+Write the intention before the effect. It is the most reusable idea in storage.
+
+</Level>
+
+<Level name="System design">
+
+Database WALs, event sourcing and the outbox pattern are journaling in other places.
+
+</Level>
+
+<Level name="Strategy">
+
+I would list the state after a crash at each point of a file append, then check with the journaling simulator. Done when I can say what recovery does at every point.
+
+</Level>
+</Levels>
+
+<Flow steps={['write data blocks', 'journal the metadata', 'write the commit record', 'checkpoint to final locations', 'free the journal space']} caption="Ordered journaling: data first, then the journal and its commit, then the real locations." />
+
+### 43. Log-structured File System (LFS)
+**Covers:** Writing everything sequentially: segments, the inode map, the checkpoint region, reading files, garbage collection and crash recovery.
+
+<Levels label="Chapter 43, Log-structured File System (LFS)">
+
+<Level name="Beginner">
+
+LFS buffers all writes in memory and writes them out as one large sequential segment, data and inodes together.
+
+</Level>
+
+<Level name="Intermediate">
+
+Inodes move with every write, so an inode map records where each inode currently lives, and a fixed checkpoint region points to the inode map.
+
+</Level>
+
+<Level name="Advanced">
+
+Old block versions become garbage; a cleaner reads segments, keeps live blocks and rewrites them compactly. Segment summaries record which file each block belongs to, so liveness can be checked.
+
+</Level>
+
+<Level name="Edge cases">
+
+A nearly full disk makes cleaning expensive, because almost every block is live.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two checkpoint regions written alternately, each stamped with a time, survive a crash in the middle of a checkpoint write.
+
+</Level>
+
+<Level name="Production level">
+
+Flash translation layers, LSM-tree databases and copy-on-write file systems such as ZFS and Btrfs share this design.
+
+</Level>
+
+<Level name="Mindset">
+
+Turn random writes into sequential ones and pay later in cleaning.
+
+</Level>
+
+<Level name="System design">
+
+Write amplification and compaction in LSM trees are this chapter's garbage collection.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run the LFS simulator, overwrite files, and count live and dead blocks per segment. Done when I can explain when cleaning stops being cheap.
+
+</Level>
+</Levels>
+
+### 44. Flash-based SSDs
+**Covers:** How flash works: pages and blocks, erase before write, wear, the flash translation layer, log-structuring, garbage collection, mapping tables and wear leveling.
+
+<Levels label="Chapter 44, Flash-based SSDs">
+
+<Level name="Beginner">
+
+An SSD stores data in flash cells with no moving parts; reads are fast and random access is cheap.
+
+</Level>
+
+<Level name="Intermediate">
+
+Flash is read and written in pages but erased in larger blocks, and a page cannot be rewritten until its block is erased. Each block survives a limited number of erases.
+
+</Level>
+
+<Level name="Advanced">
+
+The flash translation layer writes to fresh pages log-style, maps logical to physical pages, garbage-collects blocks full of stale pages, and spreads erases evenly (wear leveling).
+
+</Level>
+
+<Level name="Edge cases">
+
+A nearly full SSD writes slower, because garbage collection has little free space to work with.
+
+</Level>
+
+<Level name="Corner cases">
+
+TRIM tells the drive which logical blocks are free; without it the drive keeps copying data the file system already deleted.
+
+</Level>
+
+<Level name="Production level">
+
+Write amplification and over-provisioning set SSD lifetime under write-heavy databases.
+
+</Level>
+
+<Level name="Mindset">
+
+Every abstraction hides a different machine. An SSD that looks like a disk behaves like a log.
+
+</Level>
+
+<Level name="System design">
+
+A log-structured database on a log-structured SSD stacks two logs, and their garbage collectors can fight.
+
+</Level>
+
+<Level name="Strategy">
+
+I would run the SSD simulator with direct-mapped and log-structured translation and compare write amplification. Done when I can explain why direct mapping is so slow.
+
+</Level>
+</Levels>
+
+### 45. Data Integrity and Protection
+**Covers:** Disk failures beyond crashes: latent sector errors, block corruption, checksums, misdirected and lost writes, and scrubbing.
+
+<Levels label="Chapter 45, Data Integrity and Protection">
+
+<Level name="Beginner">
+
+Disks fail partially: a sector becomes unreadable, or returns wrong data silently.
+
+</Level>
+
+<Level name="Intermediate">
+
+Redundancy handles unreadable sectors. Silent corruption needs a checksum stored with each block and checked on every read.
+
+</Level>
+
+<Level name="Advanced">
+
+A misdirected write lands in the wrong place; storing the block's address beside its checksum catches it. A lost write reports success and writes nothing; read-after-write or checksums kept in the parent catch it.
+
+</Level>
+
+<Level name="Edge cases">
+
+A checksum stored in the same block as its data can be wrong in the same way as the data.
+
+</Level>
+
+<Level name="Corner cases">
+
+Rarely read data can rot for years unseen; scrubbing reads everything periodically to find problems while redundancy still exists.
+
+</Level>
+
+<Level name="Production level">
+
+ZFS checksums everything, databases checksum pages, and network protocols checksum packets. The CPU cost is small next to serving corrupt data.
+
+</Level>
+
+<Level name="Mindset">
+
+Do not trust a single success code. Verify end to end.
+
+</Level>
+
+<Level name="System design">
+
+The end-to-end argument: the endpoint must check integrity, because every layer in between can fail.
+
+</Level>
+
+<Level name="Strategy">
+
+I would add a CRC32 to every record of the key-value store from the database phase and corrupt the file by hand. Done when the store detects every corruption I make.
+
+</Level>
+</Levels>
+
+### 48. Distributed Systems
+**Covers:** Reliable communication over unreliable networks: packet loss, acknowledgements, timeouts, sequence numbers, and remote procedure calls.
+
+<Levels label="Chapter 48, Distributed Systems">
+
+<Level name="Beginner">
+
+Machines communicate by messages over a network that can lose, duplicate, delay or reorder them.
+
+</Level>
+
+<Level name="Intermediate">
+
+Reliability is built from acknowledgements, timeouts and retries, with sequence numbers to drop duplicates.
+
+</Level>
+
+<Level name="Advanced">
+
+RPC wraps a call in a message, sends it and waits for a reply, hiding the network behind a stub. The network cannot be fully hidden: a call can time out without the caller knowing whether the server ran it.
+
+</Level>
+
+<Level name="Edge cases">
+
+A request retried after a lost reply runs twice unless the server deduplicates by ID.
+
+</Level>
+
+<Level name="Corner cases">
+
+A server that crashes after doing the work but before replying leaves the client unable to tell success from failure.
+
+</Level>
+
+<Level name="Production level">
+
+Timeouts, idempotency keys and retry budgets are how real services live with this.
+
+</Level>
+
+<Level name="Mindset">
+
+The network is part of the program. Every remote call has three outcomes: success, failure and unknown.
+
+</Level>
+
+<Level name="System design">
+
+This chapter is the first page of phase 10; at-least-once delivery with idempotent handlers is the standard design.
+
+</Level>
+
+<Level name="Strategy">
+
+I would write a UDP client and server with acknowledgements and retries, then add loss with `tc netem`. Done when no request runs twice under loss.
+
+</Level>
+</Levels>
+
+### 49. Network File System (NFS)
+**Covers:** NFS: a stateless protocol, file handles, idempotent operations, client caching and the cache consistency problem.
+
+<Levels label="Chapter 49, Network File System (NFS)">
+
+<Level name="Beginner">
+
+NFS lets a machine use files stored on another machine as if they were local.
+
+</Level>
+
+<Level name="Intermediate">
+
+NFSv2 is stateless: every request carries what the server needs (a file handle, an offset), so a server reboot looks like a pause.
+
+</Level>
+
+<Level name="Advanced">
+
+Operations are designed to be idempotent so clients can just retry. Client caches make it fast and cause consistency problems; flush-on-close and attribute checks on open are the compromise.
+
+</Level>
+
+<Level name="Edge cases">
+
+Some operations are not naturally idempotent (creating a directory that now exists), so a retry can report an error for work that succeeded.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two clients writing the same file see each other's changes only at open and close; in between they overwrite each other.
+
+</Level>
+
+<Level name="Production level">
+
+Stateless servers are easy to recover and scale; that lesson outlived NFSv2.
+
+</Level>
+
+<Level name="Mindset">
+
+Statelessness and idempotency make failures boring.
+
+</Level>
+
+<Level name="System design">
+
+HTTP APIs that carry all state in the request and make operations idempotent inherit this design.
+
+</Level>
+
+<Level name="Strategy">
+
+I would design an idempotent "add item to cart" API and argue each operation. Done when every operation can be retried safely.
+
+</Level>
+</Levels>
+
+### 50. Andrew File System (AFS)
+**Covers:** AFS: whole-file caching, callbacks, and why it scaled to more clients than NFS.
+
+<Levels label="Chapter 50, Andrew File System (AFS)">
+
+<Level name="Beginner">
+
+AFS caches whole files on the client's local disk and works on them locally.
+
+</Level>
+
+<Level name="Intermediate">
+
+Version 2 replaced polling with callbacks: the server promises to tell clients when a cached file changes.
+
+</Level>
+
+<Level name="Advanced">
+
+Changes become visible on close, and the last client to close wins. Callbacks make the server stateful, which complicates crash recovery.
+
+</Level>
+
+<Level name="Edge cases">
+
+A huge file must be fetched whole before the first byte can be read.
+
+</Level>
+
+<Level name="Corner cases">
+
+A server crash loses its callback promises, so clients must treat their caches as suspect afterwards.
+
+</Level>
+
+<Level name="Production level">
+
+Invalidation by promise, rather than polling, is how caching systems scale.
+
+</Level>
+
+<Level name="Mindset">
+
+Push invalidation beats polling, but promises are state, and state must survive crashes.
+
+</Level>
+
+<Level name="System design">
+
+CDN purges and pub/sub invalidation are the AFS callback at web scale.
+
+</Level>
+
+<Level name="Strategy">
+
+I would compare NFS and AFS on cache behaviour, server state and crash recovery in a table. Done when I can choose one for a stated workload and defend it.
+
+</Level>
+</Levels>
+
+## Security
+
+Chapter 52 is the dialogue that opens the part. These chapters are a shorter, newer addition to the online edition.
+
+### 53. Intro Security
+**Covers:** What security means for an operating system: confidentiality, integrity and availability, policy and mechanism, and design principles.
+
+<Levels label="Chapter 53, Intro Security">
+
+<Level name="Beginner">
+
+Security protects confidentiality (secrets stay secret), integrity (data changes only with permission) and availability (the system keeps working).
+
+</Level>
+
+<Level name="Intermediate">
+
+The OS separates policy (who may do what) from mechanism (how it is enforced). The kernel is trusted; everything that asks it for something is checked.
+
+</Level>
+
+<Level name="Advanced">
+
+The classic design principles apply: economy of mechanism, fail-safe defaults, complete mediation, least privilege, separation of privilege, open design.
+
+</Level>
+
+<Level name="Edge cases">
+
+One unchecked path, a system call that forgets one check, breaks complete mediation for everything behind it.
+
+</Level>
+
+<Level name="Corner cases">
+
+Availability attacks use legitimate operations at volume: fork bombs, a disk filled by logs.
+
+</Level>
+
+<Level name="Production level">
+
+Most real breaches exploit a misconfiguration or an old, known bug, not a clever new attack.
+
+</Level>
+
+<Level name="Mindset">
+
+Assume something is trying to break it. Ask who can call this, and with what.
+
+</Level>
+
+<Level name="System design">
+
+Threat modeling in phase 11 starts from these principles.
+
+</Level>
+
+<Level name="Strategy">
+
+I would list the trust boundaries on my own machine and what crosses each. Done when I can apply each principle to my shell project.
+
+</Level>
+</Levels>
+
+### 54. Authentication
+**Covers:** Proving identity: something you know, have or are; passwords, salting and hashing, and multiple factors.
+
+<Levels label="Chapter 54, Authentication">
+
+<Level name="Beginner">
+
+Authentication answers "who are you". Passwords are the common answer and the weakest.
+
+</Level>
+
+<Level name="Intermediate">
+
+Passwords are stored as salted hashes, never as text, so a stolen password file is not a list of passwords.
+
+</Level>
+
+<Level name="Advanced">
+
+Deliberately slow hashes (bcrypt, scrypt, Argon2) make guessing expensive. A second factor protects against a stolen password.
+
+</Level>
+
+<Level name="Edge cases">
+
+Two users with the same password get different hashes only because of the salt.
+
+</Level>
+
+<Level name="Corner cases">
+
+A login form that says "no such user" for one case and "wrong password" for the other tells an attacker which accounts exist.
+
+</Level>
+
+<Level name="Production level">
+
+Rate-limit login attempts, and prefer passkeys or security keys where possible.
+
+</Level>
+
+<Level name="Mindset">
+
+Judge authentication by what an attacker would have to steal.
+
+</Level>
+
+<Level name="System design">
+
+Services authenticate each other with keys, tokens and certificates: the same idea with no human in the loop.
+
+</Level>
+
+<Level name="Strategy">
+
+I would read the format of `/etc/shadow` and hash a password with a salt in Node using `scrypt`. Done when I can explain every field.
+
+</Level>
+</Levels>
+
+### 55. Access Control
+**Covers:** Deciding what an authenticated principal may do: access control lists, capabilities, and mandatory and role-based access control.
+
+<Levels label="Chapter 55, Access Control">
+
+<Level name="Beginner">
+
+Access control answers "what may you do". Unix permissions are a small access control list: owner, group, others.
+
+</Level>
+
+<Level name="Intermediate">
+
+ACLs attach permissions to objects; capabilities are unforgeable tokens a process holds. An open file descriptor behaves like a capability.
+
+</Level>
+
+<Level name="Advanced">
+
+Discretionary control lets owners decide; mandatory control (SELinux, AppArmor) enforces a system policy; role-based control assigns permissions to roles.
+
+</Level>
+
+<Level name="Edge cases">
+
+Root bypasses most checks, which makes root a single point of failure.
+
+</Level>
+
+<Level name="Corner cases">
+
+Checking a file's permission and then opening it is a race (time of check to time of use); open first, then check the descriptor.
+
+</Level>
+
+<Level name="Production level">
+
+Linux capabilities split root into pieces, and containers drop most of them by default.
+
+</Level>
+
+<Level name="Mindset">
+
+Least privilege is a property of the design, not a setting added later.
+
+</Level>
+
+<Level name="System design">
+
+Authorization in web apps (roles, ownership checks) is this chapter with HTTP in front.
+
+</Level>
+
+<Level name="Strategy">
+
+I would set permissions on a directory tree, predict what each user can do, then verify. Done when I can explain setuid and why it is dangerous.
+
+</Level>
+</Levels>
+
+### 56. Cryptography
+**Covers:** The cryptography an OS relies on: symmetric and public-key encryption, hashing, signatures and key management.
+
+<Levels label="Chapter 56, Cryptography">
+
+<Level name="Beginner">
+
+Encryption turns data into something unreadable without a key. Symmetric schemes use one shared key; public-key schemes use a key pair.
+
+</Level>
+
+<Level name="Intermediate">
+
+Hashes give fingerprints, signatures prove who signed, and certificates bind keys to names.
+
+</Level>
+
+<Level name="Advanced">
+
+Cryptography moves the problem to key management: who holds the key, how it rotates, how it is revoked.
+
+</Level>
+
+<Level name="Edge cases">
+
+Encrypting without authenticating lets an attacker alter ciphertext undetected; use authenticated encryption.
+
+</Level>
+
+<Level name="Corner cases">
+
+Encrypted data at rest is only as safe as the key stored next to it.
+
+</Level>
+
+<Level name="Production level">
+
+Use vetted libraries, never home-made schemes. Disk encryption, TLS and signed packages are the everyday uses.
+
+</Level>
+
+<Level name="Mindset">
+
+Cryptography moves trust; it does not create it.
+
+</Level>
+
+<Level name="System design">
+
+TLS in phase 7 and signed builds in phase 11 are the system-level uses.
+
+</Level>
+
+<Level name="Strategy">
+
+I would encrypt and decrypt a file with Node's `crypto` using AES-GCM and check that tampering fails. Done when one flipped byte makes decryption throw.
+
+</Level>
+</Levels>
+
+### 57. Distributed
+**Covers:** Security across machines: authenticating remote parties, protecting messages, and the extra threats a network brings.
+
+<Levels label="Chapter 57, Distributed">
+
+<Level name="Beginner">
+
+Over a network, neither the source address nor the content of a message can be trusted by default.
+
+</Level>
+
+<Level name="Intermediate">
+
+Secure channels (TLS, SSH) give confidentiality and integrity; authentication proves who is at the other end.
+
+</Level>
+
+<Level name="Advanced">
+
+Networks add replay attacks, man-in-the-middle attacks and compromised nodes; nonces, timestamps and mutual authentication defend against them.
+
+</Level>
+
+<Level name="Edge cases">
+
+A correctly encrypted message can still be a replay of an old one.
+
+</Level>
+
+<Level name="Corner cases">
+
+A trusted node that is compromised sends perfectly authenticated malicious messages.
+
+</Level>
+
+<Level name="Production level">
+
+Mutual TLS between services, short-lived credentials and audit logs are the production practice.
+
+</Level>
+
+<Level name="Mindset">
+
+Trust each message for what it proves, not for where it seems to come from.
+
+</Level>
+
+<Level name="System design">
+
+Zero-trust networking is this chapter as architecture.
+
+</Level>
+
+<Level name="Strategy">
+
+I would set up SSH keys between two VMs and capture the traffic to see it is encrypted. Done when I can say what an attacker on the wire can and cannot learn.
+
+</Level>
+</Levels>
+
+## Appendices
+
+The appendices are reference and practice rather than new theory. The virtual machines appendix explains how
+a hypervisor virtualizes a whole machine, which covers the plan's virtualization bullet. The monitors appendix
+shows the older language-level approach to synchronization. The lab tutorial introduces C programming on Unix,
+and the systems labs and xv6 labs are projects I would pair with MIT's xv6 course: a shell, a scheduler,
+virtual memory and a file system inside a real, small kernel.
+
+## Misreadings to avoid
+
+- "Threads are faster than processes." Threads are cheaper to create and share memory more easily; whether that is faster depends on the workload and the locking.
+- "Virtual memory means swapping to disk." Virtual memory is translation and isolation; swapping is one optional use of it.
+- "Lock-free is always faster." It avoids waiting on locks, but often costs more per operation and is much harder to get right.
+- "`write` returned, so it is on disk." Not until `fsync`, and not even then if the device lies about its cache.
+- "Event-based servers have no concurrency bugs." They have no data races between instructions, and plenty of races between callbacks.
+- "Containers are lightweight VMs." They share the host kernel; that is the whole difference.
+
+## Done with this book when
+
+- My shell runs pipes, redirection and background jobs, and handles Ctrl-C correctly.
+- My thread-safe queue and thread pool pass their tests under ThreadSanitizer.
+- I can explain a deadlock I created, draw its wait-for graph and show the fix.
+- I can narrate the `strace` of a process opening and reading a file.
+- I can walk through a page fault from TLB miss to retried instruction.
+- I can explain journaling and the atomic-rename pattern, and my safe-save never leaves a half-written file.
