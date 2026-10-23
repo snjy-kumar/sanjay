@@ -1,0 +1,1294 @@
+---
+title: "Web Security for Developers, chapter by chapter"
+description: "Malcolm McDonald's Web Security for Developers, all 18 chapters climbed from beginner to strategy: injection, XSS, CSRF, auth, sessions, permissions, crypto, supply chain and DoS."
+edition: "first edition (No Starch Press, 2020)"
+tocVerified: true
+tocSources:
+  - "https://nostarch.com/websecurity"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the developer-side security book in phase 6 of the
+<a href={withBase('/plans/software-ai-developer/')}>software AI developer</a> roadmap (security and privacy),
+and in the trust lens of the <a href={withBase('/plans/underrated-fundamentals/')}>underrated fundamentals</a>.
+Each chapter takes one class of vulnerability, shows how the attack works and then shows the fix in
+code, which is exactly the order I need: see the hole, then close it in my own app.
+
+It is short and practical. The heavier books on this shelf go deeper into attack technique and
+security engineering; this one is the daily checklist.
+
+## How I would learn it
+
+For every threat chapter I do three things in a deliberately vulnerable copy of my phase 3 API: write the
+vulnerable version, exploit it myself with `curl` or the browser devtools, and then fix it and add a test
+that the exploit now fails. The exploit and the test go in the repo, so the fix cannot quietly regress.
+I keep a running threat model for the API and add a row per chapter.
+
+<Timeline items={[
+  { when: 'week 31', what: 'Chapters 1 to 5: how the web, browsers, servers and programmers work. Map the API attack surface.' },
+  { when: 'week 32', what: 'Chapters 6 to 10: injection, XSS, CSRF, authentication, sessions. Exploit and fix each.' },
+  { when: 'week 33', what: 'Chapters 11 to 15: permissions, leaks, encryption, third-party code, XML.' },
+  { when: 'week 34', what: 'Chapters 16 to 18: being an accessory, denial of service, summing up. Finish the threat model; pass the gate.' },
+]} caption="Phase 6 is four weeks. Each week ends with fixes merged and exploit tests passing." />
+
+Each chapter below climbs the nine levels, in my own words with my own examples, not the book's text.
+
+## The book's parts
+
+<Layers layers={[
+  { name: "Chapter 1: Let's Hack a Website", note: 'the attacker’s view first' },
+  { name: 'Part I: The Basics', note: 'chapters 2 to 5: the internet, browsers, web servers, how programmers work' },
+  { name: 'Part II: The Threats', note: 'chapters 6 to 17: one vulnerability class per chapter' },
+  { name: 'Chapter 18: Summing Up', note: 'the principles that tie it together' },
+]} caption="How the 18 chapters are grouped. The basics explain the machinery the threats abuse." />
+
+## Getting started
+
+
+### 1. Let's Hack a Website
+
+**Covers:** An attacker's first look at a site: the tools anyone can use, how little it takes to find a weakness, and why a developer should try it on their own code.
+
+<Flow steps={["pick a target", "read its pages and requests", "change one input", "watch the response", "find something it trusted"]} caption={"The attacker's loop. It needs only a browser, devtools and curiosity."} />
+
+<Levels label={"Chapter 1, Let's Hack a Website"}>
+<Level name="Beginner">
+
+Attacking a site needs no special tools: the browser's devtools show every request, and `curl` can replay
+any of them with different values.
+
+```sh
+curl -s 'http://localhost:3000/api/orders/42' -H 'Cookie: session=abc'
+curl -s 'http://localhost:3000/api/orders/43' -H 'Cookie: session=abc'   # someone else's?
+```
+
+If the second returns another user's order, I found a broken access check in thirty seconds.
+
+</Level>
+<Level name="Intermediate">
+
+Attackers chain small facts: a verbose error reveals the framework, the framework has a known weakness,
+the weakness needs an input the site accepts. Each fact alone looks harmless.
+
+</Level>
+<Level name="Advanced">
+
+Automated scanners and intercepting proxies (Burp Suite, OWASP ZAP) do this at scale: they crawl,
+mutate every parameter, and flag unusual responses.
+
+</Level>
+<Level name="Edge cases">
+
+Hidden form fields and disabled buttons are boundaries only in the UI. A request with `price=0` or
+`role=admin` is one edit away.
+
+</Level>
+<Level name="Corner cases">
+
+A client-side check plus a server that trusts it: the form validates a discount code in JavaScript and the
+server applies whatever discount the request says.
+
+</Level>
+<Level name="Production level">
+
+In production, assume scanners hit every public endpoint within hours of launch. Logs should show
+probing patterns (many 404s, odd parameters) and alert on them.
+
+</Level>
+<Level name="Mindset">
+
+Think like the attacker for an hour before thinking like the defender. The habit: for each input, ask
+"what if this were anything else?"
+
+</Level>
+<Level name="System design">
+
+The attack surface is every endpoint, parameter, header, file upload and webhook. A system design should
+list it.
+
+</Level>
+<Level name="Strategy">
+
+I spend an hour attacking my own API with devtools and `curl`, recording every finding. Done when the list
+has at least five findings or a written reason why each endpoint resisted.
+
+</Level>
+</Levels>
+
+## Part I: The Basics
+
+
+### 2. How the Internet Works
+
+**Covers:** The protocols underneath the web: IP, TCP, DNS, HTTP and TLS, and which of them an attacker can observe or tamper with.
+
+<Layers layers={[{"name": "HTTP", "note": "requests, headers, cookies"}, {"name": "TLS", "note": "encryption and server identity"}, {"name": "TCP", "note": "reliable ordered bytes"}, {"name": "IP", "note": "addressing and routing"}, {"name": "DNS", "note": "names to addresses"}]} caption={"The stack under every request. Without TLS, anyone on the path can read and change everything above TCP."} />
+
+<Levels label={"Chapter 2, How the Internet Works"}>
+<Level name="Beginner">
+
+A request travels as IP packets over TCP; DNS finds the address; HTTP is the text format; TLS (HTTPS)
+encrypts it.
+
+```sh
+curl -v https://example.com 2>&1 | grep -E '^\* (Connected|SSL|TLS)'
+```
+
+</Level>
+<Level name="Intermediate">
+
+HTTP is plain text: method, path, headers, body. Over plain HTTP, Wi-Fi neighbours can read cookies and
+change pages. TLS stops reading and tampering and proves the server's identity with a certificate.
+
+</Level>
+<Level name="Advanced">
+
+DNS answers are not authenticated by default, so DNS spoofing can send a user to the wrong server; TLS
+certificate checks are what catch that. HSTS tells browsers to use HTTPS only.
+
+</Level>
+<Level name="Edge cases">
+
+The first request to `http://` before a redirect to HTTPS is exposed. HSTS preload removes even that.
+
+</Level>
+<Level name="Corner cases">
+
+A valid certificate plus a hijacked DNS record for a subdomain: an attacker who controls an abandoned
+subdomain can get a real certificate for it.
+
+</Level>
+<Level name="Production level">
+
+Production: HTTPS everywhere, HSTS, modern TLS only, certificate expiry monitored, and DNS records for
+retired services removed.
+
+</Level>
+<Level name="Mindset">
+
+Every hop is untrusted until encryption and authentication make it trusted.
+
+</Level>
+<Level name="System design">
+
+Internal service-to-service traffic deserves TLS too, as networks get flatter and cloud tenants share
+hardware.
+
+</Level>
+<Level name="Strategy">
+
+I check my API with an SSL test tool and add HSTS. Done when HTTP redirects, HSTS is set, and the grade has
+no warnings.
+
+</Level>
+</Levels>
+
+### 3. How Browsers Work
+
+**Covers:** How browsers render pages, run JavaScript, enforce the same-origin policy, and store cookies, which is the security model web attacks try to bend.
+
+<Flow steps={["fetch HTML", "parse DOM", "load CSS and scripts", "run JS in page origin", "render"]} caption={"Rendering. Any script that ends up in the page runs with the page's full power."} />
+
+<Levels label={"Chapter 3, How Browsers Work"}>
+<Level name="Beginner">
+
+A browser fetches HTML, builds the DOM, runs scripts and renders. Scripts in a page can read and change
+anything in that page.
+
+</Level>
+<Level name="Intermediate">
+
+The same-origin policy isolates pages by origin (scheme, host and port): a script from `evil.example` cannot
+read responses from `bank.example`. Cookies are sent automatically with requests to their site.
+
+</Level>
+<Level name="Advanced">
+
+Cookies have attributes: `Secure` (HTTPS only), `HttpOnly` (hidden from JavaScript), `SameSite`
+(`Strict`, `Lax`, `None`) controlling cross-site sending, `Domain` and `Path` for scope.
+
+```http
+Set-Cookie: session=abc; Secure; HttpOnly; SameSite=Lax; Path=/
+```
+
+</Level>
+<Level name="Edge cases">
+
+`http://site` and `https://site` are different origins; so are `site:3000` and `site:3001`.
+
+</Level>
+<Level name="Corner cases">
+
+Same-origin policy plus automatic cookies: other sites cannot read my responses, but they can still
+make the browser *send* requests with my cookies. That gap is CSRF (chapter 8).
+
+</Level>
+<Level name="Production level">
+
+Production: every session cookie is `Secure; HttpOnly; SameSite=Lax` or stricter, and CORS allows only
+specific origins.
+
+</Level>
+<Level name="Mindset">
+
+The browser is a powerful agent acting for the user. Attacks trick it into acting for someone else.
+
+</Level>
+<Level name="System design">
+
+The origin is the security boundary of the web. Hosting user content on the same origin as the app
+weakens it; a separate domain for uploads restores it.
+
+</Level>
+<Level name="Strategy">
+
+I list every cookie my app sets with its attributes. Done when each session cookie has all three flags.
+
+</Level>
+</Levels>
+
+### 4. How Web Servers Work
+
+**Covers:** Static and dynamic resources, server-side processing, databases and caches, and the stacks that serve pages.
+
+<Flow steps={["request", "router", "handler", "database or cache", "template or JSON", "response"]} caption={"A dynamic request. Each arrow is a place where untrusted input may reach a trusted interpreter."} />
+
+<Levels label={"Chapter 4, How Web Servers Work"}>
+<Level name="Beginner">
+
+Static resources are files served as they are; dynamic resources are built per request from code, data and
+templates.
+
+</Level>
+<Level name="Intermediate">
+
+A server-side handler reads input, queries a database, renders output. Every interpreter it talks to
+(SQL, shell, template engine, file system) is a possible injection target.
+
+</Level>
+<Level name="Advanced">
+
+Frameworks add routing, sessions and templating. Their defaults (auto-escaping templates, parameterised
+query builders) are the main reason modern apps are safer than old ones.
+
+</Level>
+<Level name="Edge cases">
+
+A path parameter used as a file name: `/files/../../etc/passwd` reaches the file system unless the path is
+normalised and checked against a base directory.
+
+```ts
+const p = path.resolve(BASE, req.params.name);
+if (!p.startsWith(BASE + path.sep)) return res.status(400).end();
+```
+
+</Level>
+<Level name="Corner cases">
+
+A CDN cache plus a per-user response: a page with a user's details cached by the CDN without
+`Cache-Control: private` is then served to everyone.
+
+</Level>
+<Level name="Production level">
+
+Production servers run as non-root, serve only intended directories, and set cache headers explicitly
+for every authenticated response.
+
+</Level>
+<Level name="Mindset">
+
+Know every interpreter behind your code, because each speaks a language an attacker can write in.
+
+</Level>
+<Level name="System design">
+
+Layering (CDN, proxy, app, DB) adds places where a mistake in one layer is exposed by another.
+
+</Level>
+<Level name="Strategy">
+
+I list each interpreter my API talks to and how input reaches it. Done when each path uses a safe API.
+
+</Level>
+</Levels>
+
+### 5. How Programmers Work
+
+**Covers:** The development lifecycle from a security view: source control, branching, code review, automated tests, release, and how good process prevents vulnerabilities.
+
+<Flow steps={["write code", "review", "automated tests and scans", "build artifact", "deploy", "monitor"]} caption={"Security checks fit into the normal lifecycle. Each stage catches a different kind of mistake."} />
+
+<Levels label={"Chapter 5, How Programmers Work"}>
+<Level name="Beginner">
+
+Vulnerabilities enter through ordinary code changes. Source control, review and tests are the first
+security tools.
+
+</Level>
+<Level name="Intermediate">
+
+Code review catches logic and access mistakes; automated tests catch regressions; dependency and secret
+scanners catch known-bad packages and leaked keys.
+
+</Level>
+<Level name="Advanced">
+
+Releases should be reproducible artifacts, deployed by automation, with the ability to roll back fast when
+a vulnerability is found.
+
+</Level>
+<Level name="Edge cases">
+
+A secret committed and deleted in the next commit is still in history. It must be rotated, not just removed.
+
+</Level>
+<Level name="Corner cases">
+
+An urgent hotfix plus skipped review: the fix for one hole opens another. Emergency paths need lighter but
+not absent review.
+
+</Level>
+<Level name="Production level">
+
+Production practice: protected main branch, required review, CI with tests, `npm audit` and secret
+scanning, and signed artifacts.
+
+</Level>
+<Level name="Mindset">
+
+Security is a property of the process, not just the code.
+
+</Level>
+<Level name="System design">
+
+The pipeline itself is a target (supply-chain attacks); its credentials need least privilege.
+
+</Level>
+<Level name="Strategy">
+
+I add secret scanning and dependency audit to my CI. Done when a test commit with a fake key is blocked.
+
+</Level>
+</Levels>
+
+## Part II: The Threats
+
+
+### 6. Injection Attacks
+
+**Covers:** SQL injection, command injection, file upload attacks and remote code execution, and the defences: parameterised queries, safe APIs, least privilege and defence in depth.
+
+<Compare left={"Concatenated"} right={"Parameterised"} rows={[["\"SELECT * FROM users WHERE email = '\" + email + \"'\"", "db.query('SELECT * FROM users WHERE email = $1', [email])"], ["input ' OR '1'='1 returns every row", "input is matched literally, returns nothing"]]} caption={"The same query two ways. In the second, input is always data, never code."} />
+
+<Levels label={"Chapter 6, Injection Attacks"}>
+<Level name="Beginner">
+
+Injection happens when input is mixed into code an interpreter runs. The classic case is SQL built by
+string concatenation.
+
+```ts
+// vulnerable
+await db.query(`SELECT * FROM users WHERE email = '${email}'`);
+// email = "x' OR '1'='1"  -> returns every user
+```
+
+</Level>
+<Level name="Intermediate">
+
+Parameterised queries send code and data separately, so input can never change the query's structure.
+
+```ts
+await db.query('SELECT * FROM users WHERE email = $1', [email]);
+```
+
+Command injection is the same bug with a shell: `exec('convert ' + file)` with `file = "a.png; rm -rf ~"`.
+Use `execFile('convert', [file])`, which passes arguments without a shell.
+
+</Level>
+<Level name="Advanced">
+
+File uploads are injection too: an uploaded `.php` or `.html` file served from the same origin runs as
+code. Store uploads outside the web root, generate the stored name, check content type by inspecting
+bytes, and serve with `Content-Disposition: attachment`.
+
+</Level>
+<Level name="Edge cases">
+
+Identifiers cannot be parameterised: a column name for `ORDER BY` from the query string must be checked
+against an allowlist.
+
+```ts
+const col = ({ name: 'name', date: 'created_at' } as const)[req.query.sort as string] ?? 'created_at';
+```
+
+</Level>
+<Level name="Corner cases">
+
+An ORM plus a raw fragment: the ORM is safe until someone uses its `raw()` escape hatch with a template
+string. Search the code for `raw(` and template literals in queries.
+
+</Level>
+<Level name="Production level">
+
+Production: database users with least privilege (so injection cannot drop tables), WAF as a backstop not
+a fix, and lint rules that ban string-built queries.
+
+</Level>
+<Level name="Mindset">
+
+Never let data become code. The habit: find every place a string is handed to an interpreter.
+
+</Level>
+<Level name="System design">
+
+The same rule applies to prompts in AI features: user text inside a prompt is untrusted, and tool calls
+from model output need the same validation as any input.
+
+</Level>
+<Level name="Strategy">
+
+I write an injectable endpoint, exploit it with `curl`, fix it with parameters and add a test with the
+attack string. Done when my codebase has zero string-built queries.
+
+</Level>
+</Levels>
+
+### 7. Cross-Site Scripting Attacks
+
+**Covers:** Stored, reflected and DOM-based XSS, and the defences: output escaping, a Content Security Policy, and HttpOnly cookies.
+
+<Flow steps={["attacker input", "stored or reflected", "inserted into HTML unescaped", "browser runs it as script", "steals data or acts as user"]} caption={"XSS. The fix is at the insertion step: encode for the context the data lands in."} />
+
+<Levels label={"Chapter 7, Cross-Site Scripting Attacks"}>
+<Level name="Beginner">
+
+XSS is injecting JavaScript into a page other users see. If a comment containing `<script>` is shown
+without escaping, every reader runs it.
+
+</Level>
+<Level name="Intermediate">
+
+Escaping turns special characters into entities so they display as text. React escapes by default:
+
+```tsx
+<p>{comment}</p>                              // safe: escaped
+<p dangerouslySetInnerHTML={{ __html: comment }} /> // unsafe unless sanitised
+```
+
+Stored XSS lives in the database; reflected XSS comes back from a URL parameter; DOM-based XSS happens
+entirely in client JavaScript (`el.innerHTML = location.hash`).
+
+</Level>
+<Level name="Advanced">
+
+Context matters: HTML body, attributes, URLs, JavaScript and CSS need different encoding. A `href` from
+user input needs a scheme check, because `javascript:alert(1)` is a valid URL. A Content Security Policy
+limits which scripts can run:
+
+```http
+Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'
+```
+
+</Level>
+<Level name="Edge cases">
+
+Markdown rendering: user markdown can contain raw HTML. A sanitiser (DOMPurify) must run after rendering
+to HTML, not before.
+
+</Level>
+<Level name="Corner cases">
+
+A CSP plus an inline script allowance: `'unsafe-inline'` added to make one widget work disables most of
+the protection for the whole site. Use nonces or hashes instead.
+
+</Level>
+<Level name="Production level">
+
+Production: framework auto-escaping, a sanitiser for any rich HTML, a strict CSP (in report-only mode
+first), and `HttpOnly` session cookies so a successful XSS cannot read them directly.
+
+</Level>
+<Level name="Mindset">
+
+Escape on output, for the exact context. Input validation helps but is not the fix.
+
+</Level>
+<Level name="System design">
+
+Any feature rendering model output as HTML (an AI chat) is an XSS surface; treat model output as untrusted.
+
+</Level>
+<Level name="Strategy">
+
+I plant stored, reflected and DOM XSS in a test app, exploit each, then fix and add a CSP. Done when the
+CSP report endpoint receives no violations in normal use.
+
+</Level>
+</Levels>
+
+### 8. Cross-Site Request Forgery Attacks
+
+**Covers:** How another site can make a logged-in user's browser send state-changing requests, and the defences: correct HTTP verbs, anti-CSRF tokens, SameSite cookies, and re-authentication for sensitive actions.
+
+<Flow steps={["user logged into bank", "visits evil page", "evil page auto-submits form to bank", "browser attaches bank cookie", "bank performs transfer"]} caption={"CSRF. The bank cannot tell the request came from another site unless it checks."} />
+
+<Levels label={"Chapter 8, Cross-Site Request Forgery Attacks"}>
+<Level name="Beginner">
+
+CSRF tricks a logged-in user's browser into sending a request they did not intend. The browser attaches
+their cookies, so the server thinks it is them.
+
+</Level>
+<Level name="Intermediate">
+
+Defences: never change state on GET; require a secret token in state-changing requests that another site
+cannot know; set `SameSite=Lax` or `Strict` on session cookies.
+
+```html
+<form method="post" action="/transfer">
+  <input type="hidden" name="csrf" value="random-per-session-token">
+</form>
+```
+
+</Level>
+<Level name="Advanced">
+
+`SameSite=Lax` blocks cookies on cross-site POSTs but allows them on top-level GET navigations, which is
+why GETs must be safe. APIs using bearer tokens in an `Authorization` header are not exposed to CSRF,
+because browsers do not attach those automatically.
+
+</Level>
+<Level name="Edge cases">
+
+A login form is a CSRF target too: logging the victim into the attacker's account (login CSRF) makes the
+victim save data into it.
+
+</Level>
+<Level name="Corner cases">
+
+`SameSite=None` (needed for an embedded widget) plus cookie sessions: CSRF protection falls back entirely
+on tokens, so every endpoint must check them.
+
+</Level>
+<Level name="Production level">
+
+Production: framework CSRF middleware on, SameSite set, re-authentication for password, email and payment
+changes, and `Origin` header checks as an extra layer.
+
+</Level>
+<Level name="Mindset">
+
+Ambient authority (credentials sent automatically) is the root problem. The habit: for each
+state-changing request, ask how the server knows the user meant it.
+
+</Level>
+<Level name="System design">
+
+Cookie sessions versus tokens is a system decision with CSRF consequences; mixed models need both
+defences.
+
+</Level>
+<Level name="Strategy">
+
+I build a CSRF exploit page against a test endpoint, then add SameSite and tokens. Done when the exploit
+page fails and a test checks for the 403.
+
+</Level>
+</Levels>
+
+### 9. Compromising Authentication
+
+**Covers:** How login is attacked (brute force, credential stuffing, guessable passwords, user enumeration) and how to build it safely: hashing, salting, multi-factor authentication, third-party login, and secure logout and reset.
+
+<Flow steps={["password submitted", "rate limit check", "look up user", "verify slow hash", "MFA if enabled", "issue session"]} caption={"A safe login. The same error message for unknown user and wrong password avoids enumeration."} />
+
+<Levels label={"Chapter 9, Compromising Authentication"}>
+<Level name="Beginner">
+
+Never store passwords; store a slow, salted hash.
+
+```ts
+import { hash, verify } from '@node-rs/argon2';
+const stored = await hash(password);            // on signup
+const ok = await verify(stored, attempt);        // on login
+```
+
+</Level>
+<Level name="Intermediate">
+
+Attacks: brute force (many guesses for one account), credential stuffing (leaked pairs from other sites),
+and enumeration ("no such user" versus "wrong password"). Defences: rate limits per account and per IP,
+breached-password checks, identical error messages, and MFA.
+
+</Level>
+<Level name="Advanced">
+
+Salts make identical passwords hash differently; slow algorithms (argon2, bcrypt, scrypt) make each guess
+expensive. Third-party login (OAuth/OIDC) moves the password problem to a provider but adds redirect and
+token validation to get right.
+
+</Level>
+<Level name="Edge cases">
+
+A password reset is authentication too: reset tokens must be single-use, short-lived, random, and the
+reset response must not reveal whether the email exists.
+
+</Level>
+<Level name="Corner cases">
+
+Rate limiting per IP plus a botnet: credential stuffing from thousands of IPs passes per-IP limits. Limits
+per account and anomaly signals across accounts are needed.
+
+</Level>
+<Level name="Production level">
+
+Production: argon2id, MFA available (and required for admins), lockouts that slow rather than lock
+permanently, login alerts, and timing that does not reveal whether the user exists.
+
+</Level>
+<Level name="Mindset">
+
+Every way into an account (login, reset, OAuth, remember-me) is the login. Secure the weakest one.
+
+</Level>
+<Level name="System design">
+
+Authentication often belongs to a dedicated provider; the application then validates tokens and owns
+authorisation.
+
+</Level>
+<Level name="Strategy">
+
+I implement login with argon2, rate limits, uniform errors and TOTP MFA, plus tests for each. Done when an
+enumeration test cannot tell real from fake emails by response or timing.
+
+</Level>
+</Levels>
+
+### 10. Session Hijacking
+
+**Covers:** How sessions work (server-side and client-side), and how they are stolen: through cookie theft, session fixation, and weak session IDs; and how to prevent each.
+
+<Compare left={"Server-side session"} right={"Client-side session (signed token)"} rows={[["Random ID points to server state", "State inside a signed token"], ["Easy to revoke: delete the row", "Hard to revoke before expiry"], ["Needs a session store", "Stateless servers"], ["Small cookie", "Larger token, must stay small"]]} caption={"Two ways to remember a logged-in user, with different revocation stories."} />
+
+<Levels label={"Chapter 10, Session Hijacking"}>
+<Level name="Beginner">
+
+After login, a session ID in a cookie identifies the user. Whoever holds the ID is the user, so it must be
+unguessable and kept secret.
+
+```ts
+import { randomBytes } from 'node:crypto';
+const sid = randomBytes(32).toString('base64url');
+```
+
+</Level>
+<Level name="Intermediate">
+
+Cookie theft happens through XSS (prevented by `HttpOnly`), unencrypted traffic (prevented by `Secure` and
+HTTPS), and logs or URLs (never put session IDs in URLs).
+
+</Level>
+<Level name="Advanced">
+
+Session fixation: an attacker sets a known session ID in the victim's browser before login; if the
+server keeps the same ID after login, the attacker is now logged in. Always issue a new ID at login.
+Client-side sessions (signed tokens like JWTs) must verify the signature and algorithm.
+
+```ts
+jwt.verify(token, key, { algorithms: ['RS256'] }); // never accept "none" or a mixed list
+```
+
+</Level>
+<Level name="Edge cases">
+
+Session expiry: no expiry means a stolen ID works forever; very short expiry annoys users. Use idle and
+absolute timeouts.
+
+</Level>
+<Level name="Corner cases">
+
+Logout plus client-side tokens: deleting the cookie does not invalidate a stolen copy of a JWT. Short
+lifetimes plus a revocation list or server-side refresh tokens close the gap.
+
+</Level>
+<Level name="Production level">
+
+Production: rotate the session ID on login and privilege change, store sessions server-side for easy
+revocation, bind sensitive actions to recent authentication, and show users their active sessions.
+
+</Level>
+<Level name="Mindset">
+
+A session token is a password with an expiry date. Treat it like one.
+
+</Level>
+<Level name="System design">
+
+Session storage choice affects scaling (a shared store) and revocation; pick it with both in mind.
+
+</Level>
+<Level name="Strategy">
+
+I test fixation (set a cookie before login, check it changes after) and revocation (logout invalidates a
+copied cookie). Done when both tests pass.
+
+</Level>
+</Levels>
+
+### 11. Permissions
+
+**Covers:** Authorisation: privilege escalation, access control models, enforcing them, directory traversal, and testing access control.
+
+<Flow steps={["authenticated user", "load resource", "check user may perform action on this resource", "allow or 403/404"]} caption={"Every request needs the middle check, on the server, for this specific object, not just \"is logged in\"."} />
+
+<Levels label={"Chapter 11, Permissions"}>
+<Level name="Beginner">
+
+Authentication says who you are; authorisation says what you may do. Every endpoint must check both.
+
+```ts
+const doc = await db.docs.find(req.params.id);
+if (!doc || doc.ownerId !== req.user.id) return res.status(404).end();
+```
+
+</Level>
+<Level name="Intermediate">
+
+Models: role-based access (RBAC: admin, editor, viewer), ownership checks, and attribute-based rules
+(ABAC: "same team and not archived"). Enforce in one place, such as a policy function, not scattered
+`if`s.
+
+</Level>
+<Level name="Advanced">
+
+Privilege escalation is vertical (user becomes admin) or horizontal (user reads another user's data,
+called IDOR). Directory traversal is access control on files: `../` escapes the intended folder.
+
+</Level>
+<Level name="Edge cases">
+
+Returning 403 for another user's object confirms it exists; returning 404 does not. Choose deliberately.
+
+</Level>
+<Level name="Corner cases">
+
+A list endpoint plus a filter parameter: `/api/docs?ownerId=other` bypasses an ownership check that only
+exists on the single-item endpoint.
+
+</Level>
+<Level name="Production level">
+
+Production: deny by default, central policy, tests that call every endpoint as a different user and as
+another tenant, and audit logs for permission changes.
+
+</Level>
+<Level name="Mindset">
+
+Check the object, not just the route. The habit: in every query, ask "scoped to whom?"
+
+</Level>
+<Level name="System design">
+
+Multi-tenant systems need tenant scoping at the data layer (row-level security, or a tenant ID in every
+query) as defence in depth.
+
+```sql
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant ON docs USING (tenant_id = current_setting('app.tenant')::uuid);
+```
+
+</Level>
+<Level name="Strategy">
+
+I write a cross-tenant test that calls each endpoint with another tenant's IDs. Done when every call returns 404.
+
+</Level>
+</Levels>
+
+### 12. Information Leaks
+
+**Covers:** How applications leak useful facts to attackers: server headers, verbose errors, stack traces, comments, URLs, and timing, and how to stop each.
+
+<Compare left={"Leaky"} right={"Quiet"} rows={[["Stack trace with file paths", "Generic message plus a request ID"], ["X-Powered-By: Express", "Header removed"], ["\"No user with that email\"", "\"Email or password is incorrect\""], ["SQL error text", "Logged server-side only"]]} caption={"What an error response should and should not reveal."} />
+
+<Levels label={"Chapter 12, Information Leaks"}>
+<Level name="Beginner">
+
+Every detail I reveal (framework version, file paths, SQL errors) helps an attacker choose an exploit.
+
+```ts
+app.disable('x-powered-by');
+app.use((err, req, res, _next) => { log.error({ err, id: req.id }); res.status(500).json({ error: 'internal', id: req.id }); });
+```
+
+</Level>
+<Level name="Intermediate">
+
+Leaks come from headers, error pages, HTML comments, source maps, `.git` folders served by mistake, and
+API responses that include more fields than the UI shows.
+
+</Level>
+<Level name="Advanced">
+
+Over-fetching in APIs is the modern leak: returning the full user row (with `passwordHash` and `role`) and
+letting the frontend pick fields. Use explicit response schemas.
+
+```ts
+const PublicUser = z.object({ id: z.string(), name: z.string() });
+res.json(PublicUser.parse(user)); // strips everything else
+```
+
+</Level>
+<Level name="Edge cases">
+
+Timing: a login that returns faster for unknown users reveals which emails exist, even with identical
+messages.
+
+</Level>
+<Level name="Corner cases">
+
+Production source maps plus a secret in client code: the minified bundle hid it a little; the source map
+publishes the original file with comments.
+
+</Level>
+<Level name="Production level">
+
+Production: generic errors with request IDs, no source maps public (or none containing secrets), response
+schemas, and a periodic scan for exposed files.
+
+</Level>
+<Level name="Mindset">
+
+Say only what the caller needs. Everything else goes in the logs.
+
+</Level>
+<Level name="System design">
+
+Logs are a leak target too; they need access control and redaction.
+
+</Level>
+<Level name="Strategy">
+
+I scan my deployed API for headers, errors and exposed files, and add response schemas. Done when no
+response contains a field not in its schema.
+
+</Level>
+</Levels>
+
+### 13. Encryption
+
+**Covers:** Encryption in transit with TLS, how cryptography works at a practical level (symmetric, asymmetric, hashing), and enabling HTTPS correctly, including certificates and HSTS.
+
+<Flow steps={["client hello", "server certificate", "key exchange", "shared session key", "symmetric encrypted traffic"]} caption={"A TLS handshake in brief: asymmetric crypto agrees a key, then fast symmetric crypto protects the data."} />
+
+<Levels label={"Chapter 13, Encryption"}>
+<Level name="Beginner">
+
+Encryption makes data unreadable without a key. HTTPS uses TLS to encrypt everything between browser and server.
+
+</Level>
+<Level name="Intermediate">
+
+Symmetric encryption (AES) uses one shared key and is fast; asymmetric (RSA, elliptic curve) uses a key
+pair and is used to agree keys and sign. Hashing (SHA-256) is one-way and used for integrity, not secrecy
+of passwords (that needs slow hashes, chapter 9).
+
+</Level>
+<Level name="Advanced">
+
+Certificates bind a public key to a domain, signed by a certificate authority. Let's Encrypt automates
+issuing and renewal. Authenticated encryption (AES-GCM) gives secrecy and integrity together.
+
+```ts
+const iv = randomBytes(12);
+const c = createCipheriv('aes-256-gcm', key, iv);
+const ct = Buffer.concat([c.update(data), c.final()]); const tag = c.getAuthTag();
+```
+
+</Level>
+<Level name="Edge cases">
+
+Reusing an IV with the same key in GCM breaks confidentiality and integrity. IVs must be unique per message.
+
+</Level>
+<Level name="Corner cases">
+
+Encryption at rest plus the key stored next to the data: a database dump includes both, so the encryption
+adds nothing. Keys belong in a key management service.
+
+</Level>
+<Level name="Production level">
+
+Production: TLS 1.2 or later only, automatic certificate renewal with alerts, HSTS, and library-level
+crypto (never hand-rolled).
+
+</Level>
+<Level name="Mindset">
+
+Do not invent cryptography. Choose well-reviewed libraries and the boring defaults.
+
+</Level>
+<Level name="System design">
+
+Key management (who can decrypt what, rotation, revocation) is the system design part; algorithms are the
+easy part.
+
+</Level>
+<Level name="Strategy">
+
+I enable HTTPS with automatic renewal and encrypt one sensitive column with AES-GCM using a key from the
+environment. Done when a dump of the table shows ciphertext only.
+
+</Level>
+</Levels>
+
+### 14. Third-party Code
+
+**Covers:** The risks in dependencies, frameworks, CDN-hosted scripts and third-party services: known vulnerabilities, compromised packages, and how to manage them.
+
+<Layers layers={[{"name": "My code", "note": "a few thousand lines"}, {"name": "Direct dependencies", "note": "tens"}, {"name": "Transitive dependencies", "note": "hundreds or thousands"}, {"name": "Third-party scripts and services", "note": "run with my users' trust"}]} caption={"Most code that runs in my app is not mine. Each layer can carry a vulnerability."} />
+
+<Levels label={"Chapter 14, Third-party Code"}>
+<Level name="Beginner">
+
+Most of my application is other people's code. A vulnerability in a dependency is a vulnerability in my app.
+
+```sh
+npm audit --omit=dev
+```
+
+</Level>
+<Level name="Intermediate">
+
+Keep dependencies updated (Dependabot or Renovate), pin with a lockfile, and remove unused ones. Scripts
+loaded from a CDN can be pinned with Subresource Integrity:
+
+```html
+<script src="https://cdn.example/lib.js" integrity="sha384-..." crossorigin="anonymous"></script>
+```
+
+</Level>
+<Level name="Advanced">
+
+Supply-chain attacks: typosquatted packages, hijacked maintainer accounts, malicious install scripts.
+Defences: lockfiles, `npm ci`, reviewing new dependencies, disabling install scripts where possible,
+provenance checks.
+
+</Level>
+<Level name="Edge cases">
+
+A vulnerability with no fix available: mitigate (disable the feature, add a WAF rule) and track it, rather
+than ignore the audit warning.
+
+</Level>
+<Level name="Corner cases">
+
+A transitive dependency pinned by a direct dependency to a vulnerable version: updating my direct
+dependency is the only clean fix; `overrides` in `package.json` is the stopgap.
+
+</Level>
+<Level name="Production level">
+
+Production: automated update PRs, CI that fails on high-severity advisories, an inventory (SBOM), and a
+policy for adding new dependencies.
+
+</Level>
+<Level name="Mindset">
+
+Every dependency is a hire. Ask what it does, who maintains it, and what it can reach.
+
+</Level>
+<Level name="System design">
+
+Third-party services (analytics, payments, AI providers) receive user data; a data-flow diagram should
+show what each receives.
+
+</Level>
+<Level name="Strategy">
+
+I audit my API's dependency tree, remove three unused packages, and add automated updates. Done when CI
+blocks a PR that adds a package with a known high advisory.
+
+</Level>
+</Levels>
+
+### 15. XML Attacks
+
+**Covers:** Why XML parsers are dangerous: XML external entities (XXE), entity-expansion bombs, and how to configure parsers safely.
+
+<Figure art={`
+  lol9 -> 10 x lol8 -> 100 x lol7 -> ... -> 10^9 x "lol"
+  a 1 KB document expands to gigabytes in the parser
+`} caption={"An XML bomb: each entity expands into ten of the previous one."} />
+
+<Levels label={"Chapter 15, XML Attacks"}>
+<Level name="Beginner">
+
+XML parsers can be told to fetch external files or expand entities. A malicious document can make the
+server read local files or exhaust memory.
+
+</Level>
+<Level name="Intermediate">
+
+XXE: a document declares an entity pointing at `file:///etc/passwd` or an internal URL, and the parser
+inlines it into the parsed result. The defence is disabling DTDs and external entities in the parser.
+
+</Level>
+<Level name="Advanced">
+
+Billion laughs: nested entities expand exponentially. Safe parsers limit or disable entity expansion.
+Many formats are XML underneath (SVG, DOCX, SAML), so the risk appears where I do not expect XML.
+
+</Level>
+<Level name="Edge cases">
+
+An SVG avatar upload: SVG is XML, and processing it server-side with an unsafe parser is XXE.
+
+</Level>
+<Level name="Corner cases">
+
+An XXE pointing at a cloud metadata URL: the parser fetches internal credentials and returns them inside
+an error message.
+
+</Level>
+<Level name="Production level">
+
+Production: prefer JSON; where XML is required, use a parser with DTDs disabled, and process uploads in a
+sandbox with no network.
+
+</Level>
+<Level name="Mindset">
+
+Know what your parser does by default. Many parsers are more powerful than the job needs.
+
+</Level>
+<Level name="System design">
+
+Any service that parses complex formats from users (documents, images, archives) is a high-risk component;
+isolate it.
+
+</Level>
+<Level name="Strategy">
+
+I list every place my app parses XML, SVG or office files and check the parser settings. Done when each is
+configured safely or removed.
+
+</Level>
+</Levels>
+
+### 16. Don't Be an Accessory
+
+**Covers:** Avoiding becoming a tool in attacks on others: email spoofing and fraud, open redirects, clickjacking, and server-side request forgery.
+
+<Flow steps={["attacker supplies URL", "my server fetches it", "URL points at internal service or metadata", "response returned to attacker"]} caption={"SSRF. My server becomes the attacker's proxy into my own network."} />
+
+<Levels label={"Chapter 16, Don't Be an Accessory"}>
+<Level name="Beginner">
+
+My site can be used to attack others: sending spoofed email, redirecting to phishing sites, or being
+framed to trick clicks.
+
+</Level>
+<Level name="Intermediate">
+
+Email: publish SPF, DKIM and DMARC records so others can reject mail forged from my domain. Open
+redirects: `/redirect?to=` must only allow known destinations. Clickjacking: forbid framing.
+
+```http
+Content-Security-Policy: frame-ancestors 'none'
+```
+
+</Level>
+<Level name="Advanced">
+
+Server-side request forgery: a feature that fetches a user-supplied URL (link previews, webhooks, image
+import) can be pointed at `http://169.254.169.254/` or internal services. Defences: allowlists, resolving
+and blocking private IP ranges, and a separate egress proxy.
+
+</Level>
+<Level name="Edge cases">
+
+A redirect allowlist that checks `startsWith('https://mysite.com')` accepts `https://mysite.com.evil.example`.
+Parse the URL and compare the host exactly.
+
+</Level>
+<Level name="Corner cases">
+
+SSRF plus DNS rebinding: the hostname resolves to a public IP during the check and a private one during
+the fetch. Resolve once and connect to the checked IP.
+
+</Level>
+<Level name="Production level">
+
+Production: DMARC enforced, no open redirects, frame-ancestors set, and outbound fetches from user input
+through a restricted proxy.
+
+</Level>
+<Level name="Mindset">
+
+My server acts with my network's trust. The habit: treat any URL from a user as an attempt to borrow it.
+
+</Level>
+<Level name="System design">
+
+Agents and AI tools that fetch URLs are SSRF surfaces by design; they need the same egress controls.
+
+</Level>
+<Level name="Strategy">
+
+I build a link-preview endpoint, exploit it against a local metadata stub, then fix it. Done when private
+IPs and rebinding both fail in tests.
+
+</Level>
+</Levels>
+
+### 17. Denial-of-Service Attacks
+
+**Covers:** How services are overwhelmed (volumetric floods, protocol attacks, application-level DoS) and how to mitigate them: firewalls, CDNs, rate limits, and making expensive operations cheap or bounded.
+
+<Layers layers={[{"name": "Network edge", "note": "CDN and DDoS protection absorb floods"}, {"name": "Load balancer", "note": "connection limits, slow-client timeouts"}, {"name": "Application", "note": "rate limits, request size limits, query limits"}, {"name": "Data", "note": "bounded queries, timeouts"}]} caption={"Defence in layers. Each layer stops a different kind of overload."} />
+
+<Levels label={"Chapter 17, Denial-of-Service Attacks"}>
+<Level name="Beginner">
+
+A denial-of-service attack makes a service unavailable by overwhelming it. Large floods need upstream
+protection; application-level attacks need careful code.
+
+</Level>
+<Level name="Intermediate">
+
+Rate limiting per user or IP stops simple abuse:
+
+```ts
+import rateLimit from 'express-rate-limit';
+app.use('/api/', rateLimit({ windowMs: 60_000, limit: 100 }));
+```
+
+</Level>
+<Level name="Advanced">
+
+Application DoS targets expensive operations: a search with a huge page size, a regex with catastrophic
+backtracking (ReDoS), an image resize at 50,000 pixels, a GraphQL query nested 20 deep. Each needs a bound.
+
+</Level>
+<Level name="Edge cases">
+
+A request body limit of none: one 2 GB JSON upload exhausts memory. Set body size limits per route.
+
+</Level>
+<Level name="Corner cases">
+
+Rate limits plus a shared corporate IP: thousands of legitimate users behind one NAT hit the per-IP limit
+together. Limit by account where possible and use higher IP limits.
+
+</Level>
+<Level name="Production level">
+
+Production: a CDN or provider DDoS protection in front, body and query limits, timeouts everywhere,
+autoscaling with a cost cap, and alerts on traffic anomalies.
+
+</Level>
+<Level name="Mindset">
+
+Every expensive operation is a lever for someone else. Bound it.
+
+</Level>
+<Level name="System design">
+
+For AI features, token and cost budgets per user are DoS protection for the bill.
+
+</Level>
+<Level name="Strategy">
+
+I find the three most expensive endpoints in my API and bound each. Done when a load test of each with
+hostile parameters keeps other endpoints healthy.
+
+</Level>
+</Levels>
+
+### 18. Summing Up
+
+**Covers:** The principles behind all the chapters: automate releases, test, treat input as untrusted, keep secrets secret, least privilege, defence in depth, and stay informed.
+
+<Flow steps={["know the threats", "design defences in", "automate checks", "monitor and respond", "learn and update"]} caption={"Security as a loop rather than a project with an end date."} />
+
+<Levels label={"Chapter 18, Summing Up"}>
+<Level name="Beginner">
+
+Most web vulnerabilities come from a few causes: trusting input, mixing data and code, weak authentication
+and missing authorisation checks.
+
+</Level>
+<Level name="Intermediate">
+
+The principles generalise: validate input at the boundary, encode output for its context, keep secrets out
+of code, give every component least privilege, and keep dependencies current.
+
+</Level>
+<Level name="Advanced">
+
+Defence in depth means several independent controls: if escaping fails, CSP limits the damage; if
+access checks fail, row-level security stops cross-tenant reads.
+
+</Level>
+<Level name="Edge cases">
+
+The boundary case is the next new feature: every principle must be applied again to code that does not
+exist yet. Checklists and tests make that automatic.
+
+</Level>
+<Level name="Corner cases">
+
+A secure app plus an insecure admin tool beside it: attackers choose the weakest entry, not the main one.
+
+</Level>
+<Level name="Production level">
+
+Production: threat models updated per feature, security tests in CI, an incident response plan, and a
+way to receive vulnerability reports (`security.txt`).
+
+</Level>
+<Level name="Mindset">
+
+Security is ordinary engineering done carefully, not a separate discipline bolted on at the end.
+
+</Level>
+<Level name="System design">
+
+Security requirements belong in design docs from the start, next to performance and reliability.
+
+</Level>
+<Level name="Strategy">
+
+I finish my API's threat model with one row per chapter and a test for each fix. Done when the phase 6
+gate is met: a threat model and real, tested fixes.
+
+</Level>
+</Levels>
+
+## Misreadings to avoid
+
+- "Input validation prevents XSS and injection." Validation helps; the fixes are parameterisation and output encoding.
+- "We use a framework, so we are safe." Frameworks have escape hatches, and authorisation is always my code.
+- "HTTPS means the site is secure." It protects the channel, not the application.
+- "Security is a pentest before launch." Most findings come from everyday code changes; checks must run on every change.
+
+## Done with this book when
+
+- My phase 6 gate passes: a written threat model and real, tested fixes in my API.
+- Every vulnerability class in the threats part has an exploit test in my repo that now fails to exploit.
+- Cookies, headers (CSP, HSTS, frame-ancestors) and TLS are configured and checked in CI.
+- A cross-tenant test suite covers every endpoint and returns 404 for every foreign ID.
