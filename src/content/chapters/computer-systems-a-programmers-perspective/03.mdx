@@ -1,0 +1,2496 @@
+---
+book: computer-systems-a-programmers-perspective
+number: 3
+title: "Machine-Level Representation of Programs"
+description: "Reading x86-64 assembly from gcc: registers, operands, mov and lea, flags, jumps, loops, switch tables, the stack, arrays, structs, overflows and SSE floats."
+part: "Part I, Program Structure and Execution"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A compiler takes the C I write and turns it into a list of tiny steps the
+processor actually performs: move eight bytes here, add these two
+registers, jump if the last result was negative. This chapter teaches me to
+read that list. Once I can, the "magic" in C disappears: I can see what a
+loop costs, where a local variable lives, why a pointer bug overwrote a
+return address, and why one version of a function is faster than another.
+Every listing on this page comes from my own C, compiled with GCC 14.2 on
+an x86-64 Linux box and checked with `objdump` and `gdb`.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- Produce assembly from C with `gcc -Og -S`, disassemble object files with `objdump -d`, and step through them in `gdb`.
+- Name the sixteen x86-64 integer registers, their 32-, 16- and 8-bit parts, and the role each plays in the calling convention.
+- Read every operand form, from `$5` and `%rax` to `8(%rdi,%rsi,4)`, and compute the address it refers to.
+- Read `mov`, `lea`, arithmetic, shift and logical instructions, and the special 128-bit multiply and divide.
+- Explain the condition codes, how `cmp`, `test`, `set`, `j` and `cmov` use them, and turn an `if`, any loop or a `switch` back into C.
+- Draw the stack frame of any function: return address, saved registers, locals and stack arguments.
+- Compute the address of any element of an array, nested array or struct, including alignment padding.
+- Explain how a buffer overflow overwrites a return address, and how canaries, ASLR and non-executable stacks stop it.
+- Read SSE floating-point code: `movss`, `cvt`, `addsd`, constants in memory and `ucomisd` comparisons.
+
+What I should already know: <a href={withBase('/books/computer-systems-a-programmers-perspective/02-representing-and-manipulating-information/')}>chapter 2</a>,
+especially two's complement, sign and zero extension, shifts and IEEE 754.
+C pointers, arrays and structs should be comfortable. No previous assembly
+is needed.
+
+Reading time: about two and a half hours for this page. The chapter in the
+book is the longest in it; with practice problems and the Bomb Lab and
+Attack Lab it is two to three weeks of evenings.
+
+## Chapter map
+
+<Flow steps={["3.1 History: how x86 grew from 16 to 64 bits", "3.2 Program encodings: C to assembly to object code", "3.3 Data formats: b, w, l, q suffixes", "3.4 Accessing information: registers, operands, mov, push and pop", "3.5 Arithmetic and logic: lea, add, shifts, 128-bit multiply and divide", "3.6 Control: flags, jumps, cmov, loops, switch", "3.7 Procedures: the stack, call and ret, arguments, locals, recursion", "3.8 Arrays: pointer arithmetic, nested, fixed and variable size", "3.9 Structs, unions and alignment", "3.10 Pointers, gdb, buffer overflow and its defences, variable frames", "3.11 Floating-point code in SSE registers"]} caption="The chapter goes from the smallest piece, one instruction moving one value, to whole programs with control flow, procedure calls and data structures, then shows how it all breaks and how floating point is handled separately." />
+
+## 3.1 A Historical Perspective
+
+### In one sentence
+
+The x86 family grew over four decades from a 16-bit chip to today's 64-bit
+processors without ever dropping old instructions, which is why its
+assembly has odd names and many ways to do one thing.
+
+### The idea
+
+Intel's x86 line started with a 16-bit processor in the late 1970s. Each new
+generation added features but kept running the old programs, a promise
+called **backward compatibility**. The milestones that matter for reading
+code today are few:
+
+- **16-bit to 32-bit.** The mid-1980s step to 32 bits gave flat addressing
+  and the "extended" registers whose names start with `e`, such as `%eax`.
+  This architecture is called IA32.
+- **Floating-point and vector extensions.** A separate floating-point unit
+  with a stack of registers came first. Later the SSE extensions added
+  128-bit `%xmm` registers, then AVX widened them to 256-bit `%ymm` and
+  AVX-512 to 512-bit `%zmm`. Modern compilers do all scalar floating point
+  in these vector registers.
+- **64-bit.** AMD extended the instruction set to 64 bits in the early
+  2000s, and Intel adopted it. The registers grew to 64 bits with names
+  starting `r` (`%rax`), and eight new registers `%r8` to `%r15` were
+  added. This is **x86-64**, the target of this chapter.
+
+The x86 line is called a **CISC** (complex instruction set computer): many
+instructions, variable lengths from 1 to 15 bytes, and operands that can
+reach into memory. Its rival style, **RISC**, has fewer, fixed-length
+instructions, and is used by ARM and RISC-V. Inside, modern x86 cores break
+complex instructions into simpler micro-operations, so the gap in practice
+is smaller than the names suggest.
+
+Also behind this growth is **Moore's law**, the observation that transistor
+counts roughly doubled every couple of years for decades. The extra
+transistors went into caches, multiple cores and parallel execution
+machinery that chapter 5 relies on.
+
+### Worked example
+
+My box reports its processor and flags, which list the extensions built up
+over the decades:
+
+```bash
+$ grep -m1 'model name' /proc/cpuinfo
+model name	: Intel(R) Xeon(R) Processor
+$ grep -m1 -o -w 'lm\|sse2\|avx2\|avx512f' /proc/cpuinfo | sort -u
+avx2
+avx512f
+lm
+sse2
+```
+
+`lm` ("long mode") means 64-bit x86-64 is available; `sse2` is the
+floating-point baseline every x86-64 compiler assumes; `avx2` and `avx512f`
+are the wider vector extensions.
+
+### Step by step
+
+1. Every x86-64 processor can still run 32-bit code; the operating system decides which mode a program uses.
+2. The compiler targets a baseline (x86-64 with SSE2 by default) unless told otherwise with `-march`.
+3. Register names tell the history: `%ax` (16-bit), `%eax` (32-bit), `%rax` (64-bit) are three views of the same register.
+
+### Common mistake
+
+Treating "x86" and "x86-64" as the same when reading old tutorials. IA32
+code passes arguments on the stack and uses `%ebp` frames everywhere; x86-64
+code passes the first six arguments in registers and often has no frame
+pointer at all. Old examples will confuse more than help.
+
+### In real systems
+
+Laptops and servers mostly run x86-64 or ARM64. The ideas in this chapter
+(registers, a stack, condition flags, calling conventions) carry over to
+ARM64 almost one to one; only the spelling changes. Learning one
+instruction set deeply makes the next one a weekend's work.
+
+### Check yourself
+
+<details>
+<summary>What are the three names for the low parts of %rax, from 32 down to 8 bits?</summary>
+
+`%eax` (32), `%ax` (16), `%al` (8).
+
+</details>
+
+<details>
+<summary>Why are x86 instructions variable length?</summary>
+
+Because the set grew by extension over decades, each addition fitted into
+the remaining encoding space with prefixes, so lengths run from 1 to 15
+bytes.
+
+</details>
+
+## 3.2 Program Encodings
+
+### In one sentence
+
+GCC turns C into assembly text, the assembler turns that into binary object
+code, and the linker joins object files into an executable, and at each
+step I can look at the result.
+
+### The idea
+
+Compiling `gcc -Og -o prog p1.c p2.c` runs the whole tool chain from chapter 1:
+the preprocessor expands includes and macros, the compiler emits assembly,
+the assembler produces relocatable object files, and the linker merges
+them with libraries. The `-Og` flag asks for optimisation that keeps the
+machine code close to the source, which makes it the right level to learn
+from. Real builds use `-O1`, `-O2` or `-O3`, which reorder and transform
+code much more.
+
+#### 3.2.1 Machine-Level Code
+
+Two abstractions matter. The first is the **instruction set architecture
+(ISA)**: the format and behaviour of the instructions and the state they
+see. The ISA describes execution as if each instruction finished before
+the next started, even though real hardware overlaps many. The second is
+**virtual addresses**: the program sees memory as one big byte array, and
+the operating system and hardware translate those addresses behind the
+scenes (chapter 9).
+
+The machine-level program sees state that C hides:
+
+- The **program counter**, `%rip` on x86-64, holding the address of the next instruction.
+- The **integer register file**: sixteen 64-bit registers for addresses and integers.
+- The **condition code registers**: single-bit flags about the last arithmetic or logical result, used for `if` and loops.
+- The **vector registers**: for floating-point and SIMD values.
+
+At this level there are no types, arrays or structs. Memory is bytes;
+registers are 64-bit boxes; a pointer is just an integer that happens to be
+used as an address. Arrays and structs are contiguous runs of bytes, and it
+is up to the compiled code to compute the right addresses.
+
+#### 3.2.2 Code Examples
+
+My own first example is a function that calls another and stores the result
+through a pointer:
+
+```c
+long mult2(long, long);
+
+void multstore(long x, long y, long *dest) {
+    long t = mult2(x, y);
+    *dest = t;
+}
+```
+
+`gcc -Og -S a.c` writes `a.s`. With the directives stripped, this is
+the whole function:
+
+```asm
+multstore:
+	pushq	%rbx
+	movq	%rdx, %rbx
+	call	mult2@PLT
+	movq	%rax, (%rbx)
+	popq	%rbx
+	ret
+```
+
+`gcc -Og -c a.c` assembles it into `a.o`, and `objdump -d a.o`
+disassembles the bytes back:
+
+```text
+0000000000000000 <multstore>:
+   0:	53                   	push   %rbx
+   1:	48 89 d3             	mov    %rdx,%rbx
+   4:	e8 00 00 00 00       	call   9 <multstore+0x9>
+   9:	48 89 03             	mov    %rax,(%rbx)
+   c:	5b                   	pop    %rbx
+   d:	c3                   	ret
+```
+
+Fourteen bytes, six instructions. Things to notice: instructions are 1 to 5
+bytes here; `push %rbx` is a single byte, `53`. The call's target is
+`00 00 00 00` because `mult2` is not known yet; the linker fills it in
+(chapter 7). The disassembler drops the `q` suffix when the size is obvious
+from the registers.
+
+#### 3.2.3 Notes on Formatting
+
+Real `gcc -S` output is full of lines starting with a dot, such as
+`.cfi_startproc` or `.p2align 4`. These are **directives** for the
+assembler and debugger, not instructions, and I strip them when reading.
+
+GCC and `objdump` use **AT&T syntax**: registers start with `%`, constants
+with `$`, the source operand comes first and the destination last, and
+the operand size is part of the name (`movq`). Intel's manuals and
+Microsoft tools use **Intel syntax**, which reverses the operand order,
+drops the sigils and writes sizes as `QWORD PTR`. `objdump -M intel` shows
+the other form. This page uses AT&T throughout.
+
+<Compare left="AT&T (GCC, objdump)" right="Intel (Intel manuals, MSVC)" rows={[
+  ["movq %rdx, %rbx", "mov rbx, rdx"],
+  ["movq %rax, (%rbx)", "mov QWORD PTR [rbx], rax"],
+  ["leaq 8(%rdi,%rsi,4), %rax", "lea rax, [rdi+rsi*4+8]"],
+  ["addq $1, %rax", "add rax, 1"],
+  ["source first, destination last", "destination first, source last"],
+]} caption="The same instructions in the two syntaxes. Only the spelling and the operand order change; the machine code is identical." />
+
+### Worked example
+
+Seeing the whole pipeline on one file, keeping every intermediate:
+
+```bash
+$ gcc -Og -save-temps -c a.c
+$ ls a.*
+a.c  a.i  a.o  a.s
+```
+
+`a.i` is the preprocessed C, `a.s` the assembly, `a.o` the object code.
+Inside `gdb`, `x/14xb multstore` dumps the same fourteen bytes from memory,
+and `disassemble multstore` reprints the listing.
+
+<Flow steps={["a.c (C source)", "cpp: a.i (expanded C)", "cc1: a.s (assembly text)", "as: a.o (relocatable object)", "ld: prog (executable)", "loader: process in memory"]} caption="The tool chain from C to a running process. Each arrow is a separate program; gcc is only the driver that calls them in order." />
+
+### Step by step
+
+1. Write a small C function with no `main`.
+2. Run `gcc -Og -S file.c` and read `file.s`, ignoring lines that start with a dot.
+3. Run `gcc -Og -c file.c` and `objdump -d file.o` to see the bytes.
+4. Change one line of C and diff the two `.s` files to see what changed.
+5. Repeat with `-O2` to see what real optimisation does.
+
+### Common mistake
+
+Reading `-O0` assembly. Unoptimised code stores every variable to the
+stack and loads it again, so a three-line function becomes thirty lines of
+noise. `-Og` or `-O1` is far easier to read and closer to what ships.
+
+### In real systems
+
+Compiler Explorer (godbolt.org) shows the same thing in a browser for many
+compilers and flags side by side. Profilers like `perf annotate` show
+hot instructions inside a release build, which only makes sense if I can
+read assembly. Debuggers fall back to disassembly whenever symbols are
+missing.
+
+### Check yourself
+
+<details>
+<summary>Why is the call target 00 00 00 00 in a.o?</summary>
+
+The address of `mult2` is unknown until linking; the assembler leaves a
+placeholder and a relocation entry for the linker to fill.
+
+</details>
+
+<details>
+<summary>In AT&T syntax, which operand is written to in movq %rdx, %rbx?</summary>
+
+`%rbx`, the last operand. AT&T puts the destination last.
+
+</details>
+
+## 3.3 Data Formats
+
+### In one sentence
+
+Because x86 started as a 16-bit machine, a 16-bit value is called a "word",
+so 32 bits is a "double word" and 64 bits a "quad word", and each
+instruction carries a one-letter suffix naming its size.
+
+### The idea
+
+The historical naming fixes the vocabulary of the whole instruction set:
+
+<Trace columns={["C type", "Intel name", "Suffix", "Bytes"]} rows={[
+  ["char", "byte", "b", "1"],
+  ["short", "word", "w", "2"],
+  ["int", "double word", "l", "4"],
+  ["long, pointers (char *)", "quad word", "q", "8"],
+  ["float", "single precision", "s", "4"],
+  ["double", "double precision", "l (in old x87 code) or sd", "8"],
+]} caption="Sizes of C types on x86-64 and the instruction suffix used for each. movb, movw, movl and movq are the same instruction at four sizes." />
+
+So `movb` moves a byte, `movw` two bytes, `movl` four and `movq` eight.
+The `l` suffix stands for "long word", a leftover from 32-bit days when
+four bytes were a long. Floating-point instructions use a different family
+(`movss` for single, `movsd` for double) because they work in separate
+registers, covered in 3.11.
+
+### Worked example
+
+The same C assignment produces a differently suffixed instruction for each
+type. For `*dst = *src` with four types, `gcc -Og` emits:
+
+<Trace columns={["src and dst type", "instructions"]} rows={[
+  ["char", "movzbl (%rdi), %eax ; movb %al, (%rsi)"],
+  ["short", "movzwl (%rdi), %eax ; movw %ax, (%rsi)"],
+  ["int", "movl (%rdi), %eax ; movl %eax, (%rsi)"],
+  ["long", "movq (%rdi), %rax ; movq %rax, (%rsi)"],
+]} caption="Copying a value through two pointers at each integer size. For the small types GCC loads with zero extension into a 32-bit register (movzbl, movzwl), which avoids a partial-register dependency, then stores only the low byte or word." />
+
+### Step by step
+
+1. Find the size of the C type: 1, 2, 4 or 8 bytes.
+2. Map it to b, w, l or q.
+3. Expect the register name to match the size: `%al`, `%ax`, `%eax`, `%rax`.
+
+### Common mistake
+
+Thinking `movl` moves a C `long`. On x86-64 a `long` is eight bytes and
+moves with `movq`; `movl` moves a four-byte `int`.
+
+### In real systems
+
+When reading crash dumps, the suffix and register width tell me the C type
+the compiler thought it was dealing with. A `movl` load from a field I
+believed was a pointer is a strong hint that a header and a library
+disagree about a struct.
+
+### Check yourself
+
+<details>
+<summary>Which suffix does an instruction on a short use?</summary>
+
+`w`, for a two-byte word.
+
+</details>
+
+## 3.4 Accessing Information
+
+### In one sentence
+
+An x86-64 CPU has sixteen 64-bit integer registers, and instructions reach
+data through three kinds of operand: an immediate constant, a register, or
+a memory address computed from registers and constants.
+
+### The idea
+
+#### 3.4.1 Operand Specifiers
+
+The sixteen general-purpose registers each have four names, one per width.
+Writing to the low byte or word changes only those bytes; writing to the
+low 32 bits **zeroes the upper 32 bits** (a rule added with x86-64 that I
+check below).
+
+<Figure art={`
+ 63              31        15    7     0
+ +----------------+---------+-----+-----+
+ |         %rax   |  %eax   | %ax |%al  |   return value
+ +----------------+---------+-----+-----+
+ %rbx %ebx %bx %bl          callee saved
+ %rcx %ecx %cx %cl          4th argument
+ %rdx %edx %dx %dl          3rd argument
+ %rsi %esi %si %sil         2nd argument
+ %rdi %edi %di %dil         1st argument
+ %rbp %ebp %bp %bpl         callee saved
+ %rsp %esp %sp %spl         stack pointer
+ %r8  %r8d %r8w %r8b        5th argument
+ %r9  %r9d %r9w %r9b        6th argument
+ %r10 %r10d ...             caller saved
+ %r11 %r11d ...             caller saved
+ %r12 to %r15 (d, w, b)     callee saved
+`} caption="The sixteen integer registers and their 32-, 16- and 8-bit names, with the role each has in the Linux x86-64 calling convention. Only %rsp is truly special in hardware; the rest are conventions all compilers agree on." />
+
+Operands come in three types:
+
+- **Immediate**: a constant written with `$`, such as `$-577` or `$0x1F`.
+- **Register**: the contents of a register, such as `%rax`.
+- **Memory**: the bytes at a computed **effective address**.
+
+The general memory form is `Imm(rb, ri, s)`, meaning the address
+Imm + R[rb] + R[ri] × s, where `rb` is the base register, `ri` the index
+register, and the scale `s` is 1, 2, 4 or 8. Any part may be left out,
+giving these shapes:
+
+<Trace columns={["Form", "Address computed", "Typical C use"]} rows={[
+  ["(%rax)", "R[rax]", "*p"],
+  ["8(%rax)", "8 + R[rax]", "p->field at offset 8"],
+  ["(%rax,%rdx)", "R[rax] + R[rdx]", "byte array a[i]"],
+  ["(%rax,%rdx,4)", "R[rax] + 4 R[rdx]", "int array a[i]"],
+  ["8(%rax,%rdx,4)", "8 + R[rax] + 4 R[rdx]", "int array field r->a[i] at offset 8"],
+  ["0x40(,%rdx,8)", "0x40 + 8 R[rdx]", "long global table g[i]"],
+  ["0x2000(%rip)", "address of next instruction + 0x2000", "global variable, position independent"],
+]} caption="The memory operand forms. The scale factor exists so that one instruction can index arrays of 1-, 2-, 4- and 8-byte elements." />
+
+#### 3.4.2 Data Movement Instructions
+
+`mov` copies a value from source to destination. Both operands cannot be
+memory at once; moving memory to memory takes two instructions through a
+register. The variants:
+
+- `movb`, `movw`, `movl`, `movq` move 1, 2, 4 or 8 bytes. An immediate for `movq` must fit in 32 bits and is sign extended.
+- `movabsq` loads any 64-bit immediate into a register.
+- `movz` (zero extend) and `movs` (sign extend) copy a smaller source into a larger register: `movzbl`, `movsbq`, `movswl` and so on. The two letters name the source and destination sizes.
+- `cltq` sign-extends `%eax` into `%rax`; it is a short form of `movslq %eax, %rax`.
+
+There is no `movzlq`, because a `movl` into a 32-bit register already
+zeroes the top half.
+
+I checked every rule with a tiny C program that uses inline assembly to
+load `0x0011223344556677` into a register and then write a smaller value
+into part of it:
+
+```text
+movb  -> 00112233445566ff
+movw  -> 001122334455ffff
+movl  -> 00000000ffffffff
+movq  -> ffffffffffffffff
+movsbq-> ffffffffffffffaa
+movzbq-> 00000000000000aa
+```
+
+<Trace columns={["Instruction", "Bytes changed", "Upper bytes", "Result"]} rows={[
+  ["movb $-1, %al", "1", "kept", "0x00112233445566ff"],
+  ["movw $-1, %ax", "2", "kept", "0x001122334455ffff"],
+  ["movl $-1, %eax", "4", "zeroed", "0x00000000ffffffff"],
+  ["movq $-1, %rax", "8", "n/a", "0xffffffffffffffff"],
+  ["movsbq %al, %rax (al = 0xaa)", "8", "copies of bit 7 (1)", "0xffffffffffffffaa"],
+  ["movzbq %al, %rax (al = 0xaa)", "8", "zeros", "0x00000000000000aa"],
+]} caption="The real register contents after each move, starting from 0x0011223344556677. Only the 32-bit write clears the high half; byte and word writes leave it alone." />
+
+#### 3.4.3 Data Movement Example
+
+Swapping two longs through pointers:
+
+```c
+void swap_add_ptr(long *xp, long *yp) { long x = *xp; *xp = *yp; *yp = x; }
+```
+
+```asm
+swap_add_ptr:          # xp in %rdi, yp in %rsi
+	movq	(%rdi), %rax   # x = *xp
+	movq	(%rsi), %rdx   # tmp = *yp
+	movq	%rdx, (%rdi)   # *xp = tmp
+	movq	%rax, (%rsi)   # *yp = x
+	ret
+```
+
+Two lessons. A C pointer is just an address in a register, and
+dereferencing it is a memory operand in parentheses. And local variables
+such as `x` usually live in registers, not memory; they need no address at
+all unless the code takes one.
+
+#### 3.4.4 Pushing and Popping Stack Data
+
+The **stack** is a region of memory that grows toward lower addresses.
+`%rsp` holds the address of its top element. `pushq S` subtracts 8 from
+`%rsp` and then writes S at the new top; `popq D` reads the top into D and
+then adds 8. They are exactly equivalent to
+
+```asm
+subq $8, %rsp        # pushq %rbp
+movq %rbp, (%rsp)
+
+movq (%rsp), %rax    # popq %rax
+addq $8, %rsp
+```
+
+but encoded in one byte instead of eight. Popping does not erase the old
+value; it is still in memory below the new `%rsp` until something
+overwrites it.
+
+<Figure art={`
+  before pushq %rax        after pushq %rax        after popq %rdx
+  (%rsp = 0x108)           (%rsp = 0x100)          (%rsp = 0x108)
+
+  0x108 | older  | <-rsp   0x108 | older  |        0x108 | older  | <-rsp
+  0x100 |  ...   |         0x100 | 0x7b   | <-rsp  0x100 | 0x7b   |  stale
+  0x0f8 |  ...   |         0x0f8 |  ...   |        0x0f8 |  ...   |
+         addresses fall going down: the stack grows toward 0
+  %rax = 0x7b                                      %rdx = 0x7b
+`} caption="Push and pop. The stack top moves down by 8 on push and up by 8 on pop; the popped value stays in memory as stale data, which is why uninitialised locals can contain old values." />
+
+### Worked example
+
+What does `movl $-1, %eax` followed by `movb $0, %al` leave in `%rax`?
+The first write zeroes bytes 4 to 7 and fills bytes 0 to 3 with `ff`: 
+`0x00000000ffffffff`. The second changes only byte 0:
+`0x00000000ffffff00`. The rule is short: 32-bit writes clean the top,
+8- and 16-bit writes do not.
+
+### Step by step
+
+To decode a memory operand like `8(%rdi,%rsi,4)`:
+
+1. Take the base register value, R[rdi].
+2. Add the index register times the scale: 4 × R[rsi].
+3. Add the displacement: 8.
+4. That address is where the bytes are read or written; the suffix or register width says how many.
+
+### Common mistake
+
+Expecting `movq $0x123456789, %rax` to work. A plain `movq` immediate is only
+32 bits; the assembler switches to `movabsq` for wider constants. Another:
+forgetting that `mov` cannot go memory to memory, which explains many
+"extra" register moves in compiled code.
+
+### In real systems
+
+The scaled index form is why array loops on x86 often need no separate
+multiply: one instruction like `movl (%rdi,%rax,4), %edx` does the address
+arithmetic. The `%rip`-relative form is how position-independent
+executables (the default on modern Linux) reach globals, which matters for
+ASLR in 3.10 and for linking in chapter 7.
+
+### Check yourself
+
+<details>
+<summary>If %rdx = 0x100 and %rcx = 3, what address does 0x10(%rdx,%rcx,8) refer to?</summary>
+
+0x10 + 0x100 + 3 × 8 = 0x128.
+
+</details>
+
+<details>
+<summary>Which instruction sign-extends %eax into %rax?</summary>
+
+`cltq` (or the longer `movslq %eax, %rax`).
+
+</details>
+
+<details>
+<summary>After pushq, is %rsp larger or smaller?</summary>
+
+Smaller by 8; the stack grows toward lower addresses.
+
+</details>
+
+## 3.5 Arithmetic and Logical Operations
+
+### In one sentence
+
+Integer arithmetic on x86-64 is a small family of two-operand instructions
+(`add`, `sub`, `imul`, `and`, `or`, `xor`, shifts) plus `lea`, which
+computes an address formula without touching memory and is used everywhere
+as a fast calculator.
+
+### The idea
+
+#### 3.5.1 Load Effective Address
+
+`leaq S, D` computes the address that a memory operand S would refer to and
+writes that address, not the memory there, into D. Because the address
+formula is Imm + base + index × (1, 2, 4 or 8), compilers use `lea` to do
+small sums and multiplications in one instruction. It also does not change
+the condition codes.
+
+My function:
+
+```c
+long scale(long x, long y, long z) { return x + 4 * y + 12 * z; }
+```
+
+compiles to three `lea`s and no multiply:
+
+```asm
+scale:                          # x in %rdi, y in %rsi, z in %rdx
+	leaq	(%rdi,%rsi,4), %rax    # rax = x + 4y
+	leaq	(%rdx,%rdx,2), %rdx    # rdx = z + 2z = 3z
+	leaq	(%rax,%rdx,4), %rax    # rax = x + 4y + 4(3z)
+	ret
+```
+
+<Trace columns={["Step", "%rdi (x)", "%rsi (y)", "%rdx", "%rax"]} rows={[
+  ["start, x=1 y=2 z=3", "1", "2", "3", "?"],
+  ["leaq (%rdi,%rsi,4), %rax", "1", "2", "3", "1 + 8 = 9"],
+  ["leaq (%rdx,%rdx,2), %rdx", "1", "2", "3 + 6 = 9", "9"],
+  ["leaq (%rax,%rdx,4), %rax", "1", "2", "9", "9 + 36 = 45"],
+  ["ret", "", "", "", "45 = 1 + 8 + 36"],
+]} caption="Tracing scale(1, 2, 3). The compiler built 12z as 4 times 3z, with 3z itself made as z plus 2z, all by address arithmetic." />
+
+#### 3.5.2 Unary and Binary Operations
+
+Unary instructions take one operand that is both source and destination:
+`inc`, `dec`, `neg`, `not`. Binary ones take two, and the second is both
+input and output: `subq %rax, %rdx` means rdx = rdx − rax. Reading order
+trips people: in AT&T the destination is last, so `sub` subtracts the
+first operand from the second.
+
+#### 3.5.3 Shift Operations
+
+`sal` and `shl` (same thing) shift left. `sar` shifts right
+arithmetically, copying the sign bit in; `shr` shifts right logically,
+filling with zeros. The shift amount is an immediate or the low byte of
+`%cl`. For a 64-bit shift only the low six bits of the count are used, so
+shifting by 64 is the same as shifting by 0, which is why C leaves shifts
+by the width or more undefined.
+
+```text
+sar 60 -> ffffffffffffffff  shr 60 -> 000000000000000f
+```
+
+Both lines shift −1 right by 60; the arithmetic version keeps the sign bits,
+the logical version brings in zeros. This is chapter 2's distinction, now
+as two separate opcodes.
+
+#### 3.5.4 Discussion
+
+Most instructions work identically for signed and unsigned values, because
+two's-complement addition, subtraction and the low half of multiplication
+give the same bits either way. Only right shifts, the 128-bit multiply,
+division and comparisons need separate signed and unsigned forms. My
+`arith` function shows how freely the compiler rearranges arithmetic:
+
+```c
+long arith(long x, long y, long z) {
+    long t1 = x ^ y;
+    long t2 = z * 48;
+    long t3 = t1 & 0x0F0F0F0F;
+    long t4 = t2 - t3;
+    return t4;
+}
+```
+
+```asm
+arith:
+	xorq	%rsi, %rdi           # t1 = x ^ y
+	leaq	(%rdx,%rdx,2), %rax  # 3z
+	salq	$4, %rax             # t2 = 3z * 16 = 48z
+	andl	$252645135, %edi     # t3 = t1 & 0x0F0F0F0F
+	subq	%rdi, %rax           # t4 = t2 - t3
+	ret
+```
+
+The multiply by 48 became a `lea` and a shift. The mask used `andl` on the
+32-bit register, because the constant's upper 32 bits are zero and a 32-bit
+write zeroes them anyway; the encoding is a byte shorter. 252645135 is
+0x0F0F0F0F in decimal.
+
+#### 3.5.5 Special Arithmetic Operations
+
+Multiplying two 64-bit numbers can need 128 bits. `imulq S` (one operand,
+signed) and `mulq S` (unsigned) multiply `%rax` by S and put the 128-bit
+product in `%rdx` (high half) and `%rax` (low half). Division works the
+other way: `idivq S` divides the 128-bit value in `%rdx:%rax` by S,
+leaving the quotient in `%rax` and the remainder in `%rdx`. Before a
+signed 64-bit divide, `cqto` sign-extends `%rax` into `%rdx`; before
+an unsigned one the code sets `%rdx` to zero.
+
+```text
+mulq: rdx=0000000000000002 rax=fffffffffffffffd
+idivq -17/5: q=-3 r=-2
+```
+
+(2 to the 64 − 1) × 3 = 3 × 2 to the 64 − 3, so the high half is 2 and the
+low half is 2 to the 64 − 3, which is `0xfff...fd`. The divide shows that
+x86 truncates toward zero: −17 / 5 is −3 with remainder −2, matching C.
+
+<Figure art={`
+         %rdx (high 64 bits)          %rax (low 64 bits)
+  +------------------------------+------------------------------+
+  | 0000 0000 0000 0002          | ffff ffff ffff fffd          |
+  +------------------------------+------------------------------+
+   mulq: 128-bit product of %rax and the operand
+
+   idivq S:  (%rdx:%rax) / S  ->  quotient in %rax
+                               ->  remainder in %rdx
+   cqto: fill %rdx with copies of the sign bit of %rax first
+`} caption="The register pair used by full multiply and divide. These instructions are the only common ones with hidden fixed registers, which is why compiled division code always shuffles values into %rax." />
+
+### Worked example
+
+Trace `arith(3, 5, 1)`:
+
+<Trace columns={["Instruction", "%rdi", "%rax", "Meaning"]} rows={[
+  ["start", "3", "?", "x=3, y=5, z=1"],
+  ["xorq %rsi, %rdi", "6", "?", "3 ^ 5 = 011 ^ 101 = 110"],
+  ["leaq (%rdx,%rdx,2), %rax", "6", "3", "3z"],
+  ["salq $4, %rax", "6", "48", "48z"],
+  ["andl $0x0F0F0F0F, %edi", "6", "48", "6 & 0x0F0F0F0F = 6"],
+  ["subq %rdi, %rax", "6", "42", "48 - 6"],
+]} caption="arith(3, 5, 1) step by step returns 42. Each row is one instruction's effect on the two working registers." />
+
+### Step by step
+
+To turn a block of arithmetic assembly back into C:
+
+1. Mark the argument registers: `%rdi`, `%rsi`, `%rdx`, `%rcx`, `%r8`, `%r9`.
+2. Walk down, writing each destination as an expression of the inputs.
+3. Recognise `lea` patterns: `(%r,%r,2)` is ×3, `(%r,%r,4)` is ×5, `(%r,%r,8)` is ×9.
+4. Shifts left by k are multiplications by 2 to the k; `sar` by k is signed division rounding down.
+5. The value left in `%rax` at `ret` is the return value.
+
+### Common mistake
+
+Reading `lea` as a memory load. `leaq 8(%rdi), %rax` puts the number
+R[rdi] + 8 into `%rax`; it never touches memory. Another: forgetting that
+the two-operand `sub` computes destination minus source.
+
+### In real systems
+
+`lea`-and-shift multiplies are why multiplying by a constant is cheap in C.
+The `%rdx:%rax` pairing is behind 128-bit arithmetic in cryptography
+libraries and big-integer code, and it explains why integer division is
+slow: on most cores a 64-bit divide takes tens of cycles, while `lea`
+takes one, which is why compilers replace division by constants with
+multiply-by-reciprocal tricks.
+
+### Check yourself
+
+<details>
+<summary>What does leaq (%rdi,%rdi,4), %rax compute?</summary>
+
+5 × x, where x is in `%rdi`.
+
+</details>
+
+<details>
+<summary>Which instruction must come before idivq to divide a signed 64-bit value?</summary>
+
+`cqto`, to sign-extend `%rax` into `%rdx`.
+
+</details>
+
+<details>
+<summary>Why does arith use andl instead of andq for a 64-bit mask?</summary>
+
+The mask fits in 32 bits with zero upper bits, and a 32-bit operation
+zeroes the upper half anyway, so the result is identical with a shorter
+encoding.
+
+</details>
+
+## 3.6 Control
+
+### In one sentence
+
+Every `if`, loop and `switch` in C becomes the same three ingredients:
+an instruction that sets condition flags, then either a conditional jump,
+a conditional move, or an indirect jump through a table.
+
+### The idea
+
+#### 3.6.1 Condition Codes
+
+Besides the registers, the CPU keeps single-bit **condition codes** that
+describe the most recent arithmetic or logical result. Four matter most:
+
+- **CF** (carry flag): the last operation carried out of the top bit. It detects unsigned overflow.
+- **ZF** (zero flag): the result was zero.
+- **SF** (sign flag): the result was negative (top bit 1).
+- **OF** (overflow flag): the last operation caused two's-complement overflow, positive or negative.
+
+Arithmetic and logical instructions set them as a side effect; `lea` does
+not. Two instructions exist only to set them without writing a result:
+`cmp S1, S2` sets flags as for S2 − S1, and `test S1, S2` sets them as for
+S1 & S2. `testq %rax, %rax` is the idiomatic way to ask "is `%rax` zero,
+negative or positive?".
+
+I checked CF and OF directly on the box:
+
+```text
+add overflow OF=1 result=-9223372036854775808
+add carry CF=1 result=0
+```
+
+Adding 1 to the largest signed long sets OF (signed overflow) and wraps to
+the most negative. Adding 1 to the largest unsigned long sets CF (unsigned
+carry) and wraps to 0. The same adder sets both flags; the instruction
+reading them decides which one matters.
+
+#### 3.6.2 Accessing the Condition Codes
+
+Flags are read in three ways: `set` writes 0 or 1 into a byte register,
+`j` jumps, and `cmov` moves. All three use the same suffixes:
+
+<Trace columns={["Suffix", "Meaning", "Flags tested"]} rows={[
+  ["e / z", "equal, zero", "ZF"],
+  ["ne / nz", "not equal", "not ZF"],
+  ["s / ns", "negative / not negative", "SF / not SF"],
+  ["g / nle", "greater (signed)", "not (SF xor OF) and not ZF"],
+  ["ge / nl", "greater or equal (signed)", "not (SF xor OF)"],
+  ["l / nge", "less (signed)", "SF xor OF"],
+  ["le / ng", "less or equal (signed)", "(SF xor OF) or ZF"],
+  ["a / nbe", "above (unsigned greater)", "not CF and not ZF"],
+  ["ae / nb", "above or equal (unsigned)", "not CF"],
+  ["b / nae", "below (unsigned less)", "CF"],
+  ["be / na", "below or equal (unsigned)", "CF or ZF"],
+]} caption="Condition suffixes for set, j and cmov. 'Greater' and 'less' are the signed tests; 'above' and 'below' are the unsigned ones." />
+
+Why SF xor OF for signed less-than? After `cmp b, a` the flags reflect
+a − b. If no overflow happened, a is less than b exactly when the result
+is negative (SF). If overflow happened, the sign of the result is wrong,
+so the answer flips. XOR does that flip in one step.
+
+Two of my functions show the signed and unsigned versions side by side:
+
+```c
+int less(long a, long b) { return a < b; }
+int below(unsigned long a, unsigned long b) { return a < b; }
+```
+
+```asm
+less:                    below:
+	cmpq	%rsi, %rdi       	cmpq	%rsi, %rdi
+	setl	%al              	setb	%al
+	movzbl	%al, %eax        	movzbl	%al, %eax
+	ret                      	ret
+```
+
+The comparison instruction is identical; only `setl` versus `setb`
+encodes whether the C types were signed. This is the clearest evidence
+that types live in the instructions, not in the data.
+
+#### 3.6.3 Jump Instructions
+## 3.6 Control
+
+### In one sentence
+
+Condition codes record the sign, zero, carry and overflow of the last
+arithmetic result, and every C decision (if, loops, switch) is built from
+instructions that set those codes, then jump or move based on them.
+
+### The idea
+
+#### 3.6.1 Condition Codes
+
+Four flags matter for control:
+
+- **CF** (carry flag): the most recent unsigned addition or subtraction produced a carry out (unsigned overflow).
+- **ZF** (zero flag): the result was zero.
+- **SF** (sign flag): the most significant bit of the result was 1 (negative as a signed value).
+- **OF** (overflow flag): the most recent signed addition or subtraction overflowed.
+
+```text
+add overflow OF=1 result=-9223372036854775808
+add carry    CF=1 result=0
+```
+
+Adding 1 to `LONG_MAX` sets OF and clears CF; adding 1 to `ULONG_MAX` sets
+CF and clears OF. Same bit pattern, different flags, because signed and
+unsigned overflow are different questions.
+
+Most arithmetic instructions set the flags. `lea`, `mov` and the shift
+count register `%cl` do not. Dedicated instructions that set flags without
+changing a destination are `cmp S1, S2` (computes S2 − S1 and discards it)
+and `test S1, S2` (computes S2 & S1 and discards it).
+
+#### 3.6.2 Accessing the Condition Codes
+
+`set` instructions write a single byte from the flags: `sete` sets if ZF is
+1, `setl` if SF ≠ OF (signed less), `setb` if CF is 1 (unsigned below), and
+so on. Compilers use them for C expressions that return a boolean.
+
+```c
+int less(long a, long b)  { return a < b; }
+int below(unsigned long a, unsigned long b) { return a < b; }
+```
+
+```asm
+less:
+	cmpq	%rsi, %rdi     # a - b, flags only
+	setl	%al            # SF != OF
+	movzbl	%al, %eax
+	ret
+below:
+	cmpq	%rsi, %rdi
+	setb	%al            # CF
+	movzbl	%al, %eax
+	ret
+```
+
+Same C operators, different instructions. Signed less uses `setl`;
+unsigned uses `setb`. The `movzbl` zeroes the rest of `%eax` so the return
+value is cleanly 0 or 1.
+
+#### 3.6.3 Jump Instructions
+
+An unconditional jump is `jmp`. Conditional jumps (`je`, `jne`, `jl`,
+`jle`, `jg`, `jge`, `jb`, `jbe`, `ja`, `jae`, `js`, `jo` and friends) take
+the branch if their named condition holds. Direct jumps encode a target
+relative to the next instruction; indirect jumps go through a register or
+memory, as in jump tables for `switch`.
+
+#### 3.6.4 Jump Instruction Encodings
+
+A short jump encodes the target as an 8-bit signed displacement (about ±128
+bytes) and takes two bytes. A longer jump uses a 32-bit displacement and
+takes five. Relative encoding means the same machine code works wherever
+the binary is loaded, which is essential for position-independent code.
+
+#### 3.6.5 Implementing Conditional Branches with Conditional Control
+
+```c
+long absdiff(long x, long y) { return x < y ? y - x : x - y; }
+```
+
+At `-Og`, GCC uses a branch:
+
+```asm
+absdiff:
+	cmpq	%rsi, %rdi
+	jge	.L9               # if x >= y goto L9
+	movq	%rsi, %rax
+	subq	%rdi, %rax        # y - x
+	ret
+.L9:
+	movq	%rdi, %rax
+	subq	%rsi, %rax        # x - y
+	ret
+```
+
+#### 3.6.6 Implementing Conditional Branches with Conditional Moves
+
+At `-O2` the same function becomes branchless:
+
+```asm
+absdiff:
+	movq	%rsi, %rdx
+	movq	%rdi, %rax
+	subq	%rdi, %rdx        # y - x
+	subq	%rsi, %rax        # x - y
+	cmpq	%rsi, %rdi
+	cmovl	%rdx, %rax        # if x < y, rax = y - x
+	ret
+```
+
+`cmovl` (conditional move if less) copies `%rdx` into `%rax` only when the
+flags say so. Both subtractions always run; the move picks the answer. This
+avoids a mispredicted branch, which on this box is expensive. I measured
+it:
+
+```text
+random  branchy 64.2 ms
+random  masked  14.5 ms
+sorted  branchy 12.8 ms
+```
+
+On 16 million random integers a branch that fires half the time costs about
+five times a branchless version; once the data is sorted and the predictor
+sees a long run of the same outcome, the branchy code matches the
+branchless. Compilers choose `cmov` when both sides are cheap to compute
+and the condition is hard to predict.
+
+#### 3.6.7 Loops
+
+Every C loop is a combination of a test and a jump. A `do-while` puts the
+body first and jumps back if the condition still holds. A `while` jumps to
+the test first, so the body may never run. A `for` is a `while` with an
+initialiser and an update.
+
+```c
+long fact_do(long n) {
+    long r = 1;
+    do { r *= n; n--; } while (n > 1);
+    return r;
+}
+long fact_while(long n) {
+    long r = 1;
+    while (n > 1) { r *= n; n--; }
+    return r;
+}
+```
+
+```asm
+fact_do:
+	movl	$1, %eax
+.L2:                            # body first
+	imulq	%rdi, %rax
+	subq	$1, %rdi
+	cmpq	$1, %rdi
+	jg	.L2
+	ret
+
+fact_while:
+	movl	$1, %eax
+	jmp	.L4                 # jump to test first
+.L5:
+	imulq	%rdi, %rax
+	subq	$1, %rdi
+.L4:
+	cmpq	$1, %rdi
+	jg	.L5
+	ret
+```
+
+The do-while is shorter: no initial jump. The while has the classic
+"jump to the bottom, then jump back" shape. A for-loop produces the same
+shape as a while, with the index update before the jump.
+
+#### 3.6.8 Switch Statements
+
+A `switch` with dense case values becomes a **jump table**: an array of
+code addresses, indexed by the case value, followed by an indirect jump.
+Sparse cases become a chain of comparisons, or a mix of both.
+
+```c
+long switch_eg(long x, long n) {
+    long r = x;
+    switch (n) {
+    case 100: r *= 13; break;
+    case 102: r += 10; /* fall through */
+    case 103: r += 11; break;
+    case 104: case 106: r *= r; break;
+    default: r = 0;
+    }
+    return r;
+}
+```
+
+```asm
+switch_eg:
+	subq	$100, %rsi          # n' = n - 100
+	cmpq	$6, %rsi
+	ja	.L16                # default if n' > 6 (unsigned)
+	leaq	.L12(%rip), %rdx
+	movslq	(%rdx,%rsi,4), %rax
+	addq	%rdx, %rax
+	jmp	*%rax               # jump through table
+.L12:                           # table of 32-bit offsets
+	.long	.L15-.L12           # case 100
+	.long	.L16-.L12           # 101 -> default
+	.long	.L14-.L12           # 102
+	.long	.L13-.L12           # 103
+	.long	.L11-.L12           # 104
+	.long	.L16-.L12           # 105 -> default
+	.long	.L11-.L12           # 106
+.L15:                           # case 100: x * 13
+	leaq	(%rdi,%rdi,2), %rax
+	leaq	(%rdi,%rax,4), %rax
+	ret
+.L14:                           # case 102: fall into 103
+	addq	$10, %rdi
+.L13:                           # case 103
+	leaq	11(%rdi), %rax
+	ret
+.L11:                           # cases 104, 106
+	movq	%rdi, %rax
+	imulq	%rdi, %rax
+	ret
+.L16:                           # default
+	movl	$0, %eax
+	ret
+```
+
+The cases are shifted into the range 0 to 6; anything outside that range,
+tested with an unsigned compare (`ja`), goes to default. Case 102 falls
+into 103 because there is no `jmp` between them. Cases 104 and 106 share
+one label. Fall-through is not a bug in the assembly; it is the C
+semantics of omitting `break`.
+
+<Figure art={`
+  n   n-100   table entry
+ 100    0     .L15   ->  x * 13
+ 101    1     .L16   ->  0         (default)
+ 102    2     .L14   ->  x + 10, then fall into .L13
+ 103    3     .L13   ->  (x) + 11
+ 104    4     .L11   ->  x * x
+ 105    5     .L16   ->  0
+ 106    6     .L11   ->  x * x
+ other        .L16   ->  0  (ja catches n-100 > 6)
+`} caption="Jump table for switch_eg. Each entry is a 32-bit PC-relative offset from the table itself; the code adds the table base and jumps. Fall-through from 102 into 103 is just two consecutive labels with no jump between them." />
+
+### Worked example
+
+Predict `switch_eg(5, 102)`:
+
+1. `n' = 102 − 100 = 2`, which is not greater than 6.
+2. Table entry 2 is `.L14`.
+3. `.L14` does `rdi += 10`, so `x` becomes 15, then falls into `.L13`.
+4. `.L13` returns `15 + 11 = 26`.
+
+Checked with a driver that prints `switch_eg(5, 102)`: 26.
+
+### Step by step
+
+To reverse-engineer a switch from assembly:
+
+1. Find the range normalisation (`sub` of the smallest case) and the
+   unsigned range check (`cmp` then `ja`).
+2. Find the table and the indirect `jmp *%reg`.
+3. Map each table entry to a label.
+4. Read each case body; a label with no jump at the end falls into the next.
+
+### Common mistake
+
+Assuming every `if` becomes a jump. Compilers prefer `cmov` when both
+sides are cheap. Assuming fall-through is an accident; it is deliberate C
+behaviour, and the assembly just reflects it.
+
+### In real systems
+
+Mispredicted branches are a major performance cost in interpreters, parsers
+and any code with data-dependent control. Profile-guided optimisation
+teaches the compiler which branches are rare so it can lay out the common
+path as a fall-through. Jump tables for large switches keep the code
+compact and O(1) in the case value.
+
+### Check yourself
+
+<details>
+<summary>Which flags does setl examine, and what C comparison does it implement?</summary>
+
+SF and OF; it is true when SF ≠ OF, which is signed less-than.
+
+</details>
+
+<details>
+<summary>Why does a while loop often start with an unconditional jmp?</summary>
+
+To reach the test before the body, so that an empty iteration does no work.
+
+</details>
+
+<details>
+<summary>How does the switch code detect out-of-range case values?</summary>
+
+It subtracts the smallest case, then uses an unsigned compare (`ja`)
+against the span; any negative or too-large value wraps into the
+"greater than" range.
+
+</details>
+
+## 3.7 Procedures
+
+### In one sentence
+
+A procedure call needs a place to return to, a place for arguments and
+locals, and a convention for which registers the caller and callee may
+clobber; on Linux x86-64 that convention is the System V ABI, and the
+stack holds everything that does not fit in registers.
+
+### The idea
+
+#### 3.7.1 The Run-Time Stack
+
+The stack grows toward lower addresses. Each call pushes a **return
+address** (the instruction after the call), so `ret` can pop it into
+`%rip`. Beyond that, the stack holds saved registers, local variables that
+need an address, and any arguments past the sixth. The region belonging to
+one active call is that call's **stack frame**.
+
+<Figure art={`
+ higher addresses
+   +----------------------+
+   | caller's frame       |
+   +----------------------+
+   | argument 8 (a8)      |  16(%rsp) at entry to callee
+   | argument 7 (a7)      |   8(%rsp)
+   | return address       |   0(%rsp)   <-- pushed by call
+   +----------------------+
+   | saved %rbx           |  -8(%rsp) after push
+   | local variables      |
+   | ...                  |  %rsp points here (top of stack)
+   +----------------------+
+ lower addresses
+`} caption="A typical stack frame at the moment a callee with eight arguments has just been entered and has pushed one callee-saved register. Arguments 1 to 6 are in registers, not on the stack." />
+
+#### 3.7.2 Control Transfer
+
+`call L` pushes the return address and sets `%rip` to L. `call *%rax`
+jumps through a function pointer. `ret` pops into `%rip`. That is the
+entire control-transfer mechanism; everything else is convention.
+
+#### 3.7.3 Data Transfer
+
+Linux and macOS on x86-64 pass the first six integer or pointer arguments
+in `%rdi`, `%rsi`, `%rdx`, `%rcx`, `%r8`, `%r9`, in that order. Floating-
+point arguments use `%xmm0` to `%xmm7`. Further arguments go on the stack,
+pushed in reverse order so that the seventh is at `8(%rsp)` on entry
+(after the return address) and the eighth at `16(%rsp)`. The return value
+comes back in `%rax` (or `%xmm0` for floating point).
+
+```c
+long proc8(long a1, long a2, long a3, long a4,
+           long a5, long a6, long a7, long a8) {
+    return a1 + a2 + a3 + a4 + a5 + a6 + a7 * a8;
+}
+```
+
+```asm
+proc8:
+	addq	%rsi, %rdi          # a1 + a2
+	addq	%rdx, %rdi          # + a3
+	addq	%rcx, %rdi          # + a4
+	addq	%r8, %rdi           # + a5
+	addq	%r9, %rdi           # + a6
+	movq	16(%rsp), %rax      # a8
+	imulq	8(%rsp), %rax       # a7 * a8
+	addq	%rdi, %rax
+	ret
+```
+
+#### 3.7.4 Local Storage on the Stack
+
+Locals that need an address (because their address is taken, or they are
+arrays or structs) live on the stack. The function subtracts from `%rsp`
+to make room, then uses offsets from `%rsp` (or from a frame pointer in
+`%rbp` when one is kept).
+
+```c
+long incr(long *p, long val) { long x = *p; *p = x + val; return x; }
+long call_incr(void) {
+    long v1 = 15213;
+    long v2 = incr(&v1, 3000);
+    return v1 + v2;
+}
+```
+
+```asm
+call_incr:
+	subq	$16, %rsp
+	movq	$15213, 8(%rsp)     # v1 on the stack
+	leaq	8(%rsp), %rdi       # &v1
+	movl	$3000, %esi
+	call	incr
+	addq	8(%rsp), %rax       # v1 + v2
+	addq	$16, %rsp
+	ret
+```
+
+`v1` has to live in memory because `incr` takes a pointer to it. The 16-
+byte allocation (instead of 8) keeps `%rsp` 16-byte aligned, which the ABI
+requires before every `call`.
+
+#### 3.7.5 Local Storage in Registers
+
+Registers are faster, so locals that do not need an address stay there.
+Registers are split by convention:
+
+- **Caller-saved** (`%rax`, `%rcx`, `%rdx`, `%rsi`, `%rdi`, `%r8`–`%r11`):
+  the caller must save them if it still needs their values after a call.
+  The callee may freely overwrite them.
+- **Callee-saved** (`%rbx`, `%rbp`, `%r12`–`%r15`): the callee must restore
+  them before returning if it uses them. The caller can rely on them
+  surviving a call.
+
+```c
+long Q(long);
+long P(long x, long y) {
+    long u = Q(y);
+    long v = Q(x);
+    return u + v;
+}
+```
+
+```asm
+P:
+	pushq	%rbp
+	pushq	%rbx
+	subq	$8, %rsp            # keep 16-byte alignment
+	movq	%rdi, %rbp          # save x (callee-saved)
+	movq	%rsi, %rdi
+	call	Q@PLT               # Q(y) -> %rax
+	movq	%rax, %rbx          # save u (callee-saved)
+	movq	%rbp, %rdi
+	call	Q@PLT               # Q(x)
+	addq	%rbx, %rax          # u + v
+	addq	$8, %rsp
+	popq	%rbx
+	popq	%rbp
+	ret
+```
+
+`x` and `u` must survive the calls to `Q`, so they live in `%rbp` and
+`%rbx`. `%rax` is caller-saved, so the first return value is moved into a
+callee-saved register before the second call.
+
+#### 3.7.6 Recursive Procedures
+
+Recursion uses the same mechanism. Each call gets its own frame, so the
+same local name in different activations is a different memory location.
+
+```c
+long rfact(long n) {
+    if (n <= 1) return 1;
+    return n * rfact(n - 1);
+}
+```
+
+```asm
+rfact:
+	cmpq	$1, %rdi
+	jle	.L9
+	pushq	%rbx
+	movq	%rdi, %rbx          # save n across the recursive call
+	leaq	-1(%rdi), %rdi
+	call	rfact
+	imulq	%rbx, %rax
+	popq	%rbx
+	ret
+.L9:
+	movl	$1, %eax
+	ret
+```
+
+In `gdb` with `rfact(4)`, stopping when `n == 1`:
+
+```text
+#0  rfact (n=1)
+#1  0x401141 in rfact (n=2)
+#2  0x401141 in rfact (n=3)
+#3  0x401141 in rfact (n=4)
+#4  0x40115f in main ()
+```
+
+Four frames of `rfact` sit on the stack, each with its own saved `%rbx`
+holding that level's `n`. Unwinding them multiplies 1 × 2 × 3 × 4 = 24.
+
+### Worked example
+
+Trace `call_incr` through the call:
+
+<Trace columns={["Moment", "%rsp offset", "Memory at 8(%rsp)", "%rax"]} rows={[
+  ["after subq $16", "−16 from entry", "uninitialised", "?"],
+  ["after movq $15213", "same", "15213", "?"],
+  ["after call incr returns", "same", "18213", "15213 (old v1)"],
+  ["after addq 8(%rsp), %rax", "same", "18213", "33426"],
+  ["after addq $16, %rsp", "restored", "stale", "33426"],
+]} caption="call_incr. v1 lives at 8(%rsp); incr updates it through the pointer and returns the old value; the sum is the new return value." />
+
+### Step by step
+
+To read a procedure's assembly:
+
+1. List the argument registers in order; match them to the C parameters.
+2. Note every `push` and `subq $N, %rsp`; that is the frame size.
+3. Find every `call`; ask what must be saved across it (callee-saved
+   registers, or stack slots).
+4. The value in `%rax` at `ret` is the return.
+
+### Common mistake
+
+Assuming locals always live on the stack. Most scalars live in registers
+and have no address. Taking the address of a local (or passing it by
+pointer) is what forces it onto the stack, which is why `&local` is a
+signal to look for a stack slot.
+
+### In real systems
+
+The System V AMD64 ABI is the contract between every compiler and every
+library on Linux and macOS. Windows uses a different convention (four
+register arguments, different scratch registers). Mixing the two without a
+thunk is why a Windows DLL loaded into a Linux process (or the reverse
+through Wine) needs care. Tail-call optimisation reuses the current frame
+when the last action is a call; recursive factorial above is not a
+candidate because of the multiply after the call.
+
+### Check yourself
+
+<details>
+<summary>Where is the seventh integer argument when a callee starts?</summary>
+
+At `8(%rsp)`, just above the return address.
+
+</details>
+
+<details>
+<summary>Which registers must a callee restore before returning?</summary>
+
+The callee-saved ones it used: `%rbx`, `%rbp`, `%r12`–`%r15`.
+
+</details>
+
+<details>
+<summary>Why does call_incr allocate 16 bytes for one long?</summary>
+
+To keep `%rsp` 16-byte aligned before the call to `incr`, as the ABI
+requires.
+
+</details>
+
+## 3.8 Array Allocation and Access
+
+### In one sentence
+
+An array is a contiguous block of equal-sized elements, and the address of
+element i is the base address plus i times the element size; nested arrays
+and variable-length arrays just change how that product is computed.
+
+### The idea
+
+#### 3.8.1 Basic Principles
+
+For a T array declared `T A[N]`, the compiler reserves L · N bytes where L
+is `sizeof(T)`, and the address of `A[i]` is `&A[0] + L · i`. In assembly
+that is often a single scaled-index operand.
+
+#### 3.8.2 Pointer Arithmetic
+
+Adding an integer k to a pointer of type `T *` advances the address by
+`k * sizeof(T)` bytes. Subtracting two pointers of the same type gives the
+number of elements between them, not the byte distance. The subscript
+`E1[E2]` is defined as `*(E1 + E2)`, which is why `2[a]` and `a[2]` are
+the same.
+
+```text
+a=0x7fff36f72290 p+1=0x7fff36f72294 (diff 4 bytes)
+*(p+2)=30 p[3]=40 2[a]=30
+&a[3]-&a[0]=3 elements
+```
+
+`p` is an `int *`, so `p + 1` advances four bytes. `&a[3] - &a[0]` is 3,
+the element count, even though the byte distance is 12.
+
+#### 3.8.3 Nested Arrays
+
+A declaration `T A[R][C]` is an array of R arrays of C elements of type T.
+Row i starts at `&A[0][0] + i · C · L`, and `A[i][j]` is at
+`&A[0][0] + (i · C + j) · L`.
+
+```c
+int get_elem(int A[3][5], long i, long j) { return A[i][j]; }
+```
+
+```asm
+get_elem:
+	leaq	(%rsi,%rsi,4), %rax   # 5i
+	leaq	(%rdi,%rax,4), %rax   # A + 20i
+	movl	(%rax,%rdx,4), %eax   # *(A + 20i + 4j)
+	ret
+```
+
+`5i` is done with `lea (%rsi,%rsi,4)`; then the row base is formed and the
+column is scaled by 4.
+
+#### 3.8.4 Fixed-Size Arrays
+
+When both dimensions are compile-time constants, the compiler can strength-
+reduce the address arithmetic inside a loop. For an N×N int matrix with
+N = 16, a row is 64 bytes, so stepping to the next row of B is `addq $64`.
+
+```c
+#define N 16
+typedef int fix_matrix[N][N];
+int fix_prod_ele(fix_matrix A, fix_matrix B, long i, long k) {
+    long j; int result = 0;
+    for (j = 0; j < N; j++)
+        result += A[i][j] * B[j][k];
+    return result;
+}
+```
+
+At `-O1` the row of A and the column of B become two running pointers:
+
+```asm
+fix_prod_ele:                # optimised: step A by 4, B by 64
+	salq	$6, %rdx         # i * 64
+	addq	%rdx, %rdi       # &A[i][0]
+	leaq	(%rsi,%rcx,4), %rax  # &B[0][k]
+	leaq	1024(%rax), %rsi     # &B[16][k] end sentinel
+	movl	$0, %ecx
+.L3:
+	movl	(%rdi), %edx
+	imull	(%rax), %edx
+	addl	%edx, %ecx
+	addq	$4, %rdi         # next A[i][j]
+	addq	$64, %rax        # next B[j][k]
+	cmpq	%rsi, %rax
+	jne	.L3
+	movl	%ecx, %eax
+	ret
+```
+
+No multiply per iteration: just two pointer bumps.
+
+#### 3.8.5 Variable-Size Arrays
+
+C99 variable-length arrays have a size known only at run time. Accessing
+`A[i][j]` for `int A[n][n]` needs a multiply by the dynamic `n`:
+
+```c
+int var_ele(long n, int A[n][n], long i, long j) {
+    return A[i][j];
+}
+```
+
+```asm
+var_ele:
+	imulq	%rdx, %rdi       # n * i
+	leaq	(%rsi,%rdi,4), %rax
+	movl	(%rax,%rcx,4), %eax
+	ret
+```
+
+The first argument is `n` because the C calling convention for VLAs passes
+the dimensions before the array pointer. Fixed-size arrays avoid that
+multiply; VLAs pay for flexibility with a real `imul` every access.
+
+### Worked example
+
+Address of `A[2][3]` in `int A[3][5]` at base `0x1000`:
+
+```text
+row stride = 5 * 4 = 20
+offset     = 2 * 20 + 3 * 4 = 52
+address    = 0x1000 + 52 = 0x1034
+```
+
+### Step by step
+
+To find the address of `A[i][j]` for a nested array:
+
+1. Element size L = `sizeof(T)`.
+2. Row stride = C · L for an array with C columns.
+3. Address = base + i · row_stride + j · L.
+
+### Common mistake
+
+Declaring `int *A[n]` when meaning a 2-D VLA. That is an array of
+pointers, not a contiguous matrix; the access assembly will show an extra
+load. Another: assuming C arrays carry their length at run time. They do
+not; only VLAs have a size expression, and even then it is a separate
+value, not stored with the array.
+
+### In real systems
+
+Row-major layout (C) versus column-major layout (Fortran, MATLAB, R) is
+why the same nested loop can be ten times slower when the indices are
+swapped relative to the language. Cache behaviour of that difference is
+chapter 6; the address arithmetic is this chapter.
+
+### Check yourself
+
+<details>
+<summary>What is the byte address of A[i] for int A[] at base b?</summary>
+
+b + 4 · i.
+
+</details>
+
+<details>
+<summary>Why does var_ele need imul while get_elem does not?</summary>
+
+Because the row length n is only known at run time for the VLA; for the
+fixed 3×5 array the compiler folds the constant 5 into a `lea`.
+
+</details>
+
+## 3.9 Heterogeneous Data Structures
+
+### In one sentence
+
+Structs pack differently typed fields one after another with padding so
+each field's address meets its alignment; unions overlay fields at the
+same address; both are just offsets the compiler computes once.
+
+### The idea
+
+#### 3.9.1 Structures
+
+A struct's fields are laid out in declaration order. Each field starts at
+an offset that is a multiple of its alignment requirement (usually its
+size, up to the machine's maximum of 8 on x86-64). The struct's total size
+is rounded up so an array of them keeps every element aligned.
+
+```c
+struct rec { int i; int j; int a[2]; int *p; };
+int *addr_a(struct rec *r, long k) { return &r->a[k]; }
+```
+
+```asm
+addr_a:
+	leaq	8(%rdi,%rsi,4), %rax   # &r->a[k] = r + 8 + 4k
+	ret
+```
+
+Offsets from `offsetof` and sizes from `sizeof` on my box:
+
+```text
+rec size 24: i@0 j@4 a@8 p@16
+```
+
+<Figure art={`
+  offset  0   4   8       16      24
+          +---+---+-------+-------+
+   rec:   | i | j | a[0] a[1]|  p  |
+          +---+---+-------+-------+
+          4B  4B   8B          8B     total 24, no internal padding
+`} caption="Layout of struct rec. The int array a starts at offset 8, so &r->a[k] is r + 8 + 4k, matching the lea above." />
+
+#### 3.9.2 Unions
+
+A union's fields share the starting address. The size is the size of the
+largest field, rounded up for alignment. Unions are how C reinterprets the
+bits of one type as another without a cast that the compiler might
+optimise away.
+
+```c
+union U { float f; unsigned u; };
+unsigned float2bits(float f) { union U t; t.f = f; return t.u; }
+```
+
+```asm
+float2bits:
+	movd	%xmm0, %eax     # reinterpret the float bits as an int
+	ret
+```
+
+And the bits of `1.0f` are `0x3f800000`, matching chapter 2.
+
+#### 3.9.3 Data Alignment
+
+Alignment rules on x86-64 Linux:
+
+- 1-byte types (char) at any address.
+- 2-byte types (short) at a multiple of 2.
+- 4-byte types (int, float) at a multiple of 4.
+- 8-byte types (long, double, pointers) at a multiple of 8.
+
+Reordering fields can shrink a struct dramatically:
+
+```text
+S1 size 12: i@0 c@4 j@8      (int, char, int: 3 bytes of padding after c)
+S2 size 12: i@0 j@4 c@8      (int, int, char: 3 bytes of padding at the end)
+S3 size 24: c@0 d@8 s@16     (char, double, short: 7 + 6 bytes of padding)
+S4 size 16: d@0 s@8 c@10     (double, short, char: 5 bytes of padding at the end)
+```
+
+S3 is 24 bytes; putting the double first (S4) saves 8. S1 and S2 are the
+same size either way, because the trailing padding of S2 matches the
+internal padding of S1. Arrays of structs inherit the element size as
+their stride: an `S2` array steps by 12.
+
+<Compare left="S3: char, double, short" right="S4: double, short, char" rows={[
+  ["size 24", "size 16"],
+  ["c at 0, then 7 pad, d at 8, s at 16, then 6 pad", "d at 0, s at 8, c at 10, then 5 pad"],
+  ["array of 1000: 24 KB", "array of 1000: 16 KB"],
+]} caption="Field order changes size. Putting the most strictly aligned field first packs the rest into the trailing padding." />
+
+### Worked example
+
+Given `struct { char a; int b; char c; }`, offsets are a@0, b@4 (3 pad),
+c@8, size 12 (3 trailing pad). Reorder to put the int first, then two chars:
+b@0, a@4, c@5, size 8. Saved: 4 bytes per object.
+
+### Step by step
+
+To find a struct layout by hand:
+
+1. Walk the fields in order. For each, round the current offset up to the field's alignment, place the field, advance by its size.
+2. At the end, round the total size up to the struct's alignment (the max of its fields' alignments).
+3. For a union, the offset of every field is 0 and the size is the max field size, rounded up the same way.
+
+### Common mistake
+
+Packing a struct with `#pragma pack(1)` "to save space" without measuring.
+Unaligned loads are slower on some architectures and illegal on others;
+network code that packs on purpose must unpack into aligned locals before
+arithmetic. Another: assuming C and another language lay out the same
+struct the same way. They often do not.
+
+### In real systems
+
+Cache lines are 64 bytes on this box. A struct of 24 bytes wastes 16 bytes
+per object when an array is walked, and three objects share a line in a
+messy way. Designing structs so hot fields sit together, and cold fields
+elsewhere, is a real performance technique. Serialization formats
+(protobuf, flatbuffers, cap'n proto) exist partly because raw C layouts
+are neither portable nor stable across compilers.
+
+### Check yourself
+
+<details>
+<summary>What is the size of a struct with a char then a long?</summary>
+
+16: c at 0, 7 bytes of padding, l at 8.
+
+</details>
+
+<details>
+<summary>Why is S4 smaller than S3?</summary>
+
+Putting the 8-byte double first lets the short and char ride in what would
+have been trailing padding, instead of forcing 7 bytes of pad before the
+double.
+
+</details>
+
+## 3.10 Combining Control and Data in Machine-Level Programs
+
+### In one sentence
+
+Pointers are just integers used as addresses; gdb lets me watch them move;
+and when a write runs past a buffer, it can overwrite a return address,
+which is the classic buffer-overflow attack, now mostly stopped by
+canaries, ASLR and non-executable stacks.
+
+### The idea
+
+#### 3.10.1 Understanding Pointers
+
+Everything about pointers collapses to a few facts once I have read the
+assembly:
+
+- Every pointer has a type, which tells the compiler the element size for
+  arithmetic and the instruction suffix for loads and stores.
+- Every pointer has a value, which is an address.
+- The value `NULL` (0) is reserved to mean "no object". Dereferencing it
+  traps.
+- Casting a pointer changes only how the compiler treats the bits; it does
+  not move anything.
+- Pointers can point to functions. A call through a function pointer is
+  `call *%reg`.
+
+```text
+function pointer call via 0x7fbe35f30880
+```
+
+#### 3.10.2 Life in the Real World: Using the gdb Debugger
+
+Useful gdb commands for machine-level work:
+
+<Trace columns={["Command", "What it does"]} rows={[
+  ["break *0x40117f / break echo", "stop at an address or a function"],
+  ["run with stdin redirected", "start and feed a file on stdin"],
+  ["stepi / nexti", "step one instruction, into or over calls"],
+  ["info registers / p $rax", "show registers"],
+  ["x/16gx $rsp", "examine 16 quadwords of stack memory"],
+  ["disassemble echo", "show the function's instructions"],
+  ["info frame", "show the current stack frame layout"],
+  ["bt", "print the call stack"],
+]} caption="The gdb commands I reach for when reading machine code. x and stepi turn the abstract assembly listing into a live walk through memory and registers." />
+
+#### 3.10.3 Out-of-Bounds Memory References and Buffer Overflow
+
+A classic overflow writes past a local character buffer and into the saved
+return address. I wrote my own unsafe line reader (no length check) and an
+`echo` that uses an 8-byte buffer:
+
+```c
+static char *read_line(char *dst) {
+    int c; char *p = dst;
+    while ((c = getchar()) != EOF && c != '\n') *p++ = (char)c;
+    *p = '\0';
+    return dst;
+}
+void echo(void) {
+    char buf[8];
+    read_line(buf);
+    puts(buf);
+}
+```
+
+Compiled with `-Og -fno-stack-protector -no-pie`:
+
+```asm
+echo:
+	push   %rbx
+	sub    $0x10,%rsp
+	lea    0x8(%rsp),%rbx     # buf at rsp+8
+	mov    %rbx,%rdi
+	call   read_line
+	mov    %rbx,%rdi
+	call   puts@plt
+	add    $0x10,%rsp
+	pop    %rbx
+	ret                       # pops return address from (%rsp)
+```
+
+Stack layout while `echo` runs:
+
+<Figure art={`
+  %rsp ->  [ 8 bytes padding / unused ]
+           [ buf, 8 bytes ]              <- %rbx
+           [ saved %rbx, 8 bytes ]
+           [ return address, 8 bytes ]   <- overwritten by a long line
+  higher addresses
+`} caption="echo's frame. buf is only 8 bytes; a longer input writes through the saved %rbx into the return address. When echo executes ret, it jumps wherever the attacker wrote." />
+
+Measured behaviour:
+
+```text
+input len  7: exit=0
+input len  8: exit=0   (fits: 7 chars + NUL)
+input len 15: exit=0   (overwrites padding and saved %rbx, not yet retaddr)
+input len 16: exit=139 (SIGSEGV: return address corrupted)
+```
+
+With a crafted 19-byte input `AAAAAAAABBBBBBBBCCC`, gdb shows the return
+address becoming `0x434343` (the three C's), and `ret` jumps there:
+
+```text
+Breakpoint at ret:
+  $rsp -> 0x0000000000434343
+rip = 0x434343   (and then SIGSEGV)
+```
+
+That is a buffer-overflow exploit in miniature: the attacker chooses the
+address `ret` will use. A real exploit would write the address of injected
+code or of a useful existing gadget (return-oriented programming).
+
+#### 3.10.4 Thwarting Buffer Overflow Attacks
+
+Three defences, all active by default on this box:
+
+1. **Stack canaries.** GCC's `-fstack-protector-strong` inserts a random
+   value (the canary) between the locals and the saved registers. On exit
+   the value is checked; if it changed, the program aborts with
+   "stack smashing detected" before `ret` can use a corrupted address.
+
+```asm
+echo:   # with -fstack-protector-strong
+	push   %rbx
+	sub    $0x10,%rsp
+	mov    %fs:0x28,%rax         # load canary
+	mov    %rax,0x8(%rsp)        # store next to buf
+	...
+	mov    0x8(%rsp),%rax
+	sub    %fs:0x28,%rax         # compare
+	jne    __stack_chk_fail
+	add    $0x10,%rsp
+	pop    %rbx
+	ret
+```
+
+```text
+*** stack smashing detected ***: terminated
+exit=134   (SIGABRT)
+```
+
+2. **Non-executable stack.** The NX bit (or DEP) marks the stack and heap
+   non-executable, so injected shellcode cannot run even if the return
+   address points at it. Attackers switched to return-oriented programming,
+   chaining existing executable gadgets.
+
+3. **ASLR (address-space layout randomization).** The loader places the
+   stack, heap and shared libraries at random offsets each run, so a
+   guessed address is wrong next time. Two runs of a tiny program:
+
+```text
+main 0x564f4b559149 global 0x564f4b55c024 heap 0x564f778bd2a0 stack 0x7ffe46b67684
+main 0x557240014149 global 0x557240017024 heap 0x557249a922a0 stack 0x7ffcea0a7e44
+```
+
+Everything moved. (With `-no-pie` the main binary itself stays fixed, which
+is why my unsafe demo used that flag; PIE is the default now.)
+
+None of these is perfect alone. Canaries miss overflows that do not reach
+them (for example through a pointer). NX falls to ROP. ASLR falls to info
+leaks. Together they raise the cost of an exploit enormously. Writing C
+that never overflows is still the real fix: use bounded readers
+(`fgets`, `read` with a length), or languages that check bounds.
+
+#### 3.10.5 Supporting Variable-Size Stack Frames
+
+When a function has a VLA or uses `alloca`, the frame size is not known at
+compile time. The compiler keeps a frame pointer in `%rbp` so locals can
+be addressed from a stable base while `%rsp` moves.
+
+```c
+long vframe(long n, long idx, long *q) {
+    long i;
+    long *p[n];
+    p[0] = &i;
+    for (i = 1; i < n; i++) p[i] = q;
+    return *p[idx];
+}
+```
+
+```asm
+vframe:
+	pushq	%rbp
+	movq	%rsp, %rbp          # freeze the frame base
+	subq	$16, %rsp           # room for i
+	leaq	15(,%rdi,8), %rax
+	andq	$-16, %rax          # bytes for p[n], rounded up
+	subq	%rax, %rsp          # allocate the VLA
+	...                         # p[i] addressed from %rsp
+	leave                       # movq %rbp,%rsp ; pop %rbp
+	ret
+```
+
+`leave` restores `%rsp` from `%rbp` and pops the old `%rbp`, collapsing
+the variable-sized frame in two instructions.
+
+### Worked example
+
+Overwrite length. `buf` at `rsp+8`, return address at `rsp+24`, so the
+distance from the start of `buf` to the return address is 16 bytes. A
+16-byte write (15 chars + NUL) places the NUL on the first byte of the
+return address and crashes. A longer write can put an arbitrary address
+there. Canary version: any write past the 8-byte buffer hits the canary at
+`rsp+8` (in that build `buf` starts at `rsp`) and aborts before `ret`.
+
+### Step by step
+
+To confirm a suspected overflow with gdb:
+
+1. Build with `-Og -g -fno-stack-protector -no-pie` to keep addresses stable.
+2. Break at the `ret` of the overflowing function.
+3. Run with a long input; examine `$rsp` with `x/gx $rsp`.
+4. Step one instruction and watch `%rip` become the corrupted value.
+
+### Common mistake
+
+Thinking "my program does not take network input, so overflows do not
+matter". Command-line arguments, environment variables, files and even
+integer sizes used as lengths are inputs. Another: disabling canaries "for
+speed". The cost is a few instructions per function; the benefit is the
+difference between a crash and a remote code execution.
+
+### In real systems
+
+CVE histories are full of buffer overflows in C and C++. Modern mitigations
+have pushed attackers toward logic bugs and memory-safe-language escapes,
+but C remains in kernels, firmware and high-performance parsers, so the
+defences in this section still earn their keep every day. The Attack Lab in
+the CS:APP course builds exploits against a binary with these protections
+selectively disabled, which is the best possible drill for this section.
+
+### Check yourself
+
+<details>
+<summary>Where does a stack canary sit relative to the locals and the return address?</summary>
+
+Between them: after the locals, before the saved registers and return
+address, so any linear overflow hits the canary first.
+
+</details>
+
+<details>
+<summary>What does ASLR randomise?</summary>
+
+The base addresses of the stack, heap, shared libraries and (with PIE) the
+main binary itself, so absolute addresses differ every run.
+
+</details>
+
+<details>
+<summary>Why keep %rbp in a function with a VLA?</summary>
+
+So locals can be addressed from a fixed base while `%rsp` moves to
+allocate the variable-sized array.
+
+</details>
+
+## 3.11 Floating-Point Code
+
+### In one sentence
+
+Modern x86-64 compilers do all scalar floating-point work in the SSE
+registers `%xmm0`–`%xmm15`, with a separate set of move, convert, arithmetic
+and compare instructions that parallel the integer ones.
+
+### The idea
+
+#### 3.11.1 Floating-Point Movement and Conversion Operations
+
+`movss` moves a single-precision value (4 bytes); `movsd` moves a double
+(8 bytes). Conversions have systematic names: `cvtsi2sd` converts a signed
+integer to a double, `cvttsd2si` converts a double to a signed integer with
+truncation toward zero, `cvtss2sd` widens a float to a double, and so on.
+The `tt` in `cvtt` means truncate; without it the conversion uses the
+current rounding mode.
+
+```c
+float fcvt(int i, float *fp, double *dp, long *lp) {
+    float f = *fp; double d = *dp; long l = *lp;
+    *lp = (long) d; *fp = (float) i; *dp = (double) l;
+    return (float) d;
+}
+```
+
+```asm
+fcvt:
+	movsd	(%rdx), %xmm0        # d = *dp
+	movq	(%rcx), %rax         # l = *lp
+	cvttsd2siq %xmm0, %r8       # (long) d
+	movq	%r8, (%rcx)          # *lp = (long) d
+	pxor	%xmm1, %xmm1
+	cvtsi2ssl %edi, %xmm1       # (float) i
+	movss	%xmm1, (%rsi)        # *fp = (float) i
+	pxor	%xmm1, %xmm1
+	cvtsi2sdq %rax, %xmm1       # (double) l
+	movsd	%xmm1, (%rdx)        # *dp = (double) l
+	cvtsd2ss %xmm0, %xmm0       # return (float) d
+	ret
+```
+
+Integer arguments still arrive in the general registers (`%edi` for `i`);
+float and double arguments and return values use the XMM registers.
+
+#### 3.11.2 Floating-Point Code in Procedures
+
+The first eight floating-point arguments go in `%xmm0`–`%xmm7`. The return
+value comes back in `%xmm0`. XMM registers are all caller-saved; a callee
+may freely overwrite them. Mixing integer and floating-point arguments
+fills the two register files independently: `f(int a, double b, int c,
+float d)` puts `a` in `%edi`, `b` in `%xmm0`, `c` in `%esi`, `d` in `%xmm1`.
+
+#### 3.11.3 Floating-Point Arithmetic Operations
+
+`addsd`, `subsd`, `mulsd`, `divsd` (and the `ss` variants for float) take
+two XMM operands and write the result to the second. Unlike integer
+`add`, they do not set the integer condition codes.
+
+```c
+double funct(double a, float x, double b, int i) {
+    return a * x - b / i;
+}
+```
+
+```asm
+funct:                          # a in %xmm0, x in %xmm1, b in %xmm2, i in %edi
+	cvtss2sd %xmm1, %xmm1       # (double) x
+	mulsd	%xmm0, %xmm1        # a * x
+	pxor	%xmm0, %xmm0
+	cvtsi2sdl %edi, %xmm0       # (double) i
+	divsd	%xmm0, %xmm2        # b / i
+	subsd	%xmm2, %xmm1        # a*x - b/i
+	movapd	%xmm1, %xmm0        # return in %xmm0
+	ret
+```
+
+#### 3.11.4 Defining and Using Floating-Point Constants
+
+There is no immediate form for floating-point constants. The compiler
+emits them into a read-only section and loads them with a `%rip`-relative
+move.
+
+```c
+double cel2fahr(double temp) { return 1.8 * temp + 32.0; }
+```
+
+```asm
+cel2fahr:
+	mulsd	.LC0(%rip), %xmm0   # * 1.8
+	addsd	.LC1(%rip), %xmm0   # + 32.0
+	ret
+.LC0: .long -858993459 ; .long 1073532108    # 1.8 as IEEE bits
+.LC1: .long 0          ; .long 1077936128    # 32.0
+```
+
+Decoding those bit patterns with chapter 2's rules recovers 1.8 and 32.0.
+
+#### 3.11.5 Using Bitwise Operations in Floating-Point Code
+
+SSE provides bitwise AND, OR, XOR and AND-NOT on XMM registers (`andpd`,
+`orpd`, `xorpd`, `andnpd`). Compilers use them for sign-bit tricks: negating
+a double is XORing with a mask that has only the sign bit set; absolute
+value is ANDing with a mask that clears the sign bit; a branchless
+`x < 0 ? -x : x` uses a compare that produces a mask of all ones or zeros.
+
+```c
+double simplefabs(double x) { return x < 0 ? -x : x; }
+```
+
+```asm
+simplefabs:
+	pxor	%xmm2, %xmm2
+	movapd	%xmm0, %xmm3
+	movapd	%xmm0, %xmm1
+	xorpd	.LC3(%rip), %xmm1   # -x  (flip sign bit)
+	cmpltsd	%xmm2, %xmm0        # xmm0 = all-ones if x < 0 else 0
+	andpd	%xmm0, %xmm1        # keep -x if x < 0
+	andnpd	%xmm3, %xmm0        # keep  x if x >= 0
+	orpd	%xmm1, %xmm0
+	ret
+```
+
+Branchless, and correct for −0.0 as well.
+
+#### 3.11.6 Floating-Point Comparison Operations
+
+`ucomisd` / `ucomiss` compare two floating-point values and set the
+integer condition codes. Ordered compares (`comisd`) raise an exception on
+NaN; unordered ones (`ucomisd`) do not. Equality with NaN is special: NaN
+compares unequal to everything, including itself, which is why code that
+classifies floats often needs an extra parity check (`jp` / `jnp`), because
+a NaN comparison sets the parity flag.
+
+```c
+int find_range(float x) {
+    int result;
+    if (x < 0) result = 0;
+    else if (x == 0) result = 1;
+    else if (x > 0) result = 2;
+    else result = 3;            /* NaN */
+    return result;
+}
+```
+
+```asm
+find_range:
+	movl	$0, %eax
+	pxor	%xmm1, %xmm1
+	comiss	%xmm0, %xmm1     # compare 0 ? x
+	ja	.L8              # 0 > x  => x < 0, return 0
+	ucomiss	%xmm1, %xmm0
+	jp	.L15             # unordered (NaN)
+	movl	$1, %eax
+	jne	.L15             # not equal => handle >0 / fallthrough
+.L8:
+	ret
+.L15:
+	pxor	%xmm1, %xmm1
+	ucomiss	%xmm1, %xmm0
+	setbe	%al              # 1 if x <= 0 or unordered
+	movzbl	%al, %eax
+	addl	$2, %eax         # 2 if x > 0, 3 if NaN
+	ret
+```
+
+The parity flag (`jp`) is the tell for NaN.
+
+#### 3.11.7 Observations about Floating-Point Code
+
+Three habits help when reading it:
+
+1. XMM registers hold floats; general registers hold integers. Conversions
+   are explicit `cvt` instructions.
+2. Constants live in memory and are referenced `%rip`-relative.
+3. Comparisons go through the integer flags, so the jump instructions are
+   the same `ja` / `jb` / `je` family, plus `jp` for NaN.
+
+Everything about IEEE 754 from chapter 2 (rounding, denormals, NaN, −0)
+still applies; this section is only about how the instructions move those
+bits around.
+
+### Worked example
+
+Evaluate `funct(3.0, 4.0f, 8.0, 2)` by reading the assembly:
+
+1. `x` widens to 4.0; `a * x` = 12.0 in `%xmm1`.
+2. `i` converts to 2.0; `b / i` = 4.0 in `%xmm2`.
+3. Subtract: 12.0 − 4.0 = 8.0, returned in `%xmm0`.
+
+### Step by step
+
+To read a floating-point function:
+
+1. Map XMM argument registers to parameters (first float/double in `%xmm0`).
+2. Note every `cvt`; it is a cast in the C.
+3. Arithmetic instructions rewrite their second operand; track that register.
+4. The value in `%xmm0` at `ret` is the return.
+
+### Common mistake
+
+Looking for floating-point immediates in the instruction stream. They are
+never there; find the `.LC` labels. Another: using `==` on floats and
+expecting it to match `jp`-free assembly. Any comparison that must treat
+NaN correctly will have a parity check nearby.
+
+### In real systems
+
+AVX widens these instructions to 256- or 512-bit vectors for SIMD, but the
+scalar forms in this section are what ordinary C `double` math becomes.
+Numerically intensive code eventually moves to explicit SIMD or to GPUs;
+the first step is being able to read what the compiler already emits for
+scalar math.
+
+### Check yourself
+
+<details>
+<summary>Where do floating-point arguments and the return value live?</summary>
+
+Arguments in `%xmm0`–`%xmm7`, return value in `%xmm0`.
+
+</details>
+
+<details>
+<summary>How does the compiler materialise the constant 1.8?</summary>
+
+As an 8-byte IEEE value in a read-only section, loaded with
+`mulsd .LC0(%rip), %xmm0`.
+
+</details>
+
+<details>
+<summary>Which flag indicates a NaN comparison?</summary>
+
+The parity flag; `jp` jumps when the last `ucomisd` saw a NaN.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 3, Machine-Level Representation of Programs">
+
+<Level name="Beginner" depth={3}>
+
+I start by producing assembly for three-line functions and matching each
+instruction to one C idea. `gcc -Og -S`, strip the dotted lines, read out
+loud. Registers are named boxes; parentheses mean memory; `$` means
+constant. I do not memorise every opcode yet. I memorise the sixteen
+registers and the six argument registers, and I practise reading one
+`mov` and one `lea` until the address formula is automatic.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+I can reverse a small function from its `.s` file back to C without looking
+at the source. Condition codes and `set` / `j` / `cmov` make sense; I can
+spot a do-while by the missing initial jump. I can draw the stack frame of
+`call_incr` and of a three-deep `rfact` before running gdb, then confirm
+with `bt` and `x/gx $rsp`. Struct offsets I compute by hand match
+`offsetof`.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+I read `-O2` output. I recognise strength reduction, `lea` chains for
+constants, jump tables, and when the compiler chose `cmov` over a branch.
+I can explain why a VLA forces a frame pointer and why a 32-bit `movl`
+zeroes the upper half. I use `perf annotate` on a hot function and the
+assembly is readable rather than noise.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Partial-register writes after byte or word moves; shifts by 64 being
+no-ops in hardware while undefined in C; fall-through in a jump table;
+NaN comparisons setting parity; a struct whose size is not the sum of its
+fields; a callee that uses no callee-saved registers and has no prologue.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Variable-length frames with `alloca` in a loop; a switch whose cases are
+sparse enough that GCC emits a binary-search tree of compares instead of a
+table; ABI differences when calling a Windows DLL; a buffer overflow that
+overwrites a function pointer in a struct rather than a return address,
+bypassing the canary.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+I write C that is safe and still readable in assembly: bounded copies,
+sizes in `size_t`, no VLAs in constrained environments. I read compiler
+output before declaring an optimisation, and I check the ABI when crossing
+language boundaries. Canaries, PIE and NX stay on; when a profiler says a
+branch is hot, I look at the assembly before rewriting the C.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+Assembly is not a different language so much as C with the abstractions
+stripped. Every surprising behaviour I have blamed on "the compiler" has
+turned out to be either my misunderstanding of the ABI or undefined
+behaviour I left in the source. Reading the `.s` file is the fastest way
+to settle an argument about what a program does.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+Calling conventions, stack discipline and pointer provenance are the
+contract that lets separately compiled modules work as one program. Designs
+that fight the ABI (exotic register tricks, hand-rolled stacks without
+unwind info, packing structs for the wire and then computing on them)
+create debug and portability costs that show up years later. Designs that
+lean on the ABI (clear ownership of buffers, lengths beside pointers,
+POD types at the FFI boundary) stay boring, which is what I want.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+I learn this chapter with the Bomb Lab and then the Attack Lab. The bomb
+forces me to read assembly under time pressure without a source file; the
+attack lab forces me to write bytes that the assembly will run. Between
+them I keep a single notebook page: the register map, the addressing modes,
+the condition-code table, the stack-frame sketch, the ABI argument list.
+I rewrite that page from memory once a week until it is automatic.
+
+Done when I can take a 20-instruction function I have never seen, reconstruct
+its C, predict its stack traffic, and explain one way a buffer overflow in
+it would be stopped by the three defences in 3.10.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Why learn assembly when I write high-level languages?**
+Because bugs, performance cliffs and security holes all show up at this
+level. Reading assembly is how I verify what the compiler did, how I debug
+a crash with no symbols, and how I understand why one clean refactor was
+3× slower.
+
+**Is AT&T or Intel syntax the "right" one?**
+Neither. GCC and objdump default to AT&T; Intel's manuals and most Windows
+tools use Intel. I pick one to be fluent in and learn to read the other.
+This page uses AT&T because that is what `gcc -S` emits on Linux.
+
+**Should I write assembly by hand?**
+Almost never for application code. Compilers beat hand-written assembly on
+all but the tightest kernels, and hand-written assembly is a maintenance
+tax. Reading it is the skill; writing it is a last resort for context
+switch stubs, syscalls and specialised SIMD.
+
+**Why does -O2 change if to cmov?**
+To avoid branch misprediction. When both sides are cheap and the condition
+is unpredictable, computing both and selecting with `cmov` is faster. When
+one side is expensive or the branch is well predicted, a real jump is
+better. The compiler chooses; I check with measurements.
+
+**How much of this transfers to ARM64?**
+Almost all of the ideas: registers, a stack, condition flags or equivalent
+compare-and-branch, a calling convention, leaf vs non-leaf frames. The
+spellings change (`ldr`/`str` instead of `mov`, `x0`–`x7` for arguments)
+and there is no flags register in the same way, but a week with the ARM64
+ABI manual is enough once x86-64 is solid.
+
+## Key takeaways
+
+- C compiles to a small set of instructions that move data between registers and memory, do arithmetic, and jump on flags.
+- The sixteen integer registers and the `%rip`-relative addressing modes are the whole integer machine; floating point uses `%xmm0`–`%xmm15`.
+- `lea` computes address formulas without touching memory and is the compiler's favourite tool for cheap arithmetic.
+- Condition codes turn into `set`, `j` and `cmov`; loops and switches are just those plus labels, with jump tables for dense cases.
+- The stack holds return addresses, saved callee-saved registers, addressed locals and arguments past the sixth.
+- Arrays and structs are base-plus-offset arithmetic; alignment inserts padding that `sizeof` and `offsetof` reveal.
+- Buffer overflows overwrite return addresses; canaries, NX and ASLR make that far harder, but correct bounds checks make it unnecessary.
+- Floating-point code is the same story in a different register file, with constants in memory and NaN handled through the parity flag.
+
+## Glossary
+
+- **ABI (application binary interface):** the rules for registers, stack layout and type sizes that let separately compiled code interoperate.
+- **AT&T syntax:** the GCC/objdump assembly dialect with `%` on registers, `$` on immediates and source-then-destination operand order.
+- **Callee-saved register:** a register whose value a function must restore before returning (`%rbx`, `%rbp`, `%r12`–`%r15`).
+- **Caller-saved register:** a register a function may overwrite freely; the caller must save it if needed across a call.
+- **Canary:** a random value placed between locals and the return address to detect stack buffer overflows.
+- **CISC:** complex instruction set computer; x86's design style, with variable-length instructions and memory operands.
+- **Condition codes:** the flags CF, ZF, SF, OF that record properties of the last arithmetic result.
+- **Effective address:** the Imm + base + index × scale value a memory operand computes.
+- **ISA:** instruction set architecture; the contract between hardware and software about what instructions do.
+- **Jump table:** an array of code addresses used to implement a dense `switch`.
+- **lea:** load effective address; computes an address formula into a register without a memory access.
+- **NX / DEP:** non-executable memory permissions that stop injected stack or heap code from running.
+- **PC-relative:** an addressing mode that computes addresses from `%rip`, used for position-independent code.
+- **PIE:** position-independent executable; a main program that can be loaded at a random address (ASLR).
+- **Stack frame:** the region of stack belonging to one active function call.
+- **VLA:** variable-length array; a C99 array whose size is known only at run time.
+
+## Exercises and self-check
+
+**Warm-up**
+
+1. Name the six registers that hold the first six integer arguments, in order.
+2. Decode the address `0x10(%rax,%rdx,4)` when `%rax = 0x1000` and `%rdx = 3`.
+3. What single instruction computes `5 * x` if `x` is in `%rdi`, leaving the result in `%rax`?
+
+**Build**
+
+4. Write a C function of your own, compile with `gcc -Og -S`, and annotate every line of assembly with the C expression it implements.
+5. Use gdb to break at `ret` inside a function that has a local array, print the stack with `x/8gx $rsp`, and identify the return address, saved registers and locals.
+6. Reorder the fields of a struct with a `char`, a `double` and an `int` to minimise `sizeof`, and show before/after layouts.
+7. Build the unsafe `echo` and the canary-protected `echo`; find the shortest input that crashes each one.
+
+**Stretch**
+
+8. Write a 20-instruction x86-64 function by hand (in a `.s` file) that computes the length of a C string, link it with a C `main`, and test it.
+9. From the `-O2` assembly of a small recursive function, explain whether the compiler performed tail-call optimisation and why.
+10. Using only `objdump` and `gdb`, reverse-engineer a tiny binary you did not write (for example a classmate's Bomb Lab phase) back into equivalent C.
+
+**Self-check**
+
+<details>
+<summary>1. Which register holds the return value of an integer function?</summary>
+
+`%rax`.
+
+</details>
+
+<details>
+<summary>2. What does pushq %rbx do to %rsp?</summary>
+
+Subtracts 8, then writes `%rbx` at the new top.
+
+</details>
+
+<details>
+<summary>3. Why is there no movzlq instruction?</summary>
+
+Because `movl` into a 32-bit register already zeroes the upper 32 bits.
+
+</details>
+
+<details>
+<summary>4. How can you tell a do-while from a while in assembly?</summary>
+
+A do-while has no jump to the test before the first pass; a while usually
+starts with an unconditional `jmp` to the test.
+
+</details>
+
+<details>
+<summary>5. Where is the return address relative to %rsp at the moment a callee begins?</summary>
+
+At `0(%rsp)`; `call` just pushed it.
+
+</details>
+
+<details>
+<summary>6. What is the size of a struct with char, long, char on x86-64 Linux?</summary>
+
+24: c@0, 7 pad, l@8, d@16, 7 trailing pad.
+
+</details>
+
+<details>
+<summary>7. Name three defences against stack buffer overflows.</summary>
+
+Stack canaries, non-executable stack (NX), and ASLR (with PIE).
+
+</details>
+
+<details>
+<summary>8. Which XMM register holds a floating-point return value?</summary>
+
+`%xmm0`.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter is week 25 of
+<a href={withBase('/plans/traditional-software-developer/#strategy-5')}>phase
+5 of the traditional core</a>, and it is the reading for both the Bomb Lab
+and the Attack Lab. I would give it eight to ten sessions and refuse to
+rush.
+
+<Timeline caption="Ten sessions for chapter 3. Each ends with assembly I produced and a gdb session I can replay." items={[
+  { when: "Session 1", what: "3.1–3.3: history and data formats; gcc -Og -S on four one-line functions of different types; learn the register map by rewriting it from memory." },
+  { when: "Session 2", what: "3.4: operand forms; write and single-step the swap and the mov-extension demo; push/pop on paper and in gdb." },
+  { when: "Session 3", what: "3.5: lea chains, arith, shifts, mulq/idivq; annotate the scale and arith listings by hand." },
+  { when: "Session 4", what: "3.6: flags, set, j, cmov; reverse absdiff at -Og and -O2; rebuild fact_do, fact_while and switch_eg from their assembly." },
+  { when: "Session 5", what: "3.7: draw stack frames for call_incr, P and rfact; confirm with gdb bt and x/gx; recurse to depth 4 and photograph the frames." },
+  { when: "Session 6", what: "3.8–3.9: array address drills; measure struct layouts with offsetof; reorder fields to shrink them." },
+  { when: "Session 7", what: "3.10: run the overflow demo; corrupt a return address under gdb; rebuild with canaries and watch the abort; check ASLR across two runs." },
+  { when: "Session 8", what: "3.11: read fcvt, funct, cel2fahr, simplefabs, find_range; decode the .LC constants with chapter 2 tools." },
+  { when: "Session 9", what: "Bomb Lab phases 1–3 (or equivalent): strings, phase logic, a small switch." },
+  { when: "Session 10", what: "Bomb Lab phases 4–6 and the Attack Lab buffer-overflow levels; redo the self-check cold." },
+]} />
+
+I keep one directory of tiny C files, one annotated `.s` per file, and a
+single notebook page with the register map and ABI. When a listing
+confuses me I do not ask the internet first; I run it under gdb and watch
+the registers change. The labs are not optional for this chapter; they are
+the chapter, practised.
+
+Done when I can reverse a 20-instruction function to C, draw its stack
+frame without gdb, explain how a 16-byte overflow of an 8-byte buffer
+takes control, and name the three defences that make that harder on a
+modern Linux box.
+
