@@ -1,0 +1,1304 @@
+---
+book: the-pragmatic-programmer
+number: 4
+title: "Pragmatic Paranoia"
+description: "Design by contract, crashing early, assertions, balancing resources and taking small steps: how to write code that tells you quickly when it is wrong."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+This chapter starts from an uncomfortable fact: nobody writes perfect code,
+including me. So instead of hoping my code is right, I design it to
+detect when it is wrong, as early and as loudly as possible. Its five
+topics are contracts, crashing early, assertions, balancing resources, and
+taking steps small enough that feedback arrives in time.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- write preconditions, postconditions and invariants for a function or class, and check them;
+- tell the difference between handling an error and hiding one, and crash early when state is bad;
+- use assertions for things that "cannot happen", without side effects;
+- make every acquired resource be released, in reverse order, on every path, including errors;
+- plan work in small steps and avoid designing for a future I cannot see.
+
+What I should already know: functions, classes and exceptions in
+TypeScript or a similar language. The
+<a href={withBase('/books/the-pragmatic-programmer/03-the-basic-tools/')}>previous chapter</a>
+covered debugging; this chapter is about writing code that makes debugging
+rare and short.
+
+Reading time: about an hour for this page, plus two hours for the
+exercises.
+
+## Chapter map
+
+<Flow caption="The chapter as a line of defence, from declaring what must be true to acting when it is not. Read left to right." steps={[
+  "23. State the contract",
+  "24. Crash when it is broken",
+  "25. Assert the impossible",
+  "26. Release what you acquire",
+  "27. Take small steps",
+]} />
+
+The first three topics are about detecting wrong state. The fourth is
+about not leaking resources when things go wrong. The fifth widens the
+paranoia from code to planning: do not commit to more than you can see.
+
+## Topic 23. Design by Contract
+
+### In one sentence
+
+Every function has a contract, what it requires, what it guarantees, and
+what always stays true, and writing the contract down and checking it
+catches bugs at their source.
+
+### The idea
+
+#### Contracts between pieces of code
+
+In business, a contract says what each side must do and what each side
+gets. Code has the same structure. A function requires something of its
+caller, and in return promises something about its result. Design by
+contract, an idea developed by Bertrand Meyer for the Eiffel language,
+makes that agreement explicit.
+
+A contract has three parts. A **precondition** is what must be true before
+the function is called; it is the caller's responsibility. A
+**postcondition** is what the function guarantees when it finishes; it is
+the function's responsibility. A **class invariant** is a condition that is
+always true about an object from the caller's point of view, before and
+after every public method.
+
+The deal is simple. If the caller meets the preconditions, the function
+must meet the postconditions and keep the invariants. If the caller breaks
+a precondition, the function owes nothing and should fail loudly rather
+than guess.
+
+#### Why it matters
+
+Writing contracts forces precise thinking. "Withdraw money" becomes
+"requires an amount greater than zero and no more than the balance;
+ensures the balance has decreased by exactly that amount; the balance is
+never negative". Edge cases appear on their own: what about zero, NaN,
+more than the balance?
+
+Contracts also place blame precisely. When a precondition check fails,
+the bug is in the caller. When a postcondition fails, the bug is in the
+function. That halves the search before debugging starts.
+
+The book adds a style point: be strict in what you accept and promise as
+little as possible. A function that accepts anything and tries to make
+sense of it has a vague contract that is hard to test.
+
+#### Languages and tools
+
+Some languages support contracts directly; Eiffel is the classic example,
+and Clojure has pre and post conditions on functions. Elsewhere, contracts
+are written as checks at the start and end of functions, as assertions, as
+types, or as runtime schema validation. In TypeScript, types express part
+of a contract (this is a number); runtime checks express the rest (this
+number is positive).
+
+#### Who checks: the caller or the function?
+
+A natural question is where the precondition check lives. The book's
+answer is the function itself. If every caller had to check, the check
+would be duplicated and sooner or later one caller would forget. Putting
+it inside the function means it is written once and always runs.
+
+The caller still owns the obligation. The check exists to catch a caller
+that failed it, not to excuse callers from thinking. In practice the
+caller usually knows more about the situation and can meet the
+precondition naturally, for example by validating a form before calling
+`withdraw`.
+
+#### Contracts and inheritance
+
+Contracts also say something about subclasses. If a subclass replaces a
+method, it may accept more than the parent did, but not less, and it must
+promise at least as much, not less. In other words, preconditions can only
+be weakened and postconditions can only be strengthened. This is the
+Liskov substitution principle in contract form: code written against the
+parent must keep working when handed the child.
+
+A concrete failure: a `ReadOnlyList` subclass of `List` whose `add` method
+throws. Code that receives a `List` and calls `add` breaks, because the
+subclass has a stronger precondition (never call `add`) than the parent.
+The design is wrong, not the caller.
+
+#### Semantic invariants
+
+The book also describes semantic invariants: rules about the meaning of
+the business, not the data structure. An example in the spirit of the
+book is a payment rule that a customer is never charged twice for the same
+transaction. That rule should be stated clearly, known by everyone on the
+project, and guide every design decision near it, such as making the
+charge request idempotent with a unique key.
+
+Semantic invariants are often more important than structural ones, and
+less often written down. Listing them for a system is one of the most
+useful documents a team can have.
+
+#### Contracts and tests
+
+Contracts and tests overlap but are not the same. A test checks a few
+specific cases that I thought of. A contract checks every call, in every
+run, including cases I did not think of. The book treats contracts as a
+complement to testing: tests exercise the code, and the contracts inside
+it catch violations while the tests, or production, run.
+
+### Worked example
+
+**Simple.** A bank account class with its contract checked by hand:
+
+```ts
+// Design by contract, by hand: precondition, postcondition, class invariant.
+class Account {
+  private balance = 0;
+  private check() { if (this.balance < 0) throw new Error(`invariant: balance ${this.balance} < 0`); }
+  deposit(amount: number) {
+    if (!(Number.isFinite(amount) && amount > 0)) throw new RangeError(`pre: amount must be > 0, got ${amount}`);
+    const before = this.balance;
+    this.balance += amount;
+    if (this.balance !== before + amount) throw new Error('post: balance not increased by amount');
+    this.check();
+  }
+  withdraw(amount: number) {
+    if (!(amount > 0 && amount <= this.balance)) throw new RangeError(`pre: 0 < amount <= ${this.balance}, got ${amount}`);
+    this.balance -= amount;
+    this.check();
+  }
+  get value() { return this.balance; }
+}
+```
+
+Using it with good and bad calls:
+
+```ts
+const a = new Account();
+a.deposit(100); a.withdraw(30); console.log('balance', a.value);
+for (const bad of [() => a.deposit(-5), () => a.withdraw(500), () => a.deposit(NaN)]) {
+  try { bad(); } catch (e) { console.log((e as Error).name + ': ' + (e as Error).message); }
+}
+```
+
+The output:
+
+```text
+balance 70
+RangeError: pre: amount must be > 0, got -5
+RangeError: pre: 0 < amount <= 70, got 500
+RangeError: pre: amount must be > 0, got NaN
+```
+
+Note the NaN case. `NaN > 0` is false, so a naive check would reject it,
+but `Number.isFinite` makes the intent explicit, and the message says what
+was received.
+
+**Realistic.** An API endpoint that creates an order. Its precondition is a
+validated request body: the customer exists, every item id is known,
+quantities are positive integers. Its postcondition: one order row exists
+with the computed total, and the stock is reserved. The invariant on the
+inventory: reserved stock never exceeds stock on hand. A schema validator
+checks the precondition at the edge, a database constraint enforces the
+invariant, and an integration test checks the postcondition.
+
+A third example shows a contract checked at a service edge in
+TypeScript-style code. The handler for "create order" first runs the
+request through a schema that states the precondition: customer id is a
+non-empty string, items is a non-empty array, each quantity is a positive
+integer.
+
+A request that fails is rejected with a 400 and a list of the
+broken rules. Inside, the domain function trusts that shape and checks only
+business preconditions such as "the customer is active". At the end, a
+small check confirms the postcondition that the saved total equals the sum
+of the lines. Three layers, each checking what it is responsible for.
+
+### Step by step
+
+<Trace columns={["Call", "Precondition", "Body runs?", "Postcondition / invariant", "Outcome"]} rows={[
+  ["deposit(100)", "100 is finite and over 0: holds", "yes, 0 becomes 100", "100 = 0 + 100; 100 is not negative", "ok"],
+  ["withdraw(30)", "30 over 0 and at most 100: holds", "yes, 100 becomes 70", "70 is not negative", "ok"],
+  ["deposit(-5)", "-5 over 0: fails", "no", "not reached", "RangeError, caller's bug"],
+  ["withdraw(500)", "500 at most 70: fails", "no", "not reached", "RangeError, caller's bug"],
+  ["deposit(NaN)", "NaN is not finite: fails", "no", "not reached", "RangeError, caller's bug"],
+]} caption="Each call checked against the contract. Look at the third column: when a precondition fails, the body never runs, so state cannot be corrupted." />
+
+Writing a contract for any function:
+
+1. **List what the inputs must satisfy.** Types, ranges, relationships.
+2. **List what the result must satisfy.** Including state changes.
+3. **List what must always be true** of the object or system.
+4. **Check preconditions at the start**, postconditions and invariants at
+   the end.
+5. **Test each clause** with an input that breaks it.
+
+### Common mistake
+
+The common mistake is a weak precondition followed by guessing: the
+function accepts a negative amount and silently uses its absolute value.
+The caller's bug is hidden, and now two parts of the system disagree about
+what happened. The fix is to reject invalid input loudly, with the value
+in the message.
+
+Another mistake is checking user input with contracts. User input being
+wrong is expected, not a bug, so it needs validation with friendly errors.
+Contracts are for bugs between pieces of code.
+
+### In real systems
+
+API schemas (OpenAPI, JSON Schema), database constraints (NOT NULL, CHECK,
+foreign keys), and type systems are contracts in production. Consumer-driven
+contract tests check that a service still meets what its callers rely on.
+Each catches a broken agreement at the boundary, before it spreads.
+
+### Check yourself
+
+**Who is responsible when a precondition fails?**
+
+<details>
+<summary>Answer</summary>
+
+The caller. The function only owes its postcondition if the caller met
+the precondition.
+
+</details>
+
+**Should contract checks validate form input from users?**
+
+<details>
+<summary>Answer</summary>
+
+No. Wrong user input is expected; validate it with clear, friendly errors.
+Contracts catch programming errors between components.
+
+</details>
+
+## Topic 24. Dead Programs Tell No Lies
+
+### In one sentence
+
+When a program finds itself in a state that should be impossible, it
+should stop, because a dead program does far less damage than a crippled
+one that keeps going.
+
+### The idea
+
+It is tempting to write code that never crashes: catch every exception,
+log it, return a default and carry on. The book argues that this is often
+worse than crashing. Once the program's state is wrong, everything it
+does next is based on a lie. It may write bad data, send wrong emails or
+charge the wrong amount, and each step makes the cause harder to find.
+
+The book's phrase is to crash early. Check for errors where they happen
+and stop when something is wrong. The crash happens close to the cause,
+with a clear message, and nothing downstream is corrupted.
+
+Catch-and-release is a related trap: catching an exception only to log it
+and rethrow, or worse, to ignore it. Code full of these adds noise without
+adding safety. The book's advice is to catch only where I can actually do
+something useful, and let everything else propagate.
+
+Crashing does not have to mean the whole system goes down. Languages like
+Erlang and Elixir are designed around this: processes crash freely, and a
+supervisor restarts them in a known good state. The unit of work fails;
+the system survives.
+
+#### The cost of not crashing
+
+It helps to trace what happens after a hidden error. Say an import job
+fails to parse a date and substitutes today. The rows are saved.
+
+A nightly
+report aggregates them. A finance team uses the report. Three weeks later
+someone notices that one month's numbers look odd, and the investigation
+has to go back through the report, the aggregation and the import to find
+one swallowed exception. Every step the bad data travelled multiplied the
+cost of finding and repairing it.
+
+If the import had stopped on the first unparseable date, the cost would
+have been one failed job and a clear message on the day it happened. That
+is the asymmetry the book points at: crashing has a visible, bounded cost;
+continuing has an invisible, growing one.
+
+#### Asynchronous code
+
+In JavaScript the crash-early idea has a specific form. A promise that
+rejects with nobody handling it is an error that nobody saw.
+
+Modern Node.js
+treats an unhandled rejection as fatal by default, which is the book's
+principle built into the runtime. Code that adds a blanket handler to
+silence those warnings undoes it. The better habit is to `await` every
+promise, or attach a handler that does real work.
+
+### Worked example
+
+**Simple.** Reading a port number from configuration. One version
+"stays safe" by returning 0 on bad input; the other stops with a clear
+message.
+
+```ts
+// Swallowing an error versus crashing early.
+function parsePort(raw: string | undefined): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(`PORT must be 1-65535, got "${raw}"`);
+  return n;
+}
+function swallow(raw: string | undefined): number {
+  try { return parsePort(raw); } catch { return 0; } // "be safe"
+}
+console.log('swallowed:', swallow('80a'));
+try { console.log('port', parsePort('80a')); }
+catch (e) { console.error('fatal:', (e as Error).message); process.exitCode = 1; }
+```
+
+The output:
+
+```text
+swallowed: 0
+fatal: PORT must be 1-65535, got "80a"
+```
+
+With the swallowed version, the server starts on port 0, which asks the
+operating system for a random port. It "works", but nothing can reach it,
+and the cause is a typo far away in a config file. The crashing version
+fails at startup with the exact cause.
+
+**Realistic.** A payment worker processes a queue. A message arrives with
+a currency the code does not know. The crippled response is to treat it as
+rupees and continue. The crash-early response is to fail that message, send
+it to a dead-letter queue with the error, alert, and keep processing the
+rest. The bad message stops; the system does not.
+
+#### Making the crash useful
+
+A crash is only helpful if it explains itself. A good crash report answers
+four questions: what was being attempted, what was wrong, with which
+values, and where. "Error: invalid" answers none of them. "Importing row
+412 of orders-2026-10.csv: could not parse date 31/02/2026 in column
+shipped_at" answers all four, and usually makes the fix obvious.
+
+So when I throw at an impossible state, I include the operation, the
+offending value and enough identifiers to find the record. When an error
+passes through a layer that knows more context, that layer wraps it, for
+example with the `cause` option of `Error`, so the original stack trace
+survives and the new message adds what this layer knows. The result reads
+like a story from the outermost operation down to the root cause.
+
+### Step by step
+
+<Compare left="Crippled program" right="Dead program (crash early)" caption="Two ways to handle an impossible state. Look at the last row: where the error is found determines how long debugging takes." rows={[
+  ["Catches everything, returns a default", "Catches only what it can handle"],
+  ["Keeps running with bad state", "Stops the unit of work at the point of failure"],
+  ["Writes wrong data downstream", "Writes nothing wrong"],
+  ["Error found days later, far from cause", "Error found immediately, next to cause"],
+]} />
+
+<Figure caption="A supervisor tree. Look at the bottom row: one worker crashes and is restarted in a clean state, while its siblings keep running." art={`
+                 +-------------+
+                 | supervisor  |
+                 +------+------+
+          +-------------+-------------+
+          |             |             |
+     +----+----+   +----+----+   +----+----+
+     | worker A|   | worker B|   | worker C|
+     +---------+   +--X------+   +---------+
+                      |
+                 crash: unknown currency
+                 supervisor restarts B fresh
+`} />
+
+1. **Decide what the unit of work is.** A request, a message, a job.
+2. **At the boundary of that unit, catch, record and fail it.** Log with
+   context, return an error status, dead-letter the message.
+3. **Inside the unit, do not catch what I cannot fix.** Let it propagate.
+4. **Restart in a known good state.** A supervisor, a process manager, or
+   the orchestrator.
+
+### Common mistake
+
+The mistake is the empty catch: `catch {}` or a catch that logs and
+continues. It turns a loud bug into a quiet one. The fix is a rule: every
+catch either handles the error completely, rethrows it with more context,
+or fails the unit of work.
+
+The opposite mistake is crashing the whole server for one bad request. The
+fix is to choose the unit carefully: crash the request, not the process,
+unless the process state itself is corrupt.
+
+### In real systems
+
+In production, crash early looks like: health checks that fail when a
+dependency is broken, so the orchestrator restarts the container;
+validation at startup so a bad config never serves traffic; dead-letter
+queues for poison messages; and supervisors in Erlang, systemd or
+Kubernetes that restart failed processes.
+
+### Check yourself
+
+**Why is returning port 0 on a bad config worse than crashing?**
+
+<details>
+<summary>Answer</summary>
+
+The server starts on a random port and appears healthy, but nothing can
+reach it, and the cause is hidden far from the symptom. Crashing reports
+the exact cause at startup.
+
+</details>
+
+**What is the right unit to fail for one bad message on a queue?**
+
+<details>
+<summary>Answer</summary>
+
+The message itself: fail it, record why, move it to a dead-letter queue,
+and keep processing the others.
+
+</details>
+
+## Topic 25. Assertive Programming
+
+### In one sentence
+
+If I think something cannot happen, I add code to check it, because
+"impossible" things happen all the time.
+
+### The idea
+
+Every programmer has thought "this can never be null" or "this list can't
+be empty here". The book's view is that those beliefs are exactly where
+bugs hide, and each one should become an assertion: a check that stops the
+program with a clear message if the impossible happens.
+
+An assertion is different from error handling. Error handling deals with
+things that can legitimately go wrong: a missing file, bad user input, a
+network timeout. An assertion guards against my own logic being wrong. If
+an assertion fires, there is a bug.
+
+Assertions must not have side effects. A check that also changes state
+behaves differently when assertions are turned off. The book also points
+out that the act of checking can affect what is observed, like a debugger
+changing timing, so checks should be simple and pure.
+
+The book takes a firm position on a common practice: turning assertions
+off in production builds for speed. Its argument is that production is
+where the strangest inputs and conditions occur, so it is the last place to
+remove the safety checks. If a specific assertion is measurably too slow,
+remove that one, not all of them.
+
+#### What is worth asserting
+
+Good candidates for assertions are beliefs about my own code that are
+cheap to check:
+
+- a value that should never be null at this point, such as a user on an
+  authenticated route;
+- a list that should never be empty after a step that fills it;
+- a `switch` over a fixed set of cases that should never reach `default`;
+- a result that should be within a known range, such as a percentage
+  between 0 and 100;
+- two values that must agree, such as an order total and the sum of its
+  lines.
+
+In TypeScript, the `default` case has a typed form: a helper that accepts
+`never`, so the compiler reports a missing case at build time, plus a
+throw for the runtime case where data arrives that the types did not
+expect. That pairs a compile-time check with an assertion.
+
+#### When the check changes the result
+
+The book warns about a subtler effect too: checking can change what is
+being checked. A debugger that pauses threads changes timing; a log
+statement that calls `toString` on an object can trigger lazy loading. Bugs
+that disappear when observed are sometimes called heisenbugs. Keeping
+assertions small, pure and free of I/O keeps them from becoming one.
+
+### Worked example
+
+**Simple.** A side-effecting assertion. The check calls `queue.shift()`,
+which removes an element, and it only runs when assertions are on.
+
+```ts
+// An assertion with a side effect changes behaviour when assertions are off.
+const queue = ['a', 'b', 'c'];
+const ASSERTS = process.env.ASSERTS !== 'off';
+function assert(cond: boolean, msg: string) { if (ASSERTS && !cond) throw new Error(msg); }
+const assertLazy = (f: () => boolean, msg: string) => { if (ASSERTS && !f()) throw new Error(msg); };
+
+if (ASSERTS) assert(queue.shift() !== undefined, 'queue empty'); // BAD: shift() only runs when asserts are on
+assertLazy(() => queue.length > 0, 'queue empty');                // GOOD: pure check
+console.log(`asserts ${ASSERTS ? 'on ' : 'off'}: queue is`, queue);
+```
+
+Run twice, with assertions on and off:
+
+```text
+asserts on : queue is [ 'b', 'c' ]
+asserts off: queue is [ 'a', 'b', 'c' ]
+```
+
+The program's state depends on whether checking is enabled. That is
+precisely the bug an assertion must never introduce. In C, the same thing
+happens with `assert(x = next())` when `NDEBUG` removes the line.
+
+**Realistic.** A function merges two sorted lists. I believe both inputs
+are sorted because the callers sort them. I add an assertion at the top
+that each input is sorted, in development and in production for small
+inputs. Weeks later a new caller passes unsorted data; the assertion fires
+in staging with the caller's stack trace, instead of producing subtly
+wrong reports.
+
+A second realistic example is a guard before an irreversible action. A
+cleanup script deletes expired sessions.
+
+I believe it will only ever
+match a few thousand rows a night. So before the delete, the script counts
+the matching rows and asserts the count is below a generous threshold, say
+fifty thousand. One night a clock bug makes every session look expired;
+the assertion stops the script with the count in the message, and nobody
+is logged out. Without it, the script would have done exactly what it was
+told, which was the wrong thing.
+
+This kind of assertion is cheap insurance on anything that deletes, sends,
+charges or publishes. The threshold does not need to be precise. It only
+needs to separate "normal" from "something is badly wrong", and the
+message needs to say which number crossed it.
+
+### Step by step
+
+<Flow caption="Deciding between an assertion and error handling. Look at the first question: it is about whose fault the condition would be." steps={[
+  "Could this happen without a bug?",
+  "Yes: handle it as an error, with a clear message",
+  "No: assert it",
+  "Is the check pure and cheap?",
+  "Keep it on in production",
+]} />
+
+1. **Notice the thought "this can't happen".** Write it down as a
+   condition.
+2. **Ask whether it can happen legitimately.** If so, it is error handling.
+3. **Make the check pure.** No calls that change state.
+4. **Write a message that names the belief and the values.** "expected
+   sorted input, item 3 is less than item 2".
+5. **Leave it on** unless profiling shows that specific check is costly.
+
+### Common mistake
+
+The first mistake is using assertions to validate external input. When
+assertions are disabled, the validation disappears and bad input flows in.
+The fix is real error handling for anything from outside the program.
+
+The second is a side effect in the assertion, as shown above. The fix is to
+assert on values already computed, or on pure functions of them.
+
+### In real systems
+
+Production systems use assertions as invariant checks on data structures,
+sanity checks before irreversible actions (refuse to delete more than a
+threshold of rows), and "this should never happen" alerts that page someone.
+Many databases run internal consistency checks continuously, because
+silent corruption is the worst failure there is.
+
+### Check yourself
+
+**What is the difference between an assertion and error handling?**
+
+<details>
+<summary>Answer</summary>
+
+Error handling deals with conditions that can legitimately occur, such as
+bad input or a timeout. An assertion checks something that can only be
+false if there is a bug.
+
+</details>
+
+**What does the book advise about turning assertions off in production?**
+
+<details>
+<summary>Answer</summary>
+
+Do not turn them all off; production is where unexpected conditions
+happen. Remove only specific checks that are measured to be too slow.
+
+</details>
+
+## Topic 26. How to Balance Resources
+
+### In one sentence
+
+Whoever allocates a resource should release it, in the reverse order of
+allocation, on every path out of the code, including errors.
+
+### The idea
+
+#### Finish what you start
+
+Programs use resources that must be given back: memory, file handles,
+database connections, locks, sockets, temporary files, transactions. The
+book's tip is to finish what you start. The function or object that
+acquires a resource should be the one that releases it.
+
+When the responsibility is spread out, leaks follow. If function A opens a
+file and function B is expected to close it, then one day C calls A
+without knowing about B, and the file stays open. Under load, the process
+runs out of file handles and fails in a way that looks unrelated.
+
+The book's related tip is to act locally. Keep the acquire and the release
+close together in the code, ideally in the same function, so a reader can
+see at a glance that they balance.
+
+#### Nesting and order
+
+When a piece of code needs several resources, two rules help. Release them
+in the reverse order of allocation, so a resource is never released while
+something that depends on it is still held. And when the same set of
+resources is acquired in different places, always acquire them in the same
+order, which prevents a class of deadlocks where two threads each hold one
+lock and wait for the other.
+
+#### Exceptions and the error path
+
+Errors make balancing harder, because an exception can jump out of a
+function between the acquire and the release. Languages offer constructs
+for this. In TypeScript and JavaScript it is `try`/`finally`, and newer
+versions of the language add `using` declarations that call a dispose
+method automatically. In Python it is `with`; in C++ it is the RAII idiom,
+where an object's destructor releases the resource; in Go it is `defer`.
+
+The book also covers memory in garbage-collected languages. The collector
+frees memory that is unreachable, but not memory I still reference by
+accident: a growing cache, a listener that is never removed, a global map.
+And it never closes files or sockets for me in time.
+
+#### When I cannot balance locally
+
+Sometimes a resource outlives the code that created it, like an object
+stored in a long-lived data structure. Then the owner is the structure,
+and it needs a clear policy: the top-level structure frees its children,
+or the children are reference-counted, or the structure refuses to be
+freed while it has children. Any policy is fine if it is explicit.
+
+The book suggests building checks that resources balance: wrapper objects
+that count acquisitions and releases, and tests that assert the count
+returns to zero.
+
+#### Checking the balance
+
+The book suggests making balance checkable. A wrapper around a resource
+type can count every acquire and release.
+
+In tests, I assert the count is
+zero at the end of each test. In production, I expose the count as a
+metric. A leak then shows up as a number that only goes up, instead of a
+mysterious failure after three days of uptime.
+
+Tools help as well. Node.js can report active handles that keep the
+process alive, test runners can flag open handles after a suite, and
+memory profilers show which objects are retained and by whom. Each is a
+way of asking "did everything I started get finished".
+
+### Worked example
+
+**Simple.** Copying from one file to another, with nested `try`/`finally`
+so both files close in reverse order on every path. The "files" here are
+stand-ins that log each step.
+
+```ts
+// Balance resources: whoever acquires releases, in reverse order, on every path.
+const log: string[] = [];
+const open = (name: string) => { log.push(`open ${name}`); return { name, close: () => log.push(`close ${name}`) }; };
+function copy(failAt?: string) {
+  const src = open('src');
+  try {
+    const dst = open('dst');
+    try {
+      if (failAt === 'write') throw new Error('disk full');
+      log.push('copy bytes');
+    } finally { dst.close(); }
+  } finally { src.close(); }
+}
+copy();
+try { copy('write'); } catch (e) { log.push(`error: ${(e as Error).message}`); }
+console.log(log.join('\n'));
+```
+
+The output:
+
+```text
+open src
+open dst
+copy bytes
+close dst
+close src
+open src
+open dst
+close dst
+close src
+error: disk full
+```
+
+On the error path, both files still close, and in reverse order, before the
+error reaches the caller. That is the whole point of `finally`.
+
+**Realistic.** A web handler takes a database connection from a pool,
+starts a transaction, and calls an external service. If the external call
+throws and the connection is never released, the pool slowly drains. After
+a few hundred failed requests, every new request waits for a connection
+and the whole service appears to hang. The fix is a helper that owns the
+connection: it acquires, runs the callback inside a transaction, commits or
+rolls back, and releases in `finally`. Handlers never touch release.
+
+#### Locks and the order of acquisition
+
+Locks are the resource where order matters most. Suppose one task locks
+account A and then account B to transfer money, while another task
+transferring the opposite way locks B and then A. Each can end up holding
+one lock and waiting forever for the other, which is a deadlock.
+
+The book's advice to allocate in a consistent order fixes this. If every
+transfer locks the account with the lower id first, both tasks try to lock
+the same account first, one waits, and the other completes. The same rule
+works for database rows: updating rows in a consistent order, such as by
+primary key, avoids many deadlocks that otherwise appear only under load.
+
+Releasing in reverse order matters less for locks than for nested
+resources such as a transaction inside a connection, but it keeps the code
+symmetrical and easy to review, which is its own kind of safety.
+
+### Step by step
+
+<Layers caption="Resources acquired in a request, outermost first. Look at the order: release goes from the bottom of this stack back to the top." layers={[
+  "Connection from the pool (acquired first, released last)",
+  "Transaction on that connection",
+  "Row lock inside the transaction",
+  "Temporary file for the export (acquired last, released first)",
+]} />
+
+<Trace columns={["Step", "Happy path", "Error at the write"]} rows={[
+  ["1", "open src", "open src"],
+  ["2", "open dst", "open dst"],
+  ["3", "copy bytes", "throw disk full"],
+  ["4", "close dst (inner finally)", "close dst (inner finally)"],
+  ["5", "close src (outer finally)", "close src (outer finally)"],
+  ["6", "return normally", "error propagates to caller"],
+]} caption="The copy function on both paths. Look at rows 4 and 5: they are identical, which is what balanced resources means." />
+
+1. **List each resource the code acquires.** Including locks and
+   transactions.
+2. **Find the owner.** The narrowest scope that can release it.
+3. **Pair each acquire with a release in the same scope**, using
+   `finally`, `using`, `with`, `defer` or a destructor.
+4. **Nest in reverse order.** The last acquired is the first released.
+5. **Test the error path** and assert that counts return to zero.
+
+The same shape works for any resource that has a start and an end, not
+only files. A timer started in a component should be cleared when the
+component unmounts.
+
+An event listener added in setup should be removed in
+teardown. A temporary directory made by a test should be deleted by that
+test. Each is "finish what you start" applied to a different kind of
+resource, and each leak looks different in production: a memory graph
+that only climbs, callbacks firing for screens that are gone, a disk that
+slowly fills.
+
+### Common mistake
+
+The common mistake is releasing only on the happy path: `close()` at the
+end of the function, after code that can throw. It works in every demo and
+leaks in production. The fix is to put the release in `finally` or an
+equivalent construct, never as the last line.
+
+A second mistake is reassigning a variable that holds a resource, so the
+first one can no longer be released. The fix is to release before
+reassigning, or to keep each resource in its own scope.
+
+### In real systems
+
+Connection pools expose metrics for active and idle connections; a
+steadily rising active count is the classic leak signal. Load tests that
+run for hours catch slow leaks that a short test never shows. File handle
+limits, memory graphs that only go up, and lock wait timeouts are the
+production symptoms of unbalanced resources.
+
+### Check yourself
+
+**Why release resources in reverse order?**
+
+<details>
+<summary>Answer</summary>
+
+Later resources often depend on earlier ones, such as a transaction on a
+connection. Releasing in reverse order never frees something that a still
+held resource needs.
+
+</details>
+
+**Can a garbage-collected program leak memory?**
+
+<details>
+<summary>Answer</summary>
+
+Yes. The collector only frees unreachable objects. A cache that grows
+forever or a listener never removed stays reachable and is never freed.
+
+</details>
+
+## Topic 27. Don't Outrun Your Headlights
+
+### In one sentence
+
+Take small, deliberate steps and check feedback after each one, because
+the future is uncertain and only the next little stretch of road is lit.
+
+### The idea
+
+The image is driving at night. Headlights only light a certain distance
+ahead; if I drive so fast that I cannot stop within that distance, I am
+outrunning them. In software, the lit distance is how far I can predict the
+consequences of what I build. Anything beyond it is guessing.
+
+The book's tip is to take small steps, always. Each step should be small
+enough that I get feedback before going further: a test passes, a user
+tries it, a metric moves. Then adjust. A step that would take weeks before
+any feedback is too big.
+
+The book lists the kinds of feedback: running code and tests, a demo to a
+user, a quick experiment, a review. It also lists the warning sign:
+needing to predict the future. If I find myself estimating months ahead,
+designing for features nobody has asked for, or guessing which library
+will win, I am past my headlights.
+
+The book's term for the surprises is black swans, borrowed from Nassim
+Nicholas Taleb: rare, high-impact events nobody predicted. The way to cope
+with them is not better prediction, which is impossible, but code that is
+easy to change. That is why this topic links back to reversibility in
+chapter 2 and forward to decoupling in chapter 5.
+
+#### Signs I am predicting the future
+
+The book lists situations that require a crystal ball. Rewritten in my own
+words, they are the moments to shorten the step:
+
+- estimating completion dates many months ahead;
+- planning a design for future maintenance or extension nobody has
+  described;
+- guessing what users will need later;
+- guessing which technology will be available or popular next year.
+
+None of these is forbidden. They are just guesses, and the response to a
+guess is to make the code easy to change if the guess is wrong, rather
+than to build the guessed future now.
+
+### Worked example
+
+**Simple.** I am adding a discount feature. The big-step version is a full
+rules engine with stacking, expiry, categories and a configuration UI,
+built over three weeks before anyone sees it. The small-step version is one
+flat percentage code for one product, shipped behind a flag in two days.
+Feedback from that first step shows that customers mostly use codes for
+free shipping, a case the rules engine would not have handled.
+
+**Realistic.** A team plans to split a monolith into services. The
+headlights version picks one well-understood seam, extracts one service,
+runs it in production for two weeks, and measures. That first step
+reveals that cross-service transactions are the hard part, which changes
+how the next ten extractions are planned. A plan for all ten up front
+would have got that wrong.
+
+#### Feedback loops of different lengths
+
+Different kinds of feedback arrive at different speeds, and a healthy
+workflow uses all of them:
+
+| Feedback | Typical delay | What it tells me |
+|---|---|---|
+| Type checker and linter in the editor | seconds | The code is consistent with itself |
+| Unit tests | seconds to a minute | Each piece does what I intended |
+| Code review | hours | Another person understands and agrees |
+| Deploy behind a flag | a day | It works in the real environment |
+| Usage data | days to weeks | Users actually want it |
+
+The aim is to make each loop as short as it can be and to never go long
+without the slow, important ones. Many fast loops with no user feedback is
+still outrunning the headlights, just with good tests.
+
+### Step by step
+
+<Timeline caption="Two delivery plans for the same feature. Look at when the first feedback arrives in each." items={[
+  { label: "Big step, week 1-3", text: "Design and build the full rules engine; no feedback yet." },
+  { label: "Big step, week 4", text: "First demo; discovers the main use case was missed." },
+  { label: "Small steps, day 2", text: "One flat code live behind a flag; first real usage data." },
+  { label: "Small steps, week 1", text: "Free-shipping codes added, because data showed demand." },
+  { label: "Small steps, week 3", text: "Only the rules people actually use exist, all tested." },
+]} />
+
+1. **Ask what the smallest useful step is.** Something that produces
+   feedback.
+2. **Decide what feedback will tell me** whether to continue.
+3. **Take the step and get the feedback.** Run, test, demo, measure.
+4. **Adjust the next step.** Including stopping.
+5. **Notice when I am predicting far ahead.** Shorten the step instead.
+
+Small steps also make estimates honest. A step of a day is easy to
+estimate and easy to check; a step of a month hides its risks until the
+end. When a team breaks a large piece of work into steps of a day or two,
+the remaining work becomes visible, and so does the moment when the plan
+needs to change. That links this topic back to estimating in chapter 2:
+the most reliable way to estimate is to take a small step and measure it.
+
+### Common mistake
+
+The common mistake is building for an imagined future: a plugin system
+before a second plugin exists, configuration for options nobody asked for,
+abstractions for a scale that may never come. The fix is to build for what
+I know now, and keep it easy to change for what I do not.
+
+The other mistake is confusing small steps with no plan. Small steps still
+need a direction; the plan is just held loosely and revised at each step.
+
+### In real systems
+
+Feature flags, canary releases, trunk-based development, short sprints and
+continuous deployment are all ways to keep steps small and feedback fast.
+Teams that deploy many times a day are not reckless; each deployment is a
+small, reversible step with fast feedback.
+
+### Check yourself
+
+**What does "outrunning your headlights" mean in software?**
+
+<details>
+<summary>Answer</summary>
+
+Committing to work whose consequences I cannot see, such as long stretches
+without feedback or designing for a far future, instead of taking steps
+small enough to check.
+
+</details>
+
+**How does the book suggest coping with black swans?**
+
+<details>
+<summary>Answer</summary>
+
+Not by predicting them, which is impossible, but by keeping code easy to
+change so I can respond when the unexpected happens.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Pragmatic Paranoia">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, paranoia means one habit: never ignore an error.
+Every `catch` block either handles the problem or lets it travel on. Every
+function that receives a value it cannot use throws with a message that
+says what it got. That alone removes a large class of silent bugs.
+
+Example: a function that reads a user's age from a form converts it to a
+number and checks it is a whole number between 0 and 150, returning a
+clear validation error otherwise.
+
+Mistake: wrapping a whole script in `try { ... } catch (e) {}` to "stop it
+crashing". Fix: remove the empty catch, read the error that appears, and
+fix its cause.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level I write contracts deliberately. For each public
+function I can state its preconditions, postconditions and invariants,
+and the important ones are checked in code or enforced by types. I use
+`finally` or the language's equivalent for every resource.
+
+Example: a `Cart` class whose invariant is that the total always equals
+the sum of its line items, checked at the end of every method in
+development.
+
+Mistake: checking the invariant only in `addItem`, not in `removeItem`.
+Fix: one private `check()` called at the end of every public method, so
+none is forgotten.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level I design failure boundaries. I decide what the unit
+of work is, catch and record failures only at that boundary, and let
+everything inside propagate. I use supervisors or the platform's restart
+mechanism so that crashing a unit is cheap.
+
+Example: a job runner where each job runs in its own process. A job that
+hits an impossible state exits with an error; the runner records it,
+retries with a backoff a limited number of times, then moves it to a
+failed list for a human.
+
+Mistake: retrying forever, so a poison job blocks the queue. Fix: a retry
+limit and a dead-letter destination.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Edge cases for contracts are the values at the edge of the allowed range:
+zero, the maximum, empty collections, one element, NaN and infinity for
+numbers, empty strings and strings of only whitespace.
+
+Example: `withdraw(balance)` should be allowed and leave exactly zero;
+`withdraw(balance + 0.01)` should be rejected. Floating-point money makes
+the second case unreliable, which is why money is stored in integer minor
+units such as paise.
+
+Mistake: a precondition `amount > 0` that lets NaN through in a different
+form, such as `!(amount <= 0)`, which is true for NaN. Fix: write the
+positive condition, and test NaN explicitly.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine conditions: an exception thrown inside a `finally`
+block, which replaces the original error; a resource released twice
+because two cleanup paths both run; an assertion that fires inside an
+error handler.
+
+Example: closing a file throws because the disk is full, inside the
+`finally` after a write already failed. The original "disk full" error is
+lost, replaced by the close error.
+
+Mistake: letting cleanup errors hide the original. Fix: catch errors from
+the release itself, log them, and rethrow the original; JavaScript's
+`AggregateError` or `SuppressedError` with `using` exists for this case.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production, paranoia becomes observable. Contract violations and
+assertion failures are logged with context and counted as metrics; a
+non-zero rate pages someone. Resources are monitored: pool usage, open
+file handles, memory over time.
+
+Example: a dashboard showing database pool active connections per
+instance, with an alert when it stays above 90 percent for five minutes,
+which has caught two connection leaks before users noticed.
+
+Mistake: logging assertion failures at the same level as routine warnings,
+so they are lost. Fix: a distinct log level or event name, and an alert on
+any occurrence.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is humility turned into practice. I assume my code has bugs,
+that the inputs will be stranger than expected, and that the future will
+surprise me. That is not pessimism; it is what lets me move fast, because
+the code tells me quickly when I am wrong.
+
+Example: when I catch myself thinking "that can't happen", I write the
+assertion instead of moving on.
+
+Mistake: treating a crash as a personal failure and adding catches to make
+it go away. Fix: treat a crash with a clear message as the system working;
+the failure is the bug behind it.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+At system design level, contracts sit at every service boundary as
+schemas and versioned APIs. Failure isolation is designed in: bulkheads
+so one failing dependency cannot exhaust shared resources, timeouts on
+every remote call, circuit breakers that stop calling a broken service.
+
+Example: an order service calls a recommendation service with a 200
+millisecond timeout and a circuit breaker; when recommendations fail, the
+page renders without them instead of hanging.
+
+Mistake: no timeout on a remote call, so a slow dependency ties up every
+worker. Fix: every remote call gets a timeout and a defined fallback.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+Strategically, small steps and fast feedback are how a team stays within
+its headlights. Roadmaps are held loosely, investments in changeability
+are deliberate, and big bets are broken into experiments with a decision
+point after each.
+
+Example: a quarter's plan written as three bets, each with a first step
+that ships in two weeks and a measure that decides whether to continue.
+
+Mistake: a twelve-month fixed plan with no checkpoints. Fix: monthly
+review points where the plan is allowed, and expected, to change.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+<details>
+<summary>Isn't crashing bad for users?</summary>
+
+Crashing the right unit is good for users. A failed request with an error
+message is better than a successful-looking request that saved wrong data.
+The goal is to fail the smallest unit and restart cleanly.
+
+</details>
+
+<details>
+<summary>Do TypeScript types replace contracts?</summary>
+
+Partly. Types express the shape of data, such as "a number". They cannot
+express "a positive number no larger than the balance" without extra
+techniques. Runtime checks, branded types and schema validators cover the
+rest.
+
+</details>
+
+<details>
+<summary>Won't all these checks slow the code down?</summary>
+
+Most checks are a comparison or two and cost nothing measurable. Measure
+before removing any; if one specific check is costly, such as verifying a
+large list is sorted, sample it or run it only in tests.
+
+</details>
+
+<details>
+<summary>How is this different from defensive programming?</summary>
+
+Defensive programming often means coping quietly with bad input. The
+book's paranoia is different: detect bad state and fail loudly, rather
+than coping, unless coping is a deliberate, designed behaviour.
+
+</details>
+
+<details>
+<summary>What does "small steps" mean for a large rewrite?</summary>
+
+It means finding a way to replace the system piece by piece, with each
+piece in production before the next starts. Patterns such as the strangler
+fig, where new code gradually takes over routes from the old, exist for
+this.
+
+</details>
+
+<details>
+<summary>Where should I put contract checks in a layered app?</summary>
+
+At the boundary of each component that others call: public functions,
+service methods, API handlers. Private helpers called only from checked
+code can rely on their callers, which keeps checks from being repeated at
+every level.
+
+</details>
+
+<details>
+<summary>What is the simplest way to start leaving assertions on?</summary>
+
+Write a tiny `invariant(condition, message)` helper that always throws,
+and use it instead of the platform's assert. Then there is no build flag
+that can silently remove the checks.
+
+</details>
+
+## Key takeaways
+
+- I cannot write perfect software, so I design code to detect its own mistakes.
+- A contract states preconditions, postconditions and invariants; checking them places blame precisely.
+- Crash early: a stopped unit of work does less harm than one running on bad state.
+- Catch only where I can handle the error, and choose the unit of work to fail.
+- Assert what I believe cannot happen, with pure checks, and leave assertions on.
+- Finish what I start: the owner releases, in reverse order, on every path.
+- Keep acquire and release close together, and test the error path.
+- Take steps small enough to get feedback before going further, and prefer changeable code to prediction.
+
+## Glossary
+
+- **Precondition**: what must be true before a function is called; the caller's responsibility.
+- **Postcondition**: what a function guarantees when it returns.
+- **Class invariant**: a condition always true of an object between public method calls.
+- **Design by contract**: making those three explicit and checking them.
+- **Crash early**: stopping as soon as an impossible state is detected.
+- **Supervisor**: a process that restarts failed workers in a known good state.
+- **Dead-letter queue**: where messages that cannot be processed are kept for inspection.
+- **Assertion**: a check that can fail only if there is a bug.
+- **Resource**: anything that must be released after use, such as a file handle, connection or lock.
+- **RAII**: resource acquisition is initialisation; tying release to an object's lifetime.
+- **Black swan**: a rare, high-impact event that nobody predicted.
+
+## Exercises and self-check
+
+**Warm-up.** Pick five functions in a project I know. For each, write its
+preconditions and postconditions as comments. Count how many are actually
+checked in code.
+
+**Build.** Write a `withConnection(pool, fn)` helper that acquires a
+connection, runs `fn` inside a transaction, commits on success, rolls back
+on error, and always releases. Test it with a fake pool that counts
+acquisitions and releases, and assert the count is zero after a thrown
+error.
+
+**Stretch.** Find every empty or log-and-continue `catch` in a codebase.
+For each, decide: handle fully, rethrow with context, or fail the unit of
+work. Fix three and note what each was hiding.
+
+<details>
+<summary>Self-check: what should happen when a precondition fails?</summary>
+
+The function should throw immediately with a message naming the expected
+condition and the received value, and do nothing else.
+
+</details>
+
+<details>
+<summary>Self-check: what is wrong with closing a file on the last line of a function?</summary>
+
+Any exception before that line skips the close, leaking the handle. The
+close belongs in `finally` or an equivalent construct.
+
+</details>
+
+<details>
+<summary>Self-check: name two signs that I am outrunning my headlights.</summary>
+
+Long stretches of work with no feedback, and designing for features or
+scale nobody has asked for.
+
+</details>
+
+## How I'd study this chapter
+
+<Timeline caption="A one-week plan for the chapter. Look at day 3: the resource exercise is where the ideas become habits." items={[
+  { label: "Day 1", text: "Read topics 23 and 24; write contracts for five functions." },
+  { label: "Day 2", text: "Read topic 25; replace three 'cannot happen' comments with assertions." },
+  { label: "Day 3", text: "Read topic 26; build and test the withConnection helper." },
+  { label: "Day 4", text: "Read topic 27; split my current task into steps of a day or less." },
+  { label: "Day 5", text: "Audit catch blocks in one project and fix three." },
+]} />
+
+Done when: I can write a contract for any function on request, my
+resource helper passes its error-path test, and I have removed at least
+three silent catches from real code.
