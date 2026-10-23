@@ -49,4 +49,30 @@ const plans = defineCollection({
   }),
 });
 
-export const collections = { blog, log, plans };
+// One page per book the plans cite. The slug is the file name and must be a
+// slug in src/data/books.ts; the page draws its shelf and its citing plans
+// from there. See docs/BOOK_PAGE_GUIDE.md before writing one.
+const books = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/books' }),
+  schema: z.object({
+    /** The page title: the book's title, then what the page is. */
+    title: z.string(),
+    /** The meta description, unique to this page. */
+    description: z.string(),
+    /** The edition the chapter breakdown follows. */
+    edition: z.string(),
+    /** Whether the chapter list was checked against an official table of
+     *  contents. If it was not, the page says so and is organised by the
+     *  book's known parts instead of invented chapters. */
+    tocVerified: z.boolean(),
+    /** Where the chapter list was checked: publisher, author or library
+     *  catalogue pages. */
+    tocSources: z.array(z.string().url()).min(1),
+    /** Ids of published notes that relate, "<series>/<number>". Only the
+     *  ones that exist are shown. */
+    notes: z.array(z.string()).default([]),
+    date: z.coerce.date(),
+  }),
+});
+
+export const collections = { blog, log, plans, books };
