@@ -1,0 +1,2074 @@
+---
+book: the-c-programming-language
+number: 5
+title: "Pointers and Arrays"
+description: "K&R chapter 5 in depth: addresses, pointer arguments, the array-pointer relationship, address arithmetic, strings, pointer arrays, 2D arrays, argv, function pointers and reading declarations."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Chapter 5 is the heart of C. A **pointer** is a variable that holds the
+address of another object, and C's arrays, strings, function arguments and
+dynamic data structures are all built on pointers. This page teaches every
+section of the chapter, with diagrams of memory for each idea and a running
+list of the ways pointer code goes wrong.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- take an address with `&`, follow it with `*`, and draw what each pointer points at;
+- write functions that change their caller's variables through pointer parameters;
+- explain exactly how `a[i]` and `*(a + i)` relate, and where arrays and pointers differ;
+- do pointer arithmetic correctly and know which comparisons and subtractions are defined;
+- write string functions with pointers, and sort lines through an array of pointers;
+- use two-dimensional arrays, `argv`, function pointers, and read any C declaration.
+
+What you should already know: <a href={withBase('/books/the-c-programming-language/04-functions-and-program-structure/')}>chapter 4</a>,
+and chapter 1's call by value and character arrays.
+
+Reading time: about two hours, plus three or four evenings for the
+programs. Do not rush it; everything after this chapter assumes it.
+
+## Chapter map
+
+<Layers caption="Chapter 5 from a single pointer up to declarations of any complexity. Each layer uses the ones above it." layers={[
+  { name: "5.1 and 5.2 Pointers", note: "& and *, and pointers as function arguments" },
+  { name: "5.3 and 5.4 Pointers and arrays", note: "a[i] is *(a+i); arithmetic, comparison, subtraction" },
+  { name: "5.5 Strings through pointers", note: "char *, string literals, strcpy and strcmp" },
+  { name: "5.6 to 5.9 Arrays of pointers and 2D arrays", note: "sorting lines, day of year, ragged arrays" },
+  { name: "5.10 and 5.11 argv and function pointers", note: "command-line arguments, generic sorting" },
+  { name: "5.12 Complicated declarations", note: "reading int (*(*f)(void))[3]" },
+]} />
+
+<Figure art={`
+   address      memory           name
+             +-----------+
+   0x1000    |    42     |  <--  int x
+             +-----------+
+   0x1008    |  0x1000   |  <--  int *p = &x       *p is 42
+             +-----------+
+   0x1010    |  0x1008   |  <--  int **pp = &p     **pp is 42
+             +-----------+
+`} caption="The idea of the whole chapter in one picture. A pointer is a variable whose value is an address; following it with * reaches the object stored there." />
+
+## 5.1 Pointers and Addresses
+
+### In one sentence
+
+`&x` is the address of `x`, a pointer variable stores such an address, and
+`*p` is the object the pointer points at.
+
+### The idea
+
+Memory is an array of numbered bytes, and every object occupies some of
+them. The unary operator `&` gives the **address** of an object: `p = &c;`
+makes `p` point to `c`. It applies only to objects in memory (variables and
+array elements), not to constants, expressions or `register` variables.
+
+The unary operator `*` is **indirection** or **dereferencing**: applied to
+a pointer, it gives the object the pointer points to. If `p` points to
+`c`, then `*p` can be used anywhere `c` could, on either side of an
+assignment.
+
+A pointer's declaration mirrors its use: `int *ip;` says that `*ip` is an
+`int`. Every pointer points to a specific type, so the compiler knows what
+`*ip` is and how big it is. The exception is `void *`, a pointer to
+anything, which must be converted before it is dereferenced.
+
+### Worked example
+
+```c
+/* addr.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int x = 1, y = 2, z[3] = {7, 8, 9};
+    int *ip;
+    ip = &x;          /* ip points to x */
+    y = *ip;          /* y is now 1 */
+    *ip = 0;          /* x is now 0 */
+    ip = &z[0];       /* ip points to z[0] */
+    *ip += 10;        /* z[0] is now 17 */
+    ++*ip;            /* z[0] is 18 */
+    (*ip)++;          /* z[0] is 19; parentheses needed */
+    printf("x=%d y=%d z[0]=%d\n", x, y, z[0]);
+    return 0;
+}
+```
+
+```text
+x=0 y=1 z[0]=19
+```
+
+The parentheses in `(*ip)++` matter. Unary operators like `*` and `++`
+associate right to left, so `*ip++` means `*(ip++)`: it increments the
+pointer, not the value.
+
+### Step by step
+
+<Trace columns={["statement", "x", "y", "z[0]", "ip points to"]} rows={[
+  ["ip = &x", "1", "2", "7", "x"],
+  ["y = *ip", "1", "1", "7", "x"],
+  ["*ip = 0", "0", "1", "7", "x"],
+  ["ip = &z[0]", "0", "1", "7", "z[0]"],
+  ["*ip += 10", "0", "1", "17", "z[0]"],
+  ["++*ip; (*ip)++", "0", "1", "19", "z[0]"],
+]} caption="Each assignment through *ip changes whatever ip currently points at. Re-aiming the pointer changes which variable later writes reach." />
+
+### Common mistake
+
+Dereferencing a pointer that does not point anywhere valid. An
+uninitialised pointer holds garbage, so `*p = 5` writes to a random
+address. A **null pointer** (`NULL`, or 0 in pointer context) points
+nowhere by definition; dereferencing it is undefined and normally crashes
+with a segmentation fault. Initialise every pointer, to a real object or to
+`NULL`, and check before use when null is possible.
+
+```c
+/* nullp.c */
+#include <stdio.h>
+
+static int read_or_default(const int *p) { return p ? *p : -1; }
+
+int main(void)
+{
+    int v = 7;
+    printf("%d %d\n", read_or_default(&v), read_or_default(NULL));
+    return 0;
+}
+```
+
+```text
+7 -1
+```
+
+### In real systems
+
+Null pointer dereferences are among the most common crash causes in C and
+C++ code. Tony Hoare, who introduced null references in ALGOL W, later
+called them his "billion-dollar mistake". Static analysers track which
+pointers may be null, and newer languages make nullability part of the
+type.
+
+### Check yourself
+
+**After `int a = 5, *p = &a;`, what is `*p + 1`, and does it change `a`?**
+
+<details>
+<summary>Answer</summary>
+
+6, and no. It reads `a` through `p` and adds one; nothing is assigned.
+
+</details>
+
+**What does `*p++` increment?**
+
+<details>
+<summary>Answer</summary>
+
+The pointer. It yields `*p`, then moves `p` to the next element. To
+increment the pointed-to value write `(*p)++`.
+
+</details>
+
+## 5.2 Pointers and Function Arguments
+
+### In one sentence
+
+Because C passes arguments by value, a function changes its caller's
+variables only when it is given pointers to them.
+
+### The idea
+
+A function receives copies of its arguments. A `swap(a, b)` that exchanges
+its parameters exchanges the copies, and the caller sees no change. The fix
+is to pass the addresses, `swap(&a, &b)`, and have the function exchange
+the objects the pointers point to.
+
+Pointer parameters also let a function return more than one result. The
+book's example is `getint`, which reads an integer from input: the return
+value says whether it succeeded (a number, end of file, or not a number)
+and the number itself goes through a pointer argument. This is the same
+convention `scanf` uses, which is why `scanf("%d", &n)` needs the `&`.
+
+<Figure art={`
+   caller:  a = 1    b = 2            swap(&a, &b)
+              ^        ^
+              |        |
+   swap:    px ------ /|             *px and *py are a and b
+                 py --/
+           tmp = *px; *px = *py; *py = tmp;   ->  a = 2, b = 1
+`} caption="swap through pointers. The function gets copies of two addresses, but the addresses lead back to the caller's variables, so the writes land there." />
+
+### Worked example
+
+```c
+/* swap.c */
+#include <stdio.h>
+
+static void swap_wrong(int x, int y) { int t = x; x = y; y = t; }
+static void swap(int *px, int *py) { int t = *px; *px = *py; *py = t; }
+
+int main(void)
+{
+    int a = 1, b = 2;
+    swap_wrong(a, b);
+    printf("%d %d\n", a, b);
+    swap(&a, &b);
+    printf("%d %d\n", a, b);
+    return 0;
+}
+```
+
+```text
+1 2
+2 1
+```
+
+My `getint`, which skips white space, handles a sign and returns `EOF`, 0
+for "not a number", or a positive value for success:
+
+```c
+/* getint.c */
+#include <ctype.h>
+#include <stdio.h>
+
+static int getint(int *pn)
+{
+    int c, sign;
+    while (isspace(c = getchar()))
+        ;
+    if (!isdigit(c) && c != EOF && c != '+' && c != '-') {
+        ungetc(c, stdin);            /* not a number: leave it */
+        return 0;
+    }
+    sign = (c == '-') ? -1 : 1;
+    if (c == '+' || c == '-')
+        c = getchar();
+    for (*pn = 0; isdigit(c); c = getchar())
+        *pn = 10 * *pn + (c - '0');
+    *pn *= sign;
+    if (c != EOF)
+        ungetc(c, stdin);
+    return c;
+}
+```
+
+The rest of `getint.c`:
+
+```c
+/* getint.c, continued */
+int main(void)
+{
+    int v[8], n = 0, r;
+    while (n < 8 && (r = getint(&v[n])) != EOF && r != 0)
+        n++;
+    for (int i = 0; i < n; i++) printf("%d ", v[i]);
+    printf("(%d read)\n", n);
+    return 0;
+}
+```
+
+```text
+$ printf ' 12 -7 +30 x 5\n' | ./getint
+12 -7 30 (3 read)
+```
+
+It stops at `x`, which it pushes back with the library's `ungetc`, so the
+caller could read it as something else.
+
+### Step by step
+
+`getint(&v[0])`: `pn` holds the address of `v[0]`. The loop writes
+`*pn = 10 * *pn + ...`, which is `v[0]` itself, so after reading "12" the
+caller's `v[0]` is 12. The return value is the character after the
+number, the blank, which is positive and so means "success".
+
+### Common mistake
+
+Returning a pointer to a local variable. The local is destroyed when the
+function returns, so the pointer **dangles**, pointing at stack memory that
+the next call reuses:
+
+```c
+/* dangle.c */
+#include <stdio.h>
+
+static int *bad(void)
+{
+    int local = 42;
+    return &local;            /* local dies here */
+}
+
+int main(void)
+{
+    int *p = bad();
+    printf("%s\n", p == NULL ? "gcc returned NULL" : "dangling");
+    return 0;
+}
+```
+
+```text
+gcc returned NULL
+```
+
+gcc warns "function returns address of local variable" and, at every
+optimisation level, actually returns a null pointer instead, so that the
+bug crashes rather than silently reading garbage. Other compilers return
+the dangling address. Either way, the fix is to have the caller provide
+the storage, return a static, or allocate with `malloc`.
+
+### In real systems
+
+"Out parameters" through pointers are everywhere in C APIs: `scanf`,
+`strtol`'s end pointer, POSIX `pthread_create`'s thread ID, and every
+function that returns an error code and puts its result through a pointer.
+The convention "return status, results via pointers" is the C idiom for
+multiple return values.
+
+### Check yourself
+
+**Why does `scanf("%d", n)` crash or misbehave, while `scanf("%d", &n)` works?**
+
+<details>
+<summary>Answer</summary>
+
+`scanf` needs an address to store into. Passing `n` passes its value, which
+`scanf` treats as an address and writes to. gcc's `-Wformat` warns.
+
+</details>
+
+## 5.3 Pointers and Arrays
+
+### In one sentence
+
+In C, `a[i]` is defined as `*(a + i)`, and an array's name in an expression
+becomes a pointer to its first element.
+
+### The idea
+
+Any operation done by array subscripting can be done with pointers. If
+`pa` points to `a[0]`, then `pa + 1` points to `a[1]`, `pa + i` points to
+`a[i]`, and `*(pa + i)` is `a[i]`. This works for every element type,
+because pointer arithmetic counts in elements, not bytes.
+
+The name of an array, used in an expression, is converted to a pointer to
+its first element, so `pa = &a[0]` and `pa = a` are the same. That is
+called **array decay**. The rule goes the other way too: a pointer can be
+subscripted, `pa[i]` meaning `*(pa + i)`.
+
+There is one crucial difference: an array name is not a variable. `pa = a`
+and `pa++` are legal; `a = pa` and `a++` are not. And `sizeof a` gives the
+size of the whole array, while `sizeof pa` gives the size of a pointer.
+
+When an array is passed to a function, what is passed is the pointer to its
+first element. In a parameter list, `char s[]` and `char *s` mean exactly
+the same thing: the function gets a pointer and has no idea how long the
+array is.
+
+### Worked example
+
+```c
+/* decay.c */
+#include <stdio.h>
+
+static size_t size_in_callee(int a[]) { return sizeof a; }   /* pointer! */
+
+int main(void)
+{
+    int a[5] = {10, 20, 30, 40, 50};
+    int *pa = a;                              /* same as &a[0] */
+    printf("%d %d %d %d\n", a[2], *(a + 2), pa[2], *(pa + 2));
+    printf("%zu %zu %zu\n", sizeof a, sizeof pa, size_in_callee(a));
+    printf("%d\n", 2[a]);                     /* *(2 + a): legal, silly */
+    return 0;
+}
+```
+
+```text
+30 30 30 30
+20 8 8
+30
+```
+
+gcc warns "'sizeof' on array function parameter 'a' will return size of
+'int *'". `2[a]` is legal because `a[i]` is `*(a + i)` and addition
+commutes; it is a curiosity, not a style.
+
+A realistic use is `strlen` written with a pointer:
+
+```c
+/* mystrlen.c */
+#include <stdio.h>
+
+static size_t mystrlen(const char *s)
+{
+    const char *p = s;
+    while (*p != '\0')
+        p++;
+    return (size_t)(p - s);       /* pointer subtraction: elements */
+}
+
+int main(void)
+{
+    char buf[] = "pointer";
+    printf("%zu %zu %zu\n", mystrlen(buf), mystrlen("hi"), mystrlen(buf + 3));
+    return 0;
+}
+```
+
+```text
+7 2 4
+```
+
+Passing `buf + 3` hands the function a pointer into the middle of the
+array, and it sees the string "nter". Functions cannot tell a whole array
+from a part of one.
+
+### Step by step
+
+<Figure art={`
+   a:   +----+----+----+----+----+
+        | 10 | 20 | 30 | 40 | 50 |
+        +----+----+----+----+----+
+        a[0] a[1] a[2] a[3] a[4]
+         ^         ^              ^
+         pa        pa+2           pa+5 (one past the end: may point,
+                                        may not dereference)
+`} caption="Pointer arithmetic over an array. pa+i points i elements along, whatever the element size; a pointer one past the end is valid to form and compare, never to dereference." />
+
+### Common mistake
+
+Expecting `sizeof` to give an array's length inside a function. It gives
+the pointer size, 8 on a 64-bit machine. Every function that takes an array
+needs its length as another parameter, or a terminator like `'\0'`.
+
+### In real systems
+
+The lack of a length in a decayed array is the root of buffer overflows,
+the most exploited class of C bug. Modern APIs always pass `(pointer,
+length)` pairs (`memcpy`, `read`, `snprintf`), and C23 and compiler
+extensions add ways to annotate the relationship so tools can check it.
+
+### Check yourself
+
+**Is `int a[3]; a++;` legal?**
+
+<details>
+<summary>Answer</summary>
+
+No. An array name is not a modifiable variable. A pointer initialised from
+it, `int *p = a;`, can be incremented.
+
+</details>
+
+## 5.4 Address Arithmetic
+
+### In one sentence
+
+You can add an integer to a pointer, subtract two pointers into the same
+array, and compare them, and C scales every step by the size of the pointed
+type.
+
+### The idea
+
+If `p` points into an array, `p + n` points `n` elements further, and
+`p - q` for two pointers into the same array is the number of elements
+between them, of type `ptrdiff_t`. Pointers into the same array can be
+compared with `<`, `==` and the rest. All of this is scaled: for an `int *`,
+`p + 1` is 4 bytes along; for a `double *`, 8.
+
+The valid range is the array's elements plus one position past the end.
+Forming any other pointer, even without dereferencing it, is undefined, as
+is comparing or subtracting pointers into different arrays. Any pointer
+can be compared for equality with `NULL`.
+
+The book demonstrates with a tiny **storage allocator**: a big static
+character array, a pointer to its next free position, `alloc(n)` which
+hands out `n` bytes and advances the pointer, and `afree(p)` which gives
+back storage in the reverse order it was allocated. It is a stack of
+memory, and the checks are all pointer comparisons.
+
+### Worked example
+
+```c
+/* alloc.c */
+#include <stdio.h>
+
+#define ALLOCSIZE 64
+static char allocbuf[ALLOCSIZE];
+static char *allocp = allocbuf;            /* next free position */
+
+static char *alloc(size_t n)
+{
+    if ((size_t)(allocbuf + ALLOCSIZE - allocp) >= n) {
+        allocp += n;
+        return allocp - n;                 /* old position */
+    }
+    return NULL;                           /* not enough room */
+}
+```
+
+The rest of `alloc.c`:
+
+```c
+/* alloc.c, continued */
+static void afree(char *p)                 /* free storage from p on */
+{
+    if (p >= allocbuf && p < allocbuf + ALLOCSIZE)
+        allocp = p;
+}
+
+int main(void)
+{
+    char *a = alloc(40), *b = alloc(20), *c = alloc(10);
+    printf("%td %td %s\n", a - allocbuf, b - allocbuf, c ? "ok" : "NULL");
+    afree(b);
+    c = alloc(10);
+    printf("%td\n", c - allocbuf);
+    return 0;
+}
+```
+
+```text
+0 40 NULL
+40
+```
+
+I compute the free space as `allocbuf + ALLOCSIZE - allocp` rather than
+forming `allocp + n` and comparing, because `allocp + n` beyond one past
+the end is itself undefined.
+
+### Step by step
+
+<Trace columns={["call", "allocp offset before", "result", "allocp offset after"]} rows={[
+  ["alloc(40)", "0", "offset 0", "40"],
+  ["alloc(20)", "40", "offset 40", "60"],
+  ["alloc(10)", "60", "NULL: only 4 left", "60"],
+  ["afree(b)", "60", "-", "40"],
+  ["alloc(10)", "40", "offset 40", "50"],
+]} caption="The stack allocator. allocp only moves forward on alloc and back on afree, so frees must happen in the reverse order of allocations." />
+
+### Common mistake
+
+Pointer arithmetic outside the array, or across arrays:
+
+```c
+/* ptr_ub.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int a[4] = {0}, b[4] = {0};
+    int *end = a + 4;          /* fine: one past the end */
+    /* int *bad = a + 5;          undefined, even unused   */
+    /* ptrdiff_t d = b - a;       undefined: two arrays    */
+    printf("%td %d\n", end - a, end == a + 4);
+    (void)b;
+    return 0;
+}
+```
+
+```text
+4 1
+```
+
+On flat-memory machines the undefined versions usually compute the
+"obvious" number, which is why the bugs survive. Optimisers, though,
+assume such pointers never exist, and may delete bounds checks written as
+`if (p + n > end)` when `p + n` would overflow. Write bounds checks as
+`if (n > (size_t)(end - p))`.
+
+### In real systems
+
+The `alloc`/`afree` design is a real technique: **arena** or **region**
+allocators, used in compilers, games and web servers, hand out memory by
+bumping a pointer and free everything at once. They are much faster than
+`malloc` for many short-lived objects with a shared lifetime.
+
+### Check yourself
+
+**For `double *p` holding address 1000, what address is `p + 3`?**
+
+<details>
+<summary>Answer</summary>
+
+1024, since each `double` is 8 bytes. Pointer arithmetic is in elements.
+
+</details>
+
+**What type is the difference of two pointers?**
+
+<details>
+<summary>Answer</summary>
+
+`ptrdiff_t`, a signed integer type from `<stddef.h>`, printed with `%td`.
+
+</details>
+
+## 5.5 Character Pointers and Functions
+
+### In one sentence
+
+A string literal is an unnamed, read-only array of characters, and string
+functions are naturally written as loops that walk `char` pointers.
+
+### The idea
+
+A **string literal** such as `"hello"` is an array of characters ending in
+`'\0'`, stored somewhere by the compiler. In an expression it becomes a
+pointer to its first character, which is how `printf("hello")` receives it.
+
+There is an important difference between these two declarations.
+`char amessage[] = "now";` is an array, just big enough for the characters
+and the terminator; its contents can be changed, but `amessage` always
+refers to the same storage. `char *pmessage = "now";` is a pointer,
+initialised to point at a string literal; the pointer can be changed to
+point elsewhere, but modifying the literal through it is undefined.
+
+String functions show the pointer style at its most compact. `strcpy(s, t)`
+copies `t` into `s`; `strcmp(s, t)` returns a negative, zero or positive
+value as `s` is lexicographically less than, equal to or greater than `t`.
+
+<Figure art={`
+  char amessage[] = "now";        char *pmessage = "now";
+
+  amessage: +---+---+---+----+    pmessage: +------+
+            | n | o | w | \\0 |              |  *---+--+
+            +---+---+---+----+              +------+  |
+            (your array, writable)                    v
+                                         +---+---+---+----+
+                                         | n | o | w | \\0 |
+                                         +---+---+---+----+
+                                         (string literal, read-only)
+`} caption="An array initialised from a string owns a writable copy. A pointer initialised from a string points at the literal, which must not be modified." />
+
+### Worked example
+
+Three versions of `strcpy`, from the array style to the idiomatic pointer
+style. They all behave identically:
+
+```c
+/* strcpy3.c */
+#include <stdio.h>
+
+static void cpy_index(char *s, const char *t)
+{
+    int i = 0;
+    while ((s[i] = t[i]) != '\0')
+        i++;
+}
+
+static void cpy_ptr(char *s, const char *t)
+{
+    while ((*s = *t) != '\0') { s++; t++; }
+}
+```
+
+The rest of `strcpy3.c`:
+
+```c
+/* strcpy3.c, continued */
+static void cpy_terse(char *s, const char *t)
+{
+    while ((*s++ = *t++))          /* copy, advance, stop after '\0' */
+        ;
+}
+
+int main(void)
+{
+    char a[8], b[8], c[8];
+    cpy_index(a, "one"); cpy_ptr(b, "two"); cpy_terse(c, "three");
+    printf("%s %s %s\n", a, b, c);
+    return 0;
+}
+```
+
+```text
+one two three
+```
+
+The extra parentheses in `while ((*s++ = *t++))` tell gcc the assignment is
+intended. And my `strcmp`:
+
+```c
+/* mystrcmp.c */
+#include <stdio.h>
+
+static int mystrcmp(const char *s, const char *t)
+{
+    for (; *s == *t; s++, t++)
+        if (*s == '\0')
+            return 0;
+    return (unsigned char)*s - (unsigned char)*t;
+}
+
+int main(void)
+{
+    printf("%d %d %d %d\n", mystrcmp("abc", "abc") == 0,
+           mystrcmp("abc", "abd") < 0, mystrcmp("b", "abc") > 0,
+           mystrcmp("ab", "abc") < 0);
+    return 0;
+}
+```
+
+```text
+1 1 1 1
+```
+
+Comparing as `unsigned char` matches the standard library, which compares
+bytes as unsigned so that é (0xC3 in UTF-8) sorts after z.
+
+### Step by step
+
+`cpy_terse(c, "three")`: on each iteration `*s++ = *t++` copies one
+character, advances both pointers, and yields the character copied. The
+sixth iteration copies the `'\0'`, which is false, so the loop stops with
+the terminator already in place.
+
+### Common mistake
+
+Writing into a string literal, and copying into a buffer that is too small:
+
+```c
+/* literal_write.c */
+#include <stdio.h>
+
+int main(void)
+{
+    char arr[] = "now";
+    char *ptr = "now";
+    arr[0] = 'N';              /* fine: our own array */
+    /* ptr[0] = 'N';              undefined: crashes on Linux */
+    printf("%s %s\n", arr, ptr);
+    return 0;
+}
+```
+
+```text
+Now now
+```
+
+String literals live in a read-only section on Linux, so the commented-out
+line dies with a segmentation fault. Declaring the pointer `const char *`
+turns the mistake into a compile error. The other mistake, `strcpy` into
+too small a buffer, writes past its end; `snprintf` or a bounded copy that
+always terminates is the cure.
+
+### In real systems
+
+`strcpy` with no length is banned in many codebases (Microsoft's SDL list,
+OpenBSD's style) because of overflows. Replacements are `strlcpy` (BSD,
+now also glibc 2.38), `snprintf`, or tracking lengths explicitly. The
+pointer-walking style itself remains the core of every C string library.
+
+### Check yourself
+
+**What is wrong with `char *s; strcpy(s, "hi");`?**
+
+<details>
+<summary>Answer</summary>
+
+`s` is uninitialised, so `strcpy` writes through a garbage pointer. It
+needs to point at an array big enough for three characters.
+
+</details>
+
+## 5.6 Pointer Arrays; Pointers to Pointers
+
+### In one sentence
+
+An array of pointers lets a program reorder or sort variable-length items,
+such as lines of text, by moving pointers instead of the items themselves.
+
+### The idea
+
+Sorting lines of text is awkward with a two-dimensional character array,
+because the lines have different lengths and moving them means copying.
+Instead, store each line once, somewhere, and keep an **array of pointers**,
+`char *lineptr[MAXLINES]`, one per line. Comparing two lines is a
+`strcmp` on two pointers; exchanging them swaps two pointers.
+
+The book's program has three steps: read all lines (storing each and
+recording its pointer), sort the pointers, print the lines in pointer
+order. Its sort is quicksort from chapter 4, adapted to compare with
+`strcmp` and swap pointers.
+
+Since `lineptr` is an array of `char *`, its name decays to a `char **`, a
+**pointer to a pointer**, which is the type of the parameter in
+`writelines(char **lineptr, int n)`.
+
+### Worked example
+
+My version stores lines with `malloc` (preview of chapter 7) and sorts with
+a quicksort on pointers:
+
+```c
+/* sortlines.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAXLINES 100
+static char *lineptr[MAXLINES];
+
+static void swap(char *v[], int i, int j) { char *t = v[i]; v[i] = v[j]; v[j] = t; }
+
+static void qsort_str(char *v[], int left, int right)
+{
+    if (left >= right) return;
+    swap(v, left, left + (right - left) / 2);
+    int last = left;
+    for (int i = left + 1; i <= right; i++)
+        if (strcmp(v[i], v[left]) < 0)
+            swap(v, ++last, i);
+    swap(v, left, last);
+    qsort_str(v, left, last - 1);
+    qsort_str(v, last + 1, right);
+}
+```
+
+The rest of `sortlines.c`:
+
+```c
+/* sortlines.c, continued */
+int main(void)
+{
+    char buf[256];
+    int n = 0;
+    while (n < MAXLINES && fgets(buf, sizeof buf, stdin) != NULL) {
+        if ((lineptr[n] = malloc(strlen(buf) + 1)) == NULL) return 1;
+        strcpy(lineptr[n++], buf);
+    }
+    qsort_str(lineptr, 0, n - 1);
+    for (char **p = lineptr; p < lineptr + n; p++)
+        fputs(*p, stdout);
+    return 0;
+}
+```
+
+```text
+$ printf 'pear\napple\nfig\nbanana\n' | ./sortlines
+apple
+banana
+fig
+pear
+```
+
+### Step by step
+
+<Figure art={`
+   before sorting                    after sorting
+   lineptr[0] --> "pear\\n"           lineptr[0] --> "apple\\n"
+   lineptr[1] --> "apple\\n"          lineptr[1] --> "banana\\n"
+   lineptr[2] --> "fig\\n"            lineptr[2] --> "fig\\n"
+   lineptr[3] --> "banana\\n"         lineptr[3] --> "pear\\n"
+            (the strings themselves never move)
+`} caption="Sorting through an array of pointers. Only the pointers are swapped; each line stays where malloc put it, which makes swaps cheap regardless of line length." />
+
+The output loop walks a `char **p` from `lineptr` to `lineptr + n`; `*p` is
+each `char *`, which `fputs` prints.
+
+### Common mistake
+
+Storing the same buffer pointer in every slot: `lineptr[n++] = buf;`. Every
+element then points at `buf`, which holds only the last line read, so the
+program prints the last line `n` times. Each line needs its own storage,
+which is why the code copies it.
+
+### In real systems
+
+Sorting by pointer or by index, rather than moving records, is standard:
+database engines sort row identifiers, `sort(1)` sorts pointers to lines,
+and C++'s `std::sort` on a vector of pointers does the same thing. It also
+lets one data set have several orderings at once.
+
+### Check yourself
+
+**What is the type of `lineptr` in an expression, and of `*lineptr`?**
+
+<details>
+<summary>Answer</summary>
+
+`char **` (a pointer to the first `char *`) and `char *` (the first line's
+pointer).
+
+</details>
+
+## 5.7 Multi-dimensional Arrays
+
+### In one sentence
+
+A two-dimensional array is an array of arrays stored row after row, and a
+function receiving one must be told the length of every dimension except
+the first.
+
+### The idea
+
+`int t[2][13]` is an array of 2 elements, each an array of 13 `int`s. It is
+stored in **row-major order**: all of row 0, then all of row 1. An element
+is written `t[i][j]`, not `t[i, j]`, which would be the comma operator.
+
+The book's example converts between a day of the month and the day of the
+year, using a table of days per month with one row for ordinary years and
+one for leap years. The leap flag, 0 or 1, indexes the row.
+
+When a 2D array is passed to a function, what is passed is a pointer to its
+first row, of type `int (*)[13]`: a pointer to an array of 13 ints. So the
+parameter can be written `int t[2][13]`, `int t[][13]` or `int (*t)[13]`,
+and the column count is required so the compiler can compute where row `i`
+starts.
+
+### Worked example
+
+```c
+/* dayofyear.c */
+#include <stdio.h>
+
+static const char daytab[2][13] = {
+    {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+    {0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+};
+
+static int is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+static int day_of_year(int year, int month, int day)
+{
+    int leap = is_leap(year);
+    if (month < 1 || month > 12 || day < 1 || day > daytab[leap][month])
+        return -1;
+    for (int i = 1; i < month; i++)
+        day += daytab[leap][i];
+    return day;
+}
+```
+
+The rest of `dayofyear.c`:
+
+```c
+/* dayofyear.c, continued */
+static void month_day(int year, int yearday, int *pmonth, int *pday)
+{
+    int leap = is_leap(year), i;
+    for (i = 1; i <= 12 && yearday > daytab[leap][i]; i++)
+        yearday -= daytab[leap][i];
+    *pmonth = i;
+    *pday = yearday;
+}
+
+int main(void)
+{
+    int m, d;
+    month_day(2024, 60, &m, &d);
+    printf("%d %d %d %d/%d\n", day_of_year(2024, 3, 1),
+           day_of_year(2023, 3, 1), day_of_year(2023, 2, 29), m, d);
+    return 0;
+}
+```
+
+```text
+61 60 -1 2/29
+```
+
+Column 0 is a dummy so that month numbers 1 to 12 index directly. The range
+check is my addition; returning -1 for 29 February 2023 is what stops
+garbage input producing a plausible answer.
+
+### Step by step
+
+<Figure art={`
+   daytab[2][13] in memory (row-major):
+
+   | 0 31 28 31 ... 31 | 0 31 29 31 ... 31 |
+   |<---- row 0 ----->|<---- row 1 ----->|
+     daytab[0][0..12]     daytab[1][0..12]
+
+   daytab[i][j] is at offset  i * 13 + j  elements from the start
+`} caption="A 2D array is one block of memory, row after row. The compiler needs the row length (13) to turn [i][j] into an offset, which is why parameters must give it." />
+
+### Common mistake
+
+Passing a 2D array to a parameter of type `int **`. They are different
+types: a 2D array decays to a pointer to an array (`int (*)[13]`), not a
+pointer to a pointer. gcc reports "incompatible pointer type", and forcing
+it with a cast makes the function read array contents as addresses.
+
+### In real systems
+
+Row-major layout determines performance: looping over `t[i][j]` with `j` in
+the inner loop walks memory sequentially and uses the cache well; swapping
+the loops strides across rows and can be several times slower on large
+arrays. Numeric libraries, image buffers and game grids are all laid out
+with this in mind.
+
+### Check yourself
+
+**Why must a function parameter for `int m[4][5]` give the 5 but not the 4?**
+
+<details>
+<summary>Answer</summary>
+
+To find row `i` the compiler multiplies `i` by the row length, 5. The
+number of rows is never needed for address calculation.
+
+</details>
+
+## 5.8 Initialization of Pointer Arrays
+
+### In one sentence
+
+An array of pointers can be initialised with a list of string literals,
+giving a compact table of names.
+
+### The idea
+
+The syntax is the same as for any array initialiser: a brace list. For an
+array of `char *`, each initialiser is a string literal, which places the
+characters somewhere in memory and stores a pointer to them in the
+element. The size can be omitted and counted by the compiler.
+
+The book's example returns the name of the nth month. The table is
+internal to the function and declared `static`, so it is built once, not
+on every call, and the function returns a pointer into it.
+
+### Worked example
+
+```c
+/* monthname.c */
+#include <stdio.h>
+
+static const char *month_name(int n)
+{
+    static const char *const name[] = {
+        "Illegal month", "January", "February", "March", "April",
+        "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    };
+    return (n < 1 || n > 12) ? name[0] : name[n];
+}
+
+int main(void)
+{
+    printf("%s, %s, %s\n", month_name(1), month_name(12), month_name(13));
+    printf("%zu entries\n", sizeof (const char *[]){ "a", "b" } / sizeof (char *));
+    return 0;
+}
+```
+
+```text
+January, December, Illegal month
+2 entries
+```
+
+`const char *const` means the strings cannot be modified through the table
+and the table's pointers cannot be changed. The second `printf` uses a
+compound literal (C99) only to show that the compiler counts initialisers.
+
+### Step by step
+
+`month_name(13)` fails the range test and returns `name[0]`, a pointer to
+"Illegal month". Because `name` is `static`, the returned pointer stays
+valid after the function returns, unlike 5.2's dangling local.
+
+### Common mistake
+
+Omitting the trailing comma when adding to the list is harmless, but
+omitting a comma between two literals is not: `"May" "June"` is silently
+concatenated into "MayJune", the table becomes one shorter, and every
+later month is off by one. gcc 14 has no default warning for this; clang
+has `-Wstring-concatenation`.
+
+### In real systems
+
+Tables of strings indexed by an enum are how C programs map error codes to
+messages (`strerror`), opcodes to mnemonics and states to names for
+logging. Designated initialisers make them robust:
+`[ERR_NOMEM] = "out of memory"` stays correct when the enum is reordered.
+
+### Check yourself
+
+**Why is `name` declared `static` inside `month_name`?**
+
+<details>
+<summary>Answer</summary>
+
+So the table is created once, before the program runs, rather than on every
+call, and so pointers into it remain valid after the function returns.
+
+</details>
+
+## 5.9 Pointers vs. Multi-dimensional Arrays
+
+### In one sentence
+
+`int a[10][20]` is one block of 200 ints, while `int *b[10]` is ten
+pointers that may each point to rows of different lengths.
+
+### The idea
+
+Both `a[3][4]` and `b[3][4]` are legal and look alike, but the memory is
+completely different. `a` is a true 2D array: 200 `int`s allocated
+together, and `a[3][4]` is computed as offset 3 times 20 plus 4. `b`
+allocates only 10 pointers, and each must be made to point somewhere
+before use. `b[3][4]` follows the pointer `b[3]`, then indexes.
+
+The advantage of the pointer array is that its rows can have different
+lengths, a **ragged array**. Strings are the classic case: an array of
+pointers to month names wastes no space, while a `char[13][15]` table pads
+every name to 15 bytes.
+
+### Worked example
+
+```c
+/* ragged.c */
+#include <stdio.h>
+
+int main(void)
+{
+    char aname[][15] = { "Illegal month", "Jan", "Feb", "Mar" };
+    const char *pname[] = { "Illegal month", "Jan", "Feb", "Mar" };
+    printf("2D array: %zu bytes\n", sizeof aname);
+    printf("pointers: %zu bytes + strings\n", sizeof pname);
+    printf("%c %c\n", aname[2][0], pname[2][0]);
+    return 0;
+}
+```
+
+```text
+2D array: 60 bytes
+pointers: 32 bytes + strings
+F F
+```
+
+### Step by step
+
+<Compare left="char aname[][15]" right="const char *pname[]" caption="Two ways to store a list of names. Indexing syntax is identical; memory layout, cost and flexibility are not." rows={[
+  ["one block: 4 rows of 15 bytes", "4 pointers, strings stored separately"],
+  ["every row padded to 15", "each string exactly as long as it needs"],
+  ["aname[i][j] is an offset computation", "pname[i][j] loads a pointer, then indexes"],
+  ["rows can be modified in place", "literals are read-only"],
+  ["decays to char (*)[15]", "decays to const char **"],
+]} />
+
+### Common mistake
+
+Using a pointer array as if its rows were allocated: `int *rows[3];
+rows[0][0] = 1;` writes through an uninitialised pointer. Each row must be
+pointed at an array or `malloc`ed first.
+
+### In real systems
+
+`argv` (next section) is a ragged array. Sparse matrices, adjacency lists
+for graphs and tables of variable-length records all use arrays of pointers
+for the same reason: rows of different sizes without padding.
+
+### Check yourself
+
+**How many bytes does `int *b[10]` allocate on a 64-bit machine?**
+
+<details>
+<summary>Answer</summary>
+
+80, for ten 8-byte pointers. No `int`s are allocated.
+
+</details>
+
+## 5.10 Command-line Arguments
+
+### In one sentence
+
+`main(int argc, char *argv[])` receives the number of command-line words
+and an array of pointers to them, with `argv[0]` the program name and
+`argv[argc]` a null pointer.
+
+### The idea
+
+When the shell runs a program, it passes the words of the command line.
+`argc` (argument count) is how many there are, including the program name.
+`argv` (argument vector) is an array of pointers to strings, one per word,
+and the standard guarantees `argv[argc]` is `NULL`.
+
+The simplest example is `echo`, which prints its arguments separated by
+blanks. The book writes it twice, once indexing `argv` and once walking it
+with a pointer, which is a good drill in `char **`.
+
+The more realistic example is a pattern finder with options, in the Unix
+style: `find -x -n pattern` prints lines that do not match (`-x`), with line
+numbers (`-n`), and the flags can be combined as `-nx`. Parsing them means
+walking `argv` and, inside each argument that starts with `-`, walking its
+characters.
+
+### Worked example
+
+```c
+/* myecho.c */
+#include <stdio.h>
+
+int main(int argc, char *argv[])
+{
+    while (--argc > 0)
+        printf((argc > 1) ? "%s " : "%s", *++argv);
+    printf("\n");
+    return 0;
+}
+```
+
+```text
+$ ./myecho hello,   world
+hello, world
+```
+
+`*++argv` first moves `argv` from the program name to the next argument,
+then fetches it. The shell, not the program, collapsed the extra blanks.
+
+The option-parsing pattern finder:
+
+```c
+/* findopt.c */
+#include <stdio.h>
+#include <string.h>
+
+static int search(const char *pat, int except, int number)
+{
+    char line[256];
+    long lineno = 0;
+    int found = 0;
+    while (fgets(line, sizeof line, stdin) != NULL) {
+        lineno++;
+        if ((strstr(line, pat) != NULL) != except) {
+            if (number) printf("%ld:", lineno);
+            fputs(line, stdout);
+            found++;
+        }
+    }
+    return found;
+}
+```
+
+The option parsing is in `main`:
+
+```c
+/* findopt.c, continued */
+int main(int argc, char *argv[])
+{
+    int except = 0, number = 0, c;
+    while (--argc > 0 && (*++argv)[0] == '-')
+        while ((c = *++argv[0]))
+            switch (c) {
+            case 'x': except = 1; break;
+            case 'n': number = 1; break;
+            default:
+                fprintf(stderr, "find: illegal option %c\n", c);
+                return 2;
+            }
+    if (argc != 1) {
+        fprintf(stderr, "usage: find -x -n pattern\n");
+        return 2;
+    }
+    return search(*argv, except, number) ? 0 : 1;
+}
+```
+
+```text
+$ printf 'cat\ndog\ncatalog\n' | ./findopt -n cat
+1:cat
+3:catalog
+$ printf 'cat\ndog\ncatalog\n' | ./findopt -nx cat
+2:dog
+$ ./findopt -q cat 2>&1; echo "status $?"
+find: illegal option q
+status 2
+```
+
+### Step by step
+
+<Figure art={`
+  $ ./findopt -nx cat
+
+  argv --> [0] --> "./findopt\\0"
+           [1] --> "-nx\\0"        (*++argv)[0] == '-': an option word
+           [2] --> "cat\\0"        the pattern
+           [3] --> NULL            argv[argc]
+
+  inner loop: *++argv[0] walks 'n', 'x', then '\\0' ends it
+`} caption="argv for findopt -nx cat. The outer loop moves argv along the array; the inner loop moves argv[0] along the characters of one option word." />
+
+`*++argv[0]` parses as `*(++(argv[0]))`: it advances the pointer stored in
+`argv[0]` (which is now the current argument) to the next character and
+fetches it. `(*++argv)[0]` needs its parentheses, because without them
+`*++argv[0]` would mean the inner-loop expression.
+
+### Common mistake
+
+Reading `argv[1]` without checking `argc`. With no arguments, `argv[1]` is
+the terminating `NULL`, and `strcmp(argv[1], ...)` dereferences it. Always
+check `argc` before indexing. For real programs, use `getopt`, which
+handles combined flags, option arguments and `--`.
+
+### In real systems
+
+POSIX `getopt` and GNU `getopt_long` implement exactly this parsing, and
+the Unix conventions (single-letter flags, combinable, `--` ending options)
+come from the same era as this book. Exit status 2 for usage errors and 1
+for "no match" is `grep`'s convention, which scripts rely on.
+
+### Check yourself
+
+**For `./prog a b`, what are `argc`, `argv[2]` and `argv[3]`?**
+
+<details>
+<summary>Answer</summary>
+
+3, a pointer to "b", and `NULL`.
+
+</details>
+
+## 5.11 Pointers to Functions
+
+### In one sentence
+
+A function's name can be used as a pointer to it, so functions can be
+stored in variables, put in arrays and passed to other functions.
+
+### The idea
+
+A function is not a variable, but you can take a pointer to one. The name
+of a function, used without a call, decays to a pointer to it, like an
+array name. `int (*cmp)(const void *, const void *)` declares `cmp` as a
+pointer to a function taking two `const void *` and returning `int`, and
+`cmp(a, b)` or `(*cmp)(a, b)` calls it.
+
+The book's use is a sort that can sort lines either as text or as numbers:
+the comparison function is passed as an argument, so the sorting algorithm
+does not change. Its elements are passed as `void *`, a generic pointer, so
+the sort can work on any type.
+
+The standard library's `qsort` (Appendix B) is exactly this design, and it
+is how C does what other languages call higher-order functions or generics.
+
+### Worked example
+
+Sorting the same lines two ways with the library `qsort` and two comparison
+functions:
+
+```c
+/* sortcmp.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int cmp_text(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static int cmp_num(const void *a, const void *b)
+{
+    double x = atof(*(char *const *)a), y = atof(*(char *const *)b);
+    return (x > y) - (x < y);              /* -1, 0 or 1, no overflow */
+}
+```
+
+The rest of `sortcmp.c`:
+
+```c
+/* sortcmp.c, continued */
+static void show(char *v[], int n)
+{
+    for (int i = 0; i < n; i++) printf("%s ", v[i]);
+    printf("\n");
+}
+
+int main(int argc, char *argv[])
+{
+    char *v[] = {"10", "9", "100", "2.5", "-3"};
+    int numeric = argc > 1 && strcmp(argv[1], "-n") == 0;
+    int (*cmp)(const void *, const void *) = numeric ? cmp_num : cmp_text;
+    qsort(v, 5, sizeof v[0], cmp);
+    show(v, 5);
+    return 0;
+}
+```
+
+```text
+$ ./sortcmp
+-3 10 100 2.5 9 
+$ ./sortcmp -n
+-3 2.5 9 10 100 
+```
+
+`qsort` passes pointers to the elements, and each element is a `char *`, so
+the comparator receives a `char **` disguised as `const void *`. The cast
+`*(char *const *)a` recovers the string.
+
+### Step by step
+
+<Flow steps={["main chooses cmp_text or cmp_num", "qsort(v, 5, sizeof v[0], cmp)", "qsort calls cmp(&v[i], &v[j]) as it sorts", "cmp casts back to char ** and compares the strings", "returns negative, zero or positive"]} caption="How a function pointer flows through qsort. The sort knows nothing about strings or numbers; all type knowledge is in the comparator." />
+
+A table of function pointers is the other common use: a dispatch table
+indexed by a command, replacing a long `switch`.
+
+```c
+/* dispatch_table.c */
+#include <stdio.h>
+
+static double add(double a, double b) { return a + b; }
+static double sub(double a, double b) { return a - b; }
+static double mul(double a, double b) { return a * b; }
+
+int main(void)
+{
+    static double (*const ops[])(double, double) = { add, sub, mul };
+    const char *names = "+-*";
+    for (int i = 0; i < 3; i++)
+        printf("6 %c 4 = %g\n", names[i], ops[i](6, 4));
+    return 0;
+}
+```
+
+```text
+6 + 4 = 10
+6 - 4 = 2
+6 * 4 = 24
+```
+
+### Common mistake
+
+Calling through a function pointer of the wrong type. Casting `strcmp`
+directly to `int (*)(const void *, const void *)` and passing it to `qsort`
+for an array of `char *` compares the pointers' bytes as if they were
+strings, producing nonsense. Calling a function through an incompatible
+pointer type is undefined. Write a small wrapper with the exact signature,
+as above. The other classic is a comparator returning `a - b` on ints,
+which overflows for values of opposite sign.
+
+### In real systems
+
+Function pointers are C's mechanism for callbacks (`qsort`, `atexit`,
+`signal`), plugin interfaces, and object-oriented designs: the Linux kernel's
+`struct file_operations` is a table of function pointers that each driver
+fills in, which is a hand-built virtual method table.
+
+### Check yourself
+
+**Why does `cmp_num` return `(x > y) - (x < y)` rather than `x - y`?**
+
+<details>
+<summary>Answer</summary>
+
+The result must be an `int`; converting a `double` difference like 0.5
+truncates it to 0, wrongly saying "equal". For integers, `x - y` can
+overflow.
+
+</details>
+
+## 5.12 Complicated Declarations
+
+### In one sentence
+
+C declarations are read from the name outwards, with `[]` and `()` binding
+tighter than `*`, and `typedef` is the way to keep them readable.
+
+### The idea
+
+A C declaration mimics use: `int *f()` says that `*f()` is an `int`, so `f`
+is a function returning a pointer to `int`. `int (*pf)()` says `(*pf)()` is
+an `int`, so `pf` is a pointer to a function returning `int`. The
+parentheses change everything, because the postfix operators `[]` (array
+of) and `()` (function returning) bind more tightly than prefix `*`
+(pointer to).
+
+The reading rule is: start at the name, read right while you see `[]` or
+`()`, then read left for `*`, and step out through parentheses, repeating.
+The book writes a program, `dcl`, that converts declarations to words by
+recursive descent on that grammar, and its inverse, `undcl`.
+
+When a declaration gets hard to read, name the pieces with `typedef`
+(chapter 6). `typedef int (*cmpfn)(const void *, const void *);` turns the
+qsort comparator type into one word.
+
+### Worked example
+
+A table of declarations, each read in words:
+
+<Trace columns={["declaration", "read as"]} rows={[
+  ["int *a[10]", "a: array of 10 pointers to int"],
+  ["int (*a)[10]", "a: pointer to array of 10 ints"],
+  ["int *f(void)", "f: function returning pointer to int"],
+  ["int (*pf)(void)", "pf: pointer to function returning int"],
+  ["char **argv", "argv: pointer to pointer to char"],
+  ["void (*signal(int, void (*)(int)))(int)", "signal: function (int, pointer to function (int) returning void) returning pointer to function (int) returning void"],
+  ["int (*(*x)(void))[3]", "x: pointer to function returning pointer to array of 3 ints"],
+]} caption="Reading declarations from the name outwards. Right for [] and (), left for *, out through parentheses; the signal line is the standard library's own." />
+
+Here is a tiny version of the reading rule, my own, handling names, `*`,
+`[n]`, `()` and parentheses. It is a recursive descent parser over the
+grammar "a declarator is some stars then a direct declarator":
+
+```c
+/* dcl_mini.c */
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+static const char *s;            /* input cursor */
+static char out[512];
+
+static void skip(void) { while (*s == ' ') s++; }
+static void dirdcl(void);
+
+static void dcl(void)            /* dcl: optional *'s then dirdcl */
+{
+    int ns = 0;
+    for (skip(); *s == '*'; s++, skip()) ns++;
+    dirdcl();
+    while (ns-- > 0) strcat(out, " pointer to");
+}
+```
+
+`dirdcl` handles a name or a parenthesised declarator, then any number of
+`()` and `[n]` suffixes:
+
+```c
+/* dcl_mini.c, continued */
+static void dirdcl(void)
+{
+    skip();
+    if (*s == '(') { s++; dcl(); skip(); s++; }       /* ( dcl ) */
+    else {
+        char name[64]; int i = 0;
+        while (isalnum((unsigned char)*s) || *s == '_') name[i++] = *s++;
+        name[i] = '\0';
+        strcat(out, name); strcat(out, ":");
+    }
+    for (skip(); *s == '(' || *s == '['; skip()) {
+        if (*s == '(') { s = strchr(s, ')') + 1; strcat(out, " function returning"); }
+        else {
+            char n[16]; int i = 0; s++;
+            while (isdigit((unsigned char)*s)) n[i++] = *s++;
+            n[i] = '\0'; s++;
+            strcat(out, " array["); strcat(out, n); strcat(out, "] of");
+        }
+    }
+}
+```
+
+And a `main` that runs it on four declarations:
+
+```c
+/* dcl_mini.c, continued */
+int main(void)
+{
+    const char *tests[] = { "*a[10]", "(*a)[10]", "(*pf)()", "(*(*x)())[3]" };
+    for (int i = 0; i < 4; i++) {
+        s = tests[i]; out[0] = '\0';
+        dcl();
+        printf("int %-14s -> %s int\n", tests[i], out);
+    }
+    return 0;
+}
+```
+
+```text
+int *a[10]         -> a: array[10] of pointer to int
+int (*a)[10]       -> a: pointer to array[10] of int
+int (*pf)()        -> pf: pointer to function returning int
+int (*(*x)())[3]   -> x: pointer to function returning pointer to array[3] of int
+```
+
+It has no error handling (malformed input will crash it), which is fine
+for a reading aid and wrong for anything else.
+
+### Step by step
+
+Reading `int (*(*x)())[3]` by hand: start at `x`. Inside the innermost
+parentheses, left of `x` is `*`: "x is a pointer to". Step out; to the
+right is `()`: "a function returning". Left is `*`: "a pointer to". Step
+out; right is `[3]`: "an array of 3". Finally the base type: "int". The
+parser does the same, with recursion doing the stepping out.
+
+### Common mistake
+
+Writing `int *p, q;` and expecting two pointers. The `*` belongs to the
+declarator `*p`, not to the type, so `q` is a plain `int`. Declare one
+pointer per line, or use a `typedef` for the pointer type.
+
+```c
+/* star.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int *p, q;                 /* p is int *, q is int */
+    printf("%zu %zu\n", sizeof p, sizeof q);
+    return 0;
+}
+```
+
+```text
+8 4
+```
+
+### In real systems
+
+`cdecl`, a command-line tool and website, translates declarations both ways
+and descends directly from the book's `dcl`. Real headers hide most
+complexity with `typedef`: POSIX declares `typedef void (*sighandler_t)(int);`
+so `signal` reads as `sighandler_t signal(int, sighandler_t);`.
+
+### Check yourself
+
+**What is `char (*(*f)(void))[5]`?**
+
+<details>
+<summary>Answer</summary>
+
+`f` is a pointer to a function taking no arguments and returning a pointer
+to an array of 5 chars.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 5, Pointers and Arrays">
+<Level name="Beginner" depth={3}>
+
+The beginner's core is three facts. `&x` is where `x` lives. `*p` is what
+lives where `p` points. `a[i]` is `*(a + i)`. Draw boxes and arrows for
+every pointer program until the pictures come without effort; almost every
+pointer bug is a wrong arrow.
+
+A beginner's worked example: a function that returns both the minimum and
+maximum of an array through two pointer parameters.
+
+```c
+/* minmax.c */
+#include <stdio.h>
+
+static void minmax(const int *v, size_t n, int *lo, int *hi)
+{
+    *lo = *hi = v[0];
+    for (const int *p = v + 1; p < v + n; p++) {
+        if (*p < *lo) *lo = *p;
+        if (*p > *hi) *hi = *p;
+    }
+}
+
+int main(void)
+{
+    int v[] = {4, -2, 9, 0, 7}, lo, hi;
+    minmax(v, 5, &lo, &hi);
+    printf("%d %d\n", lo, hi);
+    return 0;
+}
+```
+
+```text
+-2 9
+```
+
+It needs `n` to be at least 1, because it reads `v[0]`; document that, or
+check it. That precondition is the beginner's first lesson in pointer
+contracts.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate skill is choosing between arrays and pointers
+deliberately, and knowing what a function receives. Arrays decay to
+pointers at every call, so every function that takes an array takes a
+pointer and a length. Strings carry their length as a terminator instead.
+
+Here is a word splitter that stores pointers into the original buffer,
+replacing blanks with terminators, the same trick `strtok` uses, without
+its static state:
+
+```c
+/* split.c */
+#include <stdio.h>
+
+static int split(char *s, char *words[], int max)
+{
+    int n = 0;
+    while (*s != '\0' && n < max) {
+        while (*s == ' ') *s++ = '\0';      /* end previous, skip blanks */
+        if (*s == '\0') break;
+        words[n++] = s;                     /* start of a word */
+        while (*s != '\0' && *s != ' ') s++;
+    }
+    return n;
+}
+
+int main(void)
+{
+    char line[] = "  pointers  are   addresses ";
+    char *w[8];
+    int n = split(line, w, 8);
+    for (int i = 0; i < n; i++) printf("[%s]", w[i]);
+    printf(" %d\n", n);
+    return 0;
+}
+```
+
+```text
+[pointers][are][addresses] 3
+```
+
+The words are not copied: each `w[i]` points into `line`, so they are
+valid only as long as `line` is.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level you reason about **object lifetimes** and
+**aliasing**. A pointer is valid only while the object it points into
+exists. Two pointers **alias** when they point into the same object, and
+functions like `memcpy` require that their source and destination do not
+overlap (`memmove` allows it).
+
+C99's `restrict` qualifier is a promise that, for the pointer's lifetime,
+the object it points to is accessed only through it. It lets the compiler
+vectorise loops it otherwise could not:
+
+```c
+/* restrict.c */
+#include <stdio.h>
+
+static void add_into(int *restrict dst, const int *restrict src, int n)
+{
+    for (int i = 0; i < n; i++)
+        dst[i] += src[i];          /* compiler may assume no overlap */
+}
+
+int main(void)
+{
+    int a[4] = {1, 2, 3, 4}, b[4] = {10, 20, 30, 40};
+    add_into(a, b, 4);
+    printf("%d %d %d %d\n", a[0], a[1], a[2], a[3]);
+    return 0;
+}
+```
+
+```text
+11 22 33 44
+```
+
+Calling `add_into(a, a + 1, 3)` breaks the promise, and the result is
+undefined. The other advanced rule is **strict aliasing**: an object may be
+accessed only through its own type, a compatible type or a character type.
+Reading a `float`'s bits through an `int *` is undefined; use `memcpy` into
+an `int` instead, which compilers optimise to a single move.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+The edges of pointer code are the ends of arrays and the null pointer.
+A pointer one past the end is valid to form, compare and subtract, never to
+dereference. A pointer before the start, `a - 1`, is not valid even to
+form, which matters for loops that walk backwards:
+
+```c
+/* backwards.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int a[] = {1, 2, 3};
+    /* for (int *p = a + 2; p >= a; p--)  forms a - 1: undefined */
+    for (int *p = a + 3; p > a; ) {
+        --p;                          /* never goes below a */
+        printf("%d ", *p);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text
+3 2 1 
+```
+
+The other edges are empty inputs: an empty string to every string function,
+`n` of 0 to every array function, `argc` of 1 to every argument parser.
+`memcpy(dst, NULL, 0)` was undefined until C2y relaxed it; check for null
+before calling with a possibly-null pointer even when the length is zero.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases appear where the array-pointer rule has exceptions. An array
+does not decay in three places: as the operand of `sizeof`, of unary `&`,
+and as a string literal initialising a `char` array. So `&a` for `int a[5]`
+is a pointer to the whole array, type `int (*)[5]`, with the same address
+as `a` but a different type:
+
+```c
+/* addr_of_array.c */
+#include <stdio.h>
+
+int main(void)
+{
+    int a[5];
+    printf("%d %td %td\n", (void *)a == (void *)&a,
+           (char *)(a + 1) - (char *)a, (char *)(&a + 1) - (char *)a);
+    return 0;
+}
+```
+
+```text
+1 4 20
+```
+
+`a + 1` steps one `int`, 4 bytes; `&a + 1` steps one whole array, 20
+bytes. The same address with different types is a recurring source of
+confusion, and the reason `int (*)[5]` exists at all.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+Production pointer code is defended by tools. AddressSanitizer
+(`-fsanitize=address`) catches out-of-bounds accesses, use after free and
+use after return at run time, at about twice the cost. Valgrind's memcheck
+does similar without recompiling. Static analysers (clang's analyser,
+Coverity, CodeQL) find null dereferences and leaks on paths tests never
+take. Fuzzers (libFuzzer, AFL++) generate the inputs that reach them.
+
+Coding rules close the gaps the tools miss. Every pointer is initialised.
+Every array parameter has a length parameter beside it. Ownership is
+documented: which function frees what. `const` marks every pointer whose
+target is not modified, so the compiler enforces read-only access.
+
+The biggest production lesson is in the data: in large C and C++ codebases
+such as Chromium and Windows, about 70 per cent of serious security bugs
+have been memory-safety bugs, according to both projects' published
+analyses. That is the reason for bounds-checked APIs and for new code in
+memory-safe languages.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is to treat every pointer as a claim: "this points to a live
+object of this type, and I may read (or write) this many elements". Each
+line of pointer code either preserves the claim or breaks it. When you
+review pointer code, ask of each pointer who owns the object, how long it
+lives, and how far it extends.
+
+Draw memory. Experienced C programmers still sketch boxes and arrows for
+tricky code, because the picture shows mistakes that the text hides.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At system scale, pointers become **ownership** and **interfaces**. A
+library API that takes a pointer must say whether it borrows it for the
+call, keeps it, or takes ownership and will free it. Many C APIs encode
+this in names: `_create` and `_destroy` pairs, `_borrow` and `_take`.
+
+<Figure art={`
+   caller owns buffer           library borrows it for one call
+   +---------------+   ptr,len   +-------------------------+
+   | char buf[256] | ----------> | parse(const char*, size)|
+   +---------------+             +-------------------------+
+        lives here                   must not keep the pointer
+
+   library owns object          caller holds an opaque handle
+   +-----------------+  handle   +-------------------------+
+   | struct db (heap)| <-------- | db *h = db_open(...)    |
+   +-----------------+           | ... db_close(h)         |
+`} caption="Two ownership patterns for pointer interfaces. Borrowing a (pointer, length) pair for one call, or holding an opaque handle the library allocates and frees." />
+
+Function pointers are the other system tool: callbacks, plugin tables and
+hand-built virtual dispatch let C programs be extended without changing
+their core.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+My strategy for this chapter is volume and drawing. I write every program
+on this page from memory, draw its memory before running it, and run all
+of them under AddressSanitizer. Then I deliberately break each one (off by
+one, missing terminator, dangling return) and read the sanitizer report
+until I can predict it.
+
+I spend extra time on 5.3 and 5.12, because the array-pointer rule and
+declaration reading are what the rest of C builds on, and on `argv`, which
+is the first real `char **` most people use.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Are arrays and pointers the same thing?** No. An array is a block of
+elements; a pointer holds an address. An array name converts to a pointer
+to its first element in most expressions, and array parameters are really
+pointers, which is why they are often confused.
+
+**What is the difference between `NULL`, 0 and `'\0'`?** `NULL` is a null
+pointer constant; 0 in a pointer context is one too. `'\0'` is the
+character with value 0, the string terminator. They are different concepts
+that happen to share the value zero.
+
+**Why do I get a segmentation fault?** The program accessed memory it was
+not allowed to: a null or garbage pointer, a freed block, a string literal,
+or far past an array. Run it under AddressSanitizer or a debugger to see
+which line.
+
+**Should I write `int* p` or `int *p`?** The compiler does not care. `int *p`
+reflects the grammar (the `*` belongs to the declarator), which avoids the
+`int* p, q;` trap; `int* p` reads as "p is an int pointer". Pick one per
+codebase.
+
+**When do I need `void *`?** For generic code that handles any type, like
+`qsort`, `memcpy` and `malloc`. It cannot be dereferenced or used in
+arithmetic until converted to a real pointer type.
+
+**Is pointer arithmetic faster than indexing?** Not with a modern compiler;
+both compile to the same code. Use whichever is clearer.
+
+## Key takeaways
+
+- A pointer holds an address; `&` takes one and `*` follows one.
+- To change a caller's variable, pass its address; that is how C returns several results.
+- `a[i]` means `*(a + i)`, and an array name decays to a pointer to its first element, except under `sizeof` and `&`.
+- A function receiving an array gets a pointer and no length; pass the length.
+- Pointer arithmetic counts elements, and is defined only within an array and one past its end.
+- `char a[] = "x"` is a writable array; `char *p = "x"` points at a read-only literal.
+- An array of pointers sorts and reorders variable-length data by moving pointers.
+- A 2D array is one row-major block; its parameter must give every dimension but the first.
+- Function pointers let algorithms like `qsort` take behaviour as an argument.
+- Read declarations from the name outwards, and use `typedef` when they get hard.
+
+## Glossary
+
+- **Pointer**: a variable whose value is the address of an object or function.
+- **Address-of (`&`)**: the operator that yields an object's address.
+- **Indirection (`*`)**: the operator that yields the object a pointer points to.
+- **Null pointer**: a pointer value that points to no object, written `NULL`.
+- **Dangling pointer**: a pointer to an object whose lifetime has ended.
+- **Array decay**: the conversion of an array expression to a pointer to its first element.
+- **Pointer arithmetic**: adding integers to pointers and subtracting pointers, scaled by element size.
+- **`ptrdiff_t`**: the signed integer type of a pointer difference.
+- **String literal**: a read-only, null-terminated character array written in double quotes.
+- **Pointer to pointer**: a pointer whose target is itself a pointer, such as `char **`.
+- **Row-major order**: storing a 2D array row after row.
+- **Ragged array**: an array of pointers to rows of different lengths.
+- **`argc` / `argv`**: the count and vector of command-line arguments passed to `main`.
+- **Function pointer**: a pointer to a function, which can be called through.
+- **`void *`**: a generic pointer type that can hold any object pointer.
+- **Aliasing**: two pointers referring to the same object.
+- **`restrict`**: a promise that an object is accessed only through one pointer.
+- **Declarator**: the part of a declaration that names the thing and gives `*`, `[]` and `()`.
+
+## Exercises and self-check
+
+These are my own exercises. The book has its own at the end of each section;
+do a selection of those too.
+
+**Warm-up (by hand)**
+
+1. Draw memory for `int a[3] = {1,2,3}, *p = a + 1, **pp = &p;` and give
+   `*p`, `p[1]`, `**pp` and `*(*pp - 1)`.
+2. Read these declarations in words: `char *(*f[4])(int)`,
+   `double (*g(void))[2]`, `const char *const *h`.
+3. Trace `*++argv[0]` and `(*++argv)[0]` on `argv` for `./p -ab c`.
+
+**Practice (write and test)**
+
+4. Write `mystrncpy`, `mystrncat` and `mystrncmp` with pointers, matching
+   the library's behaviour on short sources and full buffers.
+5. Write `tail -n N`, printing the last N lines of input, storing lines in a
+   circular array of pointers. Handle N of 0 and N larger than the input.
+6. Rewrite `day_of_year` and `month_day` with pointers instead of indexing.
+7. Add `-r` (reverse order) and `-f` (fold case) options to `sortcmp.c`,
+   combinable with `-n`.
+
+**Stretch (change the problem)**
+
+8. Extend `dcl_mini` to handle function parameters and `const`, and to
+   report errors instead of crashing on malformed input.
+9. Write a generic `bsearch_mine` with the same interface as the library's
+   `bsearch`, and test it with ints, doubles and strings.
+
+**Self-check**
+
+<details>
+<summary>1. What does `int *p; *p = 3;` do?</summary>
+
+Writes through an uninitialised pointer: undefined behaviour, typically a
+crash or silent corruption.
+
+</details>
+
+<details>
+<summary>2. Inside `void f(char s[])`, what is `sizeof s`?</summary>
+
+The size of a `char *`, 8 on a 64-bit machine. The parameter is a pointer.
+
+</details>
+
+<details>
+<summary>3. Which pointer values may you form for `int a[4]`?</summary>
+
+`a` through `a + 4`. Only `a` through `a + 3` may be dereferenced.
+
+</details>
+
+<details>
+<summary>4. Why is `char *s = "hi"; s[0] = 'H';` wrong?</summary>
+
+It modifies a string literal, which is undefined; on Linux literals are
+read-only and it crashes.
+
+</details>
+
+<details>
+<summary>5. What is the type of `t` when `int t[3][4]` is passed to a function?</summary>
+
+`int (*)[4]`, a pointer to an array of 4 ints.
+
+</details>
+
+<details>
+<summary>6. What is `argv[argc]`?</summary>
+
+A null pointer, guaranteed by the standard.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to
+<a href={withBase('/plans/traditional-software-developer/#strategy-1')}>phase 1</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, and it is the chapter the roadmap's "learn the stack and the
+heap by drawing memory" week is really about. I read King's pointer chapters
+first, then this one, and give it four sessions.
+
+<Timeline caption="Four sessions for chapter 5, each ending with drawings and programs that pass under AddressSanitizer." items={[
+  { when: "Session 1", what: "5.1 to 5.3. Write addr.c, swap.c, getint.c and decay.c. Draw memory for each before running. Break swap by passing values, and read the sanitizer output for the dangling return." },
+  { when: "Session 2", what: "5.4 and 5.5. Write alloc.c and the three strcpy versions and mystrcmp from memory. Run each on empty strings and full buffers under -fsanitize=address." },
+  { when: "Session 3", what: "5.6 to 5.10. Build sortlines, dayofyear, monthname and findopt. Draw lineptr before and after sorting, and argv for three command lines." },
+  { when: "Session 4", what: "5.11 and 5.12. Write sortcmp and the dispatch table. Read twenty declarations by hand, check with dcl_mini or cdecl, then do the self-check." },
+]} />
+
+Every program goes into `kr-ch05/`, built by default with
+`-fsanitize=address,undefined -g`, and every drawing goes into the notes
+next to it. I keep a list of every sanitizer report I caused and what
+caused it, which turns into my personal catalogue of pointer bugs.
+
+Done when I can draw any pointer expression on this page without running
+it, read any declaration in the standard headers, and write `sortlines`
+and `findopt` from memory with a clean sanitizer run.

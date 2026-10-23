@@ -1,0 +1,1911 @@
+---
+book: the-c-programming-language
+number: 6
+title: "Structures"
+description: "K&R chapter 6 in depth: structures, passing and returning them, arrays of and pointers to structures, binary trees, hash tables, typedef, unions and bit-fields, with layout and padding."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Chapter 6 introduces **structures**: a way to group related variables of
+different types under one name, such as the fields of a point, an employee
+record or a node in a tree. With pointers from chapter 5, structures are
+enough to build every classic data structure, and this chapter builds two
+of them, a binary tree and a hash table.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- declare, initialise and access structures, and nest them;
+- pass structures to functions by value or by pointer, and return them;
+- search an array of structures, with indexes or with pointers;
+- build a binary search tree and a hash table from self-referential structures;
+- use `typedef` to name types, and know what it does and does not do;
+- use unions (safely, with a tag) and bit-fields, and explain padding and alignment.
+
+What you should already know: <a href={withBase('/books/the-c-programming-language/05-pointers-and-arrays/')}>chapter 5</a>,
+especially pointers to pointers, `malloc` as a preview, and `strcmp`.
+
+Reading time: about 90 minutes, plus two or three evenings for the tree and
+the hash table.
+
+## Chapter map
+
+<Layers caption="Chapter 6 from a single structure up to data structures and low-level layout." layers={[
+  { name: "6.1 and 6.2 Structures", note: "declaring, initialising, members, passing to functions" },
+  { name: "6.3 and 6.4 Collections", note: "arrays of structures, pointers to structures, ->" },
+  { name: "6.5 and 6.6 Data structures", note: "binary tree word counter, hash table lookup" },
+  { name: "6.7 typedef", note: "naming types" },
+  { name: "6.8 and 6.9 Layout", note: "unions share storage; bit-fields pack flags" },
+]} />
+
+<Figure art={`
+   struct point { int x; int y; };
+
+   struct rect { struct point pt1; struct point pt2; };
+
+   r:  +-----------------+-----------------+
+       |      pt1        |      pt2        |
+       | +------+------+ | +------+------+ |
+       | | x: 0 | y: 0 | | | x: 4 | y: 3 | |
+       | +------+------+ | +------+------+ |
+       +-----------------+-----------------+
+       r.pt2.x is 4
+`} caption="A structure groups members; a structure can contain other structures. Access goes from the outside in, one dot per level." />
+
+## 6.1 Basics of Structures
+
+### In one sentence
+
+A structure is a collection of named members, possibly of different types,
+treated as one object.
+
+### The idea
+
+`struct point { int x; int y; };` declares a **structure type**. `point` is
+the **structure tag**, a name for this kind of structure, and `x` and `y`
+are its **members**. The declaration alone allocates no storage; it
+describes a shape.
+
+Variables are declared with the type: `struct point pt;`. A member is
+accessed with the dot operator, `pt.x`. A structure can be initialised with
+a brace list of constant values in member order, `struct point maxpt =
+{320, 200};`, or (C99) with designated initialisers, `{ .y = 200, .x = 320
+}`, which name the members and zero any left out.
+
+Structures nest. A rectangle is a pair of points, and `screen.pt1.x` reads
+from the outside in. Structure tags, member names and ordinary variables
+live in different namespaces, so a member can share a name with a variable
+without conflict.
+
+### Worked example
+
+```c
+/* point.c */
+#include <math.h>
+#include <stdio.h>
+
+struct point { int x; int y; };
+struct rect  { struct point pt1, pt2; };
+
+int main(void)
+{
+    struct point origin = {0, 0}, pt = {.y = 4, .x = 3};
+    struct rect screen = {{0, 0}, {640, 480}};
+    double dist = sqrt((double)pt.x * pt.x + (double)pt.y * pt.y);
+    printf("(%d,%d) to (%d,%d): %.1f\n", origin.x, origin.y, pt.x, pt.y, dist);
+    printf("screen %dx%d\n", screen.pt2.x - screen.pt1.x,
+           screen.pt2.y - screen.pt1.y);
+    return 0;
+}
+```
+
+```text
+(0,0) to (3,4): 5.0
+screen 640x480
+```
+
+### Step by step
+
+`struct point pt = {.y = 4, .x = 3};` names the members, so the order in the
+braces does not matter. `screen` is initialised with nested braces, one
+pair per inner structure. The `(double)` casts make the multiplication
+floating, so large coordinates cannot overflow `int`.
+
+#### Three ways to declare a structure
+
+The declaration syntax allows a type and variables in one statement, which
+is where much confusion starts. `struct point { int x, y; } a, b;` declares
+the type and two variables. `struct { int x, y; } c;` declares a variable of
+an **anonymous structure** type that cannot be named again, so no other
+variable can share its type. `struct point d;` uses a type declared earlier.
+
+```c
+/* decls.c */
+#include <stdio.h>
+
+struct point { int x, y; } a = {1, 2}, b;   /* type plus two variables */
+struct { int x, y; } c = {5, 6};            /* anonymous: one-off type */
+
+int main(void)
+{
+    struct point d = a;                     /* later use of the tag */
+    b = d;
+    int point = 7;                          /* ordinary name, no clash */
+    printf("%d %d %d %d\n", b.x, c.y, d.y, point);
+    return 0;
+}
+```
+
+```text
+1 6 2 7
+```
+
+`int point` compiles alongside `struct point` because tags live in their
+own namespace. Assigning `c` to `a` would fail, though: the anonymous type
+is a different type even though its members look identical, and gcc
+reports "incompatible types when assigning".
+
+### Common mistake
+
+Comparing structures with `==`. C does not define it: `pt == origin` is a
+compile error, "invalid operands to binary ==". Compare member by member.
+Using `memcmp` on two structures also fails in general, because padding
+bytes between members (6.4) may hold different garbage.
+
+### In real systems
+
+Structures describe every record a C program handles: network packet
+headers, file system inodes, `struct stat` from `stat(2)`, `struct tm` from
+`<time.h>`. Designated initialisers are the modern style for configuration
+tables, because they survive reordering of the members.
+
+### Check yourself
+
+**Does `struct point { int x, y; };` allocate any memory?**
+
+<details>
+<summary>Answer</summary>
+
+No. It declares a type. Memory is allocated only when a variable of that
+type is defined.
+
+</details>
+
+## 6.2 Structures and Functions
+
+### In one sentence
+
+Structures can be copied, assigned, passed to functions and returned from
+them, and large ones are usually passed by pointer instead.
+
+### The idea
+
+The legal operations on a structure are copying or assigning it as a unit,
+taking its address with `&`, and accessing its members. Since copying is
+allowed, a structure can be passed by value (the function gets a copy) and
+returned by value. That was a change from the very first C; the book
+relies on it.
+
+There are three ways to pass a structure's information: the members
+separately, the whole structure by value, or a pointer to it. By value is
+clean for small structures like points; a pointer avoids copying large ones
+and lets the function modify the caller's structure.
+
+With a pointer `pp` to a structure, the member is `(*pp).x`. The
+parentheses are needed because `.` binds tighter than `*`. This is so
+common that C has a shorthand: `pp->x`.
+
+### Worked example
+
+```c
+/* rectfun.c */
+#include <stdio.h>
+
+struct point { int x, y; };
+struct rect  { struct point pt1, pt2; };
+
+static struct point makepoint(int x, int y)
+{
+    struct point p = {x, y};
+    return p;                          /* returned by value */
+}
+
+static struct point addpoint(struct point a, struct point b)
+{
+    a.x += b.x;                        /* a is a copy */
+    a.y += b.y;
+    return a;
+}
+```
+
+The rest of the program normalises a rectangle so that `pt1` is the
+lower-left corner, writing through a pointer:
+
+```c
+/* rectfun.c, continued */
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+static void canonrect(struct rect *r)
+{
+    struct rect t = *r;                /* copy the whole structure */
+    r->pt1.x = MIN(t.pt1.x, t.pt2.x);
+    r->pt1.y = MIN(t.pt1.y, t.pt2.y);
+    r->pt2.x = MAX(t.pt1.x, t.pt2.x);
+    r->pt2.y = MAX(t.pt1.y, t.pt2.y);
+}
+
+int main(void)
+{
+    struct point p = addpoint(makepoint(1, 2), makepoint(10, 20));
+    struct rect r = {{5, 8}, {1, 2}};
+    canonrect(&r);
+    printf("(%d,%d) [(%d,%d) (%d,%d)]\n", p.x, p.y,
+           r.pt1.x, r.pt1.y, r.pt2.x, r.pt2.y);
+    return 0;
+}
+```
+
+```text
+(11,22) [(1,2) (5,8)]
+```
+
+### Step by step
+
+`addpoint` changes its parameter `a`, but `a` is a copy of the caller's
+argument, so nothing outside changes, and the modified copy is returned.
+`canonrect` gets a pointer, so its writes through `r->` change the
+caller's `r`. It works from a copy `t` so it reads the original corners
+even after writing the first ones.
+
+#### Returning a structure or filling one in
+
+A function with several results can return a structure, or take a pointer
+to one and fill it in. Returning reads better, `struct point p =
+makepoint(1, 2);`, and the compiler usually builds the result directly in
+the caller's variable, so there is no extra copy. Filling in through a
+pointer suits large structures and lets the return value report success or
+failure, which is why `stat` and `gettimeofday` work that way.
+
+```c
+/* divres.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    div_t q = div(-7, 2);                  /* a structure from the library */
+    printf("quot %d rem %d\n", q.quot, q.rem);
+    return 0;
+}
+```
+
+```text
+quot -3 rem -1
+```
+
+The standard `div` function returns a `div_t` structure holding both the
+quotient and remainder. It also shows C99's rule that integer division
+truncates toward zero, so -7 / 2 is -3 with remainder -1.
+
+### Common mistake
+
+Writing `*pp.x` for `(*pp).x`. Since `.` binds first, `*pp.x` means
+`*(pp.x)`, which does not compile because `pp` is a pointer and has no
+members. Use `pp->x`. Another mistake is returning a pointer to a local
+structure, which dangles exactly like 5.2's local `int`.
+
+### In real systems
+
+Most C APIs pass structures by pointer, often `const` for input: `stat(path,
+&st)` fills in a caller's structure; `nanosleep(const struct timespec *,
+...)` reads one. Small value types (complex numbers, 2D points, `struct
+timespec` in some newer APIs) are passed by value, which on x86-64 is done
+in registers for structures up to 16 bytes.
+
+### Check yourself
+
+**After `struct point a = {1, 2}, b; b = a; b.x = 9;`, what is `a.x`?**
+
+<details>
+<summary>Answer</summary>
+
+1. Assignment copies the structure; `b` is independent of `a`.
+
+</details>
+
+## 6.3 Arrays of Structures
+
+### In one sentence
+
+An array of structures keeps related values together, one element per
+record, instead of several parallel arrays.
+
+### The idea
+
+The book counts occurrences of each C keyword in its input. One design uses
+two parallel arrays, `char *keyword[NKEYS]` and `int keycount[NKEYS]`. The
+better design is one array of structures, each holding a keyword and its
+count, so the pair cannot fall out of step.
+
+The table is initialised at compile time in sorted order, so a binary
+search (chapter 3) can find a word. Its size is computed with `sizeof`:
+the number of elements is `sizeof keytab / sizeof keytab[0]`, which the
+compiler evaluates, so adding a keyword needs no other change.
+
+`sizeof` is a compile-time operator, so `sizeof object` and `sizeof (type
+name)` give sizes in bytes as `size_t` constants. It cannot be used in
+`#if`, because the preprocessor knows nothing about types.
+
+### Worked example
+
+```c
+/* keycount.c */
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+static struct key { const char *word; int count; } keytab[] = {
+    {"break", 0}, {"case", 0}, {"char", 0}, {"else", 0}, {"for", 0},
+    {"if", 0}, {"int", 0}, {"return", 0}, {"while", 0},
+};
+#define NKEYS (sizeof keytab / sizeof keytab[0])
+
+static int find(const char *w)
+{
+    int lo = 0, hi = (int)NKEYS - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2, c = strcmp(w, keytab[mid].word);
+        if (c < 0) hi = mid - 1;
+        else if (c > 0) lo = mid + 1;
+        else return mid;
+    }
+    return -1;
+}
+```
+
+The main loop reads words (runs of letters, digits and underscores) and
+counts the keywords:
+
+```c
+/* keycount.c, continued */
+int main(void)
+{
+    char w[64];
+    int c, n = 0, k;
+    while ((c = getchar()) != EOF) {
+        if (isalnum(c) || c == '_') {
+            if (n < 63) w[n++] = (char)c;
+            continue;
+        }
+        w[n] = '\0';
+        if (n > 0 && (k = find(w)) >= 0) keytab[k].count++;
+        n = 0;
+    }
+    for (size_t i = 0; i < NKEYS; i++)
+        if (keytab[i].count > 0)
+            printf("%4d %s\n", keytab[i].count, keytab[i].word);
+    return 0;
+}
+```
+
+```text
+$ printf 'int main() { for (;;) if (x) break; else return 0; int y; }\n' | ./keycount
+   1 break
+   1 else
+   1 for
+   1 if
+   2 int
+   1 return
+```
+
+### Step by step
+
+<Trace columns={["word read", "find result", "count after"]} rows={[
+  ["int", "6", "int 1"],
+  ["main", "-1 (not a keyword)", "-"],
+  ["for", "4", "for 1"],
+  ["if", "5", "if 1"],
+  ["x", "-1", "-"],
+  ["break", "0", "break 1"],
+]} caption="The first few words of the input. Each word is looked up by binary search over the sorted table, and only keywords change a count." />
+
+#### Parallel arrays versus an array of structures
+
+The two designs differ in what can go wrong. With parallel arrays, sorting
+one array without the other silently corrupts the data; with structures,
+`qsort` moves each record whole. The program below sorts the keyword table
+by count, which the parallel-array design could not do with one call.
+
+```c
+/* bycount.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+struct key { const char *word; int count; };
+
+static int bycount(const void *a, const void *b)
+{
+    const struct key *x = a, *y = b;
+    return (y->count > x->count) - (y->count < x->count);  /* descending */
+}
+
+int main(void)
+{
+    struct key t[] = {{"if", 3}, {"for", 7}, {"int", 5}};
+    qsort(t, sizeof t / sizeof t[0], sizeof t[0], bycount);
+    for (size_t i = 0; i < 3; i++) printf("%s %d\n", t[i].word, t[i].count);
+    return 0;
+}
+```
+
+```text
+for 7
+int 5
+if 3
+```
+
+The comparison returns the sign of the difference without subtracting,
+because `y->count - x->count` can overflow for extreme values, which is
+undefined behaviour.
+
+### Common mistake
+
+Adding a keyword to the table out of alphabetical order. Binary search
+silently fails to find some words, without any error. Either keep a test
+that checks the table is sorted, or sort it at start-up with `qsort`.
+
+### In real systems
+
+Tables of structures, sorted and binary-searched, are how compilers look
+up keywords (gcc generates a perfect hash with `gperf` for speed), how
+`getopt_long` describes options (`struct option[]`), and how embedded
+firmware stores configuration.
+
+### Check yourself
+
+**Why compute `NKEYS` with `sizeof` rather than writing 9?**
+
+<details>
+<summary>Answer</summary>
+
+So adding or removing a keyword updates the count automatically. A
+hand-written 9 would go stale.
+
+</details>
+
+## 6.4 Pointers to Structures
+
+### In one sentence
+
+Pointers to structures work like other pointers, with `->` for members, but
+pointer arithmetic over structures must respect their size and padding.
+
+### The idea
+
+The book rewrites the keyword counter with pointers: `binsearch` returns a
+`struct key *` to the found element or `NULL`, and the caller walks the
+table with a pointer. Two details are new.
+
+First, the midpoint of two pointers cannot be `(low + high) / 2`, because
+adding two pointers is meaningless. It is `low + (high - low) / 2`:
+subtracting gives an element count, half of it is added back to a pointer.
+Second, `p++` on a `struct key *` advances by `sizeof (struct key)` bytes,
+whatever that is.
+
+That size is not always the sum of the members. The compiler inserts
+**padding** so each member is suitably **aligned** for the machine,
+typically on an address that is a multiple of its own size. So `struct {
+char c; int i; }` is usually 8 bytes, not 5. Always use `sizeof`, never
+add the members up by hand.
+
+### Worked example
+
+```c
+/* padding.c */
+#include <stddef.h>
+#include <stdio.h>
+
+struct loose { char c; int i; char d; };    /* poor order */
+struct tight { int i; char c; char d; };    /* same members */
+
+int main(void)
+{
+    printf("loose %zu: c@%zu i@%zu d@%zu\n", sizeof (struct loose),
+           offsetof(struct loose, c), offsetof(struct loose, i),
+           offsetof(struct loose, d));
+    printf("tight %zu: i@%zu c@%zu d@%zu\n", sizeof (struct tight),
+           offsetof(struct tight, i), offsetof(struct tight, c),
+           offsetof(struct tight, d));
+    return 0;
+}
+```
+
+```text
+loose 12: c@0 i@4 d@8
+tight 8: i@0 c@4 d@5
+```
+
+`offsetof` from `<stddef.h>` gives a member's byte offset. Ordering members
+from largest to smallest alignment removes most padding.
+
+The pointer version of the keyword search:
+
+```c
+/* keyptr.c */
+#include <stdio.h>
+#include <string.h>
+
+struct key { const char *word; int count; };
+static struct key tab[] = { {"auto", 0}, {"break", 0}, {"case", 0}, {"char", 0} };
+#define NKEYS (sizeof tab / sizeof tab[0])
+
+static struct key *search(const char *w, struct key *base, size_t n)
+{
+    struct key *low = base, *high = base + n;     /* high: one past */
+    while (low < high) {
+        struct key *mid = low + (high - low) / 2;
+        int c = strcmp(w, mid->word);
+        if (c < 0) high = mid;
+        else if (c > 0) low = mid + 1;
+        else return mid;
+    }
+    return NULL;
+}
+```
+
+The search keeps `high` one past the end, so it never forms a pointer
+before the array. A small driver:
+
+```c
+/* keyptr.c, continued */
+int main(void)
+{
+    const char *words[] = {"case", "case", "auto", "goto"};
+    for (int i = 0; i < 4; i++) {
+        struct key *k = search(words[i], tab, NKEYS);
+        if (k != NULL) k->count++;
+    }
+    for (struct key *p = tab; p < tab + NKEYS; p++)
+        printf("%s=%d ", p->word, p->count);
+    printf("\n");
+    return 0;
+}
+```
+
+```text
+auto=1 break=0 case=2 char=0 
+```
+
+### Step by step
+
+<Figure art={`
+   struct loose (12 bytes)              struct tight (8 bytes)
+   +---+---+---+---+---------------+    +---------------+---+---+---+---+
+   | c | pad pad pad |      i      |    |       i       | c | d |pad|pad|
+   +---+---+---+---+---------------+    +---------------+---+---+---+---+
+   | d | pad pad pad |                  0               4   5   6   7
+   +---+---+---+---+
+   0   1   2   3   4 ... 8 ... 11
+`} caption="Padding from alignment. An int must start at a multiple of 4, so a char before it wastes three bytes, and the structure's size is rounded up so arrays of it stay aligned." />
+
+### Common mistake
+
+Writing a structure to a file or network with `fwrite(&s, sizeof s, 1, f)`
+and reading it on another machine. Padding, member sizes and byte order
+can all differ, and padding bytes may leak whatever was in memory before.
+Serialise member by member in a defined format instead.
+
+### In real systems
+
+Kernel and database developers reorder structure members to shrink hot
+structures; the `pahole` tool shows the holes. Network protocol headers are
+declared with fixed-width types and checked with `_Static_assert(sizeof
+(struct hdr) == 20, "...")`, so a layout change becomes a compile error.
+
+### Check yourself
+
+**Why is `low + (high - low) / 2` used with pointers?**
+
+<details>
+<summary>Answer</summary>
+
+Adding two pointers is illegal. Subtracting gives an element count, which
+can be halved and added to a pointer.
+
+</details>
+
+## 6.5 Self-referential Structures
+
+### In one sentence
+
+A structure can contain a pointer to its own type, which is how linked
+lists and trees are built.
+
+### The idea
+
+A structure cannot contain an instance of itself (it would be infinitely
+large), but it can contain a pointer to one: `struct tnode *left;`. That
+makes **self-referential structures**, the building block of every linked
+data structure.
+
+The book's problem is counting the occurrences of every word in the input,
+when the words are not known in advance. A sorted array would need
+shifting on every insertion. A **binary search tree** does better: each
+node holds one word, its count, and pointers to a left subtree of smaller
+words and a right subtree of larger ones. To add a word, compare it with
+the root and go left or right until it is found (increment the count) or a
+null pointer is reached (create a node there).
+
+The nodes are created with `malloc` (chapter 7, previewed here), which
+returns a `void *` to fresh storage, or `NULL` when memory runs out. Each
+word is copied into its own storage too, since the input buffer is reused.
+
+### Worked example
+
+```c
+/* wordtree.c */
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct tnode {
+    char *word;
+    int count;
+    struct tnode *left, *right;     /* pointers to the same type */
+};
+```
+
+The rest of `wordtree.c`:
+
+```c
+/* wordtree.c, continued */
+static struct tnode *addtree(struct tnode *p, const char *w)
+{
+    if (p == NULL) {                         /* new word */
+        p = malloc(sizeof *p);
+        if (p == NULL || (p->word = malloc(strlen(w) + 1)) == NULL)
+            exit(1);
+        strcpy(p->word, w);
+        p->count = 1;
+        p->left = p->right = NULL;
+    } else {
+        int c = strcmp(w, p->word);
+        if (c == 0) p->count++;
+        else if (c < 0) p->left = addtree(p->left, w);
+        else p->right = addtree(p->right, w);
+    }
+    return p;
+}
+```
+
+Printing in order is a recursive walk: left subtree, this node, right
+subtree. Freeing must be in the opposite order, children before parent:
+
+```c
+/* wordtree.c, continued */
+static void treeprint(const struct tnode *p)
+{
+    if (p == NULL) return;
+    treeprint(p->left);
+    printf("%4d %s\n", p->count, p->word);
+    treeprint(p->right);
+}
+
+static void treefree(struct tnode *p)
+{
+    if (p == NULL) return;
+    treefree(p->left);
+    treefree(p->right);
+    free(p->word);
+    free(p);
+}
+```
+
+And a `main` that reads lower-cased words:
+
+```c
+/* wordtree.c, continued */
+int main(void)
+{
+    struct tnode *root = NULL;
+    char w[64];
+    int c, n = 0;
+    while ((c = getchar()) != EOF) {
+        if (isalpha(c)) { if (n < 63) w[n++] = (char)tolower(c); continue; }
+        if (n > 0) { w[n] = '\0'; root = addtree(root, w); n = 0; }
+    }
+    treeprint(root);
+    treefree(root);
+    return 0;
+}
+```
+
+```text
+$ printf 'now is the time for all good men to come to the aid of their party\n' | ./wordtree
+   1 aid
+   1 all
+   1 come
+   1 for
+   1 good
+   1 is
+   1 men
+   1 now
+   1 of
+   1 party
+   2 the
+   1 their
+   1 time
+   2 to
+```
+
+### Step by step
+
+<Figure art={`
+                        now
+                      /     \\
+                    is       the
+                   /  \\     /   \\
+                 for  men  of    time
+                /  \\       \\    /   \\
+              all  good   party their  to
+             /   \\
+           aid   come
+`} caption="The tree after reading the sentence. Every word left of a node sorts before it and every word right sorts after, so an in-order walk prints them alphabetically." />
+
+The first word, "now", becomes the root. "is" is less, so it goes left;
+"the" is greater, so right. "time" is greater than "now", greater than
+"the", so it becomes the right child of "the". Each insertion follows one
+path from the root, so in a balanced tree it takes about log2(n)
+comparisons.
+
+### Common mistake
+
+Feeding the tree sorted input. Every new word goes right of the previous
+one, the tree degenerates into a linked list, insertion becomes linear and
+recursion depth equals the number of words. Balanced trees (red-black, AVL)
+or a hash table (6.6) avoid it. The other mistake is freeing a node before
+its children, which loses the only pointers to them, a leak.
+
+### In real systems
+
+Binary search trees in balanced forms are everywhere: the Linux kernel's
+`rbtree` for scheduler queues and memory areas, C++'s `std::map`, and
+database B-trees, which are wide search trees designed for disk pages.
+
+### Check yourself
+
+**Why does `addtree` return a pointer instead of returning nothing?**
+
+<details>
+<summary>Answer</summary>
+
+When it creates a node, the parent's `left` or `right` pointer (or `root`)
+must be updated to point at it. Returning the pointer lets the caller
+store it.
+
+</details>
+
+## 6.6 Table Lookup
+
+### In one sentence
+
+A hash table finds names quickly by hashing each name to one of many short
+linked lists and searching only that list.
+
+### The idea
+
+The book builds the core of a macro processor's symbol table: `install(name,
+defn)` records a name and its replacement text, and `lookup(name)` finds
+it. The structure is a **hash table**: an array of pointers, each the head
+of a **linked list** of entries whose names **hash** to that slot.
+
+A **hash function** turns a string into an array index. The book's is
+simple: for each character, multiply the running value by 31 and add the
+character, then take the remainder modulo the table size. Different names
+may hash to the same slot, a **collision**, which is why each slot is a
+list. With a good hash and a table not too full, each list is short, so
+lookups take nearly constant time.
+
+`install` looks the name up first. If it exists, the old definition is
+freed and replaced; if not, a new entry is allocated and pushed on the
+front of its list.
+
+<Figure art={`
+   hashtab[101]
+   +-----+
+   |  0  | -> NULL
+   | ... |
+   | 18  | -> [ "IN"  | "1"  | next ] -> NULL
+   | ... |
+   | 47  | -> [ "EOF" | "-1" | next ] -> [ "MAX" | "100" | next ] -> NULL
+   | ... |
+   | 60  | -> [ "OUT" | "0"  | next ] -> NULL
+   | ... |
+   | 100 | -> NULL
+   +-----+
+`} caption="A chained hash table with the hash function below. MAX and EOF both hash to 47, a collision, so slot 47 holds a list of two; EOF was installed later and so is at the front." />
+
+### Worked example
+
+```c
+/* hashtab.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct nlist { struct nlist *next; char *name, *defn; };
+#define HASHSIZE 101
+static struct nlist *hashtab[HASHSIZE];
+
+static unsigned hash(const char *s)
+{
+    unsigned h = 0;
+    for (; *s != '\0'; s++)
+        h = (unsigned char)*s + 31 * h;      /* unsigned: wraps, no UB */
+    return h % HASHSIZE;
+}
+
+static struct nlist *lookup(const char *s)
+{
+    for (struct nlist *np = hashtab[hash(s)]; np != NULL; np = np->next)
+        if (strcmp(s, np->name) == 0)
+            return np;
+    return NULL;
+}
+```
+
+`install` needs a function that allocates and copies a string. The
+library's `strdup` does that (standard since C23, POSIX before), but it is
+hidden in strict C11 mode, so I write `dupstr`:
+
+```c
+/* hashtab.c, continued */
+static char *dupstr(const char *s)
+{
+    char *p = malloc(strlen(s) + 1);
+    return p ? strcpy(p, s) : NULL;
+}
+
+static struct nlist *install(const char *name, const char *defn)
+{
+    struct nlist *np = lookup(name);
+    if (np == NULL) {                         /* not found: new entry */
+        np = malloc(sizeof *np);
+        if (np == NULL || (np->name = dupstr(name)) == NULL) return NULL;
+        np->defn = NULL;
+        unsigned h = hash(name);
+        np->next = hashtab[h];                /* push on the front */
+        hashtab[h] = np;
+    } else {
+        free(np->defn);                       /* replace old defn */
+    }
+    return (np->defn = dupstr(defn)) == NULL ? NULL : np;
+}
+```
+
+A driver that defines, redefines and looks up:
+
+```c
+/* hashtab.c, continued */
+int main(void)
+{
+    install("MAX", "100"); install("IN", "1"); install("MAX", "200");
+    struct nlist *a = lookup("MAX"), *b = lookup("OUT");
+    printf("%s %s %u %u\n", a ? a->defn : "-", b ? b->defn : "-",
+           hash("MAX"), hash("IN"));
+    return 0;
+}
+```
+
+```text
+200 - 47 18
+```
+
+### Step by step
+
+`hash("IN")`: start at 0; 'I' is 73, so `h` is 73; then 'N' is 78, so `h`
+is 78 + 31 × 73 = 2341; 101 × 23 is 2323, so 2341 mod 101 is 18. The
+second `install("MAX", ...)` finds the existing entry, frees "100" and
+stores "200".
+
+### Common mistake
+
+Using a signed type for the running hash. With `int h`, multiplying by 31
+overflows on long strings, which is undefined; with `unsigned` it wraps,
+which is defined and is exactly what a hash wants. The other mistake is a
+hash that ignores part of the key, such as only the first character, which
+puts all names starting with the same letter in one list.
+
+### In real systems
+
+Hash tables are the most used data structure in software: symbol tables in
+compilers and linkers, Python's `dict`, database hash joins, caches. Real
+implementations grow the table when it fills, and use stronger hash
+functions (SipHash in Python and Rust) so attackers cannot choose keys that
+collide.
+
+### Check yourself
+
+**Why is the table size 101 rather than 100?**
+
+<details>
+<summary>Answer</summary>
+
+A prime size spreads hash values more evenly when the hash has patterns,
+such as all values sharing a factor with the table size.
+
+</details>
+
+## 6.7 Typedef
+
+### In one sentence
+
+`typedef` gives a new name to an existing type, which shortens declarations
+and hides details, but creates no new type.
+
+### The idea
+
+`typedef int Length;` makes `Length` a synonym for `int`. Syntactically a
+`typedef` is like a storage class: write a declaration as if declaring a
+variable, put `typedef` in front, and the name becomes a type name instead.
+So `typedef char *String;` makes `String` mean `char *`, and
+`typedef struct tnode *Treeptr;` names a pointer to a tree node.
+
+A `typedef` does not create a new type. `Length` and `int` are the same
+type, freely mixed. Its value is readability and portability: `size_t`,
+`int32_t` and `FILE` are all typedefs, so the same source can use a
+different underlying type on each machine by changing one header.
+
+It also tames complicated declarations from chapter 5:
+`typedef int (*PFI)(const char *, const char *);` makes `PFI` the type
+"pointer to function taking two strings and returning int".
+
+### Worked example
+
+```c
+/* typedefs.c */
+#include <stdio.h>
+#include <string.h>
+
+typedef struct tnode Tnode;              /* name before definition */
+struct tnode { const char *word; Tnode *left, *right; };
+
+typedef int (*Cmp)(const char *, const char *);
+typedef unsigned char Byte;
+
+static const char *better(const char *a, const char *b, Cmp cmp)
+{
+    return cmp(a, b) <= 0 ? a : b;
+}
+
+int main(void)
+{
+    Tnode leaf = {"leaf", NULL, NULL}, root = {"root", &leaf, NULL};
+    Byte b = 200;
+    printf("%s %s %s %d\n", root.word, root.left->word,
+           better("pear", "apple", strcmp), b + 100);
+    return 0;
+}
+```
+
+```text
+root leaf apple 300
+```
+
+`b + 100` is 300 because `Byte` is just `unsigned char`, which is promoted
+to `int` in arithmetic, as chapter 2 explained. The typedef changed
+nothing about the type's behaviour.
+
+### Step by step
+
+`typedef struct tnode Tnode;` can come before `struct tnode` is defined,
+because it names an **incomplete type**. That is the standard way to write
+self-referential structures with a typedef name, and the basis of **opaque
+types**: a header says `typedef struct db db;` and only the `.c` file
+defines the structure, so callers can hold `db *` pointers but never touch
+the members.
+
+#### Typedef and function pointers
+
+Function-pointer typedefs are where `typedef` pays off most. Compare a
+signal-handler registration written out in full with the same thing through
+a typedef. The raw form, a function taking an `int` and a pointer to a
+function, and returning a pointer to a function, is nearly unreadable; with
+`typedef void (*Handler)(int);` it reads `Handler set(int, Handler);`.
+
+```c
+/* handlers.c */
+#include <stdio.h>
+
+typedef void (*Handler)(int);
+
+static void quiet(int n) { (void)n; }
+static void loud(int n)  { printf("event %d\n", n); }
+
+static Handler current = quiet;
+static Handler set_handler(Handler h)    /* returns the old one */
+{
+    Handler old = current; current = h;
+    return old;
+}
+
+int main(void)
+{
+    current(1);                           /* quiet: prints nothing */
+    Handler old = set_handler(loud);
+    current(2);
+    set_handler(old);
+    current(3);
+    printf("restored %s\n", current == quiet ? "quiet" : "loud");
+    return 0;
+}
+```
+
+```text
+event 2
+restored quiet
+```
+
+Without the typedef, `set_handler` would be declared
+`void (*set_handler(void (*h)(int)))(int)`, which is the same shape as the
+standard library's `signal`. Reading that declaration with chapter 5's
+right-left rule works, but nobody should have to do it at every use.
+
+#### Typedef and portability
+
+The second reason for typedefs is to isolate machine dependencies. If a
+program stores file offsets in `typedef long Offset;`, moving to a machine
+where offsets need 64 bits and `long` has 32 means changing one line. The
+standard library does exactly this: `size_t` is `unsigned long` on 64-bit
+Linux and `unsigned int` on 32-bit systems, and code that uses `size_t`
+does not care.
+
+The cost is that a typedef name hides information. When I read
+`Offset n;` I do not know its range or signedness without looking it up,
+and printing it needs the right format (`%ld` here; `%zu` for `size_t`).
+Good typedef names say what the value means, not what it is made of, and
+their headers document the range.
+
+### Common mistake
+
+Hiding a pointer in a typedef, as in `typedef char *String;`, and then
+writing `const String s;`. That makes the pointer constant, `char *const`,
+not the characters, which surprises everyone. Many style guides (the Linux
+kernel's included) forbid typedefs for pointers and for plain structures
+for this reason, and use `struct foo *` explicitly.
+
+### In real systems
+
+The fixed-width types in `<stdint.h>` (`uint8_t`, `int64_t`) are the most
+important typedefs in modern C, because they make sizes explicit for file
+formats and protocols. Opaque typedefs like `FILE`, `sqlite3` and
+`pthread_t` are how C libraries hide their implementation.
+
+### Check yourself
+
+**After `typedef int Meters; typedef int Feet;`, can you assign a `Feet` to
+a `Meters` without a warning?**
+
+<details>
+<summary>Answer</summary>
+
+Yes. Both are `int`; typedef creates synonyms, not distinct types. For real
+type safety wrap each in its own structure.
+
+</details>
+
+## 6.8 Unions
+
+### In one sentence
+
+A union holds one of several types of value in the same storage, at
+different times, and the program must track which one it holds.
+
+### The idea
+
+A **union** looks like a structure, but all its members start at the same
+address and overlap. Its size is that of the largest member, with
+alignment for the strictest. It holds one value at a time: storing into
+one member and then reading another is meaningful only in special cases.
+
+The book's motivation is a compiler's symbol table, where a constant may be
+an `int`, a `float` or a string pointer. A union lets one table entry hold
+any of them. Since the union does not remember what was stored, it is
+paired with a **tag**: a separate member saying which alternative is
+current. This **tagged union** is the C version of what other languages
+call a sum type or variant.
+
+Members are accessed like structure members, `u.ival` or `p->u.sval`.
+Unions can be nested inside structures and arrays, and initialised (C89:
+only the first member; C99: any member with a designator).
+
+### Worked example
+
+```c
+/* tagged.c */
+#include <stdio.h>
+
+enum kind { INT, REAL, STR };
+struct value {
+    enum kind kind;                 /* the tag */
+    union { int i; double d; const char *s; } u;
+};
+
+static void show(const struct value *v)
+{
+    switch (v->kind) {
+    case INT:  printf("int %d\n", v->u.i); break;
+    case REAL: printf("real %g\n", v->u.d); break;
+    case STR:  printf("str %s\n", v->u.s); break;
+    }
+}
+
+int main(void)
+{
+    struct value t[] = {{INT, {.i = 42}}, {REAL, {.d = 2.5}}, {STR, {.s = "hi"}}};
+    for (int k = 0; k < 3; k++) show(&t[k]);
+    printf("union %zu bytes, struct %zu bytes\n", sizeof t[0].u, sizeof t[0]);
+    return 0;
+}
+```
+
+```text
+int 42
+real 2.5
+str hi
+union 8 bytes, struct 16 bytes
+```
+
+The union is 8 bytes, the size of its largest member. The structure adds a
+4-byte tag, padded to 8 for alignment, so 16 in total.
+
+### Step by step
+
+<Figure art={`
+   struct value (16 bytes)
+   +-------------+-------------+---------------------------+
+   | kind (4)    | padding (4) | u (8): one of             |
+   +-------------+-------------+   int i       (first 4)   |
+                               |   double d    (all 8)     |
+                               |   const char *s (all 8)   |
+                               +---------------------------+
+`} caption="A tagged union. The three members of u share the same eight bytes; kind records which one was last stored, and every reader checks it first." />
+
+#### A larger tagged union: an expression tree
+
+Tagged unions combine naturally with self-referential structures. An
+arithmetic expression is either a number or an operator with two operands,
+and the tree for `(2 + 3) * 4` uses both kinds of node. Evaluation is a
+`switch` on the tag, recursing on operator nodes.
+
+```c
+/* expr.c */
+#include <stdio.h>
+
+enum ekind { NUM, BIN };
+
+struct expr {
+    enum ekind kind;
+    union {
+        double num;
+        struct { char op; struct expr *l, *r; } bin;
+    } u;
+};
+
+static double eval(const struct expr *e)
+{
+    if (e->kind == NUM) return e->u.num;
+    double a = eval(e->u.bin.l), b = eval(e->u.bin.r);
+    switch (e->u.bin.op) {
+    case '+': return a + b;
+    case '-': return a - b;
+    case '*': return a * b;
+    default:  return a / b;
+    }
+}
+```
+
+The tree is built from local variables, which is fine here because they
+all live until `main` returns:
+
+```c
+/* expr.c, continued */
+int main(void)
+{
+    struct expr two = {NUM, {.num = 2}}, three = {NUM, {.num = 3}};
+    struct expr four = {NUM, {.num = 4}};
+    struct expr sum = {BIN, {.bin = {'+', &two, &three}}};
+    struct expr prod = {BIN, {.bin = {'*', &sum, &four}}};
+    printf("%g %zu\n", eval(&prod), sizeof prod);
+    return 0;
+}
+```
+
+```text
+20 32
+```
+
+Every node is 32 bytes, the tag plus the larger alternative (a character
+and two pointers, padded to 24). Number nodes waste the space the operator
+alternative needs; that is the usual trade of a union, simplicity of one
+node type against some memory.
+
+<Figure art={`
+                 [BIN '*']
+                 /       \\
+          [BIN '+']     [NUM 4]
+          /       \\
+      [NUM 2]   [NUM 3]
+`} caption="The expression tree for (2 + 3) * 4. Each box is one struct expr; the tag decides whether it holds a number or an operator with two child pointers." />
+
+### Common mistake
+
+Reading a member other than the one last written, without a tag check. In
+C (since C99's technical corrigendum) that reinterprets the bytes, which is
+defined but rarely what you want; in C++ it is undefined. Bit
+reinterpretation is better written with `memcpy`, which is clear and
+compiles to the same instruction:
+
+```c
+/* floatbits.c */
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    float f = 1.0f;
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof bits);       /* well-defined everywhere */
+    printf("0x%08x\n", (unsigned)bits);
+    return 0;
+}
+```
+
+```text
+0x3f800000
+```
+
+### In real systems
+
+Tagged unions are how C implements dynamic values: every interpreter
+(CPython's objects, Lua's `TValue`, JSON parsers like cJSON) has one.
+Network and event APIs use unions too, such as `union sigval` and X11's
+`XEvent`, whose first member is the type tag.
+
+### Check yourself
+
+**What is the size of `union { char c; int i; double d; }` on x86-64?**
+
+<details>
+<summary>Answer</summary>
+
+8, the size of the largest member, `double`, which also sets the
+alignment.
+
+</details>
+
+## 6.9 Bit-fields
+
+### In one sentence
+
+Bit-fields pack several small integer members into one machine word, for
+flags and hardware registers, at the cost of portability.
+
+### The idea
+
+When storage is tight, several flags can share one word. The traditional
+way is masks with the bitwise operators from chapter 2: `#define KEYWORD
+01`, then `flags |= KEYWORD` and `if (flags & KEYWORD)`. C also offers a
+direct notation: a **bit-field** is a structure member with a width in
+bits, such as `unsigned int is_keyword : 1;`.
+
+Bit-fields are used like any member, `flags.is_keyword = 1`, and the
+compiler does the shifting and masking. A field's width must not exceed its
+type's, and fields have no address, so `&` cannot be applied.
+
+Almost everything about their layout is **implementation-defined**: whether
+fields are allocated left to right or right to left, whether a field can
+straddle a word boundary, and whether a plain `int` field is signed. So
+bit-fields are fine for flags inside one program, and unreliable for
+matching an externally defined layout such as a file format or a hardware
+register on another compiler.
+
+### Worked example
+
+```c
+/* bitfields.c */
+#include <stdio.h>
+
+struct flags {
+    unsigned is_keyword : 1;
+    unsigned is_extern  : 1;
+    unsigned is_static  : 1;
+    unsigned level      : 4;      /* 0 to 15 */
+};
+
+#define KEYWORD 01u              /* the mask equivalent */
+#define EXTERN  02u
+#define STATIC  04u
+
+int main(void)
+{
+    struct flags f = {0};
+    f.is_extern = f.is_static = 1;
+    f.level = 17;                 /* too big: wraps to 1 */
+    unsigned m = EXTERN | STATIC;
+    printf("%u %u %u %u size %zu\n", f.is_keyword, f.is_static, f.level,
+           (m & (EXTERN | STATIC)) == (EXTERN | STATIC), sizeof f);
+    return 0;
+}
+```
+
+```text
+0 1 1 1 size 4
+```
+
+### Step by step
+
+`f.level = 17` stores 17 into four bits. Seventeen is binary 10001, so the
+top bit is lost and 0001 remains: 1. gcc warns "unsigned conversion from
+'int' to 'unsigned char:4' changes value from '17' to '1'", which is a
+useful catch. The whole structure fits in one 4-byte `unsigned`.
+
+#### Masks in practice
+
+Since masks are what portable code uses, the four idioms are worth knowing
+cold: set a bit with `|=`, clear it with `&= ~`, toggle it with `^=`, and
+test it with `&`. Defining the masks as an `enum` or as shifts of 1 makes
+the bit positions visible.
+
+```c
+/* masks.c */
+#include <stdio.h>
+
+enum { READ = 1u << 0, WRITE = 1u << 1, EXEC = 1u << 2 };
+
+static void show(unsigned p)
+{
+    printf("%c%c%c\n", p & READ ? 'r' : '-', p & WRITE ? 'w' : '-',
+           p & EXEC ? 'x' : '-');
+}
+
+int main(void)
+{
+    unsigned perm = 0;
+    perm |= READ | WRITE;          /* set two bits */
+    show(perm);
+    perm &= ~WRITE;                /* clear one */
+    perm ^= EXEC;                  /* toggle one */
+    show(perm);
+    return 0;
+}
+```
+
+```text
+rw-
+r-x
+```
+
+This is the same idea as Unix file permissions, which are three groups of
+these three bits. The bit-field version would read `perm.write = 0`, which
+is nicer, but the mask version can be stored, compared, combined with a
+single `|` and written to a file with a defined meaning.
+
+### Common mistake
+
+Declaring a one-bit field as plain `int`. Whether it is signed is
+implementation-defined; on gcc it is, so the field holds 0 and -1, and
+`if (f.flag == 1)` is never true. Always use `unsigned` (or `_Bool`) for
+bit-fields.
+
+```c
+/* signed_bit.c */
+#include <stdio.h>
+
+struct s { int flag : 1; };
+
+int main(void)
+{
+    struct s v = {0};
+    v.flag = 1;
+    printf("%d %s\n", v.flag, v.flag == 1 ? "equal" : "not equal");
+    return 0;
+}
+```
+
+```text
+-1 not equal
+```
+
+### In real systems
+
+Masks with `#define` or `enum` constants remain more common than
+bit-fields in portable code, because their layout is fully defined. Device
+drivers use bit-fields for registers only when the code is tied to one
+compiler and architecture, and network code almost never does, because
+byte and bit order differ across machines.
+
+### Check yourself
+
+**Can you take the address of a bit-field?**
+
+<details>
+<summary>Answer</summary>
+
+No. A bit-field may not start on a byte boundary, so `&` cannot be applied
+to it.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 6, Structures">
+<Level name="Beginner" depth={3}>
+
+The beginner's core is that a structure is a named group of members,
+accessed with `.` on the structure and `->` through a pointer. Structures
+can be copied, passed, returned and initialised as whole values, but not
+compared with `==`. Pass a pointer when the structure is large or the
+function must change it.
+
+A beginner's worked example: a small inventory record, printed through a
+`const` pointer and updated through a plain one.
+
+```c
+/* item.c */
+#include <stdio.h>
+
+struct item { char name[16]; int qty; double price; };
+
+static void restock(struct item *it, int n) { it->qty += n; }
+
+static void show(const struct item *it)
+{
+    printf("%-6s %3d x %.2f = %.2f\n", it->name, it->qty, it->price,
+           it->qty * it->price);
+}
+
+int main(void)
+{
+    struct item pen = {"pen", 10, 1.25};
+    restock(&pen, 6);
+    show(&pen);
+    return 0;
+}
+```
+
+```text
+pen     16 x 1.25 = 20.00
+```
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate step is building collections of structures whose size is
+not known in advance. A growable array, grown by doubling with `realloc`,
+is the workhorse: amortised constant-time append, contiguous memory, and
+simple indexing.
+
+```c
+/* vec.c */
+#include <stdio.h>
+#include <stdlib.h>
+struct point { int x, y; };
+struct vec { struct point *data; size_t len, cap; };
+static int push(struct vec *v, struct point p)
+{
+    if (v->len == v->cap) {
+        size_t ncap = v->cap ? 2 * v->cap : 4;
+        struct point *nd = realloc(v->data, ncap * sizeof *nd);
+        if (nd == NULL) return -1;          /* old block still valid */
+        v->data = nd; v->cap = ncap;
+    }
+    v->data[v->len++] = p;
+    return 0;
+}
+
+int main(void)
+{
+    struct vec v = {0};
+    for (int i = 0; i < 10; i++) push(&v, (struct point){i, i * i});
+    printf("%zu %zu %d\n", v.len, v.cap, v.data[9].y);
+    free(v.data);
+    return 0;
+}
+```
+
+```text
+10 16 81
+```
+
+Assigning `realloc`'s result to a temporary first matters: if it fails it
+returns `NULL` and leaves the old block alone, and writing `v->data =
+realloc(...)` directly would leak it.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+Advanced structure work is about layout and ownership. A **flexible array
+member** (C99), an array of unspecified size as the last member, lets one
+allocation hold a header and a variable amount of data, which halves the
+number of `malloc` calls and keeps the data next to its length.
+
+```c
+/* flex.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct str { size_t len; char data[]; };   /* flexible array member */
+
+static struct str *mkstr(const char *s)
+{
+    size_t n = strlen(s);
+    struct str *p = malloc(sizeof *p + n + 1);
+    if (p) { p->len = n; memcpy(p->data, s, n + 1); }
+    return p;
+}
+
+int main(void)
+{
+    struct str *s = mkstr("structures");
+    printf("%zu %s %zu\n", s->len, s->data, sizeof *s);
+    free(s);
+    return 0;
+}
+```
+
+```text
+10 structures 8
+```
+
+`sizeof *s` is 8: the flexible member contributes nothing, so the
+allocation adds the string's bytes explicitly. Such structures cannot be
+array elements or assigned meaningfully, since assignment copies only the
+header.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Structure assignment is a **shallow copy**: it copies members, and a
+pointer member is copied as a pointer, so both structures share the target.
+Freeing through one leaves the other dangling.
+
+```c
+/* shallow.c */
+#include <stdio.h>
+#include <string.h>
+
+struct person { char *name; int age; };
+
+int main(void)
+{
+    char buf[] = "Ada";
+    struct person a = {buf, 36}, b = a;    /* b.name == a.name */
+    strcpy(b.name, "Bob");
+    b.age = 40;
+    printf("%s %d / %s %d\n", a.name, a.age, b.name, b.age);
+    return 0;
+}
+```
+
+```text
+Bob 36 / Bob 40
+```
+
+The `age` members are separate, but both `name` pointers address the same
+buffer. Structures with owned pointers need a deliberate copy function, a
+**deep copy**, that duplicates what they own.
+
+Other edges: a structure containing an array copies the whole array on
+assignment, which is the one way to "assign arrays" in C; and comparing
+structures needs a member-by-member function, because `==` is not defined
+for them.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Padding bytes have unspecified values. Comparing structures with `memcmp`
+therefore can report a difference between structures whose members are all
+equal, and writing a structure to a file or socket with `fwrite` leaks
+whatever was in the padding, sometimes old stack data.
+
+```c
+/* padcmp.c */
+#include <stdio.h>
+#include <string.h>
+
+struct s { char c; int i; };
+
+int main(void)
+{
+    struct s a, b;
+    memset(&a, 0x00, sizeof a);
+    memset(&b, 0xff, sizeof b);
+    a.c = b.c = 'x';
+    a.i = b.i = 7;
+    printf("members equal: %d, memcmp equal: %d\n",
+           a.c == b.c && a.i == b.i, memcmp(&a, &b, sizeof a) == 0);
+    return 0;
+}
+```
+
+```text
+members equal: 1, memcmp equal: 0
+```
+
+The three padding bytes after `c` differ, so `memcmp` disagrees. The fix is
+to compare members, or to `memset` every structure to zero before filling
+it when byte-wise comparison or hashing is needed.
+
+A second corner: a compound literal like `(struct point){1, 2}` inside a
+function has automatic storage, so returning its address is the same
+dangling-pointer bug as returning a local variable's address.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+Production C uses structures for encapsulation. A header declares
+`typedef struct table table;` and functions `table *table_new(void)`,
+`int table_put(table *, ...)`, `void table_free(table *)`; only the `.c`
+file knows the members. Callers cannot depend on the layout, so it can
+change without recompiling them.
+
+Rules I follow: every structure that owns memory has exactly one create
+and one destroy function; destroy accepts `NULL`, like `free`; and
+every function that can fail returns a status rather than crashing. The
+tree from 6.5 needs a recursive free, done in post-order so children go
+before their parent:
+
+```c
+/* treefree.c */
+#include <stdio.h>
+#include <stdlib.h>
+
+struct node { int key; struct node *left, *right; };
+
+static struct node *add(struct node *p, int key)
+{
+    if (p == NULL) {
+        p = calloc(1, sizeof *p);
+        if (p) p->key = key;
+    } else if (key < p->key) p->left = add(p->left, key);
+    else p->right = add(p->right, key);
+    return p;
+}
+```
+
+The rest of `treefree.c`:
+
+```c
+/* treefree.c, continued */
+static size_t destroy(struct node *p)
+{
+    if (p == NULL) return 0;
+    size_t n = destroy(p->left) + destroy(p->right);
+    free(p);                              /* after the children */
+    return n + 1;
+}
+
+int main(void)
+{
+    struct node *root = NULL;
+    int keys[] = {5, 2, 8, 1, 9, 3};
+    for (int i = 0; i < 6; i++) root = add(root, keys[i]);
+    printf("freed %zu\n", destroy(root));
+    return 0;
+}
+```
+
+```text
+freed 6
+```
+
+<Flow caption="Freeing a tree safely. Each node is freed only after both its subtrees, because freeing it first would lose the pointers to them." steps={[
+  "Reach a node; if it is NULL, return",
+  "Free the left subtree",
+  "Free the right subtree",
+  "Free the node itself",
+  "Return to the parent, which can now free itself",
+]} />
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is data first. Rob Pike's advice to choose the right data
+structures, after which the algorithms become self-evident, fits this
+chapter exactly: the word counter is easy once the tree node exists, and
+the macro table is easy once `struct nlist` exists. Before writing a
+function I sketch the structures and draw who points at whom.
+
+I also ask, for every pointer member, "who owns this?" If the answer is
+unclear the design is not finished, because the free functions and copy
+functions depend on it.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At system scale, structure layout is a performance decision. An **array
+of structures** (AoS) keeps each record together, which suits code that
+handles one record at a time. A **structure of arrays** (SoA) keeps each
+field in its own array, which suits code that scans one field across many
+records, because the cache only loads the field in use.
+
+<Compare left="Array of structures" right="Structure of arrays" caption="Two layouts for the same records. Which is faster depends on whether the hot loops touch whole records or single fields." rows={[
+  ["struct particle p[N]; p[i].x", "struct { float x[N], y[N]; } s; s.x[i]"],
+  ["Good for whole-record work", "Good for scanning one field"],
+  ["Easy to pass one record around", "Easy to vectorise with SIMD"],
+  ["Padding repeats in every element", "No per-record padding"],
+]} />
+
+Ordering members from largest to smallest removes most padding, as 6.4's
+`padding.c` showed, which matters when a structure is stored millions of
+times. And structures that cross a process boundary (files, network)
+should be serialised field by field in a defined byte order, never written
+raw, because padding, size and endianness differ between machines.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+My strategy for this chapter is to write the word tree and the hash table
+myself, then use them. Both are the base of most real programs: symbol
+tables, caches, indexes, interpreters. After writing them I can read the
+structure-heavy code of real C projects, which is mostly these two ideas
+with error handling.
+
+In the long run I reach for a library or a different language for big
+generic containers, but I keep the ability to build a small, exact data
+structure in a hundred lines, because that is often the simplest answer.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**What is the difference between `.` and `->`?** `.` selects a member of a
+structure; `->` selects a member of the structure a pointer points to.
+`p->m` is shorthand for `(*p).m`.
+
+**Should I pass structures by value or by pointer?** By pointer when the
+structure is large or must be changed, using `const` for read-only access.
+By value for small structures like points and complex numbers, where the
+copy is cheap and the code is clearer.
+
+**Why is `sizeof` my structure bigger than the sum of its members?**
+Padding. The compiler inserts unused bytes so that each member sits at an
+address its type requires, and pads the end so array elements stay
+aligned.
+
+**Can I compare two structures with `==`?** No. Write a comparison
+function that compares members. `memcmp` is unreliable because of padding
+bytes.
+
+**Should I typedef my structures?** It is a style choice. Typedefs make
+code shorter and enable opaque types; plain `struct name` makes it obvious
+that a type is a structure. Follow the codebase's convention.
+
+**When should I use a union?** When a value can be one of several types and
+memory matters, always with a tag recording which. For reinterpreting bits
+between types, `memcpy` is clearer.
+
+**Are bit-fields portable?** Their meaning is, their layout is not. Use them
+for flags inside a program, and masks for anything that must match an
+external format.
+
+## Key takeaways
+
+- A structure groups related variables into one object; members are reached with `.` or, through a pointer, `->`.
+- Structures can be copied, assigned, passed and returned as values, but not compared with `==`.
+- Pass large structures by pointer, `const` when read-only.
+- Padding makes structures larger than their members; ordering members by size reduces it.
+- A structure can contain a pointer to its own type, which builds lists and trees.
+- A binary tree and a chained hash table cover most lookup needs, and are short to write in C.
+- `typedef` creates a synonym, not a new type; opaque typedefs hide implementation.
+- A union stores one of several types in shared storage and needs a tag to say which.
+- Bit-fields pack flags, but their layout is implementation-defined; use `unsigned`.
+- Every pointer member needs a clear owner, a destroy function, and, if copied, a deep copy.
+
+## Glossary
+
+- **Structure**: a collection of named members, possibly of different types, treated as one object.
+- **Member**: a named component of a structure or union.
+- **Structure tag**: the optional name after `struct`, used to refer to the type later.
+- **Member operator (`.`)**: selects a member of a structure.
+- **Arrow operator (`->`)**: selects a member through a pointer to a structure.
+- **Padding**: unused bytes inserted to satisfy alignment.
+- **Alignment**: the address multiple at which an object of a type must start.
+- **Self-referential structure**: a structure containing a pointer to its own type.
+- **Binary search tree**: a tree in which every node's left subtree holds smaller keys and its right subtree larger ones.
+- **Hash table**: an array of buckets indexed by a hash of the key.
+- **Collision**: two keys hashing to the same bucket.
+- **Incomplete type**: a type whose size is unknown, such as a declared but undefined structure.
+- **Opaque type**: a type callers use only through pointers, with members hidden in one source file.
+- **Typedef**: a declaration giving a new name to an existing type.
+- **Union**: an object whose members share storage, holding one at a time.
+- **Tagged union**: a union paired with a member that records which alternative is current.
+- **Bit-field**: a structure member with an explicit width in bits.
+- **Flexible array member**: an unsized array as a structure's last member, sized at allocation.
+- **Shallow copy / deep copy**: copying pointers as pointers, versus duplicating what they point to.
+
+## Exercises and self-check
+
+These are my own exercises. The book has its own at the end of each
+section; do a selection of those too.
+
+**Warm-up (by hand)**
+
+1. Predict `sizeof` and every member offset for
+   `struct { char a; double b; short c; }` on x86-64, then reorder the
+   members to minimise the size. Check with `offsetof`.
+2. Insert the keys 50, 30, 70, 20, 40, 60, 80, 35 into an empty binary tree
+   and draw the result. Which keys are visited when looking up 35?
+3. Given `struct rect r, *rp = &r;`, write three equivalent expressions for
+   the x coordinate of `r`'s first point.
+
+**Practice (write and test)**
+
+4. Extend `wordtree.c` to print the ten most frequent words, by copying the
+   nodes into an array and sorting it with `qsort`.
+5. Add `undef(name)` to `hashtab.c`, removing a name and freeing its memory,
+   and test removing the first, middle and last entries of a chain.
+6. Write a tagged-union `struct value` with integer, real, string and list
+   alternatives, plus `value_print` and `value_free`.
+7. Make `hashtab.c` grow: when the number of entries exceeds twice the
+   table size, allocate a table twice as big and rehash every entry.
+
+**Stretch (change the problem)**
+
+8. Write a cross-referencer that prints every word in its input with the
+   line numbers on which it occurs, using a tree of words each with a list
+   of line numbers.
+9. Turn the hash table into an opaque module with a header, a `.c` file and
+   a test program, so that the test cannot touch the members.
+
+**Self-check**
+
+- I can explain padding and predict a structure's size.
+- I can write insertion, lookup and freeing for a binary tree from memory.
+- I can write a chained hash table and explain collisions.
+- I can use `typedef`, unions with tags, and bit-fields correctly, and name
+  what is implementation-defined about each.
+- My programs pass AddressSanitizer and LeakSanitizer with no reports.
+
+## How I'd study this chapter
+
+This chapter belongs to
+<a href={withBase('/plans/traditional-software-developer/#strategy-1')}>phase 1</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>. It is where C stops being exercises and starts being
+programs, so I give it three sessions and treat the tree and hash table as
+code I will reuse. <a href={withBase('/books/c-programming-a-modern-approach/')}>King's</a>
+chapters on structures and linked lists are a good second explanation.
+
+<Timeline caption="Three sessions for chapter 6, each ending with programs that run clean under AddressSanitizer and LeakSanitizer." items={[
+  { when: "Session 1", what: "6.1 to 6.4. Write point.c, rectfun.c, keycount.c and padding.c. Predict every sizeof and offset before running, and reorder members to shrink a structure." },
+  { when: "Session 2", what: "6.5 and 6.6. Write wordtree.c and hashtab.c from scratch, then add a tree free and undef. Draw the tree and table for a small input." },
+  { when: "Session 3", what: "6.7 to 6.9. Write the tagged union, the bit-field flags and the signed-bit trap. Then do exercises 4 to 7 and the self-check." },
+]} />
+
+Everything goes into `kr-ch06/`, built with
+`-Wall -Wextra -fsanitize=address,undefined -g`. I keep the tree and the
+hash table in a small `ds/` folder of my own, because later chapters and
+projects keep needing them.
+
+Done when I can write the word counter and the macro table from a blank
+file in under an hour each, with no sanitizer or leak reports, and explain
+every byte of a structure's layout.
