@@ -1,0 +1,1239 @@
+---
+title: "Release It!, chapter by chapter"
+description: "Michael Nygard's Release It!, all 17 chapters from beginner to strategy: stability antipatterns and patterns, designing for production, deployment, versions and chaos."
+edition: "second edition (Pragmatic Bookshelf, 2018)"
+tocVerified: true
+tocSources:
+  - "https://pragprog.com/titles/mnee2/release-it-second-edition/"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+It sits in phase 5 of the <a href={withBase('/plans/software-ai-developer/')}>software AI developer</a>
+roadmap (DevOps and production) and in the failure lens of the
+<a href={withBase('/plans/underrated-fundamentals/')}>underrated fundamentals</a>. Most of what I know about
+software is about making it work once. This book is about what happens on the thousandth day, when a
+dependency is slow, the traffic triples, and a deploy goes out at the wrong moment.
+
+Its vocabulary (integration points, cascading failures, circuit breakers, bulkheads, back pressure) is
+the vocabulary I need for the phase 5 gate and for the failure matrix in phase 10.
+
+## How I would learn it
+
+I read it in its four parts, and after each part I break something on purpose in my own phase 3 API. For
+the stability chapters I build a tiny "bad dependency" server that can be slow, hang, return garbage or
+close connections, and point my API at it. Every antipattern gets reproduced before its pattern gets
+applied, so I see the failure with my own eyes and then see it stop.
+
+The case studies I read as incidents: I write a short postmortem for each one in my own words, with the
+timeline, the trigger, the contributing causes and what would have caught it earlier.
+
+<Timeline items={[
+  { when: 'week 25', what: 'Chapters 1 to 5: stability. Build the bad-dependency server; reproduce each antipattern; add timeouts, breakers and bulkheads.' },
+  { when: 'week 26', what: 'Chapters 6 to 11: design for production. Health checks, config, logs, metrics, load balancing, security basics.' },
+  { when: 'week 27', what: 'Chapters 12 to 14: delivery. Automated deploys, migrations in phases, versioned APIs.' },
+  { when: 'week 28', what: 'Chapters 15 to 17: systemic problems. Load test, adaptation, a first chaos experiment.' },
+  { when: 'phase 10', what: 'Reread chapters 4 and 5 while writing the failure matrix.' },
+]} caption="How the four parts map onto phase 5. The stability patterns come back in the phase 10 design doc." />
+
+Each chapter below climbs the nine levels. It is my paraphrase and my examples, not text from the book.
+
+## The book's four parts
+
+<Layers layers={[
+  { name: 'Living in production', note: 'chapter 1: why production is the point' },
+  { name: 'Part I: Create Stability', note: 'chapters 2 to 5: a case study, stability, antipatterns, patterns' },
+  { name: 'Part II: Design for Production', note: 'chapters 6 to 11: a case study, foundations, processes, interconnect, control plane, security' },
+  { name: 'Part III: Deliver Your System', note: 'chapters 12 to 14: a case study, deployment, versions' },
+  { name: 'Part IV: Solve Systemic Problems', note: 'chapters 15 to 17: a case study, adaptation, chaos engineering' },
+]} caption="Each part opens with a case study, then the chapters that would have prevented it." />
+
+## Living in production
+
+
+### 1. Living in Production
+
+**Covers:** Why the real test of software is production, not QA; what it costs to aim only at passing tests; and the idea of designing for the long life of a running system.
+
+<Compare left="Aimed at QA" right="Aimed at production" rows={[["Works on the happy path", "Survives slow, broken and hostile inputs"], ["Tested for an hour", "Runs for months"], ["One user at a time", "Thousands, at the same moment"], ["Done at release", "Release is the start"]]} caption="Two targets for the same code. Passing tests is necessary; surviving production is the goal." />
+
+<Levels label="Chapter 1, Living in Production">
+<Level name="Beginner">
+
+Software spends most of its life running, not being written. "Done" means it keeps working for real
+users over months. A feature that passes every test and falls over on the first busy Monday is not done.
+
+</Level>
+<Level name="Intermediate">
+
+Production differs from test in scale (traffic, data size), time (memory leaks, log growth, certificate
+expiry) and hostility (bad inputs, bots, broken dependencies). Each of those is a design input, not an
+operations problem for later.
+
+</Level>
+<Level name="Advanced">
+
+Most of a system's cost of ownership is in operating it, so design choices that save a day of
+development and add an hour of operations per week lose within months. The useful question for each
+design choice is "what does this cost every day it runs?".
+
+</Level>
+<Level name="Edge cases">
+
+The first day and the last day are boundaries: day one has a cold cache, empty tables and no traffic
+history; year three has huge tables, old data formats and forgotten cron jobs. Designs often fail at one
+of the two.
+
+</Level>
+<Level name="Corner cases">
+
+A new release plus an unusual traffic day: a marketing launch on the same day as a schema change. Two
+normal events together make an abnormal one, which is why release timing is a production concern.
+
+</Level>
+<Level name="Production level">
+
+Practically: every service has health checks, metrics, logs with request IDs, a runbook, and an owner
+who gets paged. If no one is paged, no one owns it.
+
+</Level>
+<Level name="Mindset">
+
+The mindset shift is from "does it work?" to "how will it fail, and will I know?".
+
+</Level>
+<Level name="System design">
+
+At the system level this sets the requirements that the rest of the book meets: stability (part I),
+operability (part II), safe delivery (part III), and adaptation (part IV).
+
+</Level>
+<Level name="Strategy">
+
+I list the ten worst things that could happen to my phase 3 API in its first year. Done when each has a
+detection signal and an owner action written next to it.
+
+</Level>
+</Levels>
+
+## Part I: Create Stability
+
+
+### 2. Case Study: The Exception That Grounded an Airline
+
+**Covers:** An incident where one uncaught exception in a resource pool, after a routine database failover, blocked every thread and stopped a whole airline system; the postmortem and how the clue was found.
+
+<Flow steps={["DB failover", "connection fails during close", "exception skips release", "pool slowly drains", "every request thread blocks waiting", "system-wide outage"]} caption="The failure chain as I understand the case: a small leak in an error path became total exhaustion." />
+
+<Levels label="Chapter 2, Case Study: The Exception That Grounded an Airline">
+<Level name="Beginner">
+
+A small bug in an error path (a resource not returned to a pool when an exception is thrown) can bring
+down an entire system. The trigger was routine maintenance, not unusual traffic.
+
+</Level>
+<Level name="Intermediate">
+
+The pattern in code: acquire, use, release, where release is skipped on an exception.
+
+```js
+const conn = await pool.acquire();
+const rows = await conn.query(sql);   // throws
+pool.release(conn);                   // never runs: the connection leaks
+```
+
+The fix is `try { ... } finally { pool.release(conn) }`, or a helper that owns the lifecycle.
+
+</Level>
+<Level name="Advanced">
+
+Pool exhaustion turns every caller into a waiter. If acquire has no timeout, threads block forever, and
+the whole service stops while looking alive: processes up, ports open, no CPU. Thread dumps showed
+everyone waiting on the same pool.
+
+</Level>
+<Level name="Edge cases">
+
+A pool size of N with N-1 leaked connections still works, just slowly. The system degrades gradually,
+and then fails all at once when the last connection goes.
+
+</Level>
+<Level name="Corner cases">
+
+Failover plus a leak in the close path: the leak only happens when closing a connection to a server that
+already went away, so it never shows in normal tests. Two rare events, both needed.
+
+</Level>
+<Level name="Production level">
+
+Production defences: acquire timeouts, pool metrics (in use, waiting), alerts on waiters, and failover
+drills in staging that exercise error paths.
+
+</Level>
+<Level name="Mindset">
+
+Error paths deserve the same care as the happy path, because they run at the worst time.
+
+</Level>
+<Level name="System design">
+
+Every shared resource (connection pool, thread pool, file descriptors) is a single point of exhaustion.
+The design question is what happens to the callers when it is empty.
+
+</Level>
+<Level name="Strategy">
+
+I write the leaking version, run it against a database I restart mid-test, and watch the pool drain;
+then fix it. Done when a restart under load leaves pool usage at its normal level.
+
+</Level>
+</Levels>
+
+### 3. Stabilize Your System
+
+**Covers:** What stability means, why long-running systems fail differently, failure modes, stopping cracks from spreading, and the chain from fault to error to failure.
+
+<Flow steps={["fault", "error", "failure", "crack spreads to callers", "system outage"]} caption="A chain of failure. Stability work puts a stop between each link." />
+
+<Levels label="Chapter 3, Stabilize Your System">
+<Level name="Beginner">
+
+A stable system keeps processing work even when parts of it fail. A *fault* is a defect or condition, an
+*error* is wrong behaviour it causes, a *failure* is the system not doing its job.
+
+</Level>
+<Level name="Intermediate">
+
+Long life span is its own test: leaks, slowly growing data, caches that never shrink. A load test for an
+hour finds none of these; a longevity test running for days does.
+
+</Level>
+<Level name="Advanced">
+
+Cracks propagate through integration points: a slow call ties up a thread, which ties up a pool, which
+slows the caller's callers. Stopping propagation is the theme: each layer needs a way to fail alone.
+
+</Level>
+<Level name="Edge cases">
+
+Zero traffic for hours, then a burst: connections that idled out on a firewall are dead, and the first
+requests after a quiet night all fail. A stable design validates or refreshes idle connections.
+
+</Level>
+<Level name="Corner cases">
+
+A slow leak plus a weekly deploy: the deploy restarts processes and hides the leak, until a holiday code
+freeze stops deploys and the process runs out of memory on day nine.
+
+</Level>
+<Level name="Production level">
+
+I run a soak test at moderate load for 24 hours or more and chart memory, open file descriptors, and
+latency. A flat line is the passing grade.
+
+</Level>
+<Level name="Mindset">
+
+Expect failure, design for containment. The habit: for each component, ask what fails with it.
+
+</Level>
+<Level name="System design">
+
+The failure chain is the backbone of a failure matrix: for each dependency, how it fails, how I detect it,
+how far it spreads, and what stops it.
+
+</Level>
+<Level name="Strategy">
+
+I draw the fault-to-failure chain for three dependencies of my API. Done when each chain has at least one
+stop I have implemented and tested.
+
+</Level>
+</Levels>
+
+### 4. Stability Antipatterns
+
+**Covers:** The patterns of failure: integration points, chain reactions, cascading failures, users, blocked threads, self-denial attacks, scaling effects, unbalanced capacities, dogpiles, force multipliers, slow responses and unbounded result sets.
+
+<Figure art={`
+  [ web tier ]   all threads waiting on the API
+       |
+  [  API  ]      all pool slots waiting on the DB
+       |
+  [   DB   ]     one slow query holding locks
+`} caption="A cascading failure: a slow layer at the bottom exhausts the layers above it." />
+
+<Levels label="Chapter 4, Stability Antipatterns">
+<Level name="Beginner">
+
+Every integration point (a call over the network) will fail, sometimes by refusing, more dangerously by
+hanging. A call with no timeout can wait forever.
+
+```js
+await fetch('http://slow.example/api'); // no timeout: may wait for minutes
+```
+
+</Level>
+<Level name="Intermediate">
+
+Chain reactions happen inside one layer: one instance fails, its load moves to the others, they fail
+faster. Cascading failures cross layers: a slow dependency exhausts the caller's resources. Blocked
+threads are usually waiting on a lock, a pool or a call with no timeout. Slow responses are worse than
+fast failures, because they hold resources.
+
+</Level>
+<Level name="Advanced">
+
+The rest of the catalogue: *users* (real ones do expensive things, bots do them at scale); *self-denial*
+(my own marketing email sends everyone at once); *scaling effects* (point-to-point links grow with the
+square of the number of nodes); *unbalanced capacities* (a front end that can send more than the back end
+can take); *dogpile* (every server's cron fires at midnight); *force multiplier* (automation that
+amplifies a mistake across the fleet); *unbounded result sets* (a query with no limit).
+
+```sql
+SELECT * FROM events WHERE user_id = $1;  -- fine with 100 rows; not with 4 million
+```
+
+</Level>
+<Level name="Edge cases">
+
+An unbounded result set at its boundary: a user with zero rows returns fast, a user with a million rows
+returns all of them into memory. Production data has a long tail that test data does not.
+
+</Level>
+<Level name="Corner cases">
+
+A dogpile plus a cache expiry: every key set at deploy time with the same TTL expires at the same
+second, and every server rebuilds every key against the database at once. Jitter on TTLs fixes it.
+
+</Level>
+<Level name="Production level">
+
+In production I look for these in code review: every network call has a timeout, every query a limit,
+every scheduled job jitter, every automation a blast-radius limit.
+
+</Level>
+<Level name="Mindset">
+
+The habit is to read a design looking for the one place where waiting is unbounded.
+
+</Level>
+<Level name="System design">
+
+These are the rows of a failure matrix. Each antipattern names a failure mode to check against every
+dependency in the architecture diagram.
+
+</Level>
+<Level name="Strategy">
+
+I reproduce four antipatterns with my bad-dependency server (hang, slow response, unbounded result, dogpile).
+Done when each has a test showing the failure and a fix showing it stopped.
+
+</Level>
+</Levels>
+
+### 5. Stability Patterns
+
+**Covers:** The patterns that stop failures: timeouts, circuit breaker, bulkheads, steady state, fail fast, let it crash, handshaking, test harnesses, decoupling middleware, shed load, back pressure, and governor.
+
+<Figure art={`
+            failures over threshold
+   [closed] --------------------------> [open]   calls fail fast
+      ^                                    |
+      | trial call succeeds                | after cool-down
+      |                                    v
+      +-------------------------------- [half-open]  one trial call
+                 trial call fails: back to open
+`} caption="A circuit breaker's three states." />
+
+<Levels label="Chapter 5, Stability Patterns">
+<Level name="Beginner">
+
+A timeout bounds how long I wait. In Node:
+
+```js
+const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+```
+
+On expiry the call rejects with a `TimeoutError`, and my thread of work is free again.
+
+</Level>
+<Level name="Intermediate">
+
+A circuit breaker stops calling a dependency that keeps failing, and fails fast instead, then tries again
+later.
+
+```ts
+class Breaker {
+  private fails = 0; private openedAt = 0;
+  constructor(private limit = 5, private coolMs = 10_000) {}
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.fails >= this.limit && Date.now() - this.openedAt < this.coolMs) throw new Error('breaker open');
+    try { const v = await fn(); this.fails = 0; return v; }
+    catch (e) { if (++this.fails >= this.limit) this.openedAt = Date.now(); throw e; }
+  }
+}
+```
+
+Bulkheads give each dependency its own pool, so one slow dependency cannot use every slot.
+
+</Level>
+<Level name="Advanced">
+
+Steady state: anything that accumulates (logs, sessions, temp files, cache entries) needs a purge
+mechanism. Fail fast: check preconditions (a breaker open, a resource missing) before doing expensive
+work. Let it crash: for isolated components with a supervisor, restarting is cleaner than recovering.
+Handshaking: a server tells clients whether it can take work. Test harnesses: a fake dependency that
+misbehaves on purpose. Decoupling middleware: queues so callers do not wait. Shed load: reject early when
+over capacity (HTTP 503 with `Retry-After`). Back pressure: slow the producer. Governor: limit how fast
+automation can act.
+
+</Level>
+<Level name="Edge cases">
+
+A timeout of zero, or one longer than the caller's own timeout: if my API times out at 5 s but calls a
+dependency with a 10 s timeout, the client gives up first and my server keeps working for nobody.
+Timeouts must shrink as calls go deeper.
+
+</Level>
+<Level name="Corner cases">
+
+Retries plus a breaker plus many clients: every client retries three times as the dependency recovers,
+tripling its load at the worst moment. Retries need backoff with jitter, a retry budget, and they must sit
+inside the breaker, not around it.
+
+</Level>
+<Level name="Production level">
+
+In production, breakers expose their state as a metric, timeouts come from config, bulkheads are sized
+from measurements, and load shedding returns a fast, explicit error. These are tested with fault
+injection, not just reasoned about.
+
+</Level>
+<Level name="Mindset">
+
+Fail fast and fail small. The habit: prefer a quick, honest error to a slow, hopeful wait.
+
+</Level>
+<Level name="System design">
+
+Patterns combine into a layer around each integration point: timeout, retry with budget, breaker,
+bulkhead, fallback. In a service mesh some of these move to infrastructure, but the decisions (what to
+fall back to) stay in the application.
+
+</Level>
+<Level name="Strategy">
+
+I wrap each outbound call in my API with a timeout, a breaker and a bulkhead, and test them with the
+harness. Done when a hanging dependency leaves every other endpoint at normal latency.
+
+</Level>
+</Levels>
+
+## Part II: Design for Production
+
+
+### 6. Case Study: Phenomenal Cosmic Powers, Itty-Bitty Living Space
+
+**Covers:** A retail site through a holiday season: taking its pulse, reading vital signs during a Black Friday overload, running diagnostics, calling in a specialist, comparing treatments, and seeing whether the system responds.
+
+<Flow steps={["vital signs drift", "diagnose with data", "form hypotheses", "compare treatments", "apply one change", "watch the response"]} caption="The case reads like medicine: observe, diagnose, treat one thing, and check whether the patient responds." />
+
+<Levels label="Chapter 6, Case Study: Phenomenal Cosmic Powers, Itty-Bitty Living Space">
+<Level name="Beginner">
+
+Operating a system under stress is diagnosis: look at vital signs (request rate, errors, latency,
+resource use), decide what is wrong, change one thing, watch.
+
+</Level>
+<Level name="Intermediate">
+
+Vital signs only help if they were recorded before the crisis, so a normal baseline exists. "Is this
+number bad?" needs "what is it on a normal Tuesday?".
+
+</Level>
+<Level name="Advanced">
+
+Treatments have side effects. Restarting servers clears symptoms and destroys evidence; adding capacity
+helps only if the bottleneck is capacity; turning off a feature reduces load but costs revenue. Comparing
+options before acting is the skill.
+
+</Level>
+<Level name="Edge cases">
+
+The first minutes of the peak are a boundary: caches are cold, autoscaling has not caught up, and the
+system looks worst exactly when attention is highest.
+
+</Level>
+<Level name="Corner cases">
+
+Two treatments at once: restarting and changing a config together means I cannot tell which helped, or
+whether one helped and the other hurt.
+
+</Level>
+<Level name="Production level">
+
+Production practice: dashboards prepared for the peak, a runbook of safe levers (feature flags, cache
+TTLs, rate limits), and one person changing things at a time while others observe.
+
+</Level>
+<Level name="Mindset">
+
+Under pressure, data first and one change at a time. Guessing feels faster and is slower.
+
+</Level>
+<Level name="System design">
+
+A system should expose levers for operators: feature toggles, admission control, read-only modes. These
+are designed in, not added during the incident.
+
+</Level>
+<Level name="Strategy">
+
+I write a peak-day runbook for my API: five vital signs, their normal ranges, and three safe levers.
+Done when a game-day load test is handled using only the runbook.
+
+</Level>
+</Levels>
+
+### 7. Foundations
+
+**Covers:** The ground a system runs on: networking in the data center and the cloud, physical hosts, virtual machines and containers, and how each changes what the software can assume.
+
+<Layers layers={[{"name": "Application process", "note": "my code"}, {"name": "Container", "note": "namespaces and cgroups, ephemeral filesystem"}, {"name": "Virtual machine", "note": "guest kernel, noisy neighbours"}, {"name": "Physical host", "note": "NICs, disks, clock"}, {"name": "Network", "note": "multiple interfaces, virtual networks"}]} caption="The layers under a process. Each layer takes away an assumption my code might make." />
+
+<Levels label="Chapter 7, Foundations">
+<Level name="Beginner">
+
+Code runs on a machine with network interfaces, disks and a clock. In the cloud those are virtual, can
+change, and can disappear.
+
+</Level>
+<Level name="Intermediate">
+
+A host may have several network interfaces (public, private, admin); a server should bind to the right one
+deliberately. Containers are ephemeral: anything written to the container filesystem is gone after a
+restart, and IP addresses change.
+
+</Level>
+<Level name="Advanced">
+
+Virtual machines share physical hosts, so performance varies with neighbours. Containers share a kernel
+and see limits through cgroups; a process that reads the host's CPU count instead of the container's
+quota sizes its pools wrongly.
+
+</Level>
+<Level name="Edge cases">
+
+Binding to `localhost` inside a container makes the service unreachable from outside the container;
+binding to `0.0.0.0` exposes it on every interface. Both are common first-day mistakes.
+
+</Level>
+<Level name="Corner cases">
+
+A memory limit plus a runtime that does not see it: the process thinks it has the host's 64 GB, grows its
+heap, and is killed by the OOM killer at the container's 512 MB with no error in the application log.
+Setting `--max-old-space-size` for Node avoids it.
+
+</Level>
+<Level name="Production level">
+
+In production I treat every instance as disposable: config from the environment, logs to stdout, state
+in managed services, and clock skew handled with NTP.
+
+</Level>
+<Level name="Mindset">
+
+Do not assume the machine. Each assumption (stable IP, persistent disk, accurate clock) should be either
+guaranteed by the platform or removed.
+
+</Level>
+<Level name="System design">
+
+The platform choice (VMs, containers, serverless) decides which of these assumptions exist. Design docs
+should name the platform's guarantees explicitly.
+
+</Level>
+<Level name="Strategy">
+
+I containerise my API with memory and CPU limits and check that pool sizes and heap size follow the
+limits. Done when killing and restarting the container loses nothing.
+
+</Level>
+</Levels>
+
+### 8. Processes on Machines
+
+**Covers:** How code, configuration and transparency make a process operable: builds and artifacts, configuration management, logs, metrics, health checks and instance-level visibility.
+
+<Flow steps={["source", "immutable artifact", "config injected at start", "process emits logs and metrics", "health endpoint", "operator decisions"]} caption="The same artifact runs everywhere; only configuration differs, and transparency tells operators what is happening inside." />
+
+<Levels label="Chapter 8, Processes on Machines">
+<Level name="Beginner">
+
+Code should be built once into an immutable artifact (an image), and configuration supplied at
+startup, never baked in.
+
+```js
+const port = Number(process.env.PORT ?? 3000);
+const dbUrl = process.env.DATABASE_URL ?? (() => { throw new Error('DATABASE_URL is required'); })();
+```
+
+</Level>
+<Level name="Intermediate">
+
+Transparency is what lets anyone see inside a running process: structured logs, metrics, traces, and a
+health endpoint. A log line should be machine-readable:
+
+```json
+{"level":"error","msg":"payment failed","requestId":"r-91","provider":"stripe","ms":5003}
+```
+
+</Level>
+<Level name="Advanced">
+
+Health checks differ: *liveness* (should this process be restarted?) and *readiness* (should it get
+traffic?). A readiness check that calls the database marks every instance unready when the database blips,
+removing all capacity at once.
+
+</Level>
+<Level name="Edge cases">
+
+Missing config at startup should fail immediately and loudly; a default that silently points at the wrong
+database is worse than a crash.
+
+</Level>
+<Level name="Corner cases">
+
+Log volume plus an incident: errors spike, every request logs a stack trace, the disk fills, and the
+logging itself takes the service down. Rate-limit repetitive logs and ship logs off the host.
+
+</Level>
+<Level name="Production level">
+
+Production processes have versioned config, secrets from a vault, logs with request IDs, RED metrics
+(rate, errors, duration) per endpoint, and health checks wired to the orchestrator.
+
+</Level>
+<Level name="Mindset">
+
+If it is not visible, it is not operable. The habit: before shipping, ask "how will I know this is broken?".
+
+</Level>
+<Level name="System design">
+
+These per-process signals feed the system's dashboards, alerts and SLOs. Without consistent fields
+across services, cross-service debugging is impossible.
+
+</Level>
+<Level name="Strategy">
+
+I add structured logs, a metrics endpoint and liveness and readiness checks to my API. Done when I can
+answer "which requests failed in the last ten minutes and why" with one query.
+
+</Level>
+</Levels>
+
+### 9. Interconnect
+
+**Covers:** How instances find and talk to each other at different scales: DNS, load balancing, demand control, network routing, service discovery and migratory virtual IP addresses.
+
+<Flow steps={["client", "DNS", "load balancer", "healthy instance pool", "instance"]} caption="The usual path of a request: a name resolves to a balancer, which picks a healthy instance." />
+
+<Levels label="Chapter 9, Interconnect">
+<Level name="Beginner">
+
+DNS turns a name into addresses; a load balancer spreads requests across instances and stops sending to
+unhealthy ones.
+
+</Level>
+<Level name="Intermediate">
+
+Load balancers work at layer 4 (TCP) or layer 7 (HTTP). Layer 7 can route by path or header, terminate
+TLS, and retry. Demand control means deciding at the edge how much work to accept.
+
+</Level>
+<Level name="Advanced">
+
+DNS has caching with TTLs, so changes propagate slowly and clients may hold old addresses. Service
+discovery (a registry or the orchestrator) gives a live list of instances; virtual IPs can move between
+hosts for failover.
+
+</Level>
+<Level name="Edge cases">
+
+A DNS TTL of zero is often ignored by resolvers, and a TTL of a day means a failover takes a day for some
+clients. Long-lived processes may resolve once at startup and never again.
+
+</Level>
+<Level name="Corner cases">
+
+A load balancer retry plus a non-idempotent request: the balancer times out, retries a POST on another
+instance, and the order is created twice. Retries at any layer require idempotency at the application.
+
+</Level>
+<Level name="Production level">
+
+In production I set balancer timeouts longer than application timeouts, configure health checks that
+reflect real readiness, and drain connections on deploy.
+
+</Level>
+<Level name="Mindset">
+
+The network is part of the program. The habit: know every hop a request takes and what each hop may do
+to it.
+
+</Level>
+<Level name="System design">
+
+Interconnect choices decide failover speed and blast radius: one balancer is a single point of failure;
+regional DNS gives geographic failover at the cost of slow propagation.
+
+</Level>
+<Level name="Strategy">
+
+I draw every hop from browser to database for my API with its timeout and retry policy. Done when no hop
+has a timeout longer than the hop before it.
+
+</Level>
+</Levels>
+
+### 10. Control Plane
+
+**Covers:** The tooling that operates the system: how much of it is right, mechanical advantage and its risks, platforms, development as production, system-wide transparency, configuration services, provisioning and deployment services, command and control, and a shopping list.
+
+<Layers layers={[{"name": "Data plane", "note": "the system serving users"}, {"name": "Control plane", "note": "deploys, config, scaling, monitoring"}, {"name": "Humans", "note": "decide and approve"}]} caption="Two planes. The control plane changes the data plane; its failures are amplified across everything it controls." />
+
+<Levels label="Chapter 10, Control Plane">
+<Level name="Beginner">
+
+The control plane is everything that operates the system rather than serving users: deploy pipelines,
+config services, autoscalers, monitoring.
+
+</Level>
+<Level name="Intermediate">
+
+Automation gives mechanical advantage: one command changes a hundred servers. The same advantage
+multiplies mistakes. A governor (rate limits on automation, confirmation for large changes) keeps it safe.
+
+</Level>
+<Level name="Advanced">
+
+Development tools are production too: if the CI system or artifact registry is down, nobody can ship a
+fix. System-wide transparency means logs, metrics and traces collected centrally across all services, not
+per box.
+
+</Level>
+<Level name="Edge cases">
+
+An automation targeting "all hosts matching X" when X matches nothing (no-op) or everything (a typo in
+a filter). The everything case needs a check: refuse if the target count is above a limit.
+
+</Level>
+<Level name="Corner cases">
+
+The control plane depends on the data plane it controls: the monitoring stack runs on the cluster that
+is failing, so the dashboards go dark exactly when needed.
+
+</Level>
+<Level name="Production level">
+
+In production, critical operator tools are independent of the system they manage, deploys have a
+maximum blast radius per step, and every automated action is logged with who triggered it.
+
+</Level>
+<Level name="Mindset">
+
+Build only as much control plane as the system needs. Every tool I add is also something to operate.
+
+</Level>
+<Level name="System design">
+
+For an AI product, the control plane includes prompt and model configuration, eval gates and feature
+flags. They need the same governors as deploys.
+
+</Level>
+<Level name="Strategy">
+
+I list my control-plane pieces (CI, registry, config, monitoring) and what happens if each is down. Done
+when I have a documented way to ship a fix with any one of them unavailable.
+
+</Level>
+</Levels>
+
+### 11. Security
+
+**Covers:** Security as part of production design: the OWASP Top 10, the principle of least privilege, configured passwords, and security as an ongoing process.
+
+<Compare left="Default" right="Least privilege" rows={[["App connects to DB as owner", "App role can only read and write its tables"], ["One API key for everything", "One scoped key per integration"], ["Secrets in config files", "Secrets from a vault, rotated"], ["Admin console on the public net", "Admin behind SSO and a private network"]]} caption="Least privilege applied to a service account." />
+
+<Levels label="Chapter 11, Security">
+<Level name="Beginner">
+
+Security failures are production failures. The OWASP Top 10 is a checklist of the most common web
+weaknesses: injection, broken access control, cryptographic failures and others.
+
+</Level>
+<Level name="Intermediate">
+
+Least privilege: each process and credential can do only what it needs. A database user for the API should
+not be able to drop tables.
+
+```sql
+CREATE ROLE api LOGIN PASSWORD '...';
+GRANT SELECT, INSERT, UPDATE ON orders, users TO api;  -- no DROP, no other tables
+```
+
+</Level>
+<Level name="Advanced">
+
+Configured passwords (database passwords, API keys) live somewhere: if that somewhere is the repo or a
+config file on every host, a leak of either is a breach. Vaults, short-lived credentials and rotation
+reduce the damage window.
+
+</Level>
+<Level name="Edge cases">
+
+A secret with no expiry is the boundary case: a key leaked three years ago still works today.
+
+</Level>
+<Level name="Corner cases">
+
+A logging change plus a secret in a header: debug logging of request headers turns every `Authorization`
+header into a log line readable by everyone with log access.
+
+</Level>
+<Level name="Production level">
+
+In production I run dependency audits in CI, redact secrets in logs, rotate keys on a schedule and
+after any suspected exposure, and review access quarterly.
+
+</Level>
+<Level name="Mindset">
+
+Security is a process, not a feature you finish. The habit: assume each credential will leak and limit
+what it can do.
+
+</Level>
+<Level name="System design">
+
+Security boundaries (networks, roles, tenants) belong on the architecture diagram, next to the
+reliability boundaries.
+
+</Level>
+<Level name="Strategy">
+
+I give my API a least-privilege DB role, move secrets to the environment from a secret store, and add
+log redaction. Done when a grep of a day's logs finds no tokens.
+
+</Level>
+</Levels>
+
+## Part III: Deliver Your System
+
+
+### 12. Case Study: Waiting for Godot
+
+**Covers:** A release process that depended on a long planned-downtime window and manual steps, and what it cost the people and the business.
+
+<Flow steps={["schedule downtime window", "manual steps all night", "something fails", "roll back or push through", "exhausted team"]} caption="A manual release in a downtime window: every step is a chance for error, at the hour people are least alert." />
+
+<Levels label="Chapter 12, Case Study: Waiting for Godot">
+<Level name="Beginner">
+
+Releases that need downtime and manual steps are slow, risky and exhausting. The case shows the human cost.
+
+</Level>
+<Level name="Intermediate">
+
+Manual runbooks drift from reality; a step skipped at 3 a.m. becomes an outage. Automation makes the
+release repeatable.
+
+</Level>
+<Level name="Advanced">
+
+The longer the gap between releases, the bigger each release, the higher the risk, which makes people
+want even fewer releases. Small, frequent releases break that loop.
+
+</Level>
+<Level name="Edge cases">
+
+The window is the boundary: a release that overruns the window has to be finished or rolled back in a
+hurry, both risky.
+
+</Level>
+<Level name="Corner cases">
+
+A long release plus an unrelated failure during it: debugging is impossible because everything is
+half-changed.
+
+</Level>
+<Level name="Production level">
+
+Production practice: automated deploys, no planned downtime, and small releases.
+
+</Level>
+<Level name="Mindset">
+
+Pain in releasing is a signal to release more often with more automation, not less often.
+
+</Level>
+<Level name="System design">
+
+Release frequency is a property of the architecture: tightly coupled components force coordinated
+releases.
+
+</Level>
+<Level name="Strategy">
+
+I time my own release process and list every manual step. Done when each step is automated or deleted.
+
+</Level>
+</Levels>
+
+### 13. Design for Deployment
+
+**Covers:** Deploying across many machines, the fallacy of planned downtime, automated and continuous deployment, the phases of a deployment (expand, roll out, contract), and deploying like the professionals.
+
+<Flow steps={["expand: add new column", "deploy code writing both", "backfill", "deploy code reading new", "contract: drop old"]} caption="Expand and contract. Each step is compatible with the code before and after it, so there is never a moment that needs downtime." />
+
+<Levels label="Chapter 13, Design for Deployment">
+<Level name="Beginner">
+
+Zero-downtime deploys replace instances one at a time while the old and new versions both serve traffic.
+
+</Level>
+<Level name="Intermediate">
+
+Because two versions run at once, every change must be compatible with both. Database migrations go in
+phases: add first, migrate, then remove.
+
+```sql
+ALTER TABLE users ADD COLUMN email_normalized text;           -- expand
+UPDATE users SET email_normalized = lower(email) WHERE id < 100000; -- backfill in batches
+-- later, after code reads only the new column:
+ALTER TABLE users DROP COLUMN email;                           -- contract
+```
+
+</Level>
+<Level name="Advanced">
+
+Continuous deployment pushes every passing change to production automatically. It is safe only with
+automated tests, health checks, canaries, and fast rollback. Deploying like the pros means deploys are
+boring, frequent and reversible.
+
+</Level>
+<Level name="Edge cases">
+
+A migration that locks a big table: `ALTER TABLE ... ADD COLUMN ... DEFAULT` on older databases rewrote
+the whole table and blocked writes for minutes. On a small staging table it was instant.
+
+</Level>
+<Level name="Corner cases">
+
+A rollback after a contract step: the old code expects the dropped column and fails. Contract steps
+must wait until rollback past them is no longer needed.
+
+</Level>
+<Level name="Production level">
+
+Production deploys: canary first, metrics compared automatically, rollback with one command, and
+migrations separate from code deploys.
+
+</Level>
+<Level name="Mindset">
+
+Every deploy is temporary coexistence of two versions. Design for the overlap.
+
+</Level>
+<Level name="System design">
+
+Deployability shapes architecture: services with independent databases deploy independently; a shared
+schema couples them.
+
+</Level>
+<Level name="Strategy">
+
+I perform a column rename on my API using expand and contract with traffic running. Done when the load test
+shows no errors across all five steps.
+
+</Level>
+</Levels>
+
+### 14. Handling Versions
+
+**Covers:** Changing interfaces without breaking callers: helping others handle your versions, and handling the versions of the services you depend on.
+
+<Compare left="Compatible change" right="Breaking change" rows={[["Add an optional field", "Remove or rename a field"], ["Add a new endpoint", "Change a field's type or meaning"], ["Accept a new enum value on input", "Return a new enum value old clients do not know"], ["Loosen validation", "Tighten validation"]]} caption="What callers notice. Additive changes are safe; removals and meaning changes are not." />
+
+<Levels label="Chapter 14, Handling Versions">
+<Level name="Beginner">
+
+Once someone calls my API, its shape is a promise. Changing it breaks them.
+
+</Level>
+<Level name="Intermediate">
+
+Additive changes are usually safe. Breaking changes need a new version: a path prefix (`/v2/`), a header,
+or a new field alongside the old one.
+
+</Level>
+<Level name="Advanced">
+
+Postel's idea (be liberal in what you accept) helps clients survive change: ignore unknown fields rather
+than rejecting them. Contract tests let each consumer state what it relies on.
+
+```ts
+const User = z.object({ id: z.string(), name: z.string() }).passthrough(); // tolerate new fields
+```
+
+</Level>
+<Level name="Edge cases">
+
+A new enum value is the boundary case: adding `status: "refunded"` is additive for me and breaking for a
+client with an exhaustive `switch` that throws on unknown values.
+
+</Level>
+<Level name="Corner cases">
+
+Two versions live plus a shared database: v1 writes rows without the new field, v2 assumes it exists.
+Both versions must handle data written by the other.
+
+</Level>
+<Level name="Production level">
+
+In production I publish a deprecation timeline, measure who still calls old versions, and remove only when
+traffic is zero or the deadline passes.
+
+</Level>
+<Level name="Mindset">
+
+My interface is someone else's dependency. The habit: assume every observable behaviour is relied on.
+
+</Level>
+<Level name="System design">
+
+Versioning policy is a system decision: internal services may move fast with contract tests; public APIs
+need long-lived versions.
+
+</Level>
+<Level name="Strategy">
+
+I add a field and deprecate another in my API with contract tests for an old client. Done when the old
+client's tests pass against the new server.
+
+</Level>
+</Levels>
+
+## Part IV: Solve Systemic Problems
+
+
+### 15. Case Study: Trampled by Your Own Customers
+
+**Covers:** A launch that failed under real customer load despite QA and load testing, because the tests did not resemble how people actually used the site.
+
+<Compare left="Load test" right="Real users" rows={[["Scripted happy paths", "Unexpected paths and repeats"], ["Even arrival", "Bursts at launch time"], ["Short sessions", "Sessions kept open, many items"], ["Test data", "Production-shaped data"]]} caption="Why the launch failed. The test measured a different workload from the one that arrived." />
+
+<Levels label="Chapter 15, Case Study: Trampled by Your Own Customers">
+<Level name="Beginner">
+
+A load test only proves something about the traffic it simulates. Real users arrive in bursts and do
+unexpected things.
+
+</Level>
+<Level name="Intermediate">
+
+Good load tests model real behaviour: the mix of pages, think time, session length, and what happens when
+users get impatient and reload.
+
+</Level>
+<Level name="Advanced">
+
+The testing gap: tests verify functions; production failure is about capacity, contention and
+interaction. Both kinds are needed.
+
+</Level>
+<Level name="Edge cases">
+
+The first minute after a launch announcement: arrival rate far above the average, every cache cold.
+
+</Level>
+<Level name="Corner cases">
+
+A slow page plus impatient users: each reload adds a new request while the old one is still running,
+multiplying load exactly when the system is slow.
+
+</Level>
+<Level name="Production level">
+
+Practice: load tests from production traffic shapes, capacity headroom for launches, and a waiting room or
+queue for spikes.
+
+</Level>
+<Level name="Mindset">
+
+Test the workload, not the code. The habit: ask "what will people actually do?"
+
+</Level>
+<Level name="System design">
+
+Launch planning is a system concern: capacity, feature flags, rate limits and a rollback plan together.
+
+</Level>
+<Level name="Strategy">
+
+I build a load test from my API's real access log shape. Done when the test reproduces the p95 latency
+seen in production within 20 percent.
+
+</Level>
+</Levels>
+
+### 16. Adaptation
+
+**Covers:** Systems that keep changing: convex returns from small experiments, process and organisation that allow change, and system and information architectures that make change cheap.
+
+<Flow steps={["small change", "release", "measure", "learn", "next change"]} caption="An adaptive system shortens this loop. The architecture decides how short it can get." />
+
+<Levels label="Chapter 16, Adaptation">
+<Level name="Beginner">
+
+Software that cannot change becomes a liability. Adaptation is the ability to change it cheaply and often.
+
+</Level>
+<Level name="Intermediate">
+
+Convex returns: many small, cheap experiments have a limited downside and an unlimited upside. Processes
+and teams organised around services make experiments cheap.
+
+</Level>
+<Level name="Advanced">
+
+Architecture for change: loose coupling, explicit contracts, and data designed to evolve (versioned
+messages, additive schemas). Information architecture means modelling concepts so a new business need
+does not require rewriting everything.
+
+</Level>
+<Level name="Edge cases">
+
+A change that touches one module is the cheap boundary; one that touches every service is the expensive
+one. Counting how many components a typical feature touches measures adaptability.
+
+</Level>
+<Level name="Corner cases">
+
+A fast-changing team plus a shared library everyone pins: upgrades stall, versions drift, and the library
+becomes the bottleneck.
+
+</Level>
+<Level name="Production level">
+
+In production, feature flags, dark launches and incremental rollouts make experiments safe.
+
+</Level>
+<Level name="Mindset">
+
+Optimise for the cost of the next change, not the elegance of the current one.
+
+</Level>
+<Level name="System design">
+
+Adaptability is the reason to choose a modular monolith or services, not fashion.
+
+</Level>
+<Level name="Strategy">
+
+I count how many files my last five features touched and look for a boundary that would have shrunk
+them. Done when I have one refactor that measurably reduces it.
+
+</Level>
+</Levels>
+
+### 17. Chaos Engineering
+
+**Covers:** Breaking things deliberately to learn: its antecedents, the Simian Army, adopting your own chaos practice, and disaster simulations.
+
+<Flow steps={["define steady state", "hypothesise it holds", "inject a real-world fault", "measure difference", "fix or gain confidence"]} caption="A chaos experiment is a test of a hypothesis about steady state, not random breaking." />
+
+<Levels label="Chapter 17, Chaos Engineering">
+<Level name="Beginner">
+
+Chaos engineering means injecting failures on purpose to find weaknesses before they find you.
+
+</Level>
+<Level name="Intermediate">
+
+An experiment states a steady state (for example, 99 percent of requests succeed under 300 ms), a
+hypothesis (killing one instance keeps that true), and a limited blast radius.
+
+```sh
+docker kill api-2   # inject: one instance gone
+# observe: error rate and latency for 5 minutes
+```
+
+</Level>
+<Level name="Advanced">
+
+The practice grew from fault injection and disaster recovery drills; tools in the Simian Army style kill
+instances, add latency, or remove whole zones. Starting small and automated beats big annual drills.
+
+</Level>
+<Level name="Edge cases">
+
+A blast radius of zero teaches nothing; a blast radius of everything is an outage. Start with one
+instance in staging.
+
+</Level>
+<Level name="Corner cases">
+
+A chaos experiment plus a real incident at the same time: experiments need an abort switch and a check
+that the system is healthy before they start.
+
+</Level>
+<Level name="Production level">
+
+In production, experiments run in business hours with people watching, with an abort button and
+pre-agreed stop conditions.
+
+</Level>
+<Level name="Mindset">
+
+Confidence comes from evidence. The habit: if I believe the system survives X, I should be willing to try X.
+
+</Level>
+<Level name="System design">
+
+Chaos experiments verify the failure matrix: each row predicts a behaviour; the experiment checks it.
+
+</Level>
+<Level name="Strategy">
+
+I run three experiments on my API (kill an instance, add 2 s latency to the DB, fill the disk) and record
+results. Done when each hypothesis is confirmed or a fix is shipped and the experiment rerun.
+
+</Level>
+</Levels>
+
+## Misreadings to avoid
+
+- "Add retries everywhere." Retries without backoff, budgets and idempotency multiply outages.
+- "A circuit breaker is resilience." It only helps if the fallback is sensible and the timeout behind it is right.
+- "Chaos engineering means breaking production at random." It is a controlled experiment with a hypothesis and an abort switch.
+- "Stability is the operations team's job." Most of these failures are designed in by developers.
+
+## Done with this book when
+
+- My phase 5 gate passes: a pipeline, dashboards and a rehearsed rollback.
+- Every outbound call in my API has a timeout, a breaker and a bulkhead, tested with a misbehaving fake.
+- I have a failure matrix row for each dependency, and a chaos experiment for three of them.
+- A schema change has gone out with expand and contract under load with zero errors.
