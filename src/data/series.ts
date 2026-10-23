@@ -21,13 +21,18 @@ export interface Series {
   /** The dated notes. Empty means the series is planned: it has a slot and a
    *  description, but nothing is written or scheduled yet. */
   posts: SeriesPost[];
-  /** For a planned series only: the notes the plans say it will hold, in
-   *  order. They have no dates and no pages. They are shown as plain text,
-   *  never as links, so the site does not claim a note that is not written.
-   *  When a note is scheduled it moves into `posts` with a date. */
+  /** For a dedicated series: the notes it holds, in order. They have no
+   *  dates. A row links to its note once the file exists in the blog
+   *  collection (src/content/blog/<series>/<nn>.mdx, seriesOrder = the
+   *  row's position, 1-based) and says "not written yet" until then, so
+   *  the site never claims a note that is not written. */
   planned?: PlannedNote[];
   /** For a series that is never planned ahead, one sentence on why. */
   plannedNote?: string;
+  /** A dedicated series: its notes have no dates. Each one is released as
+   *  soon as its file is merged, numbered by its place in `planned`. The
+   *  daily series (TypeScript, React, JavaScript, Redux) never set this. */
+  undated?: boolean;
 }
 
 /** A note a plan calls for, before it has a date. `plan` and `phase` say
@@ -186,7 +191,8 @@ export const series: Series[] = [
   {
     id: 'ui',
     name: 'UI and design systems',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'The interface layer: design tokens, component APIs, loading, error and empty states, forms, accessibility, and the line between a component library and a design system.',
     blurb:
@@ -207,7 +213,8 @@ export const series: Series[] = [
   {
     id: 'backend',
     name: 'Backend and data',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'The other half of the stack: Node, HTTP, APIs, Postgres, schema design, auth, validation, queues, caching, and the failures that only appear under real load.',
     blurb:
@@ -236,7 +243,8 @@ export const series: Series[] = [
   {
     id: 'craft',
     name: 'Craft and architecture',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'The judgment layer: testing, security, performance, observability, migration, debugging, and the architectural decisions that are expensive to reverse.',
     blurb:
@@ -261,7 +269,8 @@ export const series: Series[] = [
   {
     id: 'tools',
     name: 'Tools and delivery',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'The build, the checks and the deploy: Git, Vite, Vitest, Playwright, GitHub Actions, Lighthouse, observability, and the scripts that make a site shippable.',
     blurb:
@@ -282,7 +291,8 @@ export const series: Series[] = [
   {
     id: 'packages',
     name: 'Packages and supply chain',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'How code is distributed and trusted: npm, semver, lockfiles, dependency graphs, bundle size, licences, audits, publishing, and the supply chain behind every install.',
     blurb:
@@ -301,7 +311,8 @@ export const series: Series[] = [
   {
     id: 'ai',
     name: 'AI engineering',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'LLM APIs, prompting as specification, structured output, embeddings, retrieval, RAG, evals, cost, privacy, and the difference between a demo and a feature you can keep.',
     blurb:
@@ -330,7 +341,8 @@ export const series: Series[] = [
   {
     id: 'agents',
     name: 'Agents and automation',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'Tool calling, MCP, planning loops, memory, sandboxing, guardrails, traces, agent evals, and the discipline of giving a model a bounded job with an approval gate.',
     blurb:
@@ -359,7 +371,8 @@ export const series: Series[] = [
   {
     id: 'use-cases',
     name: 'Use cases and products',
-    dateRange: 'Not scheduled',
+    dateRange: 'Undated',
+    undated: true,
     description:
       'The product layer: problem framing, user interviews, scope, analytics, SEO, onboarding, billing, support, and the iterations that turn a demo into something people use.',
     blurb:
