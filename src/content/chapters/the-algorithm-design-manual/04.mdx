@@ -1,0 +1,1612 @@
+---
+book: the-algorithm-design-manual
+number: 4
+title: "Sorting"
+description: "Why sorting solves so many other problems, how to sort well in practice, and heapsort, mergesort, quicksort and distribution sorts with the comparison lower bound, all measured in TypeScript."
+part: "Part I, Practical Algorithm Design"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Sorting is the most studied problem in computer science, and this chapter
+argues that the reason is practical, not historical: once data is sorted, a
+long list of other problems (searching, duplicates, medians, closest pairs,
+set operations) becomes easy. The chapter shows how to use sorting as a
+building block, how to call library sorts correctly, and how the four great
+sorting ideas work: heapsort (a data structure does the work), mergesort
+(divide and conquer), quicksort (randomisation) and distribution sorts
+(bucketing), with the lower bound that says why n log n is the limit for
+sorting by comparisons.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- Recognise problems that become easy after sorting, and solve them in
+  O(n log n).
+- Call library sorts correctly: comparators, keys, stability and the
+  pitfalls of default orderings.
+- Implement heapsort with bottom-up heap construction, mergesort and
+  randomized quicksort, and explain each one's running time.
+- Explain why randomized quicksort is fast in expectation on every input.
+- Use counting sort and radix sort when keys are small integers, and explain
+  the Ω(n log n) lower bound for comparison sorting.
+
+**What you should already know:** <a href={withBase('/books/the-algorithm-design-manual/03-data-structures/')}>chapter 3, Data Structures</a>
+(heaps, BSTs) and chapter 2's Big Oh and logarithms; recursion.
+
+**Reading time:** about eighty minutes straight through, four to five hours
+with the code and self-checks.
+
+All code is my own TypeScript run in Node 22 with
+`node --experimental-strip-types`. I count comparisons with an instrumented
+`less` function so the counts are exact; times are from my machine.
+
+## Chapter map
+
+<Flow caption="The chapter in order: first why to sort and how to do it in practice, then the four algorithmic ideas, each followed or framed by a story about applying them." steps={[
+  "4.1 Applications of sorting: problems sorting makes easy",
+  "4.2 Pragmatics: comparators, keys, stability, library sorts",
+  "4.3 Heapsort: sorting via a data structure",
+  "4.4 War story: cheapest airline fare combinations",
+  "4.5 Mergesort: divide and conquer",
+  "4.6 Quicksort: randomisation and the expected case",
+  "4.7 Distribution sort: bucketing, and the lower bound",
+  "4.8 War story: sorting knowledge in a courtroom",
+]} />
+
+<Compare
+  left="Algorithm"
+  right="Idea and guarantee"
+  rows={[
+    ["Heapsort", "repeatedly extract the max from a heap; O(n log n) worst case, in place, not stable"],
+    ["Mergesort", "sort halves, merge them; O(n log n) worst case, stable, needs O(n) extra space"],
+    ["Quicksort", "partition around a random pivot; O(n log n) expected, O(n²) worst, in place, fastest in practice"],
+    ["Counting / radix", "bucket by key digits; O(n + k) or O(d(n + k)), only for integer-like keys"],
+    ["Insertion sort", "insert each item into the sorted prefix; O(n²) worst, fast on small or nearly sorted input"],
+  ]}
+  caption="The chapter's algorithms at a glance. Library sorts are usually hybrids of these, such as quicksort or mergesort for large ranges with insertion sort for small ones."
+/>
+
+## 4.1 Applications of Sorting
+
+### In one sentence
+
+Sorting is a building block: an O(n log n) sort followed by a linear pass
+solves searching, duplicate detection, frequency counting, selection, set
+operations and closest-pair problems that would otherwise take quadratic
+time.
+
+### The idea
+
+Once items are in order, equal items are adjacent, nearby values are
+neighbours, and the k-th smallest item is at index k. Those three facts turn
+many problems from "compare everything with everything" into "sort, then
+look at neighbours". Since sorting costs O(n log n) and a pass costs O(n),
+the whole solution is O(n log n), far better than O(n²) for large n.
+
+The book lists the standard applications. In my words:
+
+- **Searching:** binary search on sorted data is O(log n) per query
+  (chapter 5).
+- **Closest pair:** in one dimension, the two closest numbers are adjacent
+  after sorting, so one pass over neighbours finds them.
+- **Element uniqueness:** duplicates are adjacent after sorting.
+- **Frequency distribution, or the mode:** equal items form runs; the
+  longest run is the most frequent item.
+- **Selection:** the k-th smallest item, including the median, is at index k
+  (though chapter 4's quickselect does better, see below).
+- **Convex hulls:** the standard algorithms sort the points first, then sweep
+  (Part II covers them).
+- **Set operations:** intersection, union and difference of two sorted lists
+  are one merge-like pass.
+
+<Figure art={`
+   unsorted:  42  7 19  7 88 23 19 19 61
+   sorted:     7  7 19 19 19 23 42 61 88
+               ----  --------
+               dup   run of 3: the mode is 19
+                              ^ index 4: the median
+                     19 -> 23: smallest gap between distinct values
+
+   one O(n log n) sort, then each question is an O(n) scan
+`} caption="What sorting buys. After one sort, duplicates sit next to each other, runs show frequencies, the median sits at the middle index, and the closest values are neighbours." />
+
+### Worked example
+
+**Simple: four answers from one sort.** I sorted a small list and answered
+four questions with single passes:
+
+```ts
+const s = [42, 7, 19, 7, 88, 23, 19, 19, 61].sort((x, y) => x - y);
+let dup = false;
+for (let i = 1; i < s.length; i++) if (s[i] === s[i - 1]) dup = true;
+// mode: track the longest run of equal neighbours
+// median: s[s.length >> 1]
+// closest distinct pair: smallest positive s[i] - s[i - 1]
+```
+
+```text
+sorted: 7 7 19 19 19 23 42 61 88
+has duplicate: true; mode 19 x3; median 19; closest distinct pair 19,23 gap 4
+```
+
+**Realistic: selection without a full sort.** Finding the median by sorting
+costs O(n log n). **Quickselect** partitions around a random pivot like
+quicksort but recurses only into the side containing the k-th position, so
+its expected cost is O(n) (n + n/2 + n/4 + … by chapter 2's geometric
+series). On a million random numbers:
+
+```text
+median of 1e6: quickselect 39 ms, sort 3375 ms, equal=true
+```
+
+The sort with a comparator function was unusually slow on this machine, but
+the shape of the gap is real: selection does a fraction of sorting's work,
+because it never orders the parts it discards.
+
+### Step by step
+
+Intersecting two sorted lists in one pass, `A = 2 5 8 9` and
+`B = 1 5 6 9 12`:
+
+<Trace
+  columns={["i (A)", "j (B)", "compare", "action", "output"]}
+  rows={[
+    ["2", "1", "1 is smaller", "advance j", "—"],
+    ["2", "5", "2 is smaller", "advance i", "—"],
+    ["5", "5", "equal", "output, advance both", "5"],
+    ["8", "6", "6 is smaller", "advance j", "5"],
+    ["8", "9", "8 is smaller", "advance i", "5"],
+    ["9", "9", "equal", "output, advance both", "5 9"],
+    ["end", "12", "A exhausted", "stop", "5 9"],
+  ]}
+  caption="Two pointers walk the sorted lists once, always advancing past the smaller value. Total work O(|A| + |B|) after sorting, against O(|A| · |B|) for comparing every pair."
+/>
+
+### Common mistake
+
+**The mistake:** solving "find duplicates" or "find the closest pair" with
+two nested loops over all pairs.
+
+**Why it fails:** that is Θ(n²): fine for a hundred items, half a trillion
+comparisons for a million.
+
+**The fix:** sort first, then scan neighbours. Or, for duplicates and
+frequencies specifically, use a hash map (chapter 3), which is O(n) expected;
+sorting has the advantage of also giving order-based answers like medians.
+
+### In real systems
+
+Databases use sorting this way constantly. `ORDER BY`, `GROUP BY` (equal keys
+adjacent), `DISTINCT` and sort-merge joins all sort first and then scan;
+query planners choose between sorting and hashing for grouping and joins
+based on memory and data size. MapReduce and Spark sort ("shuffle") by key
+between stages so that each reducer sees all values for a key together.
+
+Command-line work uses the same trick: `sort | uniq -c | sort -rn` is
+frequency counting by sorting, and it scales to files larger than memory
+because `sort` spills to disk with an external merge sort.
+
+### Check yourself
+
+<details>
+<summary>How do you test whether two lists of n items contain the same elements (as multisets)?</summary>
+
+Sort both and compare element by element: O(n log n). Or count elements with
+a hash map: O(n) expected.
+
+</details>
+
+<details>
+<summary>Why is quickselect O(n) expected when quicksort is O(n log n)?</summary>
+
+Quickselect recurses into only one side of each partition, so the expected
+work is n + n/2 + n/4 + …, a geometric series under 2n (with a somewhat
+larger constant for random pivots). Quicksort recurses into both sides.
+
+</details>
+
+## 4.2 Pragmatics of Sorting
+
+### In one sentence
+
+Using a library sort well means choosing the order (comparator or key),
+knowing whether the sort is stable, and avoiding the default orderings and
+broken comparators that silently give wrong results.
+
+### The idea
+
+In practice you rarely write a sort; you call one. The questions are about
+what you ask it to do. The book raises them as a checklist, which I
+paraphrase:
+
+- **Increasing or decreasing?** Easy to get backwards; say it explicitly.
+- **By the key only, or the whole record?** Sorting customer records by
+  last name means the comparator looks at the name field.
+- **What about equal keys?** Ties need a rule: break them by a second key, or
+  keep the original order.
+- **Non-numeric data?** Alphabetical order raises questions about case,
+  accents, spaces and punctuation, and numbers inside strings.
+
+A **comparator** is a function of two items that returns a negative number
+if the first comes first, positive if the second does, and zero if they tie.
+A sort is **stable** if items with equal keys keep their original relative
+order. Stability matters when you sort by one key and then another: a stable
+sort by department, after a sort by name, gives departments with names in
+order inside each.
+
+<Figure art={`
+   input (in name order):  Asha/eng  Dev/ops  Kiran/eng  Meera/eng  Ravi/ops
+
+   stable sort by dept:    Asha/eng  Kiran/eng  Meera/eng  Dev/ops  Ravi/ops
+                           (names stay in order within each dept)
+
+   unstable sort by dept:  Meera/eng  Asha/eng  Kiran/eng  Ravi/ops  Dev/ops
+                           (equal keys may come out in any order)
+`} caption="Stability. A stable sort keeps the earlier order among equal keys, so sorting by a secondary key first and the primary key second gives a correct two-level order." />
+
+### Worked example
+
+**Simple: the default sort trap in JavaScript.**
+
+```ts
+[10, 9, 1, 100, 25].sort();                  // compares as strings
+[10, 9, 1, 100, 25].sort((a, b) => a - b);   // numeric
+```
+
+```text
+default sort: 1 10 100 25 9 | numeric: 1 9 10 25 100
+```
+
+Without a comparator, JavaScript converts elements to strings and orders
+them by UTF-16 code units, so "100" comes before "25". This is one of the
+most common bugs in JavaScript code that handles numbers.
+
+**Realistic: a broken comparator.** A comparator must be consistent: if a
+comes before b and b before c, then a before c, and it must return a negative
+value when a should come first. A common broken version returns only 1 or 0:
+
+```text
+bad comparator (a > b ? 1 : 0): 3 1 2 5 4
+```
+
+It never says "a comes first", so the sort is free to leave items as they
+were, and the output is not sorted at all. In JavaScript the result of an
+inconsistent comparator is implementation-defined; in Java, `TimSort` may
+throw "Comparison method violates its general contract".
+
+Stability, done right, from my run (JavaScript's sort has been stable by
+specification since ES2019):
+
+```text
+stable by dept: eng:Asha eng:Meera eng:Kiran ops:Ravi ops:Dev
+```
+
+Within each department, the original order (Asha, Ravi, Meera, Dev, Kiran)
+is preserved.
+
+### Step by step
+
+Writing a correct two-key comparator: sort orders by status (open first),
+then by due date (earliest first), then by ID to make ties deterministic.
+
+<Trace
+  columns={["step", "comparator part", "what it returns"]}
+  rows={[
+    ["1", "rank(a.status) − rank(b.status)", "non-zero if statuses differ: done"],
+    ["2", "a.due − b.due", "non-zero if due dates differ: done"],
+    ["3", "a.id.localeCompare(b.id)", "final tie-break, never zero for distinct IDs"],
+  ]}
+  caption="Chain comparisons from most to least significant and return the first non-zero result. The final tie-break on a unique field makes the order fully deterministic, which matters for pagination and tests."
+/>
+
+### Common mistake
+
+**The mistake:** subtracting large numbers or mixed types in a comparator, or
+returning booleans.
+
+**Why it fails:** `a - b` with timestamps as strings gives NaN; a boolean
+return is coerced to 0 or 1 and never signals "less than"; in languages with
+fixed-size integers, subtracting values near the limits overflows and flips
+the sign.
+
+**The fix:** compare explicitly (`a < b ? -1 : a > b ? 1 : 0`) for anything
+that is not a small number, use `localeCompare` or a collator for strings,
+and always add a final tie-break for deterministic output.
+
+### In real systems
+
+Unstable or non-deterministic ordering causes real bugs in paginated APIs:
+if two rows tie on the sort key and the database returns them in different
+orders on different queries, a user paging through results sees duplicates
+and misses rows. The fix is the tie-break on a unique key, the same as the
+comparator above.
+
+Sorting text for people is locale-dependent: German, Swedish and Turkish
+order some letters differently, and "file10" should come after "file9" in a
+file browser (natural sort). `Intl.Collator` with the `numeric` option
+handles both in JavaScript.
+
+### Check yourself
+
+<details>
+<summary>Why does [10, 9, 1].sort() give 1, 10, 9?</summary>
+
+Without a comparator, JavaScript sorts by string order, and "10" comes before
+"9" because "1" comes before "9".
+
+</details>
+
+<details>
+<summary>How can you get a stable result from an unstable sort?</summary>
+
+Add the original index as the final tie-break key: compare by the real key,
+and when equal, by original position.
+
+</details>
+
+## 4.3 Heapsort: Fast Sorting via Data Structures
+
+### In one sentence
+
+Heapsort builds a heap from the array in linear time and then repeatedly
+moves the maximum to the end, sorting in place in O(n log n) worst-case time.
+
+### The idea
+
+Selection sort (chapter 2) repeatedly finds the largest remaining item and
+puts it at the end. Its only problem is that finding the largest costs O(n)
+by scanning. Heapsort is selection sort with the scan replaced by a heap,
+which finds and removes the largest in O(log n). That one change turns
+Θ(n²) into Θ(n log n): the idea of the whole chapter 3, that a better data
+structure speeds up an unchanged algorithm.
+
+#### Heaps
+
+A **heap** is a binary tree in which every node's key is at least its
+children's keys (a **max-heap**; a min-heap flips the rule). It is stored
+level by level in an array, with the children of index i at 2i + 1 and
+2i + 2 and its parent at the floor of (i − 1)/2. The tree is always as
+complete as possible, filled left to right, so its height is ⌊lg n⌋. The
+heap is only partly ordered: the root is the maximum, but siblings and
+cousins can be in any order.
+
+#### Constructing heaps
+
+The obvious way to build a heap is to insert items one at a time, each
+bubbling up from the bottom: O(log n) per item, O(n log n) total.
+
+#### Extracting the minimum (or maximum)
+
+The book calls this extracting the minimum, with a min-heap; heapsort as I
+write it uses a max-heap and extracts the maximum, which is the same
+operation mirrored. Swap the root with the last item, shrink the heap by
+one, and **sift down** the new root: swap it with its larger child until
+neither child is larger. That walks one root-to-leaf path: O(log n).
+
+```ts
+function siftDown(a: number[], i: number, n: number) {
+  for (;;) {
+    const l = 2 * i + 1, r = l + 1; let m = i;
+    if (l < n && a[m] < a[l]) m = l;
+    if (r < n && a[m] < a[r]) m = r;
+    if (m === i) return;
+    [a[i], a[m]] = [a[m], a[i]]; i = m;
+  }
+}
+```
+
+#### Faster heap construction
+
+There is a better way to build the heap: treat the array as a tree already,
+and sift down every non-leaf node, starting from the last one and moving up
+to the root. Each subtree becomes a heap before its parent is processed.
+
+```ts
+function heapsort(a: number[]) {
+  const n = a.length;
+  for (let i = (n >> 1) - 1; i >= 0; i--) siftDown(a, i, n);   // build: O(n)
+  for (let end = n - 1; end > 0; end--) {                      // n extractions
+    [a[0], a[end]] = [a[end], a[0]];
+    siftDown(a, 0, end);
+  }
+}
+```
+
+Why is the bottom-up build O(n) and not O(n log n)? Most nodes are near the
+bottom, where sifting down is cheap. About n/2 nodes are leaves (cost 0),
+n/4 are one level up (cost at most 1), n/8 two levels up (cost at most 2),
+and so on. The total is n times the sum of h/2^(h+1) over heights h, and
+that sum converges to a constant (it is 1). So the build is linear. I
+counted comparisons on 100,000 random items:
+
+```text
+build heap bottom-up         cmp=    187,943  cmp/(n lg n)=0.11  3 ms
+build heap by insertion      cmp=    227,589  cmp/(n lg n)=0.14  23 ms
+build heap by insertion, sorted cmp=  1,468,946  cmp/(n lg n)=0.88  35 ms
+heapsort random              cmp=  3,019,364  cmp/(n lg n)=1.82  38 ms
+```
+
+On random input both builds are cheap, because random insertions rarely
+bubble far. On sorted input (each new item larger than everything), insertion
+hits its worst case, 1.47 million comparisons, eight times the bottom-up
+build's 188,000, which is about 1.9n. The full heapsort used about 1.82 n lg n
+comparisons, nearly all in the extraction phase.
+
+#### Sorting by incremental insertion
+
+The book closes the section with a contrast: sorting by inserting items one
+at a time into a sorted structure. Into a sorted array, each insertion
+shifts items, which is insertion sort's O(n²). Into a balanced search tree,
+each insertion is O(log n), and an in-order traversal reads the sorted
+result, so the total is O(n log n). Any dictionary with fast insert and fast
+ordered traversal gives an n log n sort, and heaps are simply the leanest such
+structure for the job.
+
+<Figure art={`
+   array [ 4 | 10 | 3 | 5 | 1 ]  as a tree, before and after build:
+
+             4                          10
+           /   \\                       /   \\
+         10     3      sift down      5     3
+        /  \\           from i=1,     /  \\
+       5    1          then i=0     4    1
+
+   i=1: 10 already larger than 5 and 1, nothing to do
+   i=0: 4 smaller than 10, swap; then 4 smaller than 5, swap
+`} caption="Bottom-up heap construction on five items. Only the non-leaf positions (indices 1 and 0) are sifted, from the last one back to the root; each sift moves an item down at most to the leaves." />
+
+### Worked example
+
+**Simple: heapsort by hand.** Starting from the heap `[10, 5, 3, 4, 1]`:
+swap 10 to the end and sift 1 down, giving `[5, 4, 3, 1 | 10]`; swap 5 to
+the end and sift, giving `[4, 1, 3 | 5, 10]`; then `[3, 1 | 4, 5, 10]`, then
+`[1 | 3, 4, 5, 10]`. The sorted suffix grows from the right.
+
+**Realistic: why libraries rarely use plain heapsort.** Heapsort has the best
+guarantees of the in-place sorts, O(n log n) worst case with O(1) extra
+space, but in practice it is slower than quicksort by a constant factor,
+because sifting down jumps across the array (poor cache locality) and does
+about twice as many comparisons. So libraries use it as a safety net:
+**introsort**, the usual C++ `std::sort`, runs quicksort and switches to
+heapsort if the recursion gets suspiciously deep, keeping quicksort's speed
+and heapsort's worst case.
+
+### Step by step
+
+The extraction phase on the heap `[10, 5, 3, 4, 1]`:
+
+<Trace
+  columns={["round", "swap root with end", "sift down the new root", "heap | sorted"]}
+  rows={[
+    ["1", "10 ↔ 1", "1 vs children 5, 3: swap with 5; 1 vs child 4: swap", "5 4 3 1 | 10"],
+    ["2", "5 ↔ 1", "1 vs 4, 3: swap with 4; no children left", "4 1 3 | 5 10"],
+    ["3", "4 ↔ 3", "3 vs 1: no swap", "3 1 | 4 5 10"],
+    ["4", "3 ↔ 1", "heap of one", "1 | 3 4 5 10"],
+  ]}
+  caption="Each round moves the current maximum to the front of the sorted suffix and restores the heap in O(log n). After n − 1 rounds the array is sorted, using no memory beyond the array itself."
+/>
+
+### Common mistake
+
+**The mistake:** building the heap by n insertions and believing that is the
+only way, or getting the child indices wrong for zero-based arrays.
+
+**Why it fails:** insertion-built heaps cost O(n log n) on bad input (sorted
+input in my run took eight times the work). Off-by-one child indices (2i and
+2i + 1 are for one-based arrays) silently break the heap property.
+
+**The fix:** build bottom-up, sifting down from index ⌊n/2⌋ − 1 to 0, and use
+2i + 1 and 2i + 2 with zero-based arrays.
+
+### In real systems
+
+Heapsort itself appears where worst-case guarantees and no extra memory
+matter: embedded systems, the Linux kernel's generic `sort()` helper, and as
+introsort's fallback. Heaps more broadly are in every scheduler and priority
+queue.
+
+The linear-time build matters when you have all the items up front: Python's
+`heapq.heapify` and C++'s `std::make_heap` use the bottom-up method, so
+turning a list into a priority queue is O(n), not O(n log n).
+
+### Check yourself
+
+<details>
+<summary>Why is bottom-up heap construction linear?</summary>
+
+Most nodes are near the bottom where sifting is cheap: half are leaves, a
+quarter sift at most one level, and so on. The total work is n times a
+convergent sum, which is O(n).
+
+</details>
+
+<details>
+<summary>Is heapsort stable?</summary>
+
+No. Swapping the root with the last item can move equal keys past each other.
+
+</details>
+
+## 4.4 War Story: Give me a Ticket on an Airplane
+
+### In one sentence
+
+Pricing an airline trip meant finding the cheapest combination of fares that
+satisfied a thicket of rules, and the solution was to generate combinations
+in increasing order of price and stop at the first legal one.
+
+### The idea
+
+The story, in outline and in my words. A company building airline pricing
+software needed, for a requested trip, the cheapest valid combination of
+fares. Each leg of the trip had many candidate fares, and fare rules (which
+fares could combine, minimum stays, and so on) made most combinations
+illegal. Checking legality was expensive; there were far too many
+combinations to check them all.
+
+The insight was to separate ordering from checking. Sort each leg's fares by
+price. The cheapest combination overall is the cheapest of each, the next
+cheapest is found by bumping one leg to its next fare, and so on. Using a
+priority queue of candidate combinations keyed by total price, you can
+generate combinations in exactly increasing order of total, check each, and
+stop at the first one that passes. Usually that is early, so only a few
+expensive legality checks run.
+
+The lesson the book draws is that sorting and priority queues let you look
+at candidates in the order that matters, which turns "check everything and
+keep the best" into "check until the first success".
+
+### Worked example
+
+**Simple: why sums of sorted lists come out in order.** With outbound fares
+sorted `120, 150, 210, 260` and return fares `100, 140, 180, 300`, the
+cheapest total is 120 + 100. Any other combination uses at least one fare
+that is not the cheapest of its list, so it costs at least as much. After
+taking combination (i, j), the only new candidates that could be next are
+(i + 1, j) and (i, j + 1).
+
+**Realistic: my version with made-up rules.** I invented two rules (O1
+combines only with R4; O2 does not combine with R1 or R2) and enumerated by
+total with a priority queue, seeding it with (0, 0) and pushing the two
+successors of each rejected pair:
+
+```text
+try O1+R1 = 220 rejected by rule
+try O2+R1 = 250 rejected by rule
+try O1+R2 = 260 rejected by rule
+try O2+R2 = 290 rejected by rule
+try O1+R3 = 300 rejected by rule
+try O3+R1 = 310 VALID
+tested 6 of 16 combinations
+```
+
+Six legality checks instead of sixteen; with real fare lists of hundreds per
+leg and several legs, the saving is orders of magnitude.
+
+<Figure art={`
+             R1=100  R2=140  R3=180  R4=300
+   O1=120     220     260     300     420
+   O2=150     250     290     330     450
+   O3=210     310     350     390     510
+   O4=260     360     400     440     560
+
+   totals grow to the right and downward; the heap frontier
+   moves out from the top-left corner in order of total:
+   220, 250, 260, 290, 300, 310 (first valid)
+`} caption="The grid of combined prices. Because both lists are sorted, every row and column increases, so the cheapest unexplored combinations always lie on a frontier next to the explored corner, which the priority queue tracks." />
+
+### Step by step
+
+The priority queue's contents as the search runs:
+
+<Trace
+  columns={["pop", "result", "push", "queue after (total: pair)"]}
+  rows={[
+    ["220: O1+R1", "rejected", "O2+R1, O1+R2", "250: O2R1, 260: O1R2"],
+    ["250: O2+R1", "rejected", "O3+R1, O2+R2", "260: O1R2, 290: O2R2, 310: O3R1"],
+    ["260: O1+R2", "rejected", "O1+R3 (O2+R2 already queued)", "290: O2R2, 300: O1R3, 310: O3R1"],
+    ["290: O2+R2", "rejected", "O3+R2, O2+R3", "300: O1R3, 310: O3R1, 330: O2R3, 350: O3R2"],
+    ["300: O1+R3", "rejected", "O1+R4 (O2+R3 already queued)", "310: O3R1, 330: O2R3, 350: O3R2, 420: O1R4"],
+    ["310: O3+R1", "valid", "stop", "—"],
+  ]}
+  caption="Each pop is the cheapest unexplored combination. A 'seen' set stops pairs from being queued twice. The queue stays small (the frontier), so each step costs O(log of the frontier size)."
+/>
+
+### Common mistake
+
+**The mistake:** computing every combination's price, checking every one for
+validity, and keeping the best.
+
+**Why it fails:** the number of combinations multiplies across legs, and the
+validity checks are the expensive part. Most of that work is on combinations
+far more expensive than the answer.
+
+**The fix:** generate candidates in order of the objective (price) and stop at
+the first one that passes; a sorted list per dimension plus a priority queue
+of the frontier does this.
+
+### In real systems
+
+Airline pricing engines and travel search still face this problem at
+enormous scale, with fares, rules and availability multiplied across many
+legs. "Best-first" enumeration with priority queues, plus pruning, is the
+standard approach in ranking systems as well: a search engine merges sorted
+posting lists to find the top-scoring documents without scoring all of them
+(threshold algorithms and WAND-style evaluation).
+
+The same frontier trick answers "the k smallest sums of pairs" and "the k-th
+smallest element of a sorted matrix", both common interview problems that
+are this war story in miniature.
+
+### Check yourself
+
+<details>
+<summary>After popping pair (i, j), why are (i + 1, j) and (i, j + 1) the only new candidates needed?</summary>
+
+Every other unexplored pair is at least as expensive as one of those or as
+something already in the queue, because rows and columns are sorted. The
+frontier grows only from the pair just taken.
+
+</details>
+
+<details>
+<summary>What is the role of the seen set?</summary>
+
+Pair (i + 1, j + 1) can be reached from both (i + 1, j) and (i, j + 1); the set
+stops it being queued and checked twice.
+
+</details>
+
+## 4.5 Mergesort: Sorting by Divide and Conquer
+
+### In one sentence
+
+Mergesort splits the array in half, sorts each half recursively and merges
+the two sorted halves in linear time, giving O(n log n) in every case and a
+stable sort.
+
+### The idea
+
+**Divide and conquer** solves a problem by splitting it into smaller pieces of
+the same kind, solving them recursively, and combining the results (chapter
+5 covers the method in general). For sorting, the split is trivial (cut in
+half) and the combine step is the **merge**: given two sorted lists,
+repeatedly take the smaller of their two front items. Each step outputs one
+item, so merging n items costs at most n − 1 comparisons.
+
+```ts
+function mergesort(a: number[]): number[] {
+  if (a.length <= 1) return a;
+  const m = a.length >> 1;
+  const L = mergesort(a.slice(0, m)), R = mergesort(a.slice(m));
+  const out: number[] = []; let i = 0, j = 0;
+  while (i < L.length && j < R.length) out.push(R[j] < L[i] ? R[j++] : L[i++]);
+  while (i < L.length) out.push(L[i++]);
+  while (j < R.length) out.push(R[j++]);
+  return out;
+}
+```
+
+Why n log n: the recursion halves the size at each level, so there are lg n
+levels. At each level, the merges together touch every item once, so each
+level costs O(n). Levels times cost per level gives O(n log n), in the worst
+case as well as the average. In recurrence form (chapter 5), T(n) = 2T(n/2)
++ O(n).
+
+Taking from the left list on ties (`R[j] < L[i]` is strict) is what makes the
+sort stable: equal items from the left half, which came first, are output
+first.
+
+<Figure art={`
+   level 0:        [ 38 27 43  3  9 82 10 ]               split
+   level 1:     [ 38 27 43  3 ]     [ 9 82 10 ]
+   level 2:    [ 38 27 ] [ 43 3 ]  [ 9 82 ] [ 10 ]
+   level 3:   [38] [27] [43] [3]  [9] [82] [10]
+                 \\  /     \\  /     \\  /     |
+   merge:      [27 38]  [3 43]   [9 82]   [10]
+                  \\      /          \\      /
+               [3 27 38 43]       [9 10 82]
+                      \\             /
+                 [ 3  9 10 27 38 43 82 ]
+
+   lg n levels, n work per level of merges: n lg n
+`} caption="Mergesort's recursion tree. Splitting goes down lg n levels; merging comes back up, and each level of merges handles every item once." />
+
+### Worked example
+
+**Simple: counting comparisons.** On 100,000 random numbers my instrumented
+mergesort did 1,536,583 comparisons, 0.93 n lg n, very close to the
+theoretical minimum for comparison sorting (section 4.7): lg(100,000!) is
+about 1,516,704. Mergesort is nearly optimal in comparisons.
+
+```text
+mergesort random             cmp=  1,536,583  cmp/(n lg n)=0.93  275 ms
+```
+
+It was also the slowest of my three sorts in time (275 ms against 38 ms for
+heapsort), because my version allocates new arrays at every level. Real
+implementations merge into one preallocated buffer.
+
+**Realistic: sorting data larger than memory.** Mergesort is the natural
+**external sort**: sort chunks that fit in memory, write each sorted chunk
+(a "run") to disk, then merge all the runs in one pass using a priority queue
+of their front items (a k-way merge). Merging reads every file sequentially,
+which is what disks and network storage are fastest at. Databases sort
+large tables this way, and Unix `sort` does it for big files.
+
+### Step by step
+
+Merging `[3, 27, 38, 43]` and `[9, 10, 82]`:
+
+<Trace
+  columns={["L front", "R front", "take", "output so far"]}
+  rows={[
+    ["3", "9", "3 (L)", "3"],
+    ["27", "9", "9 (R)", "3 9"],
+    ["27", "10", "10 (R)", "3 9 10"],
+    ["27", "82", "27 (L)", "3 9 10 27"],
+    ["38", "82", "38 (L)", "3 9 10 27 38"],
+    ["43", "82", "43 (L)", "3 9 10 27 38 43"],
+    ["—", "82", "copy the rest of R", "3 9 10 27 38 43 82"],
+  ]}
+  caption="Six comparisons merge seven items; when one list runs out, the rest of the other is copied without comparisons. Merging is linear because every step outputs one item."
+/>
+
+### Common mistake
+
+**The mistake:** writing the merge with `<=` in the wrong direction, or
+taking from the right list on ties.
+
+**Why it fails:** the sort still sorts, but loses stability, which breaks
+multi-key sorting that relies on it.
+
+**The fix:** on ties, take from the left list. Test stability explicitly
+with records that share keys.
+
+### In real systems
+
+**Timsort**, the sort in Python, Java (for objects), Android and V8's
+`Array.prototype.sort`, is a mergesort hybrid. It finds runs that are already
+sorted in the data, extends short ones with insertion sort, and merges runs
+with a careful balancing policy. Real data is often partly sorted, and Timsort
+exploits that to approach linear time on such inputs while staying
+O(n log n) and stable on all inputs.
+
+Mergesort also parallelises and distributes well: each half is independent,
+and merges can be split. Distributed sorts (as in the shuffle phase of Spark
+and Hadoop) are merge-based.
+
+### Check yourself
+
+<details>
+<summary>What is mergesort's main practical drawback?</summary>
+
+It needs O(n) extra memory for merging (on arrays), unlike heapsort and
+quicksort, which sort in place.
+
+</details>
+
+<details>
+<summary>Why is mergesort good for linked lists?</summary>
+
+Merging linked lists needs no extra array, only pointer changes, and
+mergesort never needs random access, so it sorts a linked list in
+O(n log n) with O(log n) extra space for the recursion.
+
+</details>
+
+## 4.6 Quicksort: Sorting by Randomization
+
+### In one sentence
+
+Quicksort partitions the array around a pivot so that smaller items go left
+and larger items right, then sorts each side recursively; with a random
+pivot it runs in O(n log n) expected time on every input and is usually the
+fastest sort in practice.
+
+### The idea
+
+Pick an item, the **pivot**, and rearrange the array so that everything
+smaller than the pivot comes before it and everything larger after it. This
+**partition** step takes one pass, O(n), and puts the pivot in its final
+sorted position. Then sort the two sides independently. Unlike mergesort,
+the work happens before the recursion (partitioning) rather than after
+(merging), and no extra array is needed.
+
+```ts
+function quicksort(a: number[], lo = 0, hi = a.length - 1): void {
+  if (lo >= hi) return;
+  const pi = lo + Math.floor(Math.random() * (hi - lo + 1));   // random pivot
+  [a[pi], a[hi]] = [a[hi], a[pi]];
+  const p = a[hi]; let f = lo;                                 // f: first "large" slot
+  for (let i = lo; i < hi; i++)
+    if (a[i] < p) { [a[i], a[f]] = [a[f], a[i]]; f++; }
+  [a[f], a[hi]] = [a[hi], a[f]];                               // pivot to its place
+  quicksort(a, lo, f - 1); quicksort(a, f + 1, hi);
+}
+```
+
+The cost depends on how evenly the pivot splits. If it always lands in the
+middle, the recursion has lg n levels with O(n) partitioning work per level:
+O(n log n). If it always lands at an end (the smallest or largest item), each
+partition removes only one item, the recursion is n levels deep, and the
+total is n + (n − 1) + … = Θ(n²).
+
+#### 4.6.1 Intuition: the expected case
+
+A pivot does not need to be the exact median to be useful. Call a pivot
+"good" if it lands in the middle half of the values (between the 25th and
+75th percentiles). Half of all items are good pivots. A good pivot leaves at
+most three-quarters of the items on either side, so after about log base 4/3
+of n good pivots along any path, the sizes are down to one. Since every other
+pivot is good on average, paths are about twice that long: still O(log n)
+levels, each with O(n) work. A fuller analysis gives about 2n ln n, or
+1.39 n lg n, expected comparisons.
+
+<Figure art={`
+   good split (pivot near the median)        bad split (pivot at an end)
+
+             n                                     n
+          /     \\                                 /
+        n/2     n/2                            n-1
+       /  \\    /  \\                            /
+     n/4  n/4 n/4  n/4                       n-2
+      ...  lg n levels                        ...  n levels
+   work per level: n                       work per level: n, n-1, ...
+   total: n lg n                           total: about n^2 / 2
+`} caption="Quicksort's cost is the depth of its recursion times the work per level. Balanced splits give lg n levels; consistently lopsided splits give n levels and quadratic time." />
+
+#### 4.6.2 Randomized algorithms
+
+The bad case happens when pivots are consistently extreme. With the "last
+element" rule, a sorted input triggers it every time, and sorted inputs are
+common. Choosing the pivot **at random** changes the nature of the guarantee:
+the expected running time is O(n log n) for **every** input, because the
+expectation is over the algorithm's own random choices, not over the inputs.
+No input is bad; only very unlucky coin flips are, and their probability is
+tiny for large n.
+
+That is the defining idea of a **randomized algorithm**: an algorithm that
+makes random choices, with a guarantee that holds in expectation (or with high
+probability) for any input. Chapter 6 develops the tools. My measurements on
+100,000 items, and on 20,000 already sorted items with the last element as
+pivot:
+
+```text
+quicksort random pivot, random cmp=  1,970,532  cmp/(n lg n)=1.19  55 ms
+quicksort random pivot, sorted cmp=  2,061,211  cmp/(n lg n)=1.24  35 ms
+quicksort last pivot, sorted 20000: cmp=199,990,000 (n^2/2 = 200,000,000), 909 ms
+```
+
+With a random pivot, sorted and random inputs cost about the same. With a
+fixed pivot on sorted input, the comparison count is n(n − 1)/2 exactly, and
+20,000 items took longer than 100,000 did with a random pivot. (My measured
+1.2 n lg n is below the 1.39 n lg n figure because that figure drops a
+lower-order term: the exact expected count is 2(n + 1)H(n) − 4n, about 2.02
+million at n = 100,000, close to the 1.97 million I counted.)
+
+#### 4.6.3 Is quicksort really quick?
+
+All three sorts are O(n log n), so asymptotics cannot choose between them.
+The book's answer, which matches measurement, is that quicksort's inner loop
+is very simple: compare with a pivot held in a register, maybe swap, move on,
+all walking sequentially through memory. Heapsort jumps around the array;
+mergesort copies data to a second array. In practice a well-implemented
+quicksort is typically two to three times faster than either. That is a
+constant-factor argument, the kind Big Oh ignores and engineering cannot.
+
+### Worked example
+
+**Simple: one partition by hand.** Array `[7, 2, 9, 4, 3, 8]` with the last
+element, 8, as pivot. Scan from the left, keeping a boundary f: items before f
+are smaller than 8. The 7, 2, 4 and 3 are smaller and are swapped into the
+front; 9 is not. The result is `[7, 2, 4, 3, 8, 9]` with 8 at index 4, its
+final position.
+
+**Realistic: why production sorts randomise or choose pivots carefully.**
+A quicksort with a deterministic pivot rule can be attacked: Doug
+McIlroy's well-known paper on a "killer adversary" for quicksort showed how
+to construct inputs that force quadratic behaviour in deterministic library
+implementations. If a server sorts data an attacker supplies, that becomes a
+denial-of-service attack. Randomised pivots, median-of-three with
+randomisation, or introsort's heapsort fallback all close that hole.
+
+### Step by step
+
+Partition of `[7, 2, 9, 4, 3, 8]` with pivot 8 (already at the end):
+
+<Trace
+  columns={["i", "a[i]", "a[i] smaller than 8?", "action", "array", "f after"]}
+  rows={[
+    ["0", "7", "yes", "swap a[0] with a[0]", "7 2 9 4 3 8", "1"],
+    ["1", "2", "yes", "swap a[1] with a[1]", "7 2 9 4 3 8", "2"],
+    ["2", "9", "no", "nothing", "7 2 9 4 3 8", "2"],
+    ["3", "4", "yes", "swap a[3] with a[2]", "7 2 4 9 3 8", "3"],
+    ["4", "3", "yes", "swap a[4] with a[3]", "7 2 4 3 9 8", "4"],
+    ["end", "—", "—", "swap pivot into a[4]", "7 2 4 3 8 9", "pivot at 4"],
+  ]}
+  caption="Lomuto-style partitioning. Everything left of f is smaller than the pivot; the final swap puts the pivot between the two parts, in its sorted position. One pass, n − 1 comparisons."
+/>
+
+### Common mistake
+
+**The mistake:** recursing on both sides without care, so that bad splits
+nest the recursion n levels deep and overflow the call stack.
+
+**Why it fails:** even with random pivots an unlucky run can be deep, and with
+fixed pivots on sorted data the depth is exactly n.
+
+**The fix:** recurse on the smaller side and loop on the larger (my measured
+version does this), which bounds the stack depth by lg n. Use random pivots,
+and handle many equal keys with a three-way partition (less, equal, greater)
+so that arrays full of duplicates do not go quadratic.
+
+### In real systems
+
+Quicksort variants are the default for primitive types in many standard
+libraries. Java sorts primitive arrays with a dual-pivot quicksort; C++'s
+`std::sort` is introsort; Go uses **pattern-defeating quicksort**
+(pdqsort), which detects sorted and adversarial patterns and switches
+strategies, and Rust's unstable sort descends from the same design. Object arrays in Java and Python use Timsort, a stable mergesort
+hybrid, because stability matters for objects.
+
+Quickselect, quicksort's one-sided relative, is in C++ as `nth_element` and is
+how databases and analytics tools compute medians and percentiles without
+sorting.
+
+### Check yourself
+
+<details>
+<summary>What input makes last-element-pivot quicksort quadratic, and what fixes it?</summary>
+
+Already sorted (or reverse-sorted) input, because every pivot is the largest
+(or smallest) item. A random pivot fixes it in expectation for every input.
+
+</details>
+
+<details>
+<summary>Why is randomized quicksort's guarantee stronger than "fast on average inputs"?</summary>
+
+The expectation is over the algorithm's own random choices, so it holds for
+any input, including adversarial ones; no particular input is slow.
+
+</details>
+
+## 4.7 Distribution Sort: Sorting via Bucketing
+
+### In one sentence
+
+When keys are small integers or can be split into digits, distribution sorts
+(bucket, counting and radix sort) place items into buckets by key instead of
+comparing them, beating n log n, which the comparison lower bound shows is
+the best any comparison-based sort can do.
+
+### The idea
+
+To sort a phone book by hand, you would not compare names pairwise: you would
+make piles by first letter, then sort each pile. That is **bucket sort**:
+distribute items into buckets by a prefix of the key, sort each bucket
+(recursively or otherwise), and concatenate. If keys are spread evenly,
+buckets are small and the total is close to linear.
+
+**Counting sort** is the extreme case for small integer keys in a range 0 to
+k − 1: count how many items have each key, turn counts into starting
+positions with a running sum, and place each item directly in its slot. Cost
+O(n + k), and it is stable if you place items in input order (or, as in my
+version, walk the input backwards while decrementing the positions).
+
+```ts
+function countingSort(a: number[], k: number): number[] {
+  const c = new Array(k).fill(0);
+  for (const x of a) c[x]++;
+  for (let i = 1; i < k; i++) c[i] += c[i - 1];       // c[x] = items with key at most x
+  const out = new Array(a.length);
+  for (let i = a.length - 1; i >= 0; i--) out[--c[a[i]]] = a[i];
+  return out;
+}
+// countingSort([34, 21, 34, 19, 21, 50, 19, 34], 120) → 19 19 21 21 34 34 34 50
+```
+
+**Radix sort** sorts integers by one digit at a time with a stable counting
+sort, starting from the least significant digit. Because each pass is
+stable, ties on the current digit keep the order from earlier (less
+significant) digits, so after the last pass everything is sorted. With
+32-bit keys and 8-bit digits, that is four passes of O(n + 256) each.
+
+```text
+2e6 uint32: LSD radix 764 ms, typed-array sort 147 ms, Array.sort with comparator 4929 ms, same=true
+```
+
+My radix sort beat the comparator-based `Array.sort` by six times, but lost
+to the engine's native typed-array sort, which is compiled code with no
+function call per comparison. Asymptotics and constants again: radix is
+linear, but a tuned native n log n sort can still win at a few million items.
+
+#### 4.7.1 Lower bounds for sorting
+
+Can any comparison sort beat n log n? No, and the argument is one of the most
+elegant in the subject. A comparison sort learns about its input only through
+comparisons, each with two outcomes. Picture all its possible runs as a
+**decision tree**: each internal node is a comparison, each branch an
+outcome, each leaf a final ordering. To sort correctly, the tree needs a
+different leaf for each of the n! possible input orders. A binary tree with
+n! leaves has height at least lg(n!), and lg(n!) is Θ(n log n) (chapter 2).
+So some input forces at least that many comparisons.
+
+```text
+lg(n!) = 1,516,704  n lg n = 1,660,964      (n = 100,000)
+```
+
+My mergesort used 1,536,583 comparisons on this size, within about 1.3
+percent of the bound. Distribution sorts escape the bound because they do not
+compare: they use the key's value to index an array, getting more than one
+bit of information per step.
+
+<Figure art={`
+   decision tree for sorting three items a, b, c:
+
+                       a < b ?
+                  yes /       \\ no
+                b < c ?        a < c ?
+              /      \\        /      \\
+           a b c    a < c ?  b a c    b < c ?
+                   /     \\           /     \\
+                a c b   c a b      b c a   c b a
+
+   3! = 6 leaves need height at least lg 6, about 2.58: some input takes 3
+`} caption="Every comparison sort is a decision tree. It needs one leaf per possible ordering, n! in all, so its height (the worst-case number of comparisons) is at least lg(n!), which is Θ(n log n)." />
+
+### Worked example
+
+**Simple: counting sort by hand.** Ages `34 21 34 19 21 50 19 34`: counts are
+19 → 2, 21 → 2, 34 → 3, 50 → 1. Running sums give the end of each key's
+block: 19 ends at 2, 21 at 4, 34 at 7, 50 at 8. Walking the input backwards
+and placing each item at its block's next slot from the end gives
+`19 19 21 21 34 34 34 50`, with equal ages in their original order.
+
+**Realistic: when distribution sorting wins.** Sorting a billion 32-bit
+integers, suffix-array construction, and GPU sorting all use radix sorts,
+because their keys are fixed-width and their data is huge, where the linear
+pass count beats the log factor. Postal sorting machines and card sorters
+historically did exactly LSD radix sort, one digit per pass.
+
+### Step by step
+
+LSD radix sort on two-digit numbers `[53, 21, 39, 25, 11, 33]`, one decimal
+digit per pass:
+
+<Trace
+  columns={["pass", "digit used", "result (stable on that digit)"]}
+  rows={[
+    ["start", "—", "53 21 39 25 11 33"],
+    ["1", "ones", "21 11 53 33 25 39"],
+    ["2", "tens", "11 21 25 33 39 53"],
+  ]}
+  caption="After the ones pass, items are ordered by their last digit; the stable tens pass keeps that order among equal tens digits (21 before 25, 33 before 39), so the result is fully sorted after two passes."
+/>
+
+### Common mistake
+
+**The mistake:** using counting sort when the key range k is much larger than
+n, such as sorting 1,000 timestamps in milliseconds by counting.
+
+**Why it fails:** the cost is O(n + k), and allocating and scanning a count
+array of 10¹² slots is absurd.
+
+**The fix:** use counting sort only when k is O(n), and radix sort with
+digit sizes chosen so each pass has a small range (8 or 16 bits). Otherwise,
+use a comparison sort.
+
+### In real systems
+
+Radix sorts dominate GPU sorting libraries and high-performance analytics
+engines for integer and fixed-width keys. Counting sort appears inside other
+algorithms (building suffix arrays, histogram-based methods) and in
+database engines that sort small-domain columns such as enums or dates.
+
+The lower bound has practical weight too: it tells you that no clever
+comparator trick will make a general sort asymptotically faster, so
+performance work on sorting focuses on constants (cache use, branch
+prediction, parallelism) or on changing the problem (sorting keys instead of
+records, avoiding the sort, partial sorting).
+
+### Check yourself
+
+<details>
+<summary>Why must each pass of LSD radix sort be stable?</summary>
+
+Stability preserves the order established by earlier, less significant
+digits among items whose current digit ties. Without it, earlier passes'
+work would be scrambled.
+
+</details>
+
+<details>
+<summary>Does the lower bound mean radix sort is impossible?</summary>
+
+No. The bound applies only to algorithms that learn about the order through
+comparisons. Radix sort uses key values as array indices, which gives more
+information per step.
+
+</details>
+
+## 4.8 War Story: Skiena for the Defense
+
+### In one sentence
+
+Knowledge of classic sorting and searching algorithms, and their history,
+turned out to be decisive in a legal dispute, which is the book's reminder
+that this material has weight far beyond programming contests.
+
+### The idea
+
+The story, in outline and in my words; I am giving only its shape, not its
+details. The author served as an expert witness in a dispute involving
+software, where the technical questions came down to properties of
+well-known sorting and searching methods: what they cost, what was already
+standard practice, and whether a claimed technique was really new. Being
+able to explain those algorithms clearly, with their complexities and the
+published record of who had used them, was what mattered.
+
+The lessons, as I take them: the classical algorithms are a shared language
+with a long public history, so knowing them lets you recognise an old idea
+in new packaging; and explaining an algorithm to a non-specialist, simply and
+precisely, is a skill as important as implementing it.
+
+### Worked example
+
+**Simple: recognising a classic in disguise.** A "novel" method that keeps
+records in fixed-size buckets by the first few characters of a key, then
+sorts within buckets, is bucket sort. A "new" scheme that keeps the best k
+results so far and replaces the worst when a better one arrives is a bounded
+heap. Naming the classic tells you its costs, its known pitfalls and its
+history in one step.
+
+**Realistic: explaining to a non-specialist.** Suppose you must explain why
+an approach does not scale. "It's O(n²)" means nothing to a judge or a
+manager. "Doubling the data quadruples the time; at last year's data volume
+it took an hour, at this year's it would take four, and at next year's
+sixteen" is the same fact in a form anyone can weigh.
+
+### Step by step
+
+How I would prepare an explanation of an algorithmic claim for a
+non-technical audience:
+
+<Trace
+  columns={["step", "question", "output"]}
+  rows={[
+    ["1", "What does the method actually do, step by step?", "a plain-language description, no jargon"],
+    ["2", "Which classical algorithm is it closest to?", "a name with published references"],
+    ["3", "What does it cost as the data grows?", "a growth rate turned into concrete times"],
+    ["4", "What was known before?", "dated sources: textbooks, papers, documentation"],
+    ["5", "What is genuinely different, if anything?", "a precise, honest statement"],
+  ]}
+  caption="A checklist for explaining an algorithm outside engineering. Steps 2 and 4 are where knowing the classics pays: a well-known method has a well-documented history."
+/>
+
+### Common mistake
+
+**The mistake:** assuming that because you have not seen a technique, it is
+new.
+
+**Why it fails:** most practical algorithmic ideas have been published, often
+decades ago, under names you may not know.
+
+**The fix:** before calling an idea new (in a design document, a paper or a
+patent discussion), search the classical literature and catalogues such as
+Part II of this book.
+
+### In real systems
+
+Engineers meet this in design reviews and incident write-ups more often than
+in courtrooms: naming the standard technique ("this is a k-way merge",
+"that's a bloom filter") lets everyone reason with its known properties.
+Prior-art searches in patent work rely on exactly this kind of algorithmic
+literacy.
+
+### Check yourself
+
+<details>
+<summary>What is the practical lesson of this war story for an engineer?</summary>
+
+Know the classical algorithms well enough to recognise them in disguise and
+to explain their costs and history simply; that knowledge carries weight in
+reviews, decisions and disputes.
+
+</details>
+
+<details>
+<summary>How would you explain "quadratic" to a non-specialist?</summary>
+
+In concrete terms: doubling the data quadruples the time, with real numbers
+from their situation.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Sorting">
+
+<Level name="Beginner" depth={3}>
+
+At the smallest level, this chapter says two things. First, many problems get
+easy once the data is sorted: duplicates become neighbours, the median sits
+in the middle, and the closest values are side by side. Second, good sorting
+algorithms take about n log n steps, so sorting a million items is a fraction
+of a second.
+
+The smallest worked version: you have a list of 10,000 email addresses and
+want to know whether any appears twice. Comparing every pair is 50 million
+comparisons. Sorting and checking neighbours is about 130,000 comparisons
+for the sort plus 10,000 for the scan. Same answer, hundreds of times less
+work.
+
+The beginner's mistake in JavaScript is calling `.sort()` on numbers without
+a comparator and getting string order (1, 10, 100, 25, 9). If you can sort
+numbers correctly and solve the duplicate problem by sorting, you have the
+beginner level.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you know the four ideas and their trade-offs.
+Heapsort: in place, O(n log n) worst case, not stable, slower in practice.
+Mergesort: stable, O(n log n) worst case, needs extra memory, ideal for
+linked lists and external data. Quicksort: in place, fastest in practice,
+O(n log n) expected with random pivots, O(n²) worst. Distribution sorts:
+linear for integer-like keys.
+
+You write correct comparators: explicit three-way results, chained keys from
+most to least significant, and a final tie-break on a unique field. You know
+JavaScript's sort is stable and use that for multi-key sorting.
+
+A worked case: a table of orders that users can sort by any column. Stable
+sorting means clicking "customer" after "date" gives customers with their
+orders in date order. A tie-break on order ID keeps pagination consistent
+when two orders share a date and customer.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+At the advanced level you can prove the bounds. Mergesort: lg n levels with
+linear merging at each. Heapsort: a linear build (the convergent sum of
+heights) plus n extractions of O(log n). Quicksort: good pivots occur half the
+time, so expected depth is O(log n); the exact expected count is about
+2n ln n. The lower bound: a decision tree with n! leaves has height at least
+lg(n!) = Θ(n log n).
+
+You also use the one-sided relatives. Quickselect finds the k-th smallest in
+expected O(n), and my run found the median of a million in 39 ms. A bounded
+heap finds the top k in O(n log k). A k-way merge with a heap combines k
+sorted streams in O(n log k).
+
+A worked case: the airline war story's frontier enumeration. Generating pair
+sums of two sorted lists in increasing order, with a heap of frontier pairs
+and a seen set, tested 6 of 16 combinations in my version. The same idea finds
+the k-th smallest element of a sorted matrix.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Sorted and reverse-sorted input is the first edge case: it is common in
+practice and is the worst case for fixed-pivot quicksort (199,990,000
+comparisons for 20,000 items in my run) and for heap building by insertion.
+Random pivots and bottom-up heap construction remove both.
+
+Many duplicate keys are the second. A two-way partition puts all equal keys on
+one side, so an array of identical items makes quicksort quadratic. A
+three-way partition (less, equal, greater) handles it in linear time.
+
+Mixed and special values are the third. NaN breaks numeric comparators
+(every comparison with NaN is false), `undefined` is always moved to the end
+by JavaScript's sort, and strings with numbers need natural sort. Clean or
+normalise keys before sorting.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Arrays of length 0 or 1 must return immediately; recursive sorts get this from
+their base case, and a bug there either crashes or loops. Arrays of length 2
+are where off-by-one errors in partition boundaries show up first.
+
+Comparator contracts are a corner case with real consequences. A comparator
+that is not consistent (for example, one that returns random values, or 1 and
+0 only) can make Java throw an exception and makes JavaScript's result
+implementation-defined. Sorting floating-point numbers with negative zero and
+positive zero, or locale-dependent strings, can make "equal" depend on the
+comparator.
+
+Integer overflow in `a - b` comparators is the classic corner case in
+languages with fixed-size integers: comparing a large positive and a large
+negative number overflows and reverses the order. Explicit comparisons avoid
+it.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production you almost always use the library sort, and the skill is
+using it well and knowing its algorithm. V8, Python and Java (objects) use
+Timsort, stable and fast on partly sorted data. Java primitives use
+dual-pivot quicksort, C++ `std::sort` is introsort, and Go uses pdqsort. Each
+choice reflects the trade-offs in this chapter.
+
+Know when not to sort. If you need only the top k, use a bounded heap. If you
+need only the median or a percentile, use quickselect. If you need only
+grouping, a hash map may be faster. My runs: top-10 with a heap was twenty
+times faster than a full sort; the median by quickselect was far faster than
+sorting.
+
+Large data needs external sorting: sort memory-sized chunks, write runs, and
+k-way merge them. Databases, `sort` on the command line and distributed
+shuffles all work this way. Sorting keys (or indices) instead of whole records
+also saves time when records are large.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is "sort first, then think". When a problem involves comparing
+items with each other, ask whether sorted order would put the relevant
+items next to each other. It so often does that trying it should be a
+reflex.
+
+The second part of the mindset is that asymptotically equal algorithms are
+chosen by constants, stability, memory and worst cases. Heapsort, mergesort
+and quicksort are all n log n, and libraries pick among them for exactly
+those engineering reasons.
+
+A worked example of the mindset: asked to find overlapping meetings in a
+calendar, sorting by start time puts every possible overlap between
+neighbours in a sweep, turning a pairwise check into a single pass that
+tracks the latest end time seen.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+Sorting is a system-design tool. Databases choose between sort-based and
+hash-based plans for joins and grouping; sort-based plans produce ordered
+output for free and degrade gracefully when data exceeds memory. Search and
+analytics systems keep data sorted on disk (LSM trees, sorted column files)
+so that queries can merge and skip rather than scan.
+
+Distributed computation sorts by key between stages: the shuffle in
+MapReduce and Spark partitions data by key and sorts within partitions so
+each reducer can stream through its groups. Partitioning by sampled key
+ranges (as distributed sorts do) is bucket sort at cluster scale.
+
+Pagination and APIs depend on stable, deterministic ordering. A design that
+returns "page 2" must sort by a total order (a unique tie-break), or users will
+see duplicates and gaps as data changes.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy is to treat sorting as the default first step for any problem
+about relationships among items, and to choose the variant deliberately:
+library sort for general data, counting or radix for small integer keys,
+quickselect for single ranks, bounded heaps for top k, external merge for
+data larger than memory.
+
+Then reason about the worst case. Know which inputs hurt each algorithm
+(sorted input, duplicates, adversarial patterns) and make sure your choice
+is safe for the inputs you will really see, especially if users control them.
+
+Done when you can look at a new problem, say within a minute whether sorting
+makes it easy and which sort or sort-relative to use, implement heapsort,
+mergesort and randomized quicksort from memory with their bounds, and explain
+the lower bound with the decision-tree argument.
+
+</Level>
+
+</Levels>
+
+<Timeline caption="Milestones in how sorting is understood and used, in the order the chapter builds them. Dates are deliberately omitted; the order is the point." items={[
+  { when: "Idea 1", what: "sorting as a building block: sort, then scan neighbours" },
+  { when: "Idea 2", what: "a data structure (the heap) turns selection sort into n log n" },
+  { when: "Idea 3", what: "divide and conquer (mergesort) gives n log n in every case" },
+  { when: "Idea 4", what: "randomisation (quicksort) makes every input fast in expectation" },
+  { when: "Idea 5", what: "bucketing beats n log n by not comparing; the lower bound explains why" },
+]} />
+
+## Questions people ask
+
+**Which sort should I implement for an interview?** Usually mergesort or
+quicksort, whichever you can write correctly from memory, with its bounds and
+trade-offs. Interviewers care more that you know when to sort and which
+variant (quickselect, heap, counting) fits than about the sort itself.
+
+**Why is quicksort used if its worst case is quadratic?** With random or
+carefully chosen pivots the worst case is vanishingly unlikely, and its
+constants are the best. Libraries add a heapsort fallback (introsort) to
+guarantee O(n log n) anyway.
+
+**Is JavaScript's sort stable?** Yes, since ES2019 the specification requires
+it, and V8 uses Timsort. Older engines were not consistent, which is why old
+advice says otherwise.
+
+**When does radix sort beat a comparison sort?** For large arrays of
+fixed-width integer keys, especially in compiled code or on GPUs. In
+JavaScript, the native typed-array sort beat my radix sort at two million
+items, so measure.
+
+**Can I sort faster than n log n?** Not with comparisons only, by the
+decision-tree argument. With integer keys, yes: counting and radix sort are
+linear in n for fixed key widths.
+
+**What is an in-place sort?** One that uses only O(1) or O(log n) memory
+beyond the input array. Heapsort and quicksort are in place; array
+mergesort is not.
+
+## Key takeaways
+
+- Sorting makes many problems easy: duplicates, frequencies, medians, closest
+  pairs and set operations become a sort plus a linear scan.
+- Use library sorts with explicit comparators, chained keys and a unique
+  tie-break; never call JavaScript's `.sort()` on numbers without one.
+- Heapsort is selection sort with a heap: O(n log n) worst case, in place,
+  with a linear-time bottom-up heap build.
+- Mergesort is stable and O(n log n) in every case, needs O(n) extra space,
+  and is the basis of external sorting and Timsort.
+- Randomized quicksort is O(n log n) expected on every input and fastest in
+  practice; fixed pivots are quadratic on sorted input.
+- Quickselect, bounded heaps and k-way merges solve "part of the sort"
+  problems faster than sorting everything.
+- Counting and radix sort beat n log n for integer keys by bucketing rather
+  than comparing.
+- Any comparison sort needs Ω(n log n) comparisons in the worst case, because
+  its decision tree must have n! leaves.
+- Generating candidates in sorted order and stopping at the first valid one
+  (the airline war story) avoids checking everything.
+
+## Glossary
+
+- **Comparator:** a function returning negative, zero or positive to order two
+  items.
+- **Stable sort:** a sort that keeps equal keys in their original relative
+  order.
+- **In-place sort:** a sort using only a small amount of memory beyond the
+  input.
+- **Heap / max-heap:** an array-based tree where each parent is at least as
+  large as its children.
+- **Sift down:** moving an item down a heap, swapping with its larger child,
+  until the heap property holds.
+- **Divide and conquer:** splitting a problem into smaller ones of the same
+  kind, solving them and combining.
+- **Merge:** combining two sorted lists into one sorted list in linear time.
+- **External sort:** sorting data larger than memory by sorting runs and
+  merging them.
+- **Pivot:** the item quicksort partitions around.
+- **Partition:** rearranging items so those smaller than the pivot precede it
+  and larger ones follow.
+- **Randomized algorithm:** an algorithm that makes random choices, with
+  guarantees over those choices for every input.
+- **Quickselect:** a partition-based algorithm for the k-th smallest item, in
+  expected linear time.
+- **Counting sort:** sorting small integer keys by counting occurrences.
+- **Radix sort:** sorting by digits with a stable sort per digit.
+- **Decision tree:** a model of a comparison algorithm with comparisons at
+  nodes and outcomes at leaves.
+
+## Exercises and self-check
+
+**Warm-up.** Write a function that returns the k-th most frequent word in a
+text by sorting, then rewrite it with a hash map and a bounded heap. Compare
+both on a large text file.
+
+**Build.** Implement quicksort with a three-way partition and a random pivot.
+Test it against the library sort on random arrays, sorted arrays, arrays with
+only three distinct values, and arrays of identical items, and count
+comparisons on each.
+
+**Stretch.** Implement an external sort: generate a file of 10 million random
+integers, sort it with a fixed memory budget of 1 million at a time by writing
+sorted runs to disk, and merge the runs with a heap. Measure time and compare
+with sorting in memory.
+
+<details>
+<summary>1. Why are duplicates adjacent after sorting, and what does that give you?</summary>
+
+Equal keys must be consecutive in sorted order, so one pass comparing each
+item with its predecessor detects duplicates and counts runs.
+
+</details>
+
+<details>
+<summary>2. What is the cost of building a heap bottom-up, and why?</summary>
+
+O(n): most nodes are near the bottom and sift only a few levels; the total is
+n times a convergent sum.
+
+</details>
+
+<details>
+<summary>3. Which of heapsort, mergesort and quicksort are stable?</summary>
+
+Only mergesort (as usually written). Heapsort and standard in-place quicksort
+are not.
+
+</details>
+
+<details>
+<summary>4. Quicksort with the first element as pivot runs on reverse-sorted input. What happens?</summary>
+
+Every pivot is the largest item, so each partition removes only one item and
+the running time is Θ(n²).
+
+</details>
+
+<details>
+<summary>5. Why does radix sort process the least significant digit first?</summary>
+
+Each stable pass preserves the order from previous (less significant)
+digits among ties, so after the most significant pass the whole key is
+sorted. Starting from the most significant digit instead needs recursive
+bucketing.
+
+</details>
+
+<details>
+<summary>6. What does the decision-tree argument prove, and what does it not apply to?</summary>
+
+That any comparison sort needs at least lg(n!) = Θ(n log n) comparisons in the
+worst case. It does not apply to algorithms that use key values directly, such
+as counting and radix sort.
+
+</details>
+
+<details>
+<summary>7. How do you find the 100 largest values in a stream of a billion?</summary>
+
+Keep a min-heap of size 100; for each value larger than the heap's minimum,
+replace the minimum. O(n log 100) time, O(100) memory.
+
+</details>
+
+<details>
+<summary>8. Why does sorting by one key and then stably by another give a two-level order?</summary>
+
+The second sort orders by its key and, among ties, keeps the order from the
+first sort, so items with equal second keys stay ordered by the first key.
+
+</details>
+
+## How I'd study this chapter
+
+I would start with the applications section and solve each listed problem
+(duplicates, mode, median, closest pair, intersection) by sorting, in code,
+before reading about any sorting algorithm. That builds the reflex the
+chapter cares about most. Then I would implement heapsort, mergesort and
+randomized quicksort with an instrumented comparison counter, run them on
+random, sorted and duplicate-heavy inputs, and compare the counts with the
+formulas.
+
+For the war stories, I would build the fare-combination enumerator with a
+heap and test it against brute force on random rule sets. I would finish with
+counting and radix sort and the decision-tree argument, drawing the tree for
+three items by hand. This chapter is part of <a href={withBase('/plans/traditional-software-developer/#strategy-4')}>phase 4 of my learning plan</a>,
+and the <a href={withBase('/books/the-algorithm-design-manual/')}>book's overview</a>
+shows where it leads next.
+
+Done when I can implement all three n log n sorts from memory with their
+bounds, solve any of the application problems by sorting in a few minutes,
+explain the lower bound with a decision tree, and pick correctly between a
+full sort, quickselect, a bounded heap and a distribution sort.
