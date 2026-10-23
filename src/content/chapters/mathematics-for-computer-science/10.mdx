@@ -1,0 +1,1591 @@
+---
+book: mathematics-for-computer-science
+number: 10
+title: "Communication Networks"
+description: "Structured switching networks as digraphs: routing problems as permutations, diameter, switch size and switch count, latency, congestion, and the trade-offs between the complete binary tree, the 2-D array, the butterfly and the Beneš network, with the Beneš congestion-1 proof by induction and two-colouring."
+part: "Part II, Structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+This chapter takes the digraphs of chapter 9 and puts them to work as
+hardware. Vertices become switches and terminals, edges become wires,
+and a "routing problem" is simply a list of who wants to talk to whom.
+The question is how to wire up N inputs to N outputs so that any such
+list can be served quickly, with few switches, and without any one
+switch becoming a traffic jam. Four designs are compared: a complete
+binary tree, a grid, the butterfly and the Beneš network. Each wins on
+some measure and loses on another, until the last one, which, with a
+neat induction proof, gets congestion down to the smallest possible
+value. The chapter is short in the book, so this page spends extra time
+building each network in code and measuring the claims directly.
+
+## Before you start
+
+**After this chapter you will be able to:**
+
+- Model a switching network as a digraph with input terminals, output terminals and switches, and state a routing problem as a permutation.
+- Define and compute a network's diameter, switch size, switch count, latency and congestion.
+- Explain why the complete binary tree has small diameter but congestion N, and why the 2-D array has congestion 2 but N² switches.
+- Build the butterfly network recursively, route through it by fixing one address bit per level, and explain its congestion of about √N.
+- Build the Beneš network as two butterflies back to back and prove, by induction and a two-colouring argument, that its congestion is 1.
+
+**What you should already know:** digraphs, paths and distance from
+chapter 9; induction from chapter 5; geometric sums (the book's problem
+on them in chapter 5); binary representations of numbers. Bipartite
+graphs and two-colouring appear in chapter 11, but this page explains
+the small part needed. In code: arrays, Maps and recursion in TypeScript.
+
+**How this page is organised:** one section per book section, 10.1 to
+10.9, each with the same parts: the idea in one sentence, the
+explanation (with a sub-heading where the book has a subsection), a
+worked example, a step-by-step trace, a common mistake, where it shows up
+in real systems, and a check. All TypeScript snippets were run with
+Node 22 and the output shown is real. Where a snippet uses random
+permutations, the printed worst case is a property that holds for every
+run, not a figure that changes.
+
+**Time:** about two sessions of two to three hours each, plus an hour
+to code the Beneš router yourself.
+
+## Chapter map
+
+<Flow caption="The chapter's arc: define what a network must do, define how to measure it, then try four designs in turn, each fixing a weakness of the last." steps={[
+  { title: "10.1–10.2 Setup", body: "terminals, switches, routing problems as permutations" },
+  { title: "10.3–10.6 Measures", body: "diameter, switch size, switch count, latency, congestion" },
+  { title: "10.6 Tree", body: "short paths, but the root carries everything" },
+  { title: "10.7 Array", body: "congestion 2, but N² switches" },
+  { title: "10.8 Butterfly", body: "N log N switches, congestion about √N" },
+  { title: "10.9 Beneš", body: "two butterflies back to back, congestion 1" },
+]} />
+
+## 10.1 Complete Binary Tree
+
+### In one sentence
+
+The first network is a complete binary tree whose leaves are switches
+attached to one input and one output terminal each, and since a tree has
+exactly one path between any two vertices, routing is forced: go up to
+the lowest common ancestor and come back down.
+
+### The idea
+
+#### Terminals, switches and packets
+
+The networks in this chapter move **packets**: chunks of data of roughly
+fixed size. Two kinds of vertex appear in the pictures. **Terminals** are
+where packets enter (input terminals) and leave (output terminals); they
+are the computers, processors or phones. **Switches** are the vertices in
+between; a switch receives packets on its incoming edges and forwards
+them on outgoing edges. Directed edges are the wires. A packet's journey
+is a directed path: input terminal, a sequence of switches, output
+terminal.
+
+#### The tree design
+
+Put the switches in a complete binary tree. Each leaf switch has one
+input terminal and one output terminal hanging off it. Each internal
+switch connects up to its parent and down to its two children, with
+edges in both directions so packets can climb and descend. A leaf switch
+thus has edges to and from its terminals and its parent; an internal
+switch, to and from its parent and two children. Most switches have three
+incoming and three outgoing edges, which the book calls a 3 × 3 switch.
+
+Because a tree has a unique path between any two vertices (chapter 11
+proves this for undirected trees; the directed version here inherits it),
+the route from input i to output j is forced: climb from leaf i to the
+lowest common ancestor of leaves i and j, then descend to leaf j, then
+step out to the output terminal.
+
+<Figure art={`
+                          r
+                   +------+------+
+                   s1            s2
+                +--+--+       +--+--+
+                l0    l1      l2    l3
+                |     |       |     |
+              in0   in1     in2   in3      (input terminals)
+              out0  out1    out2  out3     (output terminals)
+
+   route in1 -> out3:  in1, l1, s1, r, s2, l3, out3   (6 edges)
+`} caption="The complete binary tree with four leaves. Every leaf switch has an input and an output terminal; each tree edge is a pair of wires, one up and one down." />
+
+### Worked example
+
+**Simple: routing as climbing to a common ancestor.** Number the tree's
+switches heap-style: root 1, children of k are 2k and 2k + 1, and with N
+leaves the leaf for terminal i is N + i. Then the route between leaves a
+and b is found by repeatedly moving the larger number to its parent
+until they meet:
+
+```ts
+function treeRoute(N: number, i: number, j: number): string[] {
+  let a = N + i, b = N + j; const up: number[] = [], down: number[] = [];
+  while (a !== b) { if (a > b) { up.push(a); a >>= 1; } else { down.push(b); b >>= 1; } }
+  return [...up, a, ...down.reverse()].map((x) => `t${x}`);
+}
+console.log(treeRoute(4, 1, 3).join(' '));
+```
+
+```text
+t5 t2 t1 t3 t7
+```
+
+Five switches, so four switch-to-switch edges, plus the two terminal
+edges: six edges in all, matching the figure.
+
+**Realistic: why the tree is the first idea anyone has.** If you have
+ever drawn an org chart for message passing ("ask your manager, who asks
+their manager, who passes it down the other side"), you have drawn this
+network. It is cheap and easy to reason about. The rest of the chapter is
+about why it is a poor choice when everyone talks at once.
+
+### Step by step
+
+<Trace columns={["step", "a", "b", "action"]} rows={[
+  ["0", "5 (leaf 1)", "7 (leaf 3)", "start at the two leaves"],
+  ["1", "5", "3", "b = 7 is larger: record 7 on the way down, move b to its parent 3"],
+  ["2", "2", "3", "a = 5 is larger: record 5 on the way up, move a to 2"],
+  ["3", "2", "1", "b = 3 is larger: record 3 on the way down, move b to 1"],
+  ["4", "1", "1", "a = 2 is larger: record 2 on the way up, move a to 1; they meet at the root"],
+  ["5", "", "", "route: up 5, 2, the root 1, then down 3, 7"],
+]} caption="Heap numbering turns 'find the lowest common ancestor' into repeated halving of the larger index." />
+
+### Common mistake
+
+**The wrong way:** treating the tree as undirected and saying a packet
+"travels along an edge" in either direction on one wire.
+
+**Why it fails:** the networks here are digraphs, and congestion is
+counted at switches along directed paths. Each tree edge stands for two
+wires, one each way; the up-traffic and down-traffic through a switch
+both count against it.
+
+**The right way:** draw each tree edge as a pair of opposite arrows, and
+count a packet at every switch it passes through, going up or down.
+
+### In real systems
+
+- **Early cluster interconnects and simple LAN hierarchies** (access switch, aggregation switch, core switch) are trees, and they share the tree's weakness at the top.
+- **Fat trees** fix the root bottleneck by making links fatter near the root; they are the standard way data-centre networks are described today, and they are built from many small switches in a Clos-style arrangement, an idea related to the Beneš network at the end of this chapter.
+- **Reduction trees** in parallel computing (summing an array across processors) use exactly the up-the-tree path, and there the root bottleneck does not matter because every packet is meant to combine at the root.
+
+### Check yourself
+
+1. In the four-leaf tree, which switches does the route from input 0 to output 1 use?
+2. How many switches does the route from input 0 to output 3 use?
+
+<details>
+<summary>Answer</summary>
+
+1. Leaf 0, its parent s1, and leaf 1: three switches (t4, t2, t5 in heap numbering).
+2. Five: leaf 0, s1, the root, s2, leaf 3.
+
+</details>
+
+## 10.2 Routing Problems
+
+### In one sentence
+
+A routing problem for a network with N inputs and N outputs is a
+permutation π of 0 to N − 1, saying the packet at input i must reach
+output π(i), and a routing that solves it is a choice of one path per
+input.
+
+### The idea
+
+#### Permutations as traffic patterns
+
+The book's networks always have N inputs and N outputs, with N a power
+of two to keep the recursive constructions tidy. A **routing problem** is
+a permutation π of the set from 0 to N − 1: every input sends exactly
+one packet, and every output receives exactly one. That is a strong
+simplification (real traffic is not a permutation), but it captures the
+hard case where everyone talks at the same moment and nobody is idle.
+
+A **routing** P for π is a set of N paths P_i, where P_i goes from input i
+to output π(i). In a tree there is only one choice per packet; in other
+networks there may be many, and a good routing chooses well.
+
+#### Why permutations are the right test
+
+If a network handles every permutation well, it handles any traffic
+pattern in which each terminal sends and receives at most one packet at a
+time, because you can extend such a pattern to a full permutation by
+adding dummy packets. More general traffic (one input sending to many
+outputs) can be broken into rounds of permutations. So permutations are
+a clean worst-case benchmark.
+
+There are N! permutations, which for N = 8 is 40,320 and for N = 1024 is
+a number with more than 2,600 digits. Any claim of the form "the network
+handles every routing problem" therefore needs a proof, not a test; the
+tests on this page are exhaustive only for N = 4 and N = 8.
+
+### Worked example
+
+**Simple: two routing problems on the tree.** The **identity** problem,
+π(i) = i, asks every packet to come back out at its own leaf. The
+**reversal** problem, π(i) = N − 1 − i, sends input 0 to the far output,
+input 1 to the next-farthest, and so on.
+
+```ts
+const N = 4;
+const identity = Array.from({ length: N }, (_, i) => i);
+const reversal = Array.from({ length: N }, (_, i) => N - 1 - i);
+console.log(JSON.stringify(identity), JSON.stringify(reversal));
+console.log(reversal.map((d, i) => treeRoute(N, i, d).join(' ')).join(' | '));
+```
+
+```text
+[0,1,2,3] [3,2,1,0]
+t4 t2 t1 t3 t7 | t5 t2 t1 t3 t6 | t6 t3 t1 t2 t5 | t7 t3 t1 t2 t4
+```
+
+Every reversal route passes through t1, the root.
+
+**Realistic: permutations in a parallel machine.** In a parallel sort or
+a matrix transpose, processor i sends its block to processor π(i) for
+some fixed permutation, all at once. A fast Fourier transform does the
+same with the bit-reversal permutation. These are exactly the routing
+problems of this chapter, and the hardware that carries them is a
+switching network of the kind being designed here.
+
+### Step by step
+
+<Trace columns={["input i", "π(i) for reversal", "route (heap ids)", "passes the root?"]} rows={[
+  ["0", "3", "t4 t2 t1 t3 t7", "yes"],
+  ["1", "2", "t5 t2 t1 t3 t6", "yes"],
+  ["2", "1", "t6 t3 t1 t2 t5", "yes"],
+  ["3", "0", "t7 t3 t1 t2 t4", "yes"],
+]} caption="Solving the reversal routing problem on the four-leaf tree. Each input's destination is in the other half, so every path must climb to the root." />
+
+### Common mistake
+
+**The wrong way:** measuring a network on one friendly routing problem
+(often the identity) and calling it fast.
+
+**Why it fails:** the identity is the easiest case for almost every
+design. Network quality is defined by the worst permutation, as the next
+sections make precise.
+
+**The right way:** for each measure, take the worst case over all
+permutations, with the best routing for each.
+
+### In real systems
+
+- **Collective operations** in parallel programming libraries (all-to-all, transpose, shuffle) generate permutation traffic, and their performance depends on how the network handles bad permutations.
+- **Load testing** a network or a sharded service with uniform traffic hides the adversarial patterns; "all clients hit the shard on the other side" is the reversal problem in disguise.
+- **Telephone exchanges**, where this theory began, must connect any caller to any free line, which is a permutation of the active subset.
+
+### Check yourself
+
+1. How many routing problems are there for N = 4?
+2. In a tree with N = 8, how many reversal paths pass through the root?
+
+<details>
+<summary>Answer</summary>
+
+1. 4! = 24.
+2. All 8, since input i and output 7 − i are always in opposite halves.
+
+</details>
+
+## 10.3 Network Diameter
+
+### In one sentence
+
+If every wire takes one time unit and packets follow shortest paths, the
+worst delay is the largest input-to-output distance, called the
+network's diameter, and for the complete binary tree with N inputs it is
+2 log N + 2.
+
+### The idea
+
+#### Delay as path length
+
+The time between a packet entering an input and arriving at its output is
+roughly proportional to the number of wires it crosses, so the book
+models delay as path length, one unit per edge. With shortest-path
+routing, the slowest packet in the worst case is the one whose input and
+output are farthest apart. The **diameter** of a network is therefore
+defined as the largest shortest-path distance from any input terminal to
+any output terminal.
+
+This is narrower than the usual graph diameter, which takes the largest
+distance between any two vertices. For a communication network only
+input-to-output distances matter; how far one switch is from another is
+irrelevant unless a packet has to make that trip.
+
+#### The tree's diameter
+
+In the complete binary tree with N = 2^n leaves, the worst pair is an
+input and an output in opposite halves. The path climbs n levels from
+leaf to root, descends n levels to the other leaf, and adds one terminal
+edge at each end: 2n + 2 = 2 log N + 2 edges (logs are base 2 throughout).
+For four leaves that is 6; for 1,024 leaves it is only 22. The logarithm
+grows slowly, so diameter is the tree's strong point.
+
+#### 10.3.1 Switch Size
+
+Diameter can be cut further by using bigger switches. Most tree switches
+are 3 × 3 (parent plus two children, in and out). With 5 × 5 switches you
+can build a complete 4-ary tree, whose height is log base 4 of N, half the
+binary height. Push this to the limit and a single N × N switch connects
+everything with diameter 2.
+
+The book's point is that this is cheating. An N × N switch is the very
+thing we are trying to build; hiding it inside one box just moves the
+design problem inside the box. The real challenge is to get the effect
+of an N × N switch out of small, fixed-size parts such as 2 × 2 or 3 × 3
+switches, and to compare designs at a fixed switch size.
+
+### Worked example
+
+**Simple: measuring diameter by routing the worst permutation.** Using
+`treeRoute` and the reversal problem, count edges on each path (switches
+on the path minus one, plus two terminal edges):
+
+```ts
+for (const N of [4, 16, 1024]) {
+  const rev = Array.from({ length: N }, (_, i) => treeRoute(N, i, N - 1 - i));
+  const diam = Math.max(...rev.map((p) => p.length + 1));
+  console.log(`tree N=${N}: switches ${2 * N - 1}, diameter ${diam}`);
+}
+```
+
+```text
+tree N=4: switches 7, diameter 6
+tree N=16: switches 31, diameter 10
+tree N=1024: switches 2047, diameter 22
+```
+
+All three agree with 2 log N + 2: 2·2 + 2, 2·4 + 2 and 2·10 + 2.
+
+**Realistic: the switch-size trade-off in numbers.** For N = 4,096
+terminals, the diameter of a complete d-ary tree is 2 log_d N + 2:
+
+```ts
+for (const d of [2, 4, 8, 16, 64, 4096])
+  console.log(`d=${d}: switch size ${d + 1}x${d + 1}, diameter ${2 * Math.round(Math.log(4096) / Math.log(d)) + 2}`);
+```
+
+```text
+d=2: switch size 3x3, diameter 26
+d=4: switch size 5x5, diameter 14
+d=8: switch size 9x9, diameter 10
+d=16: switch size 17x17, diameter 8
+d=64: switch size 65x65, diameter 6
+d=4096: switch size 4097x4097, diameter 4
+```
+
+The last line is the "monster switch": the tree collapses to one root with
+4,096 children. Its diameter is excellent and it tells us nothing, because
+the 4,097 × 4,097 switch still has to be built from something.
+
+<Compare caption="Bigger switches buy shorter paths, but only by moving the hard part inside the switch." left="Small switches (2 × 2, 3 × 3)" right="Large switches (up to N × N)" rows={[
+  ["more levels, longer diameter", "fewer levels, shorter diameter"],
+  ["each part is simple and cheap", "each part is itself a switching network"],
+  ["the design problem is visible", "the design problem is hidden in the box"],
+  ["fair basis for comparing designs", "comparisons become meaningless"],
+]} />
+
+### Step by step
+
+<Trace columns={["step", "claim", "why"]} rows={[
+  ["1", "a worst pair is input 0 and output N − 1", "they are in opposite halves, so their common ancestor is the root"],
+  ["2", "leaf to root is n = log N edges", "a complete binary tree with N leaves has height log N"],
+  ["3", "root to the other leaf is another n edges", "same height on the other side"],
+  ["4", "add one edge at each end for the terminals", "input terminal to leaf, leaf to output terminal"],
+  ["5", "no pair is farther apart", "every route climbs at most to the root and back"],
+  ["6", "diameter = 2 log N + 2", "sum of steps 2 to 4"],
+]} caption="Why the tree's diameter is 2 log N + 2." />
+
+### Common mistake
+
+**The wrong way:** using the ordinary graph diameter (the largest
+distance between any two vertices) for a switching network.
+
+**Why it fails:** in a directed network some switch pairs are not even
+connected (in a butterfly, nothing goes backwards), so the ordinary
+diameter can be infinite while every input reaches every output quickly.
+
+**The right way:** take the maximum only over input-output pairs, as the
+book defines it.
+
+### In real systems
+
+- **Hop count** is the everyday name for path length in networking; tools like traceroute display it, and data-centre topologies are compared by their maximum hop count between servers.
+- **High-radix switches** (switches with many ports) are popular in modern interconnects precisely because they cut the diameter, which is the switch-size trade-off above. The chip inside such a switch is itself a small switching network.
+- **Latency budgets** in distributed systems are often dominated by the number of network hops, so reducing diameter shows up directly in tail latency.
+
+### Check yourself
+
+1. What is the diameter of the complete binary tree with N = 256?
+2. Why does the book not allow an N × N switch?
+
+<details>
+<summary>Answer</summary>
+
+1. 2 · 8 + 2 = 18.
+2. Because it does not solve the problem; it just renames it. Designs must be compared at a fixed, small switch size.
+
+</details>
+
+## 10.4 Switch Count
+
+### In one sentence
+
+Switches cost money and space, so the second measure is how many a design
+uses, and the complete binary tree uses 1 + 2 + 4 + … + N = 2N − 1, which
+is about as few as 3 × 3 switches allow.
+
+### The idea
+
+#### Counting by levels
+
+The tree has 1 switch at the root level, 2 below it, 4 below those, and so
+on down to N leaves. That is the geometric sum of 2^i for i from 0 to
+log N. The geometric sum formula gives the sum of r^i for i from 0 to n as
+(r^(n+1) − 1) / (r − 1); with r = 2 and n = log N it is 2N − 1.
+
+#### Why that is close to optimal
+
+Every input terminal and every output terminal has to attach to some
+switch, and a 3 × 3 switch has room for only a few attachments while also
+connecting to the rest of the network. So any design with N inputs, N
+outputs and constant-size switches needs a number of switches at least
+proportional to N. The tree's 2N − 1 is within a small constant factor of
+that, so the book calls it nearly the best possible. Later designs use
+N log N or N² switches, and those extra factors are the price of better
+congestion.
+
+### Worked example
+
+**Simple: the geometric sum, checked.**
+
+```ts
+for (const N of [4, 16, 1024]) {
+  let s = 0; for (let k = 1; k <= N; k *= 2) s += k;
+  console.log(N, s, 2 * N - 1);
+}
+```
+
+```text
+4 7 7
+16 31 31
+1024 2047 2047
+```
+
+**Realistic: cost as a design input.** Suppose each switch costs the same
+and you need 1,024 terminals. The tree costs 2,047 switches. The grid of
+10.7 costs 1,024² = 1,048,576. The butterfly of 10.8 costs 1,024 · 11 =
+11,264, and the Beneš network of 10.9 costs 2 · 1,024 · 10 = 20,480. Those
+four numbers, against the congestion figures computed later, are the whole
+story of the chapter: you pay in switches to buy freedom from
+bottlenecks, and the art is paying as little as possible.
+
+<Timeline caption="Switch counts for N = 1,024 terminals, from the cheapest design to the most expensive." items={[
+  { when: "tree", what: "2N − 1 = 2,047 switches" },
+  { when: "butterfly", what: "N(log N + 1) = 11,264 switches" },
+  { when: "Beneš", what: "2N log N = 20,480 switches" },
+  { when: "2-D array", what: "N² = 1,048,576 switches" },
+]} />
+
+### Step by step
+
+<Trace columns={["level from the top", "switches", "running total"]} rows={[
+  ["0 (root)", "1", "1"],
+  ["1", "2", "3"],
+  ["2", "4", "7"],
+  ["k", "2^k", "2^(k+1) − 1"],
+  ["log N (leaves)", "N", "2N − 1"],
+]} caption="The running total is always one less than the next power of two, which is the geometric sum formula in action." />
+
+### Common mistake
+
+**The wrong way:** comparing designs by switch count alone and picking the
+tree.
+
+**Why it fails:** switch count ignores how traffic spreads. The cheapest
+design is also the one with the worst congestion, as 10.6 shows.
+
+**The right way:** compare designs on all four measures at once (diameter,
+switch size, switch count, congestion), as the book's running table does.
+
+### In real systems
+
+- **Bill of materials** for a cluster network is driven by switch and cable counts; designers trade them against bisection bandwidth, which is closely related to congestion.
+- **On-chip networks** pay for switches in silicon area and power, so the same counting matters inside a processor.
+- **Software overlays** (message brokers, relay trees in video streaming) also count "switches", as servers, and face the same trade-off.
+
+### Check yourself
+
+1. How many switches does the complete binary tree with N = 64 have?
+2. Use the geometric sum formula with r = 3 to count the switches in a complete ternary tree with 27 leaves.
+
+<details>
+<summary>Answer</summary>
+
+1. 2 · 64 − 1 = 127.
+2. Levels have 1, 3, 9, 27 switches: (3^4 − 1) / 2 = 40.
+
+</details>
+
+## 10.5 Network Latency
+
+### In one sentence
+
+When routings are chosen to optimise something other than delay (such as
+congestion), packets may take longer paths, so the book defines the
+latency of a routing as its longest path and the network's latency as the
+worst routing latency over all problems, using the optimal routing for
+each.
+
+### The idea
+
+#### Latency of a routing
+
+For a fixed routing P, the most delayed packet is the one with the
+longest path. That length is the **latency** of P. If the routing is
+shortest-path, latency is at most the diameter; if it is chosen for some
+other reason, it can be more.
+
+#### Latency of a network
+
+To get a number for the whole network, the book fixes an objective (say,
+minimum congestion), picks an optimal routing for each permutation
+according to that objective, takes each routing's latency, and reports
+the largest. This is a worst case over problems of a best case over
+routings, the same "max of min" shape that congestion will have.
+
+If routings are chosen to minimise delay, network latency equals the
+diameter. For every network in this chapter, it equals the diameter
+anyway, for a structural reason: in the tree each path is unique, and in
+the array, butterfly and Beneš network every input-to-output path has the
+same length. So no routing choice can make a packet slower, and the book
+can concentrate on congestion without worrying about delay.
+
+### Worked example
+
+**Simple and realistic: a network where avoiding congestion costs
+latency.** Two packets share a fast switch A, but packet 1 also has a
+three-switch detour:
+
+```ts
+const routes: string[][][] = [
+  [["A"]],                         // packet 0: in0 → A → out0
+  [["A"], ["B1", "B2", "B3"]],     // packet 1: in1 → A → out1, or the detour
+];
+const edges = (p: string[]) => p.length + 1;
+for (const r1 of routes[1]) {
+  const paths = [routes[0][0], r1];
+  const use = new Map<string, number>(); for (const p of paths) for (const s of p) use.set(s, (use.get(s) ?? 0) + 1);
+  console.log(`packet 1 via ${r1.join('-')}: congestion ${Math.max(...use.values())}, latency ${Math.max(...paths.map(edges))}`);
+}
+```
+
+```text
+packet 1 via A: congestion 2, latency 2
+packet 1 via B1-B2-B3: congestion 1, latency 4
+```
+
+The routing that minimises congestion doubles the latency. This network's
+diameter is 2, but its latency when minimising congestion is 4. Real
+networks make this choice constantly: an uncongested longer route often
+beats a congested short one, because waiting in a queue costs more than
+an extra hop.
+
+### Step by step
+
+<Trace columns={["step", "what is fixed", "what is chosen", "result"]} rows={[
+  ["1", "the objective (minimum congestion)", "", ""],
+  ["2", "a routing problem π", "an optimal routing for π", "a set of paths"],
+  ["3", "that routing", "its longest path", "the routing's latency"],
+  ["4", "", "the worst π", "the network's latency"],
+]} caption="Network latency is defined in layers: objective, then best routing per problem, then worst problem." />
+
+### Common mistake
+
+**The wrong way:** assuming latency always equals diameter.
+
+**Why it fails:** it does only when the chosen routings are shortest
+paths or when all paths have equal length. Adaptive routing in real
+networks routinely sends packets on longer paths.
+
+**The right way:** state the objective used to pick routings, then
+measure latency under it. For this chapter's four networks the
+equal-length property makes latency equal diameter.
+
+### In real systems
+
+- **Adaptive routing** in high-performance interconnects deliberately takes non-minimal paths around hot links, trading hop count for less queueing.
+- **Traffic engineering** in wide-area networks moves flows onto longer paths to balance load; latency-sensitive flows are pinned to short paths.
+- **Content delivery** picks a farther but less loaded server when the near one is busy, which is the same trade.
+
+### Check yourself
+
+1. In the toy network, what is the latency of the routing that sends both packets through A?
+2. Why does every input-output path in a butterfly have the same length?
+
+<details>
+<summary>Answer</summary>
+
+1. 2.
+2. Because the butterfly is layered: every edge goes from one column to the next, and inputs are all in the first column and outputs all in the last.
+
+</details>
+
+## 10.6 Congestion
+
+### In one sentence
+
+The congestion of a routing is the largest number of its paths that pass
+through any one switch, and the congestion of a network is the worst,
+over all routing problems, of the best congestion achievable for that
+problem; for the complete binary tree it is N, which is as bad as it gets.
+
+### The idea
+
+#### The root as a bottleneck
+
+In the tree, every packet whose input and output are in opposite halves
+must go through the root. Under the reversal permutation that is every
+packet. A switch handles packets one at a time (or a few at a time), so
+if all N packets pile into the root, they queue, and the whole network is
+as slow as one switch. Worse, if the root fails, the network splits into
+two halves that cannot talk.
+
+#### Congestion of a routing
+
+The book makes "pile up" precise. For a routing P, the **congestion** is
+the maximum, over switches, of how many paths of P pass through that
+switch. For the tree with the identity problem, each packet goes into its
+leaf switch and straight back out, so every switch carries at most one
+packet: congestion 1. For the reversal problem, all N paths pass through
+the root, and each child of the root sees all N as well, since every path
+climbs through one child and descends through the other: congestion N.
+
+#### Congestion of a network
+
+A network may offer several routings for a problem, so a fair measure
+lets the network pick its best routing for each problem and then asks
+about the worst problem. In symbols, network congestion is the maximum
+over permutations π of the minimum over routings P solving π of the
+congestion of P. The book calls this a "max of min" (maximin) quantity.
+It answers: if an adversary picks the traffic pattern and I pick the
+routes, how bad can it get?
+
+For the tree there is no choice of routes, and the adversary picks the
+reversal, so the network congestion is N.
+
+<Figure art={`
+   packets carried by each switch, N = 4
+
+   level            identity pi(i) = i     reversal pi(i) = 3 - i
+   -----            ------------------     ----------------------
+   root r                 0                        4
+   s1, s2                 0 each                   4 each
+   leaves l0..l3          1 each                   2 each
+
+   congestion             1                        4 = N
+`} caption="The same tree under two routing problems. The identity never leaves the leaves; the reversal sends every packet over the top." />
+
+### Worked example
+
+**Simple: computing congestion.** A routing is an array of paths, each a
+list of switch ids. Count how often each id appears and take the maximum:
+
+```ts
+type Path = string[];
+const congestion = (paths: Path[]) => {
+  const use = new Map<string, number>();
+  for (const p of paths) for (const s of p) use.set(s, (use.get(s) ?? 0) + 1);
+  return Math.max(...use.values());
+};
+for (const N of [4, 16, 1024]) {
+  const ident = Array.from({ length: N }, (_, i) => treeRoute(N, i, i));
+  const rev = Array.from({ length: N }, (_, i) => treeRoute(N, i, N - 1 - i));
+  console.log(`tree N=${N}: congestion identity ${congestion(ident)}, reversal ${congestion(rev)}`);
+}
+```
+
+```text
+tree N=4: congestion identity 1, reversal 4
+tree N=16: congestion identity 1, reversal 16
+tree N=1024: congestion identity 1, reversal 1024
+```
+
+**Realistic: how bad is a typical permutation?** For N = 8 there are only
+40,320 permutations, so we can route all of them and tally the
+congestion:
+
+```ts
+const hist = new Map<number, number>();
+for (const p of perms(8)) {
+  const c = congestion(p.map((d, i) => treeRoute(8, i, d)));
+  hist.set(c, (hist.get(c) ?? 0) + 1);
+}
+console.log('tree N=8 congestion histogram:', JSON.stringify([...hist].sort((a, b) => a[0] - b[0])));
+```
+
+```text
+tree N=8 congestion histogram: [[1,1],[2,127],[3,2576],[4,5872],[5,12032],[6,12224],[7,6912],[8,576]]
+```
+
+(`perms` is a small recursive generator of all permutations.) Two things
+stand out. Only one permutation, the identity, gets congestion 1: any
+packet that leaves its own leaf arrives at another leaf, which also
+carries that leaf's own outgoing packet. And 576 permutations hit the
+maximum of 8. That number is 4! · 4!: exactly the permutations that send
+every left-half input to the right half and every right-half input to
+the left, so all eight packets cross the root. The bad case is not
+exotic; it is a whole family of traffic patterns.
+
+### Step by step
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "take π(i) = N − 1 − i", "the adversary's choice"],
+  ["2", "input i and output π(i) are in opposite halves", "i below N/2 exactly when N − 1 − i is at least N/2"],
+  ["3", "every path from i to π(i) passes the root", "the tree path between leaves in opposite halves goes through their common ancestor, the root"],
+  ["4", "there is only one routing for π", "tree paths are unique"],
+  ["5", "its congestion is N", "all N paths share the root"],
+  ["6", "network congestion is at least N", "max over π of the best routing is at least this π's value"],
+  ["7", "network congestion is at most N", "only N packets exist"],
+]} caption="Why the complete binary tree's congestion is exactly N." />
+
+### Common mistake
+
+**The wrong way:** defining network congestion as the worst congestion
+over all routings of all problems.
+
+**Why it fails:** that punishes a network for routings it would never
+choose. Any network has silly routings with high congestion.
+
+**The right way:** let the network pick the best routing for each
+problem (the inner minimum), then take the worst problem (the outer
+maximum).
+
+### In real systems
+
+- **Bisection bandwidth** (how much traffic can cross a cut that splits the terminals in half) is the practical cousin of congestion; the tree's bisection is one link at the root, which is why plain trees are not used for heavy all-to-all traffic.
+- **Single points of failure**: the root is also a reliability problem. Redundant cores in data-centre designs exist to remove it.
+- **Hot keys** in a sharded database are the same phenomenon in software: one shard carries a share of the traffic out of all proportion to its size.
+
+### Check yourself
+
+1. What is the congestion of the routing for π(i) = i on the tree, in the book's model where a packet goes up one switch and back down?
+2. For N = 8, why does the root have to carry all packets under 4! · 4! different permutations?
+
+<details>
+<summary>Answer</summary>
+
+1. 1: each switch is used by at most one path.
+2. Those are the permutations mapping the left half onto the right half (4! ways) and the right half onto the left (4! ways); every packet crosses.
+
+</details>
+
+## 10.7 2-D Array
+
+### In one sentence
+
+The 2-D array (grid) puts N² switches in N rows and N columns, sends each
+packet right along its row and then down its destination column, and
+achieves congestion 2 at the cost of diameter 2N and N² switches.
+
+### The idea
+
+#### The design
+
+Input i enters at the left end of row i. Output j leaves at the bottom of
+column j. Each switch has an edge to its right neighbour and one to the
+switch below, so it is a 2 × 2 switch (two in, two out). Every input can
+reach every output by some mix of right and down moves, and all such
+paths have the same length.
+
+#### Diameter
+
+The farthest pair is input 0 (top row) and output N − 1 (rightmost
+column): the packet crosses all N columns and then descends N − 1 rows.
+Counting the terminal edges, that is 2N edges. For N = 4 the book's
+picture gives 8. Compared with 2 log N + 2 for the tree, this is terrible
+for large N.
+
+#### Theorem: the congestion of the N-input array is 2
+
+The proof has two halves.
+
+**At most 2.** For any permutation π, use the routing "go right along row
+i to column π(i), then go down". The switch in row i and column j can
+then carry only two kinds of packet: the packet that started in row i
+(travelling right), and the packet whose destination is column j
+(travelling down). There is exactly one packet of each kind, because π is
+a permutation. So no switch carries more than two.
+
+**At least 2.** Some permutation forces 2 whatever the routing. Take any π
+with π(0) = 0 and π(N − 1) = N − 1 (the identity is one). The packet from
+input N − 1 enters at the bottom-left switch. The packet for output 0
+must leave from the bottom of column 0, which means it passes the
+bottom-left switch too. The packet starting at input 0 is the one for
+output 0, and it is a different packet from the one starting at input
+N − 1 (for N at least 2). So two packets share that switch in every
+routing.
+
+Since all paths have equal length, latency equals diameter.
+
+<Figure art={`
+          col 0   col 1   col 2   col 3
+   in0 -> [ ] --> [ ] --> [ ] --> [ ]
+           |       |       |       |
+   in1 -> [ ] --> [ ] --> [ ] --> [ ]
+           |       |       |       |
+   in2 -> [ ] --> [ ] --> [ ] --> [ ]
+           |       |       |       |
+   in3 -> [ ] --> [ ] --> [ ] --> [ ]
+           |       |       |       |
+          out0    out1    out2    out3
+
+   route for in1 -> out2:  right along row 1 to col 2, then down
+`} caption="The 4-input array. Edges go right and down only; the switch at row i, column j sees at most the row-i packet and the column-j packet." />
+
+### Worked example
+
+**Simple: one route, and the load map for one permutation.**
+
+```ts
+const arrayRoute = (N: number, i: number, j: number): Path => [
+  ...Array.from({ length: j + 1 }, (_, c) => `a${i},${c}`),
+  ...Array.from({ length: N - 1 - i }, (_, r) => `a${i + 1 + r},${j}`),
+];
+console.log(arrayRoute(4, 1, 2).join(' '));
+const pi = [3, 0, 2, 1];
+const use = new Map<string, number>();
+for (const [i, d] of pi.entries()) for (const s of arrayRoute(4, i, d)) use.set(s, (use.get(s) ?? 0) + 1);
+for (let r = 0; r < 4; r++) console.log(Array.from({ length: 4 }, (_, c) => use.get(`a${r},${c}`) ?? 0).join(' '));
+console.log('identity', congestion([0, 1, 2, 3].map((d, i) => arrayRoute(4, i, d))));
+```
+
+```text
+a1,0 a1,1 a1,2 a2,2 a3,2
+1 1 1 1
+1 0 0 1
+2 1 1 1
+2 1 1 1
+identity 2
+```
+
+The load map shows where the 2s appear: at switches where a packet still
+moving right meets a packet already moving down. The identity also has
+congestion 2, at the bottom-left switch, exactly as the lower-bound half
+of the proof predicts.
+
+**Realistic: checking the theorem on many permutations.**
+
+```ts
+for (const N of [4, 8, 32]) {
+  let worst = 0;
+  for (let t = 0; t < 200; t++) {
+    const p = Array.from({ length: N }, (_, i) => i).sort(() => Math.random() - 0.5);
+    worst = Math.max(worst, congestion(p.map((d, i) => arrayRoute(N, i, d))));
+  }
+  console.log(`array N=${N}: switches ${N * N}, worst congestion over 200 random permutations ${worst}`);
+}
+```
+
+```text
+array N=4: switches 16, worst congestion over 200 random permutations 2
+array N=8: switches 64, worst congestion over 200 random permutations 2
+array N=32: switches 1024, worst congestion over 200 random permutations 2
+```
+
+(The shuffle is crude, but the theorem guarantees 2 for every
+permutation, so the output does not depend on which ones were drawn.)
+
+### Step by step
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "route each packet right to column π(i), then down", "a valid routing for any π"],
+  ["2", "a packet moving right through (i, j) started in row i", "it never changes row before turning"],
+  ["3", "a packet moving down through (i, j) is headed for column j", "it never changes column after turning"],
+  ["4", "the turning switch (i, π(i)) is counted once for its packet", "it is both, but it is one packet"],
+  ["5", "at most one packet started in row i, one is headed for column j", "π is a permutation"],
+  ["6", "so each switch carries at most 2", "steps 2 to 5"],
+  ["7", "with π(0) = 0 and π(N − 1) = N − 1, the bottom-left switch carries 2", "the input-(N − 1) packet and the output-0 packet both use it"],
+]} caption="Both halves of the congestion-2 theorem for the array." />
+
+### Common mistake
+
+**The wrong way:** reading "congestion 2" as "the array is the best
+design".
+
+**Why it fails:** the array needs N² switches and has diameter 2N. For
+N = 1,000 that is a million switches and paths of about 2,000 hops.
+
+**The right way:** read the table row as a trade: the array buys low
+congestion with a huge switch count and long paths, which only makes
+sense for small N.
+
+### In real systems
+
+- **Crossbar switches** (a grid of crosspoints connecting N inputs to N outputs) are the array idea in silicon; they are used inside a switch chip where N is modest, and they scale badly for exactly the N² reason.
+- **Mesh networks on chips** (many-core processors laid out as grids) use dimension-ordered routing, "go along X, then along Y", which is the right-then-down routing here.
+- **Systolic arrays** for matrix multiplication move data right and down through a grid of processing elements, with the same regular, low-contention flow.
+
+### Check yourself
+
+1. What is the diameter of the array with N = 8?
+2. In the proof of "at most 2", which two packets can pass switch (2, 5)?
+
+<details>
+<summary>Answer</summary>
+
+1. 2 · 8 = 16.
+2. The packet starting at input 2 (moving right, if its destination column is 5 or more) and the packet destined for output 5 (moving down, if it started in row 2 or above).
+
+</details>
+
+## 10.8 Butterfly
+
+### In one sentence
+
+The butterfly is built recursively from two half-size butterflies plus a
+new column of input switches, uses N(log N + 1) switches of size 2 × 2,
+has diameter log N + 2, routes each packet along a unique path by fixing
+one address bit per column, and has congestion √N or √(N/2): a compromise
+between the tree and the array.
+
+### The idea
+
+#### A recursive definition
+
+The book defines the butterfly as a recursive data type, describing only
+the switches and their wires (terminals are added afterwards). Write F_n
+for the butterfly switches with N = 2^n input switches and N output
+switches.
+
+- **Base case, F_1:** two input switches and two output switches, with every input switch wired to every output switch (four wires).
+- **Constructor, F_(n+1):** take two copies of F_n, a "top" one and a "bottom" one, and add a new column of 2^(n+1) input switches. For each i, new input switch i and new input switch 2^n + i are both wired to the same two places: input switch i of the top copy and input switch i of the bottom copy. The outputs of F_(n+1) are the outputs of the two copies together.
+
+<Figure art={`
+   new input column                 two copies of F_n
+
+   new switch i         ----+---->  top copy, input row i
+                            +---->  bottom copy, input row i
+   new switch 2^n + i   ----+---->  top copy, input row i
+                            +---->  bottom copy, input row i
+
+   outputs of F_(n+1) = outputs of the top copy, then outputs of the bottom copy
+
+   F_1 (base case):   in0 --> out0    in0 --> out1
+                      in1 --> out0    in1 --> out1
+`} caption="One step of the butterfly construction. The first column decides only one thing: top copy or bottom copy, which is the top bit of the destination." />
+
+#### Size and diameter
+
+Each construction step adds one column, and F_1 has two, so F_n has n + 1
+columns of height 2^n. The switch count is N(log N + 1). Every edge goes
+from one column to the next, so every input-to-output switch path has
+log N edges, and adding the two terminal edges gives diameter log N + 2,
+better even than the tree.
+
+#### Routing by fixing bits
+
+Routing is recursive too. To get from an input of F_(n+1) to an output in
+the top copy, the first hop must go to the top copy; for the bottom copy,
+to the bottom copy; and then you route recursively inside that copy. So
+there is **exactly one path** from each input to each output, and latency
+equals diameter.
+
+With rows numbered in binary, "top or bottom copy" is the top bit of the
+output's row number. Unrolling the recursion: at column l, the packet
+moves to the row whose bit l (counting from the most significant) now
+matches the destination's. After log N hops all bits match. This is
+called **bit-fixing** routing.
+
+#### Congestion of about √N
+
+The book states the result and leaves the proof as a problem; here is the
+shape of an argument. Let n = log N. After l hops, a packet's row is the
+destination's top l bits followed by the source's bottom n − l bits. So
+the packets that can pass a given switch at column l are those whose
+source shares its bottom n − l bits (at most 2^l of them) and whose
+destination shares its top l bits (at most 2^(n − l)). The load is at most
+the smaller of 2^l and 2^(n − l), which peaks in the middle column at
+2^(n/2) = √N when n is even, and at 2^((n − 1)/2) = √(N/2) when n is odd.
+
+The bit-reversal permutation (send row r to the row whose binary digits
+are r's in reverse) attains that bound, and because routes are unique,
+no cleverer routing exists. So the network congestion is √N or √(N/2).
+
+### Worked example
+
+**Simple: a bit-fixing route.** From input 3 (011) to output 6 (110) with
+N = 8:
+
+```ts
+const n = 3; let r = 3; const d = 6; const rows = [r.toString(2).padStart(3, '0')];
+for (let l = 0; l < n; l++) {
+  const bit = 1 << (n - 1 - l);
+  r = (r & ~bit) | (d & bit);
+  rows.push(r.toString(2).padStart(3, '0'));
+}
+console.log('rows visited:', rows.join(' → '));
+```
+
+```text
+rows visited: 011 → 111 → 111 → 110
+```
+
+The middle step changes nothing because bit 2 of the source already
+matched. The packet still takes a hop; it just goes "straight across".
+
+**Realistic: measuring congestion exhaustively and at scale.** With
+`butterflyRoute(N, i, d)` returning the switch ids `b<column>,<row>` along
+the bit-fixing path:
+
+```ts
+function butterflyRoute(N: number, i: number, d: number): Path {
+  const n = Math.log2(N); let r = i; const p = [`b0,${r}`];
+  for (let l = 0; l < n; l++) { const bit = 1 << (n - 1 - l); r = (r & ~bit) | (d & bit); p.push(`b${l + 1},${r}`); }
+  return p;
+}
+for (const N of [4, 8]) {
+  let worst = 0;
+  for (const p of perms(N)) worst = Math.max(worst, congestion(p.map((d, i) => butterflyRoute(N, i, d))));
+  console.log(`butterfly N=${N}: switches ${N * (Math.log2(N) + 1)}, worst congestion over all ${perms(N).length} permutations ${worst}`);
+}
+for (const N of [16, 64, 256, 1024])
+  console.log(`butterfly N=${N}: bit-reversal permutation congestion ${congestion(Array.from({ length: N }, (_, i) => butterflyRoute(N, i, bitrev(i, Math.log2(N)))))}`);
+```
+
+```text
+butterfly N=4: switches 12, worst congestion over all 24 permutations 2
+butterfly N=8: switches 32, worst congestion over all 40320 permutations 2
+butterfly N=16: bit-reversal permutation congestion 4
+butterfly N=64: bit-reversal permutation congestion 8
+butterfly N=256: bit-reversal permutation congestion 16
+butterfly N=1024: bit-reversal permutation congestion 32
+```
+
+N = 4 and N = 16 are even powers of two, giving √N = 2 and 4; N = 8 is an
+odd power, giving √(8/2) = 2; then 8, 16, 32 are √64, √256 and √1024.
+Where does the pile-up happen? For N = 16 under bit reversal:
+
+```ts
+const use = new Map<string, number>();
+for (let i = 0; i < 16; i++) {
+  let r = i; const dd = bitrev(i, 4);
+  for (let l = 0; l < 4; l++) {
+    const bit = 1 << (3 - l); r = (r & ~bit) | (dd & bit);
+    const k = `level ${l + 1} row ${r}`; use.set(k, (use.get(k) ?? 0) + 1);
+  }
+}
+console.log('busiest switches:', [...use].filter(([, v]) => v === 4).map(([k]) => k).join(', '));
+```
+
+```text
+busiest switches: level 2 row 0, level 2 row 9, level 2 row 6, level 2 row 15
+```
+
+All four hot spots are in the middle column, as the argument predicts.
+
+### Step by step
+
+In the table, a switch at column l is reachable from the 2^l sources that
+share its bottom 4 − l bits, and leads to the 2^(4 − l) destinations that
+share its top l bits; the load is at most the smaller of the two.
+
+<Trace columns={["column", "row (binary)", "bits fixed so far", "packets that could be here"]} rows={[
+  ["0", "s3 s2 s1 s0 (source)", "none", "1 (only the source)"],
+  ["1", "d3 s2 s1 s0", "top 1", "at most min(2, 8) = 2"],
+  ["2", "d3 d2 s1 s0", "top 2", "at most min(4, 4) = 4"],
+  ["3", "d3 d2 d1 s0", "top 3", "at most min(8, 2) = 2"],
+  ["4", "d3 d2 d1 d0 (destination)", "all", "1 (only the destination)"],
+]} caption="Bit-fixing in a 16-input butterfly. In the middle column, a row mixes two destination bits with two source bits, so up to four packets can collide there." />
+
+### Common mistake
+
+**The wrong way:** assuming that because the butterfly has many paths
+overall, a packet can dodge a busy switch.
+
+**Why it fails:** there is exactly one path from each input to each
+output. The butterfly has no routing freedom at all, so an adversarial
+permutation cannot be routed around.
+
+**The right way:** to beat the √N bound you need path diversity, which is
+precisely what the Beneš network adds.
+
+### In real systems
+
+- **The fast Fourier transform** has a butterfly-shaped data flow, which is where the name comes from; FFT hardware and parallel FFT codes are laid out on this network.
+- **Multistage interconnection networks** (omega, butterfly and related designs) were used in classic shared-memory parallel computers to connect processors to memory banks, and they suffered the hot-spot problem described here.
+- **Randomised routing**, a known fix, sends each packet first to a random intermediate row and then to its destination, which spreads load on average; it is a probabilistic cousin of the Beneš idea.
+
+### Check yourself
+
+1. How many switches and columns does the butterfly with N = 32 have?
+2. What is its congestion?
+
+<details>
+<summary>Answer</summary>
+
+1. 6 columns of 32: 192 switches.
+2. 32 = 2^5 is an odd power, so √(32/2) = 4.
+
+</details>
+
+## 10.9 Beneš Network
+
+### In one sentence
+
+Placing two butterflies back to back, so that the network grows a new
+column of inputs and a new column of outputs at each recursive step,
+gives the Beneš network: 2N log N switches of size 2 × 2, diameter
+2 log N + 1, and congestion 1, proved by induction with a two-colouring
+of a constraint graph at each step.
+
+### The idea
+
+#### The construction
+
+The idea came from Václav Beneš at Bell Labs in the 1960s. Write B_n for
+the Beneš switches with N = 2^n inputs and outputs.
+
+- **Base case, B_1:** the same as F_1, two inputs fully wired to two outputs.
+- **Constructor, B_(n+1):** take two copies of B_n (upper and lower), add a new column of 2^(n+1) input switches wired exactly as in the butterfly (new inputs i and 2^n + i both feed input i of each copy), and also add a new column of 2^(n+1) output switches wired as the mirror image (new outputs i and 2^n + i are both fed from output i of each copy).
+
+Each step adds two columns, so B_n has 2n columns of height N, for
+2N log N switches. Every input-to-output switch path crosses all 2 log N
+columns, so it has 2 log N − 1 edges, and with the terminal edges the
+diameter is 2 log N + 1. Compared with the butterfly, Beneš roughly
+doubles the switch count and the diameter. In exchange, each packet now
+has a choice at every level of the recursion: upper copy or lower copy.
+
+<Layers caption="The Beneš network B_(n+1) as nested layers: a choice column on each side, and two smaller Beneš networks in the middle, which are themselves built the same way." layers={[
+  { title: "new input column", body: "inputs i and i + N/2 each send one packet to the upper copy and one to the lower copy" },
+  { title: "upper B_n and lower B_n", body: "each routes a permutation of N/2 packets with congestion 1 (induction hypothesis)" },
+  { title: "new output column", body: "outputs j and j + N/2 each receive one packet from each copy" },
+]} />
+
+#### Theorem: the congestion of the N-input Beneš network is 1
+
+**Proof by induction on n**, with P(n) being "B_n has congestion 1", that
+is, every permutation of its 2^n inputs can be routed with no two packets
+sharing a switch.
+
+**Base case.** B_1 is F_1. Each packet's route is input switch i to output
+switch π(i); the two packets start at different switches and end at
+different switches, so congestion is 1.
+
+**Inductive step.** Assume every permutation of N = 2^n inputs routes
+through B_n with congestion 1, and take a permutation π of 2N inputs for
+B_(n+1). The middle is handled by the hypothesis; the only question is
+which packets go to the upper copy and which to the lower, so that the
+two new columns are not overloaded.
+
+There are two kinds of conflict:
+
+- **Input side.** Packets entering at inputs i and i + N share the same pair of out-wires (to input i of each copy). If both went to the same copy they would collide at that copy's input switch i. So they must go to different copies.
+- **Output side.** Packets bound for outputs j and j + N both arrive via output j of a copy. If they came through the same copy they would collide at that copy's output switch j. So they must go to different copies.
+
+Draw a **constraint graph**: one vertex per packet, a "black" edge
+between each input-side pair, and a "grey" edge between each output-side
+pair. A valid assignment is a two-colouring (upper or lower) in which
+every edge joins different colours.
+
+Every vertex has exactly one black edge (its input partner) and exactly
+one grey edge (its output partner). So the graph splits into cycles that
+alternate black, grey, black, grey (an input pair and its own output
+pair can make a cycle of length two, a doubled edge). An alternating cycle
+has even length, and an even cycle can be two-coloured by alternating
+colours around it. So the whole constraint graph can be two-coloured.
+
+Colour the packets that way and send each to its colour's copy. The
+upper copy now receives one packet at each of its inputs (one from each
+input pair) and must deliver one to each of its outputs (one for each
+output pair): that is a permutation of N packets, which by the hypothesis
+routes with congestion 1, and likewise for the lower copy. The new
+columns carry one packet per switch by the colouring. So B_(n+1) routes π
+with congestion 1, and since the lowest possible congestion of any
+network carrying at least one packet is 1, the congestion of B_(n+1) is
+exactly 1. ∎
+
+#### The book's worked example
+
+The book works the inductive step on N = 8 with the permutation π(0) = 1,
+π(1) = 5, π(2) = 4, π(3) = 7, π(4) = 3, π(5) = 6, π(6) = 0, π(7) = 2.
+Black edges join packets 0–4, 1–5, 2–6 and 3–7. Grey edges join the packets
+bound for outputs 0 and 4 (packets 6 and 2), 1 and 5 (0 and 1), 2 and 6
+(7 and 5), and 3 and 7 (4 and 3). That gives one six-cycle,
+0, 4, 3, 7, 5, 1, and one two-cycle, 2 and 6.
+
+<Figure art={`
+   black edges (input pairs):   0 - 4    1 - 5    2 - 6    3 - 7
+   grey edges (output pairs):   6 = 2    0 = 1    7 = 5    4 = 3
+
+   cycle A:   0 - 4 = 3 - 7 = 5 - 1 = 0      (length 6, alternating)
+   cycle B:   2 - 6 = 2                      (length 2, a doubled edge)
+
+   colouring: upper = 0, 3, 5, 2      lower = 4, 7, 1, 6
+`} caption="The constraint graph for the eight-packet example, drawn as text: '-' for black (input-side) edges, '=' for grey (output-side) edges. Both cycles are even, so alternating colours works." />
+
+### Worked example
+
+**Simple: the two-colouring in code.** Walk each alternating cycle:
+colour a packet, give its input partner the other colour, then jump to
+the packet that shares an output pair with that partner, which must take
+the first colour again:
+
+```ts
+function colour(pi: number[]): number[] {
+  const N = pi.length, h = N / 2, inv: number[] = []; pi.forEach((d, i) => (inv[d] = i));
+  const c: number[] = new Array(N).fill(-1);
+  for (let s = 0; s < N; s++) {
+    if (c[s] !== -1) continue;
+    let p = s, col = 0;
+    while (c[p] === -1) {
+      c[p] = col; const q = p < h ? p + h : p - h; c[q] = 1 - col;
+      const d = pi[q], d2 = d < h ? d + h : d - h; p = inv[d2];
+    }
+  }
+  return c;
+}
+const ex = [1, 5, 4, 7, 3, 6, 0, 2];
+console.log('colours for the 8-packet example:', JSON.stringify(colour(ex)));
+```
+
+```text
+colours for the 8-packet example: [0,1,0,0,1,0,1,1]
+```
+
+Colour 0 (upper) is packets 0, 2, 3 and 5; colour 1 (lower) is 1, 4, 6
+and 7, matching the figure. Projecting each half onto its four-input
+subnetwork (input i mod 4, output π(i) mod 4) gives the two smaller
+problems that the induction hands to B_2:
+
+```text
+upper subproblem: [1,2,0,3]  lower subproblem: [3,1,0,2]
+```
+
+Both are permutations of 0 to 3, as the proof requires.
+
+**Realistic: a full recursive router, verified on every permutation of
+eight.** The router colours, splits, recurses, and wraps each sub-route
+with the new first and last switch, using ids `s<column>,<row>`:
+
+```ts
+function benes(pi: number[], col0 = 0, row0 = 0): Path[] {
+  const N = pi.length;
+  if (N === 2) return pi.map((d, i) => [`s${col0},${row0 + i}`, `s${col0 + 1},${row0 + d}`]);
+  const h = N / 2, c = colour(pi), sub: number[][] = [[], []], who: number[][] = [[], []];
+  pi.forEach((d, i) => { sub[c[i]][i % h] = d % h; who[c[i]][i % h] = i; });
+  const inner = [0, 1].map((s) => benes(sub[s], col0 + 1, row0 + s * h));
+  const cols = 2 * Math.log2(N), out: Path[] = [];
+  for (const s of [0, 1]) inner[s].forEach((p, k) => {
+    const i = who[s][k];
+    out[i] = [`s${col0},${row0 + i}`, ...p, `s${col0 + cols - 1},${row0 + pi[i]}`];
+  });
+  return out;
+}
+console.log('congestion:', congestion(benes(ex)), ' path of packet 0:', benes(ex)[0].join(' '));
+let worst = 0; for (const p of perms(8)) worst = Math.max(worst, congestion(benes(p)));
+console.log('Beneš N=8, worst congestion over all 40320 permutations:', worst);
+```
+
+```text
+congestion: 1  path of packet 0: s0,0 s1,0 s2,0 s3,1 s4,1 s5,1
+Beneš N=8, worst congestion over all 40320 permutations: 1
+```
+
+And at larger sizes, on random permutations (the theorem guarantees the
+printed 1 for every permutation):
+
+```text
+Beneš N=64: switches 768, path switches 12, worst congestion over 50 random permutations 1
+Beneš N=1024: switches 20480, path switches 20, worst congestion over 50 random permutations 1
+```
+
+A path through 2 log N switches has 2 log N − 1 edges, plus 2 terminal
+edges: 2 log N + 1, the diameter claimed above (13 for N = 64).
+
+### Step by step
+
+<Trace columns={["step", "statement", "why"]} rows={[
+  ["1", "base case: B_1 routes any permutation of 2 with congestion 1", "two packets, distinct start and end switches"],
+  ["2", "assume B_n works for all permutations of N", "induction hypothesis"],
+  ["3", "input partners i, i + N must use different copies", "they share the wires into input i of each copy"],
+  ["4", "output partners (bound for j, j + N) must use different copies", "they share the wires out of output j of each copy"],
+  ["5", "each packet has one black and one grey constraint edge", "one input partner, one output partner"],
+  ["6", "the constraint graph is a union of alternating, hence even, cycles", "a graph where every vertex has one edge of each colour"],
+  ["7", "it is two-colourable", "alternate colours around each even cycle"],
+  ["8", "each copy gets a permutation of N packets", "one packet per input pair and per output pair goes to each copy"],
+  ["9", "each copy routes its share with congestion 1", "induction hypothesis"],
+  ["10", "B_(n+1) routes π with congestion 1", "new columns carry one packet per switch by steps 3, 4, 7"],
+]} caption="The Beneš congestion-1 proof, step by step." />
+
+### Common mistake
+
+**The wrong way:** colouring greedily, packet by packet, "upper unless it
+conflicts".
+
+**Why it fails:** a greedy choice can paint two ends of a grey edge the
+same colour when the cycle closes, if you do not follow the cycle. The
+proof works because it colours whole cycles in alternation.
+
+**The right way:** follow each alternating cycle from a starting packet,
+as the `colour` function does; even length guarantees it closes without a
+clash. (Every 40,320 eight-packet permutation routes with congestion 1
+under this rule, as the exhaustive check confirms.)
+
+### In real systems
+
+- **Rearrangeable networks**: the Beneš network is the standard example of a network that can realise any permutation without conflicts if the routes are computed together, which is how it is described in switching theory. The "looping algorithm" above is the classic way to set it.
+- **Clos networks**, a related three-stage design from telephone switching, underlie modern data-centre fabrics (leaf-spine and fat-tree designs). A Beneš network is what you get by applying the Clos idea recursively with 2 × 2 switches.
+- **Permutation hardware** inside chips and in some cryptographic and FFT accelerators uses Beneš-style networks to realise arbitrary bit or word permutations with few switches.
+- **Lower bound intuition:** if each 2 × 2 switch contributes one binary choice, a network that can realise all N! permutations needs at least log₂(N!) choices, which is close to N log N. For N = 1,024, log₂(1,024!) is about 8,769 while Beneš uses 20,480 switches: within a small constant factor of what any such design must use.
+
+### Check yourself
+
+1. How many switches and what diameter does the Beneš network with N = 16 have?
+2. Why is every cycle in the constraint graph even?
+
+<details>
+<summary>Answer</summary>
+
+1. 2 · 16 · 4 = 128 switches; diameter 2 · 4 + 1 = 9.
+2. Each vertex has exactly one black and one grey edge, so along a cycle the edge colours alternate, and an alternating closed walk has an even number of edges.
+
+</details>
+
+## The four designs side by side
+
+<Compare caption="The book's running comparison, completed. Diameter counts terminal edges; congestion is the worst case over permutations with the best routing for each." left="Network" right="Diameter, switch size, switches, congestion" rows={[
+  ["complete binary tree", "2 log N + 2, 3 × 3, 2N − 1, N"],
+  ["2-D array", "2N, 2 × 2, N², 2"],
+  ["butterfly", "log N + 2, 2 × 2, N(log N + 1), √N or √(N/2)"],
+  ["Beneš", "2 log N + 1, 2 × 2, 2N log N, 1"],
+]} />
+
+## From beginner to strategy
+
+<Levels label="Chapter 10, Communication Networks">
+<Level name="Beginner" depth={3}>
+
+The smallest working idea: a network is a digraph of terminals and
+switches, a routing problem is a permutation, and you judge a design by
+how long its paths are (diameter), how many switches it uses, and how
+many packets pile up on the busiest switch (congestion).
+
+Try it: draw the four-leaf tree and route the reversal permutation by
+hand, then count how many packets pass the root.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+Be able to derive each row of the comparison table: the tree's 2 log N + 2
+and 2N − 1 from its levels; the array's congestion 2 from the
+right-then-down routing and the bottom-left switch; the butterfly's
+N(log N + 1) from its recursion and its unique bit-fixing routes. Code
+each network and measure congestion on the worst permutations.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+Own the two key arguments: the max-of-min definition of network
+congestion (and why it is the fair one), and the Beneš induction with its
+two-colouring of alternating cycles. Understand why the butterfly's lack
+of path diversity forces √N, and why adding a mirrored half creates
+exactly enough choice to reach 1.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+- **N = 2:** the butterfly and Beneš networks coincide (both are F_1 = B_1).
+- **Identity traffic:** almost every design looks perfect on it; it is never a fair test.
+- **Two-cycles in the constraint graph:** when an input pair is also an output pair, the cycle has length two; the colouring still works.
+- **Odd powers of two:** the butterfly's congestion is √(N/2), not √N, because the middle column falls between two levels.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+- **Non-permutation traffic:** if two inputs target the same output, no network avoids sharing that output switch; the theory assumes permutations.
+- **Online routing:** the Beneš router needs the whole permutation up front. If packets arrive one at a time and existing routes cannot be moved, congestion 1 is not guaranteed; that is the difference between rearrangeable and strictly non-blocking networks.
+- **Switch failures:** the butterfly's unique paths mean a single failed switch disconnects some input-output pairs; Beneš has alternative routes.
+- **Latency versus congestion:** in networks with unequal path lengths, minimising congestion can raise latency, as the toy example in 10.5 shows.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+Real fabrics are measured with the same quantities under other names: hop
+count (diameter), port count (switch size), bill of materials (switch
+count), and bisection bandwidth or oversubscription (congestion). When
+evaluating a topology, test adversarial patterns (transpose, bit
+reversal, all-to-one-half) rather than uniform random traffic, and know
+whether routes are fixed, adaptive or globally scheduled.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+Every design trades something. The useful habit is to put each option in
+a table with all the measures at once and ask which measure your
+workload actually stresses. The second habit is to look for the
+adversary: what input makes this design worst, and can I prove nothing
+worse exists?
+
+</Level>
+<Level name="System design" depth={3}>
+
+The same patterns appear above the hardware. A single coordinator or
+broker is the tree's root. A full mesh of service connections is the
+array's N². Sharding by key bits is bit-fixing, with the same hot-spot
+risk when keys are skewed. Two-stage load balancing (pick a random
+intermediate, then the destination) is the software cousin of Beneš and
+of randomised routing.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+This chapter feeds graph theory (chapters 11 and 12 use bipartite
+colouring and trees), probability (randomised routing in later chapters
+and in algorithms courses), and systems work on data-centre networks and
+parallel computing. I plan to keep the comparison table and the Beneš
+proof as reference material and revisit them when studying network
+topologies and distributed system design.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Why does the book count congestion at switches, not at wires?** Switches
+are where packets queue and compete; it is also simpler to state.
+Counting at wires gives similar conclusions for these designs.
+
+**Is the Beneš network "the answer"?** For the book's measures, yes:
+small switches, N log N switches, logarithmic diameter, congestion 1. In
+practice the routes must be computed for each whole permutation, which
+takes time and needs global knowledge, so real systems often use
+Clos-style designs with adaptive or randomised routing instead.
+
+**Why is N a power of two?** The recursive constructions halve N at each
+step. Other sizes can be handled by padding or by mixed-radix versions.
+
+**Does congestion 1 mean no waiting at all?** In the model, yes: each
+switch carries one packet per routing round. Real traffic arrives over
+time and is not a clean permutation, so queues still form.
+
+**How does the butterfly relate to the FFT?** The FFT combines values in
+pairs whose indices differ in one bit, one bit per stage, which is
+exactly the butterfly's wiring.
+
+## Key takeaways
+
+- A network is a digraph of terminals and switches; a routing problem is a permutation; a routing is one path per packet.
+- Diameter is the largest input-to-output shortest distance; switch size must be fixed for fair comparisons; switch count measures cost.
+- Latency is the longest path in the chosen routing; here it equals diameter because paths are unique or all the same length.
+- Congestion of a network is the max over permutations of the min over routings of the busiest switch's load.
+- Tree: 2 log N + 2, 2N − 1 switches, congestion N (the root).
+- Array: 2N, N² switches, congestion 2 (right then down; the bottom-left switch).
+- Butterfly: log N + 2, N(log N + 1) switches, congestion √N or √(N/2), unique bit-fixing routes.
+- Beneš: 2 log N + 1, 2N log N switches, congestion 1, by induction and two-colouring alternating cycles.
+
+## Glossary
+
+- **Packet:** a fixed-size chunk of data moving through the network.
+- **Terminal:** an input or output end point (a computer, processor or phone).
+- **Switch:** a vertex that forwards packets from incoming to outgoing edges.
+- **k × k switch:** a switch with k incoming and k outgoing edges.
+- **Routing problem:** a permutation π; input i must reach output π(i).
+- **Routing:** a set of paths solving a routing problem.
+- **Diameter:** the largest shortest-path distance from an input to an output.
+- **Switch count:** the number of switches in the network.
+- **Latency:** the length of the longest path in a routing; for a network, the worst over problems using optimal routings.
+- **Congestion:** the most paths through one switch in a routing; for a network, the max over problems of the min over routings.
+- **Complete binary tree network:** switches in a binary tree, terminals at the leaves.
+- **2-D array:** an N × N grid of 2 × 2 switches with right and down edges.
+- **Butterfly F_n:** the recursive network with log N + 1 columns and unique bit-fixing routes.
+- **Bit-fixing routing:** fixing one bit of the row number per column to match the destination.
+- **Beneš network B_n:** two butterflies back to back, built recursively with a new input and output column at each step.
+- **Constraint graph:** packets as vertices, edges between packets that must use different subnetworks.
+- **Two-colouring:** assigning one of two colours to each vertex so every edge joins different colours.
+
+## Exercises and self-check
+
+**Warm-up (by hand).**
+
+1. Draw the 8-input butterfly and route input 5 to output 2 by bit fixing. Which switches does it pass?
+2. For the 4-input array, find a permutation other than the identity whose congestion is 2, and name the switch.
+3. Compute diameter, switch count and congestion for the tree, array, butterfly and Beneš network with N = 64.
+4. For N = 8 and π = (7, 6, 5, 4, 3, 2, 1, 0) written as π(0) to π(7), draw the Beneš constraint graph and two-colour it.
+
+**Build (code and test).**
+
+5. Write a function that takes any layered network (as a list of columns and wires) and a routing, checks that each path is valid along the wires, and reports its congestion. Use it to verify the Beneš router's paths, not just its switch counts.
+6. Implement randomised two-phase routing on the butterfly (first to a random row, then to the destination, using a butterfly twice) and measure the average congestion of the bit-reversal permutation over many trials.
+7. Write a brute-force search that, for N = 4, finds the minimum congestion over all routings for every permutation in a small network you design with some path choices, and compare with your intuition.
+
+**Stretch (change the problem).**
+
+8. Prove that the butterfly's congestion is at least √N for even powers of two by showing that the bit-reversal permutation sends √N packets through one middle-column switch.
+9. Show that a network in which every switch has at most two settings and which can realise all N! permutations must have at least log₂(N!) switches, and compare that with 2N log N.
+
+**Self-check.**
+
+<details>
+<summary>1. Why is the tree's congestion N?</summary>
+
+Under the reversal permutation every packet crosses between halves, and the unique route for each passes through the root.
+
+</details>
+
+<details>
+<summary>2. Why can no switch in the array carry three packets with right-then-down routing?</summary>
+
+A switch at row i, column j sees only the packet that started in row i and the packet bound for column j, and there is one of each.
+
+</details>
+
+<details>
+<summary>3. Why can't the butterfly avoid its hot spots by rerouting?</summary>
+
+Its routes are unique: there is exactly one path from each input to each output.
+
+</details>
+
+<details>
+<summary>4. What makes the Beneš constraint graph two-colourable?</summary>
+
+Each packet has exactly one input-side and one output-side constraint, so the graph is a union of alternating cycles, which have even length.
+
+</details>
+
+## How I'd study this chapter
+
+I plan two sessions. In the first (two to three hours) I read 10.1 to
+10.7 alongside the 6.042J lecture on communication networks, code the
+tree and array routers, and reproduce the comparison table rows for them
+by measurement.
+
+In the second (two to three hours) I read 10.8 and 10.9, build the
+butterfly recursively, check its bit-fixing routes and the √N hot spots,
+and then write the Beneš proof out in my own words, drawing the
+constraint graph for two permutations of my own.
+
+Then an hour to code the Beneš looping router from scratch, without
+looking at this page, and verify it on all 40,320 permutations of eight.
+
+In my notebook I keep the four-row comparison table and the outline of
+the Beneš induction.
+
+**Done when** I can fill in the comparison table from memory with a
+one-line reason for each entry, and my own Beneš router passes the
+exhaustive N = 8 check. This chapter feeds
+<a href={withBase('/plans/traditional-software-developer/#strategy-2')}>Phase 2 of the traditional core</a>.
