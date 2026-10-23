@@ -1,0 +1,936 @@
+---
+plan: traditional-software-developer
+phase: 6
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+
+The plan text above is the contract for this phase. This section is how I would
+work through it: every bullet in the phase, one at a time, climbing from "what
+is it" to "how would I design with it". The primary book is
+[Operating Systems: Three Easy Pieces](/sanjay/books/operating-systems-three-easy-pieces/);
+the reference I keep open beside it is
+[The Linux Programming Interface](/sanjay/books/the-linux-programming-interface/).
+
+<Layers
+  caption="Where this phase sits: my program on top, the kernel in the middle, the hardware from phase 5 underneath."
+  layers={[
+    { name: 'My program', note: 'calls read(), malloc(), pthread_create()' },
+    { name: 'C library (glibc / musl)', note: 'wraps system calls, buffers I/O, runs malloc' },
+    { name: 'System call boundary', note: 'a trap: user mode to kernel mode and back' },
+    { name: 'Kernel', note: 'processes, scheduler, virtual memory, file systems, drivers' },
+    { name: 'Hardware', note: 'CPU modes, MMU, timer interrupt, disk, NIC' },
+  ]}
+/>
+
+#### Processes: address space, fork/exec, wait, signals, exit codes
+
+<Levels label="Phase 6, processes">
+<Level name="Beginner" depth={5}>
+
+A process is a running program plus everything the kernel tracks for it: its
+own address space, open files, a process ID, and a parent. `fork()` makes a near
+copy of the caller; `exec()` replaces the program inside the current process;
+`wait()` lets the parent collect the child's exit status. Exit code 0 means
+success, anything else means "something went wrong", and the shell's `$?`
+shows it.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+The shell is just this loop: read a line, `fork()`, in the child `exec()` the
+command, in the parent `waitpid()` for it. Splitting creation (fork) from
+loading (exec) is what lets the child rearrange file descriptors in between,
+which is how redirection and pipes work without the program knowing.
+
+```c
+pid_t pid = fork();
+if (pid == 0) {                 /* child */
+  execlp("ls", "ls", "-l", (char *)NULL);
+  perror("execlp");             /* only reached if exec failed */
+  _exit(127);
+}
+int status;
+waitpid(pid, &status, 0);       /* parent */
+if (WIFEXITED(status)) printf("exit %d\n", WEXITSTATUS(status));
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+`fork()` does not copy memory eagerly: pages are shared and marked
+copy-on-write, so the first write by either side triggers a page fault and a
+private copy. A signal is an asynchronous notification delivered by the kernel
+when the process next returns to user mode; a handler may only call
+async-signal-safe functions. An exit status packs either an exit code or the
+signal that killed the process, which is why a shell reports `128 + n` for a
+death by signal `n`.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A child that exits before the parent waits becomes a zombie: its entry stays
+until it is reaped. A parent that exits first leaves an orphan, which is
+re-parented to init (or a subreaper) and reaped there. `exec()` keeps open file
+descriptors unless they are marked close-on-exec, so a forgotten descriptor
+leaks into every program you start.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Forking a multithreaded program copies only the calling thread; a mutex held by
+another thread at that moment stays locked forever in the child, so the only
+safe thing to do after such a fork is `exec()`. Calling `exit()` instead of
+`_exit()` in a failed child flushes the parent's stdio buffers a second time,
+and the output appears twice.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Containers make this matter: PID 1 inside a container has no default signal
+handlers and must reap zombies, which is why images use a tiny init. Exit codes
+are an API for schedulers and CI; a job that exits 0 after failing hides the
+failure from every system above it.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Treat a process as an isolation boundary with a contract: what it inherits,
+what it returns, how it is told to stop. If I cannot say who reaps a process and
+what happens to its descriptors, I do not understand the program yet.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Process-per-request (old CGI, pre-fork servers) buys isolation and costs memory
+and start-up time; supervisors (systemd, Kubernetes) are process managers that
+restart on non-zero exit. Graceful shutdown is a signal protocol: SIGTERM, drain,
+then exit, with SIGKILL as the deadline.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Read the process chapters of OSTEP, then write the fork/exec/wait loop from
+memory. Prove I understand it by making a zombie on purpose, watching it in
+`ps`, and fixing it. Done when I can explain every line of my shell's launcher.
+
+</Level>
+</Levels>
+
+<Flow
+  caption="How a shell runs one command."
+  steps={['read line', 'parse', 'fork()', 'child: dup2 + exec()', 'parent: waitpid()', 'print prompt']}
+/>
+
+#### Threads: stacks, shared memory, context switches, and the cost of a thread
+
+<Levels label="Phase 6, threads">
+<Level name="Beginner" depth={5}>
+
+A thread is a second line of execution inside the same process. Threads share
+the heap, globals and open files; each has its own stack and registers. That
+sharing is why threads are cheap to talk between and easy to get wrong.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+With pthreads: `pthread_create` starts a function on a new thread,
+`pthread_join` waits for it. In Node, `worker_threads` gives separate heaps and
+message passing; it is closer to processes than to pthreads, which is a design
+choice, not a limitation.
+
+```ts
+import { Worker } from 'node:worker_threads';
+const w = new Worker(new URL('./hash.js', import.meta.url), { workerData: buf });
+w.on('message', (digest) => console.log(digest));
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+A context switch saves one thread's registers and loads another's; switching
+between threads of the same process skips the address-space change, so the TLB
+stays warm. Each thread reserves a stack (often 8 MB of virtual space on Linux,
+mostly unbacked until touched), which is why ten thousand threads is a memory
+and scheduling problem long before it is a CPU one.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A thread that returns a pointer to its own stack hands back garbage. A thread
+that is never joined or detached leaks its resources. Thread-local storage
+looks global but is per thread, which surprises code that caches in it.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Two threads writing different variables on the same cache line still slow
+each other down (false sharing, from phase 5). A signal sent to a process is
+delivered to one arbitrary thread that does not block it, so handlers and
+threads mix badly unless one thread waits for signals with `sigwait`.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Thread pools exist because creating a thread per task costs microseconds and
+memory; databases, web servers and the libuv pool in Node all bound their
+threads. A too-small pool starves; a too-large one thrashes the scheduler and
+the cache.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Shared mutable state is the price of threads. I default to sharing nothing,
+passing messages, and making the shared part small enough to reason about.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Threads, processes, event loops and async runtimes are four answers to "how
+do I wait for many things at once". Pick by the workload: CPU-bound work wants
+roughly one thread per core; I/O-bound work wants an event loop or many cheap
+tasks.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build the thread pool in the build list, measure throughput as I vary the pool
+size from 1 to 64, and plot it. Done when the graph and my explanation of its
+shape agree.
+
+</Level>
+</Levels>
+
+#### System calls and the user/kernel boundary
+
+<Levels label="Phase 6, system calls">
+<Level name="Beginner" depth={5}>
+
+A system call is how a program asks the kernel to do something it is not
+allowed to do itself: open a file, allocate pages, send a packet. The program
+runs in user mode; the kernel runs in kernel mode with full access to the
+hardware.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+`printf` is a library function; `write` is the system call underneath it.
+`strace` shows the boundary: every call, its arguments and its return value.
+
+```sh
+strace -f -e trace=openat,read,write,close cat notes.txt
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+The CPU enters the kernel through a trap instruction (`syscall` on x86-64)
+that jumps to a handler the kernel registered at boot; the system call number
+goes in a register and selects the routine. Limited direct execution is the
+idea: run user code at full speed on the real CPU, and keep control through
+traps and a timer interrupt.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+System calls fail with -1 and set `errno`; `EINTR` means a signal interrupted
+a slow call and it may need retrying. `read` and `write` may transfer fewer
+bytes than asked, so correct code loops.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Some "calls" never enter the kernel: `gettimeofday` and `clock_gettime` are
+served from the vDSO, a page the kernel maps into every process. So counting
+`strace` lines undercounts the time a program spends asking for the time.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+System call cost shows up as throughput limits: many tiny writes are slow,
+which is why stdio buffers and why `io_uring` batches. Seccomp filters limit
+which calls a process may make; container runtimes ship a default profile.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+When a program is slow or stuck, ask what it is asking the kernel for. The
+boundary is the most honest log a program has.
+
+</Level>
+<Level name="System design" depth={5}>
+
+The user/kernel line is a trust boundary, the same shape as a browser sandbox
+or an API gateway: narrow interface, validate every argument, never trust a
+pointer from the other side.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Run `strace` on five programs I use daily and write one paragraph on each.
+Done when I can predict the first twenty calls of `cat file` before running it.
+
+</Level>
+</Levels>
+
+#### Scheduling: FIFO, shortest job first, round robin, priority, and fairness
+
+<Levels label="Phase 6, scheduling">
+<Level name="Beginner" depth={5}>
+
+The scheduler decides which ready thread runs next on each CPU. FIFO runs jobs
+in arrival order; shortest job first runs the shortest one first; round robin
+gives each job a time slice in turn.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Two metrics pull against each other: turnaround time (finish quickly) and
+response time (start quickly). SJF and its preemptive form STCF minimise
+average turnaround; round robin minimises response time and is terrible for
+turnaround.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Real schedulers do not know job lengths, so they learn from behaviour. The
+multi-level feedback queue moves a job down when it uses its whole slice and
+boosts everyone periodically so nobody starves. Linux's CFS and its successor
+EEVDF track virtual runtime and pick the thread that has had the least, which
+is fairness by accounting.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+The convoy effect: one long job at the head of a FIFO queue makes every short
+job wait. A time slice shorter than the context-switch cost spends the CPU on
+switching.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Priority inversion: a low-priority thread holds a lock a high-priority thread
+needs, while a medium-priority thread keeps the low one from running.
+Priority inheritance fixes it by lending the high priority to the lock holder.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+In containers, CPU limits are enforced by the CFS bandwidth controller; a
+service can be throttled for most of every 100 ms period while the host looks
+idle, which shows up as tail latency, not as high CPU.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Every scheduler is a policy about whose time matters. Say the metric first,
+then judge the policy.
+
+</Level>
+<Level name="System design" depth={5}>
+
+The same policies reappear above the OS: request queues in a load balancer,
+job queues with priorities, fair-share quotas between tenants. Head-of-line
+blocking in HTTP/1.1 is the convoy effect again.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write a scheduler simulator in TypeScript for FIFO, SJF, STCF, RR and a small
+MLFQ, run the OSTEP homework inputs, and check my averages by hand once. Done
+when I can pick a policy for a stated metric and defend it.
+
+</Level>
+</Levels>
+
+#### Synchronization: mutexes, semaphores, condition variables, atomics, and memory ordering
+
+<Levels label="Phase 6, synchronization">
+<Level name="Beginner" depth={5}>
+
+When two threads update the same data, the result can depend on timing: a race
+condition. A mutex lets one thread at a time into a critical section, so the
+update happens as one step.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+A condition variable lets a thread sleep until some state changes, always
+together with a mutex and always in a loop. A semaphore is a counter with
+wait and post; with an initial value of 1 it is a lock, with N it bounds a
+resource.
+
+```c
+pthread_mutex_lock(&m);
+while (queue_empty(&q))           /* while, not if */
+  pthread_cond_wait(&not_empty, &m);
+item = queue_pop(&q);
+pthread_mutex_unlock(&m);
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Locks are built on atomic instructions like compare-and-swap; a spinlock loops
+on one, a futex-based mutex spins briefly and then asks the kernel to sleep.
+Memory ordering is the rule for when one thread's writes become visible to
+another: compilers and CPUs reorder, and acquire/release semantics are the
+contract that stops them reordering across the lock.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Spurious wakeups are allowed, so `if` around `cond_wait` is a bug. Signalling
+before the waiter starts waiting loses the signal unless the state is checked
+under the lock. Unlocking a mutex from a thread that did not lock it is
+undefined.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Double-checked locking without proper atomics can hand out a pointer to a
+half-built object. A data race on a plain `int` is undefined behaviour in C,
+even if the hardware "would be fine".
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Lock contention shows up as low CPU and high latency; profilers that sample
+off-CPU time find it. In JavaScript, `Atomics` and `SharedArrayBuffer` bring the
+same problems to workers, and most production Node code avoids them on
+purpose.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Name the invariant the lock protects, in a comment, next to the lock. If I cannot
+name it, the lock is guarding a feeling.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Distributed locks and leases are the same idea across machines, with a new
+failure: the holder can pause or vanish. Fencing tokens are the distributed
+answer to "the lock holder is not who you think".
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build the producer–consumer queue twice, with condition variables and with
+semaphores, run it under ThreadSanitizer, and break it on purpose by changing
+`while` to `if`. Done when TSan is clean and I can explain each removed line's
+failure.
+
+</Level>
+</Levels>
+
+#### Deadlock: the four conditions, detection, prevention, and avoidance
+
+<Levels label="Phase 6, deadlock">
+<Level name="Beginner" depth={5}>
+
+Deadlock is when threads wait for each other forever. Thread A holds lock 1 and
+wants lock 2; thread B holds lock 2 and wants lock 1.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+It needs all four conditions at once: mutual exclusion, hold-and-wait, no
+preemption, and circular wait. Break any one and the deadlock cannot happen.
+The common fix is a global lock order: always take lock 1 before lock 2.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Prevention removes a condition by design (ordering, try-lock and back off, take
+all locks at once). Avoidance, like the banker's algorithm, refuses requests
+that could lead to an unsafe state and needs to know demands in advance.
+Detection builds a wait-for graph, finds a cycle and kills or rolls back a
+victim, which is what databases do.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Ordering by lock address works until two code paths lock the same pair in a
+different order through a callback. A thread that locks a non-recursive mutex
+twice deadlocks with itself.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Livelock: both threads back off and retry in lockstep forever, busy and
+making no progress. Randomised back-off breaks the symmetry.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Postgres detects deadlocks after `deadlock_timeout` and aborts one transaction
+with an error the application must retry. Async code deadlocks too: two
+promises awaiting each other, or a pool exhausted by tasks waiting on tasks in
+the same pool.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Deadlocks are designed in, not typed in. I look for them in the lock graph,
+not in the stack trace.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Timeouts are the distributed system's deadlock detector: crude, but they turn
+"forever" into an error. Every wait in a service gets a deadline.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write a program that deadlocks reliably, attach `gdb`, print all thread stacks,
+draw the wait-for graph, then fix it with a lock order. That is the gate's
+"a deadlock you created and how you fixed it".
+
+</Level>
+</Levels>
+
+<Figure
+  caption="The wait-for graph of a two-lock deadlock: a cycle means nobody can move."
+  art={`
+  Thread A ──holds──▶ lock 1
+     ▲                  │
+   waits              wanted by
+     │                  ▼
+  lock 2 ◀──holds── Thread B
+`}
+/>
+
+#### Memory management: paging, segmentation, page replacement, and malloc
+
+<Levels label="Phase 6, memory management">
+<Level name="Beginner" depth={5}>
+
+Every process sees its own virtual address space. The kernel and the MMU map
+virtual pages to physical frames, so two programs can both use address
+0x400000 without colliding.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Segmentation split memory into variable-sized pieces (code, heap, stack) with
+a base and a bound; it fragments. Paging splits it into fixed-size pages
+(usually 4 KiB) mapped through page tables, and the TLB caches recent
+translations. `malloc` lives in user space and carves pages from the kernel
+(via `brk` or `mmap`) into small blocks.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Multi-level page tables keep the table small by only allocating the parts in
+use. When memory is short, the kernel evicts pages; the policy approximates
+LRU with a clock algorithm because true LRU is too expensive to track. An
+allocator keeps free lists, splits and coalesces blocks, and fights
+fragmentation.
+
+```c
+struct block { size_t size; struct block *next; };  /* free-list header */
+static struct block *free_list;
+void *my_malloc(size_t n);  /* first-fit, split the rest */
+```
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+`malloc(0)` may return NULL or a unique pointer. Freeing twice corrupts the
+free list. Memory that is allocated but never touched does not use physical
+RAM yet, so "allocated" and "resident" are different numbers.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Linux overcommits by default: `malloc` can succeed and the process can be
+killed later by the OOM killer on first touch. Bélády's anomaly: with FIFO
+replacement, adding frames can increase page faults.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Containers set memory limits through cgroups; exceeding one kills the process
+without a stack trace, and exit code 137 is the clue. Node's heap limit and
+the container limit are two different ceilings, and the lower one wins.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Memory is a cache hierarchy with a page-shaped unit. Ask "is it resident, is it
+in the TLB, is it in the cache" before asking "is it allocated".
+
+</Level>
+<Level name="System design" depth={5}>
+
+Database buffer pools, the OS page cache and an application cache are three
+layers caching the same bytes. Deciding which one owns the data is a design
+decision, not a tuning flag.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build the free-list allocator from the build list, test it against random
+alloc/free sequences, and compare fragmentation for first-fit and best-fit.
+Done when it survives a property test and I can draw the heap after ten
+operations.
+
+</Level>
+</Levels>
+
+#### What happens on a page fault
+
+<Timeline
+  caption="One page fault, in order. This is the gate's last question."
+  items={[
+    { when: '1', what: 'The CPU translates a virtual address; the TLB misses.' },
+    { when: '2', what: 'The MMU walks the page table and finds the entry not present (or not writable).' },
+    { when: '3', what: 'The CPU traps into the kernel with the faulting address.' },
+    { when: '4', what: 'The kernel checks the address against the process memory map. Not mapped: SIGSEGV.' },
+    { when: '5', what: 'Mapped: find a free frame, evicting a page if needed (writing it back if dirty).' },
+    { when: '6', what: 'Fill the frame: zero it, read it from the file or swap, or copy it for copy-on-write.' },
+    { when: '7', what: 'Update the page table entry, return from the trap, retry the instruction.' },
+  ]}
+/>
+
+#### File systems: inodes, directories, journaling, and crash consistency
+
+<Levels label="Phase 6, file systems">
+<Level name="Beginner" depth={5}>
+
+A file is bytes plus metadata; a directory maps names to files. On Unix the
+metadata lives in an inode (size, owner, permissions, block pointers), and the
+name lives only in the directory.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+A hard link is a second name for the same inode; a symbolic link is a small
+file holding a path. `rm` removes a name; the data goes away when the last name
+and the last open descriptor are gone.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Writing one file touches several blocks: the data, the inode, a bitmap. A crash
+between them leaves the disk inconsistent. `fsck` repairs after the fact;
+journaling writes the intended change to a log first, commits, then applies it,
+so recovery replays or discards whole transactions.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+`write` returning success means the kernel has the bytes, not the disk.
+`fsync` on the file is not enough for a new file; the directory entry needs an
+`fsync` on the directory too.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+The atomic-replace pattern (write a temp file, `fsync` it, `rename` over the
+old one, `fsync` the directory) is safe; skip one step and a crash can leave an
+empty file. Deleting an open log file frees no space until the process closes
+it.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Disks full of deleted-but-open files, inodes exhausted by millions of tiny
+files, and `fsync` latency spikes are the real failures. Databases depend on
+`fsync` semantics for durability, and lying disks or caches break that
+promise.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Durability is a sequence of promises, each with its own failure. Ask "if the
+power goes now, what is on the disk".
+
+</Level>
+<Level name="System design" depth={5}>
+
+A database's write-ahead log is a journal; a log-structured file system is a
+log-structured merge tree's older cousin. The same idea, write intent before
+effect, runs from the file system to event sourcing.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Use `strace` on a program that opens and writes a file, then write the atomic
+save function in C and in Node, and kill the process at each step to see what
+survives. Done when my save function never leaves a half file.
+
+</Level>
+</Levels>
+
+#### I/O: blocking, non-blocking, polling, interrupts, and epoll/kqueue
+
+<Levels label="Phase 6, I/O models">
+<Level name="Beginner" depth={5}>
+
+A blocking `read` waits until data arrives. A non-blocking one returns at once,
+with data or with "try again" (`EAGAIN`).
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+To watch many descriptors at once, a program asks the kernel which ones are
+ready: `select` and `poll` take the whole list each time; `epoll` (Linux) and
+`kqueue` (BSD, macOS) keep an interest list in the kernel and return only the
+ready ones. Node's event loop is libuv on top of these.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Devices signal completion with interrupts; the kernel's handler wakes the
+waiting thread. Readiness APIs say "you can read now"; completion APIs like
+`io_uring` and Windows IOCP say "the read is done". Regular files are always
+"ready" to epoll, which is why libuv runs file I/O on a thread pool.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Edge-triggered epoll reports a change once; if I do not drain the socket until
+`EAGAIN`, I never hear about the rest. A peer closing the connection shows up as
+a readable socket whose `read` returns 0.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+A slow `fs` call or a `dns.lookup` (which uses `getaddrinfo` on the thread pool)
+can exhaust libuv's four default threads and stall unrelated file reads.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Event-loop lag is the Node metric that reveals blocking work on the main thread.
+Back-pressure (respecting `write()` returning false) is what keeps a fast
+producer from filling memory.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Know what kind of waiting my program does. Most performance problems in servers
+are waiting problems dressed as CPU problems.
+
+</Level>
+<Level name="System design" depth={5}>
+
+The reactor pattern (one loop, many handlers) and thread-per-connection are the
+two classic server shapes; most modern servers mix them: an event loop for
+sockets and a pool for blocking work.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write a small echo server three ways: blocking with a thread per client, `poll`,
+and `epoll`. Load it with a few thousand connections. Done when I can explain
+the difference in the numbers.
+
+</Level>
+</Levels>
+
+#### Containers: namespaces, cgroups, and why a container is not a tiny VM
+
+<Levels label="Phase 6, containers">
+<Level name="Beginner" depth={5}>
+
+A container is a normal process that the kernel shows a restricted view of the
+system: its own process list, file system, network and hostname.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Namespaces give the view (PID, mount, network, UTS, IPC, user, cgroup); cgroups
+limit the resources (CPU, memory, I/O, PIDs). An image is a stack of file
+system layers mounted with overlayfs.
+
+```sh
+sudo unshare --pid --fork --mount-proc bash   # a shell that is PID 1
+ps aux                                        # only two processes visible
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+All containers on a host share one kernel. So a kernel bug is a shared risk,
+system calls are the attack surface (hence seccomp), and a Linux container on a
+Mac actually runs inside a hidden Linux VM.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Root in a container is root on the host unless user namespaces remap it. Tools
+like `free` or old JVMs read host memory, not the cgroup limit.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+A container's PID 1 ignores SIGTERM by default if it installs no handler, so
+`docker stop` waits ten seconds and then kills it. Zombies pile up if PID 1
+never reaps.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Kubernetes requests and limits map to cgroup settings; CPU limits cause
+throttling, memory limits cause OOM kills. Read-only root file systems and
+dropped capabilities are cheap hardening.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+A container is packaging and isolation of processes, not of kernels. Say which
+threat it protects against before trusting it.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Choose the boundary by the threat: processes for my own code, containers for
+packaging and resource limits, micro-VMs (Firecracker, gVisor) for untrusted
+code.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build a toy container with `unshare`, `chroot` and a cgroup limit, then compare
+it with `docker run`. Done when I can explain each flag of my script.
+
+</Level>
+</Levels>
+
+<Compare
+  caption="Containers and virtual machines, side by side."
+  left="Container"
+  right="Virtual machine"
+  rows={[
+    ['Shares the host kernel', 'Runs its own guest kernel'],
+    ['Isolation by namespaces and cgroups', 'Isolation by the hypervisor and hardware'],
+    ['Starts in milliseconds', 'Boots in seconds'],
+    ['Kernel bug can cross the boundary', 'Hypervisor bug can cross the boundary'],
+  ]}
+/>
+
+#### Virtualization and the hypervisor boundary
+
+<Levels label="Phase 6, virtualization">
+<Level name="Beginner" depth={5}>
+
+A virtual machine runs a whole operating system on virtual hardware. The
+hypervisor is the layer that shares the real machine between guests.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Type 1 hypervisors run on the hardware (KVM inside Linux, Xen, Hyper-V); type
+2 run as an application on a host OS. Most cloud servers are VMs on KVM-like
+hypervisors.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Early VMs used trap-and-emulate and binary translation; modern CPUs add
+hardware support (VT-x, AMD-V) and nested page tables so the guest's page
+tables translate through a second level. Paravirtual drivers (virtio) let the
+guest cooperate instead of pretending to be real hardware.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Guests see stolen CPU time when neighbours are busy; clocks drift when a VM
+is paused or migrated. Nested virtualization works, slowly.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Side channels like Spectre cross the hypervisor boundary through shared
+caches, which is why clouds pin or isolate tenants for sensitive workloads.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Noisy neighbours, steal time in `top`, and live migration pauses are real
+causes of latency spikes on cloud VMs.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Every layer of virtualization is another contract that can be slightly
+dishonest about time and performance. Measure on the real target.
+
+</Level>
+<Level name="System design" depth={5}>
+
+The stack is VMs for tenancy, containers for packaging, processes for
+isolation inside an app. Serverless platforms hide all three and expose cold
+starts instead.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Read the virtual machine appendix of OSTEP, run a Linux VM with KVM, and
+compare a CPU-bound benchmark inside and outside it. Done when I can draw the
+two-level address translation.
+
+</Level>
+</Levels>
+
+#### The learning strategy for this phase
+
+<Timeline
+  caption="Five weeks, one build per week, reading kept to one chapter at a time."
+  items={[
+    { when: 'Week 29', what: 'Processes and system calls: OSTEP 4–6, the shell launcher, strace on five programs.' },
+    { when: 'Week 30', what: 'Scheduling and memory: OSTEP 7–10, 13–23, the scheduler simulator, the page-fault walk-through.' },
+    { when: 'Week 31', what: 'Concurrency: OSTEP 26–32, the thread pool, the producer–consumer queue, the deadlock.' },
+    { when: 'Week 32', what: 'Persistence: OSTEP 36–42, the atomic save, the allocator.' },
+    { when: 'Week 33', what: 'I/O models, containers, VMs: OSTEP 33 and the appendix, the echo servers, the toy container, the gate.' },
+  ]}
+/>
+
+The rule for the phase is "use it, then build a small piece of it". Each
+concept above is learned in that order: run the real thing under `strace`,
+read one chapter, build the smallest version, break it on purpose, write down
+what broke. The Linux Programming Interface is not read in order; it is the
+place I look up the exact rules of a call when my build surprises me.
+
+#### How I would learn it
+
+I would start every session with a terminal, not a book. If the topic is
+processes, I run `ps`, `pstree` and `strace -f bash -c 'ls | wc -l'` first, and
+only then read the OSTEP chapter, because the chapter then answers questions I
+already have. I write the C first without help, run it under ASan and
+ThreadSanitizer, and only then ask an AI to review it for races I missed. Every
+bug goes into the bug log with the symptom, the cause and the rule. On Friday I
+rebuild the week's smallest piece from a blank file. If I cannot, the week is
+not done.
+
+#### Exercises
+
+- Write `mysh`: run a command, `|` pipes, `<` and `>` redirection, `&`
+  background jobs, and Ctrl-C that stops the child and not the shell.
+- Make a zombie, show it in `ps`, then fix the parent so it reaps.
+- Write a scheduler simulator for FIFO, SJF, STCF, RR and MLFQ, and match the
+  OSTEP homework answers.
+- Build a bounded producer–consumer queue, then a thread pool on top of it;
+  run both under ThreadSanitizer.
+- Create a two-lock deadlock, capture all thread stacks in `gdb`, and fix it.
+- Write a first-fit allocator with a free list, splitting and coalescing.
+- Trace `cat file` with `strace` and annotate every line.
+- Write the atomic-save function and kill it mid-way ten times.
+- Build a toy container with `unshare` and a memory cgroup, then OOM it.
+
+#### The gate
+
+Closed book, no AI: the shell and the thread-safe queue work and pass their
+tests; I explain a deadlock I created and the fix; I narrate the `strace` of a
+process opening a file; I walk through a page fault from TLB miss to retried
+instruction.
