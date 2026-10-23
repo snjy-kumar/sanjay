@@ -1,0 +1,2254 @@
+---
+title: "Crafting Interpreters, chapter by chapter"
+description: "Nystrom's Crafting Interpreters, all 30 chapters from beginner to strategy: a tree-walk interpreter, then a bytecode VM with closures and a GC."
+edition: "first edition (2021), free online at craftinginterpreters.com"
+tocVerified: true
+tocSources:
+  - "https://craftinginterpreters.com/contents.html"
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Figure from '../../components/book/Figure.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+This is the primary book for phase 9 of the <a href={withBase('/plans/traditional-software-developer/')}>traditional core</a>,
+theory and compilers. It builds one small language, Lox, twice. The first
+time, in Java, as a tree-walk interpreter that is easy to read. The second
+time, in C, as a bytecode virtual machine that is fast enough to be real.
+Doing both is the point: the first teaches what a language *means*, the
+second teaches what it *costs*.
+
+<Flow steps={["Source text", "Scanner → tokens", "Parser → syntax tree", "Resolver → scopes", "Interpreter or compiler → bytecode", "VM → result"]} caption="The pipeline the whole book walks, front to back." />
+
+## How I would learn it
+
+I would not read this book as a book. I would read it as a pair of
+tickets: build a tree-walker, then build a VM. I would port part II to
+TypeScript, because that is the language I think in and copying Java
+would let me skip understanding. I would keep part III in C, because the
+point of part III is memory, and I would run every chapter under
+AddressSanitizer from chapter 19 onward.
+
+Before each chapter I write the tests for what it adds. After each
+chapter I close the book and rebuild the chapter's piece from memory, then
+write a short note in my study log: what it does, the bug I hit, and the
+rule I took from it. The tree-walker and the VM live in one repository with
+one shared directory of `.lox` tests and expected output, so the
+tree-walker becomes the oracle for the VM. I do the chapter challenges that
+touch what the gate needs: error recovery, closures, the collector.
+
+<Timeline items={[
+  { when: 'week 42', what: 'Chapters 1 to 8 in TypeScript: scanner, syntax tree, parser, evaluator, statements.' },
+  { when: 'week 43', what: 'Chapters 9 to 13: control flow, functions, resolver, classes. Whole test suite green.' },
+  { when: 'week 44', what: 'Chapters 14 to 23 in C: chunk, VM, Pratt compiler, values, strings, tables, variables, jumps.' },
+  { when: 'week 45', what: 'Chapters 24 to 30: calls, closures, the collector, classes, optimisation. Benchmark both.' },
+]} caption="How the book fits phase 9's four weeks. The theory work from the phase runs alongside." />
+
+When I finish, I want two numbers I measured myself (the tree-walker
+against the VM on the same benchmark) and one diagram I drew myself (the
+life of an upvalue). Every chapter below climbs the same nine levels, from
+what it is to how I know I have learned it.
+
+## The book in three parts
+
+<Layers layers={[
+  { name: 'Part I: Welcome', note: 'chapters 1 to 3: why build a language, the map of an implementation, the Lox language' },
+  { name: 'Part II: A Tree-Walk Interpreter', note: 'chapters 4 to 13: jlox, in Java; I port it to TypeScript' },
+  { name: 'Part III: A Bytecode Virtual Machine', note: 'chapters 14 to 30: clox, in C, with its own memory and collector' },
+  { name: 'Backmatter', note: 'appendix I, the grammar; appendix II, the generated syntax tree classes' },
+]} caption="How the book is laid out. Part III reimplements part II faster and closer to the machine." />
+
+## Part I: Welcome
+
+### 1. Introduction
+
+**Covers:** What the book is for, who it is for, and why someone who will never ship
+a language should still build one. The design note asks what makes a good
+name for a language.
+
+<Levels label="Chapter 1, Introduction">
+<Level name="Beginner">
+
+An interpreter is a program that takes source code and runs it. A compiler
+takes source code and turns it into another form that something else runs.
+Both start the same way: read text, find structure.
+
+</Level>
+<Level name="Intermediate">
+
+Languages are everywhere in ordinary work: config formats, query builders,
+template engines, regex, the TypeScript type system. Knowing how one is
+built makes all of them less mysterious.
+
+</Level>
+<Level name="Advanced">
+
+The book's bet is that one small but complete language, with closures,
+classes and a garbage collector, teaches more than a survey of ten
+techniques. Completeness forces every piece to fit.
+
+</Level>
+<Level name="Edge cases">
+
+"Small" does not mean "toy". A language with first-class functions already
+needs closures, and closures already need a careful memory model.
+
+</Level>
+<Level name="Corner cases">
+
+A language name that collides with an existing tool breaks search, package
+names and file extensions at once. It is a naming problem that becomes a
+distribution problem.
+
+</Level>
+<Level name="Production level">
+
+Real languages are judged by error messages, tooling and speed, not by
+grammar. Keep that in mind from chapter 1 so the later chapters on error
+reporting do not feel optional.
+
+</Level>
+<Level name="Mindset">
+
+Build the whole thing end to end before polishing any one stage. A working
+crude pipeline teaches more than a perfect lexer.
+
+</Level>
+<Level name="System design">
+
+A language implementation is a pipeline of transformations with clear
+boundaries. That shape, stage by stage with a typed hand-off, is the same
+shape as a build tool or a data pipeline.
+
+</Level>
+<Level name="Strategy">
+
+Read chapter 1 once, then write down three "languages" I use every week
+that are not general-purpose languages. That list is my motivation for the
+next eleven weeks. Done when I have a written list of three everyday languages I use and what building one would teach me.
+
+</Level>
+</Levels>
+
+### 2. A Map of the Territory
+
+**Covers:** The stages every implementation passes through, the names for them, and
+the shortcuts real implementations take.
+
+<Layers layers={[{name: "Scanning", note: "characters → tokens"}, {name: "Parsing", note: "tokens → syntax tree"}, {name: "Static analysis", note: "names, scopes, types"}, {name: "Intermediate representation", note: "a form easy to optimize"}, {name: "Optimization", note: "same meaning, cheaper"}, {name: "Code generation", note: "machine code or bytecode"}, {name: "Runtime", note: "VM, GC, built-ins"}]} caption="The front end at the top, the back end at the bottom." />
+
+<Levels label="Chapter 2, A Map of the Territory">
+<Level name="Beginner">
+
+The front end understands the source; the back end produces something that
+runs. Between them sits an intermediate form that neither the user nor the
+CPU sees.
+
+</Level>
+<Level name="Intermediate">
+
+Shortcuts are normal: single-pass compilers skip the tree, tree-walk
+interpreters skip code generation, transpilers emit another high-level
+language. TypeScript's own compiler is mostly a type checker plus a
+transpiler.
+
+</Level>
+<Level name="Advanced">
+
+Compiling ahead of time and interpreting are ends of a spectrum. A JIT
+interprets first, then compiles the hot parts. "Compiled versus
+interpreted" is a property of an implementation, not of a language.
+
+</Level>
+<Level name="Edge cases">
+
+Some languages cannot be fully parsed without knowing what names mean (C's
+`a * b;` is a declaration if `a` is a type). Then the clean stage boundaries
+leak.
+
+</Level>
+<Level name="Corner cases">
+
+A transpiler that targets JavaScript inherits JavaScript's runtime rules.
+If the source language promises integer division, the output has to
+emulate it, and that emulation is a hidden runtime.
+
+</Level>
+<Level name="Production level">
+
+Production compilers keep source positions through every stage so errors
+and debuggers can point at the right line. Losing positions early is the
+most common reason an error message is useless.
+
+</Level>
+<Level name="Mindset">
+
+Name the stage before debugging. "Is this a scanning bug, a parsing bug or
+a runtime bug?" halves the search.
+
+</Level>
+<Level name="System design">
+
+Each stage is a pure-ish function from one representation to the next.
+That makes each one testable in isolation: snapshot the tokens, snapshot
+the tree, snapshot the bytecode.
+
+</Level>
+<Level name="Strategy">
+
+Draw the map from memory, then label which stages the tools I use every
+day implement: `tsc`, `esbuild`, Babel, V8. Check it against their docs. Done when I can draw the seven stages from memory and place `tsc`, `esbuild` and V8 on the drawing.
+
+</Level>
+</Levels>
+
+### 3. The Lox Language
+
+**Covers:** A tour of Lox: dynamic typing, automatic memory, expressions and
+statements, variables, control flow, functions, closures, classes,
+inheritance and a tiny standard library. The design note separates
+expressions from statements.
+
+<Levels label="Chapter 3, The Lox Language">
+<Level name="Beginner">
+
+Lox looks like JavaScript with less: `var`, `fun`, `class`, `print`, `nil`,
+`true`, numbers and strings. If I can read JavaScript I can read Lox.
+
+</Level>
+<Level name="Intermediate">
+
+Its semantics are the real spec: numbers are doubles, `nil` and `false` are
+the only falsey values, `+` works on two numbers or two strings and nothing
+else, functions are first-class.
+
+</Level>
+<Level name="Advanced">
+
+Every feature has a cost in the implementation. Closures need captured
+variables to outlive their stack frame; classes need method binding so
+`this` survives being passed around.
+
+</Level>
+<Level name="Edge cases">
+
+`0` and `""` are truthy in Lox, unlike JavaScript. A test suite should
+assert that, because a port written by a JavaScript developer will get it
+wrong by habit.
+
+</Level>
+<Level name="Corner cases">
+
+Comparing a number to a string with `==` is allowed and false; comparing
+them with `<` is a runtime error. Equality and ordering have different
+rules.
+
+</Level>
+<Level name="Production level">
+
+A language spec that lives only in prose drifts from the implementation.
+The book's answer is a large test suite of `.lox` files with expected
+output; that suite is the real spec.
+
+</Level>
+<Level name="Mindset">
+
+Write the semantics down before writing the code. Every "what should this
+do?" question answered later costs a rewrite.
+
+</Level>
+<Level name="System design">
+
+The expression/statement split decides the grammar's shape, how blocks
+return values and whether `if` can be used inline. It is a design decision
+with ripple effects, not a syntax detail.
+
+</Level>
+<Level name="Strategy">
+
+Before chapter 4, I write twenty small Lox programs with the output I
+expect. They become my first acceptance tests, written before I know how
+the implementation works. Done when twenty `.lox` programs with expected output are committed before any implementation code.
+
+</Level>
+</Levels>
+
+## Part II: A Tree-Walk Interpreter
+
+### 4. Scanning
+
+**Covers:** Turning a string of characters into a list of tokens: lexemes, token
+types, literals, line numbers, the longest-match rule, reserved words and
+error reporting. The design note covers implicit semicolons.
+
+```ts
+type TokenType = 'LEFT_PAREN' | 'NUMBER' | 'STRING' | 'IDENTIFIER' | 'EQUAL_EQUAL' | 'EOF'; // and more
+interface Token { type: TokenType; lexeme: string; literal: unknown; line: number }
+
+function scanToken(src: string, i: number): [Token | null, number] {
+  const c = src[i];
+  if (c === '=' && src[i + 1] === '=') return [{ type: 'EQUAL_EQUAL', lexeme: '==', literal: null, line: 1 }, i + 2];
+  // the longest match wins: "==" before "="
+  return [null, i + 1];
+}
+```
+
+<Levels label="Chapter 4, Scanning">
+<Level name="Beginner">
+
+A scanner walks the source one character at a time and groups characters
+into tokens: `var`, `x`, `=`, `12.5`, `;`. Whitespace and comments vanish.
+
+</Level>
+<Level name="Intermediate">
+
+It needs one character of lookahead for `!=`, `<=`, `//`, and two for a
+number like `12.` that may or may not have a fraction. Identifiers are
+scanned first, then checked against a keyword table.
+
+</Level>
+<Level name="Advanced">
+
+The token set of most languages is a regular language, so a scanner is a
+finite automaton in disguise. Writing it by hand just inlines the states
+into `switch` arms. That link is phase 9's first theory payoff.
+
+</Level>
+<Level name="Edge cases">
+
+An unterminated string at end of file, a lone `!`, a number that ends in a
+dot, a comment on the last line with no newline, a tab or `\r` inside a
+string.
+
+</Level>
+<Level name="Corner cases">
+
+`orchid` must be one identifier, not the keyword `or` followed by `chid`.
+That is the maximal-munch rule, and it is why keywords are matched after
+the whole identifier is read.
+
+</Level>
+<Level name="Production level">
+
+Report every error with a line and column, keep scanning after the first
+error, and never crash on bad input. A scanner is the first thing fuzzing
+should hit.
+
+</Level>
+<Level name="Mindset">
+
+The scanner should not know the grammar. If I find myself checking "are we
+inside a function?" in the scanner, the work belongs to the parser.
+
+</Level>
+<Level name="System design">
+
+Scanning eagerly into an array is simple; scanning on demand (chapter 16)
+saves memory and lets errors stream. Choose based on whether the whole
+input fits comfortably in memory.
+
+</Level>
+<Level name="Strategy">
+
+Write the scanner, then a fuzz test that feeds random bytes and asserts it
+never throws. Then compare my scanner's states with a drawn DFA for
+numbers and identifiers. Done when the scanner passes my token tests and a fuzz run of random bytes without throwing.
+
+</Level>
+</Levels>
+
+### 5. Representing Code
+
+**Covers:** Context-free grammars, rules and productions, a grammar for Lox
+expressions, syntax tree classes generated from a small metaprogram, and
+the Visitor pattern as a way to add operations to a fixed set of node
+types.
+
+```ts
+type Expr =
+  | { kind: 'binary'; left: Expr; op: string; right: Expr }
+  | { kind: 'literal'; value: number | string | boolean | null }
+  | { kind: 'grouping'; inner: Expr }
+  | { kind: 'unary'; op: string; right: Expr };
+
+const show = (e: Expr): string => {
+  switch (e.kind) {
+    case 'binary': return `(${e.op} ${show(e.left)} ${show(e.right)})`;
+    case 'literal': return String(e.value);
+    case 'grouping': return `(group ${show(e.inner)})`;
+    case 'unary': return `(${e.op} ${show(e.right)})`;
+  }
+};
+```
+
+<Levels label="Chapter 5, Representing Code">
+<Level name="Beginner">
+
+A syntax tree is the code as nested objects. `1 + 2 * 3` becomes a `+`
+node whose right child is a `*` node. The tree shape encodes precedence.
+
+</Level>
+<Level name="Intermediate">
+
+A grammar is a set of rules that generate every valid program. Rules with
+alternatives and recursion are enough to describe nested expressions that
+regular expressions cannot.
+
+</Level>
+<Level name="Advanced">
+
+The Visitor pattern solves the "expression problem" in one direction:
+adding operations is easy, adding node types is hard. In TypeScript a
+discriminated union plus an exhaustive `switch` gives the same trade with
+compiler-checked exhaustiveness.
+
+</Level>
+<Level name="Edge cases">
+
+A grammar can generate the same string with two different trees; that is
+ambiguity, and chapter 6 resolves it with precedence levels.
+
+</Level>
+<Level name="Corner cases">
+
+Grouping parentheses must survive as nodes or be dropped deliberately.
+Dropping them is fine for evaluation but loses information a formatter or
+error message might need.
+
+</Level>
+<Level name="Production level">
+
+Production compilers keep positions and often trivia (comments,
+whitespace) on nodes so tools like formatters and refactorings can
+round-trip source. An AST for an interpreter and a CST for an editor are
+different trees.
+
+</Level>
+<Level name="Mindset">
+
+Generating boilerplate from a description is legitimate engineering when
+the description is the source of truth. Here the grammar is that source.
+
+</Level>
+<Level name="System design">
+
+The tree is the contract between the parser and everything after it. A
+stable, well-typed tree lets the resolver, interpreter and later a
+formatter evolve independently.
+
+</Level>
+<Level name="Strategy">
+
+Port the AST to a TypeScript union, write the pretty-printer, and add a
+`never` check so a new node kind fails compilation everywhere it is not
+handled. Done when the AST pretty-printer passes its tests and adding a node kind breaks compilation everywhere it is unhandled.
+
+</Level>
+</Levels>
+
+### 6. Parsing Expressions
+
+**Covers:** Recursive descent: one function per grammar rule, precedence and
+associativity encoded in the order of the rules, syntax errors, panic
+mode and synchronizing on statement boundaries. The design note argues
+about precedence tables that follow history instead of logic.
+
+```ts
+// equality → comparison ( ( "!=" | "==" ) comparison )* ;
+function equality(): Expr {
+  let expr = comparison();
+  while (match('BANG_EQUAL', 'EQUAL_EQUAL')) {
+    const op = previous();
+    const right = comparison();
+    expr = { kind: 'binary', left: expr, op: op.lexeme, right }; // left-associative by the loop
+  }
+  return expr;
+}
+```
+
+<Levels label="Chapter 6, Parsing Expressions">
+<Level name="Beginner">
+
+Recursive descent reads tokens left to right and calls one function per
+rule. Lower-precedence rules call higher-precedence ones, so `*` binds
+tighter than `+` without any table.
+
+</Level>
+<Level name="Intermediate">
+
+A `while` loop gives left associativity (`1 - 2 - 3` is `(1 - 2) - 3`);
+recursion on the right gives right associativity, which assignment needs.
+
+</Level>
+<Level name="Advanced">
+
+Left-recursive rules (`expr → expr "+" term`) loop forever in recursive
+descent, so the grammar is rewritten into the iterative form. Recursive
+descent is a top-down, LL-style parser; it predicts from the next token.
+
+</Level>
+<Level name="Edge cases">
+
+Unary minus binds tighter than binary minus: `-1 - -2`. A missing closing
+parenthesis at end of file must produce a clean error, not an index out of
+range.
+
+</Level>
+<Level name="Corner cases">
+
+`a = b = c` must parse right-associatively while `a - b - c` parses left.
+And `1 + 2 = 3` must be rejected as an invalid assignment target, which is
+easiest to detect after parsing the left side.
+
+</Level>
+<Level name="Production level">
+
+Panic mode: after an error, skip tokens until a likely statement boundary
+and continue, so one typo produces one error, not fifty. Cap the number of
+reported errors.
+
+</Level>
+<Level name="Mindset">
+
+Let the grammar drive the code. If the code and the written grammar
+disagree, one of them is wrong; fix the grammar first.
+
+</Level>
+<Level name="System design">
+
+Hand-written recursive descent is what most production compilers use
+(including TypeScript's), because it gives the best error messages and is
+easy to extend. Generators win when the grammar changes often.
+
+</Level>
+<Level name="Strategy">
+
+Write the parser, then a table of 30 expressions with their expected
+printed trees. Add each precedence bug I hit as a new row. That table is
+my phase-9 gate rehearsal. Done when a table of 30 expressions parses to the expected trees, including assignment and unary cases.
+
+</Level>
+</Levels>
+
+### 7. Evaluating Expressions
+
+**Covers:** Walking the tree to produce values: representing Lox values in the host
+language, truthiness, equality, runtime type errors and reporting them
+with a line number. The design note compares static and dynamic typing.
+
+<Levels label="Chapter 7, Evaluating Expressions">
+<Level name="Beginner">
+
+Evaluation is a post-order walk: evaluate the children, then apply the
+operator. A literal evaluates to itself.
+
+</Level>
+<Level name="Intermediate">
+
+Lox values map onto host values: number to `number`, string to `string`,
+`nil` to `null`. Each operator checks operand types at runtime and throws a
+runtime error with the operator's token for the line.
+
+</Level>
+<Level name="Advanced">
+
+The host language's rules leak if I am careless. `==` must use Lox's
+equality, not JavaScript's coercion; division by zero must do whatever Lox
+says, not whatever IEEE 754 does by accident.
+
+</Level>
+<Level name="Edge cases">
+
+`NaN == NaN` in Lox follows the host's double equality unless I decide
+otherwise. Decide, document, test.
+
+</Level>
+<Level name="Corner cases">
+
+`"a" + 1` is a runtime error in Lox. In a port to JavaScript, forgetting
+the check silently produces `"a1"`, which is the exact class of bug dynamic
+typing is blamed for.
+
+</Level>
+<Level name="Production level">
+
+Runtime errors must carry a source position and stop cleanly, not crash
+the host. Separate "error in the user's program" from "bug in my
+interpreter" in exit codes and messages.
+
+</Level>
+<Level name="Mindset">
+
+Static versus dynamic typing is a trade between when errors are found and
+what programs are allowed. Neither is free, and the design note is worth
+reading twice.
+
+</Level>
+<Level name="System design">
+
+A tree-walker is slow because every node visit is a function call and a
+type check. That cost is the motivation for part III.
+
+</Level>
+<Level name="Strategy">
+
+After this chapter, Lox can be a calculator. I run my twenty programs from
+chapter 3 that are pure expressions and record which ones fail and why. Done when every operator has tests for every operand type pair, and runtime errors show a line number.
+
+</Level>
+</Levels>
+
+### 8. Statements and State
+
+**Covers:** Statements, expression statements and `print`, global variables, the
+environment as a map from names to values, assignment, block scope and
+nested environments. The design note covers implicit variable
+declaration.
+
+<Figure art={`
+ global env      { a: 1 }
+      ^
+      | enclosing
+ block env       { b: 2 }
+      ^
+      | enclosing
+ inner block     { a: 3 }    lookup "a" → 3, lookup "b" → 2
+`} caption="Environments form a chain; lookup walks outward until it finds the name." />
+
+<Levels label="Chapter 8, Statements and State">
+<Level name="Beginner">
+
+Statements do something instead of producing a value. `var x = 1;` stores
+a value under a name in an environment.
+
+</Level>
+<Level name="Intermediate">
+
+Blocks create a new environment that points to its enclosing one. Lookup
+and assignment walk the chain outward; declaration always writes to the
+innermost.
+
+</Level>
+<Level name="Advanced">
+
+Declaring and assigning are different operations: declaration creates a
+binding, assignment mutates an existing one and must fail if none exists.
+Mixing them is how implicit globals happen.
+
+</Level>
+<Level name="Edge cases">
+
+Using a variable that was declared but not initialised, redeclaring a
+global (allowed in Lox for the REPL), assignment to an undefined name.
+
+</Level>
+<Level name="Corner cases">
+
+`var a = a;` inside a block where an outer `a` exists. Does the
+initializer see the outer `a` or the new, uninitialised one? Lox makes it
+an error; chapter 11 enforces that.
+
+</Level>
+<Level name="Production level">
+
+Restore the previous environment in a `finally`, so a runtime error in a
+block does not leave the interpreter in the wrong scope for the next REPL
+line.
+
+</Level>
+<Level name="Mindset">
+
+Scope is a data structure. Once I can draw the environment chain, closures
+and shadowing stop being magic.
+
+</Level>
+<Level name="System design">
+
+A map per scope is simple and slow. Real implementations resolve names to
+slots at compile time (chapter 11 and chapter 22), trading flexibility for
+speed.
+
+</Level>
+<Level name="Strategy">
+
+Draw the environment chain for three programs by hand before running
+them. Then add a debug command that prints the chain at a breakpoint. Done when I can draw the environment chain for a nested-block program and the debugger agrees with me.
+
+</Level>
+</Levels>
+
+### 9. Control Flow
+
+**Covers:** Turing completeness, `if` and the dangling-else ambiguity, the logical
+operators `and` and `or` with short-circuiting, `while`, and `for` as
+syntactic sugar that desugars into `while`. The design note is about how
+much sugar a language should have.
+
+<Compare left="for loop as written" right="what the parser builds" rows={[["for (var i = 0; i < 3; i = i + 1) print i;", "{ var i = 0; while (i < 3) { print i; i = i + 1; } }"], ["initializer", "a statement before the loop, in a new block"], ["condition, omitted", "the literal true"], ["increment", "the last statement of the body"]]} caption="Desugaring: the back end only ever sees while." />
+
+<Levels label="Chapter 9, Control Flow">
+<Level name="Beginner">
+
+`if` picks one branch, `while` repeats a body while a condition is truthy.
+With a loop and a variable, the language can compute anything a computer
+can, which is what Turing complete means.
+
+</Level>
+<Level name="Intermediate">
+
+`and` and `or` are control flow, not ordinary operators: they evaluate the
+right side only if they have to, and return an operand, not a boolean.
+`nil or "default"` is `"default"`.
+
+</Level>
+<Level name="Advanced">
+
+The dangling else (`if a if b x else y`) is a real grammar ambiguity. The
+rule "an else binds to the nearest if" is a choice the parser makes by
+being greedy.
+
+</Level>
+<Level name="Edge cases">
+
+A `for` with all three clauses empty is an infinite loop. A condition that
+is a number `0` loops forever in Lox, because `0` is truthy.
+
+</Level>
+<Level name="Corner cases">
+
+A `for` loop variable captured by a closure: is there one variable for the
+whole loop or one per iteration? Chapter 25's design note returns to this;
+JavaScript's `let` chose one per iteration.
+
+</Level>
+<Level name="Production level">
+
+Desugaring keeps the back end small but makes error messages point at code
+the user never wrote. Keep the original positions on desugared nodes.
+
+</Level>
+<Level name="Mindset">
+
+Sugar is cheap to add and expensive to remove. Every new form is a new
+thing every tool has to understand.
+
+</Level>
+<Level name="System design">
+
+Lowering many surface forms into few core forms is how every compiler
+stays manageable: Babel, TypeScript's downlevelling and SQL planners all
+do it.
+
+</Level>
+<Level name="Strategy">
+
+Implement `for` by desugaring, then write the Fibonacci program and a
+short-circuit test where the right side would crash if evaluated. Done when `for` is desugared to `while`, and a short-circuit test proves the right operand is never evaluated.
+
+</Level>
+</Levels>
+
+### 10. Functions
+
+**Covers:** Call syntax, arity checks, native functions like `clock`, function
+declarations, parameters, `return` via an exception in the tree-walker,
+local functions and closures that capture their defining environment.
+
+```ts
+class LoxFunction {
+  constructor(private decl: FunDecl, private closure: Environment) {}
+  call(interp: Interpreter, args: Value[]): Value {
+    const env = new Environment(this.closure); // the defining scope, not the caller's
+    this.decl.params.forEach((p, i) => env.define(p.lexeme, args[i]));
+    try { interp.executeBlock(this.decl.body, env); }
+    catch (r) { if (r instanceof ReturnSignal) return r.value; throw r; }
+    return null;
+  }
+}
+```
+
+<Levels label="Chapter 10, Functions">
+<Level name="Beginner">
+
+A function call evaluates the callee and the arguments, checks the count,
+binds parameters in a fresh environment and runs the body.
+
+</Level>
+<Level name="Intermediate">
+
+The fresh environment's parent is the environment where the function was
+*defined*, not where it is *called*. That one pointer is what makes
+closures and lexical scope work.
+
+</Level>
+<Level name="Advanced">
+
+`return` unwinds through nested statements; the tree-walker uses a thrown
+value to jump straight back to the call. It is a legitimate use of
+exceptions for control flow because the host has no other non-local exit.
+
+</Level>
+<Level name="Edge cases">
+
+Calling a non-callable value, wrong arity, a function with no `return`
+returning `nil`, recursion deep enough to overflow the host stack.
+
+</Level>
+<Level name="Corner cases">
+
+A closure created inside a loop, captured and called after the loop ends,
+sees the variable's final value if the loop shares one environment.
+
+</Level>
+<Level name="Production level">
+
+Deep recursion in user code becomes a host stack overflow in a tree-walker.
+Catch it and report "stack overflow" with the Lox call stack, not a host
+crash.
+
+</Level>
+<Level name="Mindset">
+
+A function value is code plus an environment. Say it out loud until it is
+boring.
+
+</Level>
+<Level name="System design">
+
+Native functions are the foreign-function interface in miniature: the
+boundary where the language trusts the host. Every runtime's standard
+library is built on this seam.
+
+</Level>
+<Level name="Strategy">
+
+Write a counter-making closure, a recursive Fibonacci and a higher-order
+`map` in Lox; draw the environments for the closure case and check them in
+the debugger. Done when closures, recursion and a higher-order `map` all pass, and deep recursion reports a clean stack overflow.
+
+</Level>
+</Levels>
+
+### 11. Resolving and Binding
+
+**Covers:** Why the dynamic environment chain gives the wrong answer for some
+closures, static scope, a separate resolver pass that computes how many
+scopes away each variable lives, and the static errors it can now report.
+
+<Levels label="Chapter 11, Resolving and Binding">
+<Level name="Beginner">
+
+A resolver walks the tree once before running it and works out, for every
+variable use, which declaration it refers to.
+
+</Level>
+<Level name="Intermediate">
+
+It records a depth: "this `a` is two scopes out". At runtime the
+interpreter jumps exactly that many environments instead of searching, so a
+later declaration with the same name cannot hijack the lookup.
+
+</Level>
+<Level name="Advanced">
+
+This is the first static analysis pass. It turns lexical scope from "what
+happens at runtime" into a property of the program text, which is what
+makes later optimisations possible.
+
+</Level>
+<Level name="Edge cases">
+
+Reading a local in its own initializer, declaring two locals with the same
+name in one scope, `return` at top level.
+
+</Level>
+<Level name="Corner cases">
+
+A closure defined before a later global declaration of the same name: with
+dynamic lookup it would see the new global, with resolution it keeps the
+one it closed over. The book's example is the case to memorise.
+
+</Level>
+<Level name="Production level">
+
+Every static check moved from runtime to a pass is an error the user sees
+before the program runs. That is the same value proposition as
+TypeScript, at a smaller scale.
+
+</Level>
+<Level name="Mindset">
+
+When behaviour depends on order of execution but should not, compute it
+statically once.
+
+</Level>
+<Level name="System design">
+
+A pass that annotates the tree (a side table keyed by node) keeps the AST
+immutable. Compilers stack many such passes; each reads the tree and adds
+facts.
+
+</Level>
+<Level name="Strategy">
+
+Reproduce the closure bug before writing the resolver, so I see the
+failure. Then add the resolver and keep the failing program as a
+regression test. Done when the closure-capture bug is a failing test before the resolver and a passing one after it.
+
+</Level>
+</Levels>
+
+### 12. Classes
+
+**Covers:** Class declarations, instances, fields set dynamically, methods, `this`
+bound when a method is accessed, and initializers with their special
+return rules. The design note compares classes with prototypes.
+
+<Levels label="Chapter 12, Classes">
+<Level name="Beginner">
+
+A class is a callable that makes instances. Instances hold fields;
+methods live on the class and are looked up when a property is not a
+field.
+
+</Level>
+<Level name="Intermediate">
+
+Accessing a method returns a bound method: a closure whose environment
+defines `this` as the instance. That is why `var m = obj.method; m();` still
+knows its object in Lox (and not in plain JavaScript).
+
+</Level>
+<Level name="Advanced">
+
+Fields shadow methods. Lookup order is instance fields first, then the
+class's methods, then (chapter 13) the superclass chain.
+
+</Level>
+<Level name="Edge cases">
+
+`this` outside a method is a static error. Calling `init` directly
+returns `this`. A bare `return;` inside `init` is allowed; returning a
+value is not.
+
+</Level>
+<Level name="Corner cases">
+
+Storing a function in a field and calling it: it is a plain function, not
+a method, so it has no `this`. Same syntax, different binding.
+
+</Level>
+<Level name="Production level">
+
+Dynamic field creation makes every property access a hash lookup. Real VMs
+recover speed with hidden classes and inline caches, the techniques behind
+V8.
+
+</Level>
+<Level name="Mindset">
+
+Object orientation is a few runtime rules about lookup and binding. Once
+seen, `this` bugs in JavaScript become explainable instead of folklore.
+
+</Level>
+<Level name="System design">
+
+Classes versus prototypes is a trade between a fixed shape that tools can
+reason about and a flexible one that is easy to extend at runtime.
+
+</Level>
+<Level name="Strategy">
+
+After implementing classes, write the JavaScript equivalent of each Lox
+test and note every place JavaScript's `this` behaves differently. Done when class, field, method and `init` tests pass, and I have written down three ways JavaScript's `this` differs.
+
+</Level>
+</Levels>
+
+### 13. Inheritance
+
+**Covers:** Superclasses, inheriting methods, `super` calls resolved statically
+through an extra environment, and the errors around them.
+
+<Levels label="Chapter 13, Inheritance">
+<Level name="Beginner">
+
+`class B < A` makes B's method lookup fall back to A's. B can override a
+method and call the original with `super.method()`.
+
+</Level>
+<Level name="Intermediate">
+
+`super` refers to the superclass of the class where the method is
+*defined*, not of the object's class. That is why it is bound in an
+environment at class definition time.
+
+</Level>
+<Level name="Advanced">
+
+If `super` used the runtime class of `this`, a three-level hierarchy would
+loop forever when the middle class calls `super`. The static binding is
+not an optimisation, it is correctness.
+
+</Level>
+<Level name="Edge cases">
+
+Inheriting from a non-class, a class inheriting from itself, `super` in a
+class with no superclass, `super` outside a class.
+
+</Level>
+<Level name="Corner cases">
+
+A method that calls `super.method` where the superclass inherits that
+method from its own superclass: lookup must continue up the chain from the
+right starting point.
+
+</Level>
+<Level name="Production level">
+
+Deep hierarchies make lookup slower and behaviour harder to predict.
+Production VMs cache method lookups and invalidate caches when classes
+change.
+
+</Level>
+<Level name="Mindset">
+
+Inheritance is code reuse via lookup delegation. Knowing the mechanism
+makes "composition over inheritance" an informed choice, not a slogan.
+
+</Level>
+<Level name="System design">
+
+This is the end of the tree-walker: a complete, slow language. Freezing it
+with its test suite gives part III a reference implementation to diff
+against.
+
+</Level>
+<Level name="Strategy">
+
+Run the full Lox test suite against my port and record the pass rate.
+Fix failures before starting part III; the tree-walker is my oracle. Done when the tree-walker passes the book's test suite for every chapter it covers, and the pass rate is in my log.
+
+</Level>
+</Levels>
+
+## Part III: A Bytecode Virtual Machine
+
+<Compare left="Tree-walk interpreter (part II)" right="Bytecode VM (part III)" rows={[["Walks the AST directly", "Compiles to a flat array of bytes first"], ["Every node is an object on the heap", "Instructions sit next to each other in memory"], ["Host language manages memory", "The VM manages its own heap and GC"], ["Easy to read and change", "Fast, and harder to change"], ["Variables found by environment lookup", "Locals live in stack slots"]]} caption="Why the book builds Lox a second time." />
+
+### 14. Chunks of Bytecode
+
+**Covers:** What bytecode is, a dynamic array of bytes called a chunk, opcodes,
+constants stored in a side pool, line information and a disassembler.
+The design note: test your language.
+
+```c
+typedef enum { OP_CONSTANT, OP_ADD, OP_RETURN } OpCode;
+typedef struct {
+  int count, capacity;
+  uint8_t* code;      // the instructions
+  int* lines;         // one line number per byte
+  ValueArray constants;
+} Chunk;
+```
+
+<Levels label="Chapter 14, Chunks of Bytecode">
+<Level name="Beginner">
+
+Bytecode is a list of small numbered instructions. `OP_CONSTANT 0` means
+"push constant number 0"; the constant itself sits in a separate pool.
+
+</Level>
+<Level name="Intermediate">
+
+A chunk is a growable array, the same dynamic array from phase 3, doubled
+on overflow. A disassembler prints it back as text so I can see what the
+compiler produced.
+
+</Level>
+<Level name="Advanced">
+
+Bytecode sits between a tree (easy, slow) and machine code (fast,
+platform-specific). It is dense, so it is cache-friendly, which is most of
+why it is faster than walking pointers.
+
+</Level>
+<Level name="Edge cases">
+
+More than 256 constants overflow a one-byte operand; the book adds a long
+form. Line info for every byte wastes memory; run-length encoding is the
+exercise.
+
+</Level>
+<Level name="Corner cases">
+
+A multi-byte instruction split across a buffer resize is fine because the
+array moves as a whole, but any raw pointer into the old buffer is now
+dangling. That is phase 5's lesson resurfacing.
+
+</Level>
+<Level name="Production level">
+
+Write the disassembler first. Every VM bug later is diagnosed by reading
+the bytecode the compiler emitted.
+
+</Level>
+<Level name="Mindset">
+
+Build the inspection tool before the thing it inspects.
+
+</Level>
+<Level name="System design">
+
+JVM class files, Python `.pyc` files and WebAssembly are all chunks with
+constant pools and metadata. The same shape recurs because the problem is
+the same.
+
+</Level>
+<Level name="Strategy">
+
+Implement the chunk and disassembler, then run it under ASan with a test
+that forces several resizes. Done when the disassembler prints a hand-built chunk correctly and an ASan run over many resizes is clean.
+
+</Level>
+</Levels>
+
+### 15. A Virtual Machine
+
+**Covers:** An instruction pointer, the dispatch loop, a value stack, arithmetic
+instructions and a stack-based calculator. The design note compares
+register-based bytecode.
+
+<Figure art={`
+ 1 + 2 * 3   compiles to:
+
+ OP_CONSTANT 1     stack: [1]
+ OP_CONSTANT 2     stack: [1, 2]
+ OP_CONSTANT 3     stack: [1, 2, 3]
+ OP_MULTIPLY       stack: [1, 6]
+ OP_ADD            stack: [7]
+ OP_RETURN         prints 7
+`} caption="A stack machine: operands are pushed, operators pop and push." />
+
+<Levels label="Chapter 15, A Virtual Machine">
+<Level name="Beginner">
+
+The VM is a loop: read the next byte, `switch` on it, do the work, repeat.
+Operands come from a stack and results go back on it.
+
+</Level>
+<Level name="Intermediate">
+
+A stack machine needs no register allocation: the compiler just emits
+instructions in post-order. That is why most teaching VMs, the JVM and
+CPython are stack machines.
+
+</Level>
+<Level name="Advanced">
+
+Dispatch overhead dominates simple instructions. Keeping the instruction
+pointer in a local variable, and computed-goto dispatch where the compiler
+supports it, are the classic speedups.
+
+</Level>
+<Level name="Edge cases">
+
+Stack overflow from deep expressions, popping an empty stack because the
+compiler emitted bad code, an unknown opcode.
+
+</Level>
+<Level name="Corner cases">
+
+Operand order for non-commutative operators: pop `b` first, then `a`, and
+compute `a - b`. Getting it backwards passes every test that only uses
+`+` and `*`.
+
+</Level>
+<Level name="Production level">
+
+Add a trace mode that prints the stack before every instruction. It costs
+nothing when off and saves days when on.
+
+</Level>
+<Level name="Mindset">
+
+Correctness first, then measure the loop. Do not micro-optimise dispatch
+before there is a benchmark.
+
+</Level>
+<Level name="System design">
+
+Register machines (Lua 5, Dalvik) execute fewer, bigger instructions;
+stack machines are simpler to compile to. The choice moves complexity
+between the compiler and the VM.
+
+</Level>
+<Level name="Strategy">
+
+Hand-assemble a chunk for `(1 + 2) * -3`, run it with tracing on, and
+predict every stack state before looking. Done when I predict every stack state of a traced program before running it, and all predictions match.
+
+</Level>
+</Levels>
+
+### 16. Scanning on Demand
+
+**Covers:** The scanner rewritten in C, producing one token at a time when the
+compiler asks, with tokens pointing into the source instead of copying it.
+Keywords are recognised with a hand-built trie.
+
+<Levels label="Chapter 16, Scanning on Demand">
+<Level name="Beginner">
+
+Instead of building an array of all tokens, the compiler calls
+`scanToken()` whenever it needs the next one.
+
+</Level>
+<Level name="Intermediate">
+
+A token stores a pointer to its first character and a length. No string
+copies, so scanning allocates nothing.
+
+</Level>
+<Level name="Advanced">
+
+Keyword recognition becomes a switch on the first letter, then a
+comparison of the rest: a trie unrolled into code, which is a DFA again.
+
+</Level>
+<Level name="Edge cases">
+
+Tokens point into the source buffer, so the source must outlive every
+token and every string built from one.
+
+</Level>
+<Level name="Corner cases">
+
+An error token carries a message instead of a slice of source; code that
+prints tokens must handle both kinds.
+
+</Level>
+<Level name="Production level">
+
+Zero-copy scanning is how fast parsers (simdjson, many SQL parsers) work.
+The cost is lifetime discipline.
+
+</Level>
+<Level name="Mindset">
+
+Copying is a design decision. Avoid it when you can prove the lifetime.
+
+</Level>
+<Level name="System design">
+
+Pull-based scanning lets the parser control the pace, which is the same
+backpressure idea as a pull-based stream.
+
+</Level>
+<Level name="Strategy">
+
+Compare memory use of my eager TypeScript scanner and the C one on a large
+file, and write the number down. Done when the C scanner passes the same token tests as the TypeScript one, with zero allocations per token.
+
+</Level>
+</Levels>
+
+### 17. Compiling Expressions
+
+**Covers:** A single-pass compiler: a Pratt parser that emits bytecode directly as it
+parses, a table of prefix and infix parse functions with precedence, and
+the end of the separate syntax tree. The design note: it is just parsing.
+
+```ts
+// Pratt core: parse anything that binds at least as tightly as `prec`.
+function parsePrecedence(prec: number) {
+  advance();
+  const prefix = rules[previous.type].prefix;
+  if (!prefix) return error('Expect expression.');
+  prefix();
+  while (prec <= rules[current.type].precedence) {
+    advance();
+    rules[previous.type].infix!();
+  }
+}
+```
+
+<Levels label="Chapter 17, Compiling Expressions">
+<Level name="Beginner">
+
+The compiler reads tokens and writes bytecode in the same pass. Each token
+type has a rule: what to do when it starts an expression (prefix) and what
+to do when it appears between two (infix).
+
+</Level>
+<Level name="Intermediate">
+
+Precedence lives in a table, not in the shape of the functions. Adding an
+operator is one table row.
+
+</Level>
+<Level name="Advanced">
+
+Pratt parsing is recursive descent where the loop condition compares
+binding power. For a left-associative infix rule, parse the right operand
+at one level higher than the operator; for right-associative, at the same
+level.
+
+</Level>
+<Level name="Edge cases">
+
+A token with no prefix rule at the start of an expression (`* 3`), a
+missing operand at end of input.
+
+</Level>
+<Level name="Corner cases">
+
+`-a.b` versus `(-a).b`: unary must parse its operand at unary precedence so
+the call/property suffix binds tighter than the minus.
+
+</Level>
+<Level name="Production level">
+
+Single-pass compilation means no tree to optimise or analyse later. Real
+compilers that need static types or optimisation keep an AST or an IR.
+
+</Level>
+<Level name="Mindset">
+
+Two parsers for the same grammar, written differently, is the best proof
+I understand parsing rather than one implementation of it.
+
+</Level>
+<Level name="System design">
+
+Pratt parsers are popular in editors and language servers because they
+handle incomplete input and operator tables that change, like
+user-defined operators.
+
+</Level>
+<Level name="Strategy">
+
+Write a Pratt parser in TypeScript for arithmetic with `^` as
+right-associative, then rewrite my chapter 6 parser's tests to run against
+it. Done when my Pratt parser passes the chapter 6 precedence table, including a right-associative operator.
+
+</Level>
+</Levels>
+
+### 18. Types of Values
+
+**Covers:** Tagged unions in C: a `Value` struct with a type tag and a union for
+booleans, `nil` and numbers, plus the comparison and logical instructions
+that need them.
+
+```c
+typedef enum { VAL_BOOL, VAL_NIL, VAL_NUMBER } ValueType;
+typedef struct {
+  ValueType type;
+  union { bool boolean; double number; } as;
+} Value;
+#define IS_NUMBER(v) ((v).type == VAL_NUMBER)
+```
+
+<Levels label="Chapter 18, Types of Values">
+<Level name="Beginner">
+
+Every runtime value carries a tag that says what it is. Before using a
+value as a number, check the tag.
+
+</Level>
+<Level name="Intermediate">
+
+A C union overlaps fields in the same memory, so a value is as small as its
+largest member plus the tag. It is the C version of a TypeScript
+discriminated union, without the compiler checking that I read the right
+member.
+
+</Level>
+<Level name="Advanced">
+
+Reading the wrong union member is undefined behaviour, and nothing stops
+it. The macros `IS_NUMBER` and `AS_NUMBER` exist to make that mistake
+visible in review.
+
+</Level>
+<Level name="Edge cases">
+
+Equality between values of different types must return false, not compare
+raw bits.
+
+</Level>
+<Level name="Corner cases">
+
+Padding bytes in the struct are uninitialised, so comparing whole values
+with `memcmp` is wrong even when the tags and payloads match.
+
+</Level>
+<Level name="Production level">
+
+The book's last chapter replaces this struct with NaN boxing: every value
+in one 64-bit double. Tagged unions first, clever encodings later.
+
+</Level>
+<Level name="Mindset">
+
+A type system at runtime is just tags and checks. Static types decide
+which checks can be deleted.
+
+</Level>
+<Level name="System design">
+
+The value representation is the most performance-critical decision in a
+dynamic language VM. It touches every instruction.
+
+</Level>
+<Level name="Strategy">
+
+Add a test for every operator with every pair of operand types, which is
+a small grid. Fill it in before implementing. Done when the operator-by-type grid is fully tested, and no code reads a union member without checking its tag.
+
+</Level>
+</Levels>
+
+### 19. Strings
+
+**Covers:** Heap-allocated objects, an `Obj` header shared by every object type,
+string objects, concatenation, and a linked list of all objects so they
+can be freed. The design note is about string encodings.
+
+<Levels label="Chapter 19, Strings">
+<Level name="Beginner">
+
+Strings do not fit in a fixed-size value, so the value holds a pointer to
+a heap object.
+
+</Level>
+<Level name="Intermediate">
+
+Every heap object starts with the same header (its type and a `next`
+pointer). C lets a pointer to the struct be treated as a pointer to its
+first field, which is how the book fakes inheritance.
+
+</Level>
+<Level name="Advanced">
+
+Concatenation allocates a new string; strings are immutable, which is what
+later makes interning and hashing safe.
+
+</Level>
+<Level name="Edge cases">
+
+Empty strings, strings with embedded zero bytes if length is stored, very
+long concatenation chains that allocate quadratically.
+
+</Level>
+<Level name="Corner cases">
+
+"Length" can mean bytes, code points or user-perceived characters. UTF-8
+makes indexing by character an O(n) walk.
+
+</Level>
+<Level name="Production level">
+
+Every allocation goes on the object list so nothing leaks at exit. Run
+under Valgrind or ASan after every chapter from here on.
+
+</Level>
+<Level name="Mindset">
+
+Memory ownership is a design decision. Here the VM owns every object, and
+that rule makes the garbage collector possible.
+
+</Level>
+<Level name="System design">
+
+The string representation decision (UTF-8, UTF-16, ropes) shapes a
+language's performance for years. JavaScript is stuck with UTF-16 for
+compatibility.
+
+</Level>
+<Level name="Strategy">
+
+Measure concatenation in a loop of 10,000, then explain the curve. Done when concatenation works, nothing leaks under Valgrind, and the 10,000-concatenation curve is explained in my log.
+
+</Level>
+</Levels>
+
+### 20. Hash Tables
+
+**Covers:** A hash table from scratch: FNV-1a hashing, open addressing with linear
+probing, load factor and growth, tombstones for deletion, and string
+interning so equal strings share one object.
+
+<Levels label="Chapter 20, Hash Tables">
+<Level name="Beginner">
+
+A hash table turns a key into an array index with a hash function, so
+lookup is usually one step.
+
+</Level>
+<Level name="Intermediate">
+
+Linear probing: on a collision, try the next slot. Grow the array when it
+is about three-quarters full, rehashing every entry.
+
+</Level>
+<Level name="Advanced">
+
+Deletion cannot just empty a slot, or later probes stop too early. A
+tombstone marks "something was here, keep looking". Interning means string
+equality becomes pointer equality.
+
+</Level>
+<Level name="Edge cases">
+
+A table full of tombstones and no empties: the find loop never ends unless
+tombstones count toward the load factor.
+
+</Level>
+<Level name="Corner cases">
+
+Interned strings must be removed from the intern table when they are
+collected, or the table keeps them alive forever (chapter 26 handles it
+with weak references).
+
+</Level>
+<Level name="Production level">
+
+Predictable hashes invite adversarial collisions; production tables use
+seeded hashes. Phase 3's hash table lesson, applied.
+
+</Level>
+<Level name="Mindset">
+
+The same data structure appears in a language runtime, a database and a
+cache. Knowing one implementation deeply transfers.
+
+</Level>
+<Level name="System design">
+
+Interning trades memory and a lookup on creation for O(1) comparison
+forever after. It pays when strings are compared far more often than
+created, like identifiers.
+
+</Level>
+<Level name="Strategy">
+
+Reuse my phase 3 hash table if it is good enough; if not, this is the
+chapter to fix it, with a benchmark at several load factors. Done when the table passes insert, delete and re-insert tests with tombstones, and load-factor benchmarks are recorded.
+
+</Level>
+</Levels>
+
+### 21. Global Variables
+
+**Covers:** Statements in the compiler, global declarations and lookups through a
+hash table keyed by interned names, assignment, and error recovery in the
+single-pass compiler.
+
+<Levels label="Chapter 21, Global Variables">
+<Level name="Beginner">
+
+Globals live in a hash table from name to value. `OP_DEFINE_GLOBAL`,
+`OP_GET_GLOBAL` and `OP_SET_GLOBAL` read and write it.
+
+</Level>
+<Level name="Intermediate">
+
+Globals are late-bound: a function can refer to a global defined later in
+the file, because lookup happens when the code runs.
+
+</Level>
+<Level name="Advanced">
+
+Assignment needs to know if the left side is a valid target before it
+emits code. The Pratt parser passes a `canAssign` flag down so `a + b = c`
+is rejected.
+
+</Level>
+<Level name="Edge cases">
+
+Assigning to an undefined global must be a runtime error and must not
+create it as a side effect of the failed set.
+
+</Level>
+<Level name="Corner cases">
+
+The REPL redefines globals across lines, which is why redefinition is
+allowed for globals and not for locals.
+
+</Level>
+<Level name="Production level">
+
+Hash lookups for every global access are slow; real VMs cache global slots
+or resolve them at link time.
+
+</Level>
+<Level name="Mindset">
+
+Late binding is flexibility paid for at every access.
+
+</Level>
+<Level name="System design">
+
+Globals as a mutable hash table is the same design as JavaScript's global
+object, and the same source of accidental coupling.
+
+</Level>
+<Level name="Strategy">
+
+Benchmark a loop that reads a global versus a local after chapter 22 and
+record the ratio. Done when globals work across REPL lines and `a + b = c` is rejected at compile time.
+
+</Level>
+</Levels>
+
+### 22. Local Variables
+
+**Covers:** Locals on the VM stack, the compiler tracking scope depth and a list of
+locals, resolution to stack slots at compile time, and popping locals at
+the end of a block.
+
+<Levels label="Chapter 22, Local Variables">
+<Level name="Beginner">
+
+Local variables live on the same stack as temporary values. The compiler
+knows at compile time which slot each one occupies.
+
+</Level>
+<Level name="Intermediate">
+
+`OP_GET_LOCAL 2` means "copy stack slot 2 to the top". No names at
+runtime, no hashing.
+
+</Level>
+<Level name="Advanced">
+
+This is chapter 11's resolver folded into the compiler: scope is resolved
+statically to a slot index.
+
+</Level>
+<Level name="Edge cases">
+
+More than 256 locals in a function, shadowing an outer local, reading a
+local in its own initializer (marked "declared but not ready").
+
+</Level>
+<Level name="Corner cases">
+
+Leaving a block must pop exactly its locals, and later captured locals
+(chapter 25) must be closed instead of simply popped.
+
+</Level>
+<Level name="Production level">
+
+Slot-based locals are why local variable access is fast in nearly every
+VM. They also make debuggers need debug info to map slots back to names.
+
+</Level>
+<Level name="Mindset">
+
+Names are for humans; machines want offsets.
+
+</Level>
+<Level name="System design">
+
+The compile-time scope model and the runtime stack layout must agree
+exactly. Two components sharing one invariant is a place to put
+assertions.
+
+</Level>
+<Level name="Strategy">
+
+Disassemble nested blocks and check every `OP_POP` matches a declaration. Done when nested-scope tests pass and every `OP_POP` in a disassembly matches a declaration I can point to.
+
+</Level>
+</Levels>
+
+### 23. Jumping Back and Forth
+
+**Covers:** Control flow in bytecode: conditional and unconditional jumps, back-patching
+jump offsets once the target is known, `and`/`or` as jumps, `while` and
+`for` loops with `OP_LOOP`. The design note revisits "goto considered
+harmful".
+
+<Figure art={`
+ if (c) A else B
+
+   <c>
+   OP_JUMP_IF_FALSE  ──┐   offset patched after A is compiled
+   OP_POP              │
+   <A>                 │
+   OP_JUMP  ───────────┼──┐
+   OP_POP   <──────────┘  │
+   <B>                    │
+   ...      <─────────────┘
+`} caption="Back-patching: emit the jump with a placeholder, fill in the offset later." />
+
+<Levels label="Chapter 23, Jumping Back and Forth">
+<Level name="Beginner">
+
+Structured control flow compiles down to jumps. `if` is "jump past the
+then-branch if false".
+
+</Level>
+<Level name="Intermediate">
+
+The compiler does not know how far to jump until it has compiled the
+branch, so it emits a placeholder and patches it afterwards.
+
+</Level>
+<Level name="Advanced">
+
+`and` and `or` compile to jumps too; short-circuiting falls out of the
+encoding. Loops use a backward jump to the condition.
+
+</Level>
+<Level name="Edge cases">
+
+A jump offset larger than 16 bits must be a compile error, not a silent
+wrap that jumps into the middle of an instruction.
+
+</Level>
+<Level name="Corner cases">
+
+The condition value has to be popped on both paths, which is why the
+diagram shows an `OP_POP` at the start of each branch.
+
+</Level>
+<Level name="Production level">
+
+Compilers build a control-flow graph from these jumps to optimise. Jumps
+into the middle of an instruction are the classic VM security bug.
+
+</Level>
+<Level name="Mindset">
+
+Structured programming is a discipline on top of goto, not a replacement
+for it.
+
+</Level>
+<Level name="System design">
+
+WebAssembly deliberately has only structured control flow so it can be
+validated in one pass. A design constraint chosen for safety.
+
+</Level>
+<Level name="Strategy">
+
+Disassemble a nested `if` inside a `while` and draw every jump arrow by
+hand before running it. Done when my hand-drawn jump arrows for a nested `if` inside a `while` match the disassembly.
+
+</Level>
+</Levels>
+
+### 24. Calls and Functions
+
+**Covers:** Function objects, compiling each function into its own chunk, call frames
+with their own slot window on the shared stack, the call and return
+instructions, runtime stack traces and native functions in C.
+
+<Figure art={`
+ value stack:  [ script | fn | arg1 | arg2 | local | temp ]
+                          ^
+                          frame.slots   (slot 0 = the callee itself)
+
+ frames:       [ frame 0: <script>, ip ]
+               [ frame 1: fn,       ip ]   ← current
+`} caption="Each call frame is a window onto the one shared value stack." />
+
+<Levels label="Chapter 24, Calls and Functions">
+<Level name="Beginner">
+
+Each function compiles to its own chunk. Calling it pushes a call frame
+that remembers which function is running and where its instruction
+pointer is.
+
+</Level>
+<Level name="Intermediate">
+
+Arguments are already on the stack when the call happens, so they become
+the callee's first locals with no copying. Slot 0 holds the function
+itself.
+
+</Level>
+<Level name="Advanced">
+
+Return pops the frame, discards the callee's stack window and pushes the
+return value. Overlapping windows are the reason calls in this VM are
+cheap.
+
+</Level>
+<Level name="Edge cases">
+
+Arity mismatch, calling a non-function, exceeding the maximum frame count
+(a clean "stack overflow", not a C crash).
+
+</Level>
+<Level name="Corner cases">
+
+A runtime error deep in a call chain must print a trace from the innermost
+frame outward with line numbers from each chunk's line table.
+
+</Level>
+<Level name="Production level">
+
+Native functions cross the boundary between VM and C. They must not keep
+pointers to VM objects without telling the GC (chapter 26).
+
+</Level>
+<Level name="Mindset">
+
+A call stack is a data structure I can print. Stack traces stop being
+magic once I have built one.
+
+</Level>
+<Level name="System design">
+
+This is the same frame layout idea as the C calling convention from phase
+5, moved into software. Tail calls, coroutines and async all start by
+changing how frames are kept.
+
+</Level>
+<Level name="Strategy">
+
+Write a recursive Fibonacci benchmark and compare it with my tree-walker.
+Record the speed-up; it is the first proof part III was worth it. Done when runtime errors print a full Lox stack trace and the VM-versus-tree-walker speed-up is measured.
+
+</Level>
+</Levels>
+
+### 25. Closures
+
+**Covers:** Closure objects, upvalues that point at captured variables, open upvalues
+still on the stack and closed upvalues moved to the heap when their
+scope ends, and sharing one upvalue between closures. The design note:
+closing over the loop variable.
+
+<Timeline items={[{when: "Variable declared", what: "lives in a stack slot"}, {when: "Inner function created", what: "captures it through an open upvalue pointing at the slot"}, {when: "Enclosing scope ends", what: "OP_CLOSE_UPVALUE copies the value into the upvalue; the upvalue now points at itself"}, {when: "Closure called later", what: "reads and writes through the upvalue, as if nothing moved"}]} caption="The life of a captured variable." />
+
+<Levels label="Chapter 25, Closures">
+<Level name="Beginner">
+
+A closure is a function plus the variables from outer scopes it uses.
+Those variables must survive after the outer function returns.
+
+</Level>
+<Level name="Intermediate">
+
+While the outer function is running, the upvalue points at the variable's
+stack slot. When the variable goes out of scope, it is moved to the heap
+and the upvalue follows it.
+
+</Level>
+<Level name="Advanced">
+
+Two closures that capture the same variable must share one upvalue, or an
+assignment through one would be invisible to the other. The VM keeps a
+sorted list of open upvalues to find and reuse them.
+
+</Level>
+<Level name="Edge cases">
+
+Capturing a variable from two levels out, which the middle function must
+capture too, even if it never uses it.
+
+</Level>
+<Level name="Corner cases">
+
+A closure created in each iteration of a loop: one shared variable or a
+fresh one per iteration. Lox's `for` desugaring decides it, and the
+design note shows the JavaScript `let` answer.
+
+</Level>
+<Level name="Production level">
+
+Closures that capture large scopes keep everything alive. Memory leaks in
+JavaScript applications are often a closure holding a reference nobody
+remembers.
+
+</Level>
+<Level name="Mindset">
+
+"Where does this variable live, and for how long?" is the question behind
+closures, ownership in Rust and every leak I will debug.
+
+</Level>
+<Level name="System design">
+
+Moving values from stack to heap only when needed is escape analysis done
+lazily at runtime. Optimising compilers try to prove it statically.
+
+</Level>
+<Level name="Strategy">
+
+Draw upvalues for the counter example, then for two closures sharing one
+variable, and predict the output before running. Done when the counter and the shared-variable programs print what I predicted from my upvalue drawings.
+
+</Level>
+</Levels>
+
+### 26. Garbage Collection
+
+**Covers:** Reachability, roots, mark-sweep collection with a tri-colour worklist,
+tracing through every object type, weak references for the string table,
+when to collect, and stress-testing the collector. The design note covers
+generational collectors.
+
+<Flow steps={["Mark roots: stack, globals, frames, open upvalues, compiler", "Trace: grey objects mark what they reference", "Remove unmarked strings from the intern table", "Sweep: free every unmarked object", "Set next threshold: live bytes × growth factor"]} caption="One mark-sweep cycle." />
+
+<Levels label="Chapter 26, Garbage Collection">
+<Level name="Beginner">
+
+The GC frees objects nothing can reach. Start from the roots, mark
+everything reachable, then free what is not marked.
+
+</Level>
+<Level name="Intermediate">
+
+The tri-colour abstraction: white is unvisited, grey is found but not yet
+traced, black is done. The collector loops until there is no grey left.
+
+</Level>
+<Level name="Advanced">
+
+Collection triggers when allocated bytes pass a threshold that scales
+with live memory, so the GC's cost stays proportional to allocation
+rather than to a fixed timer.
+
+</Level>
+<Level name="Edge cases">
+
+Objects that are only reachable from the compiler while it is still
+compiling, or from a C local in the middle of an operation, must be
+treated as roots or pushed on the stack temporarily.
+
+</Level>
+<Level name="Corner cases">
+
+A GC can run inside any allocation, including one in the middle of
+building another object. The book's "stress GC" mode, which collects on
+every allocation, is how these bugs surface.
+
+</Level>
+<Level name="Production level">
+
+Pause times matter more than throughput for interactive programs.
+Incremental, concurrent and generational collectors exist to shorten
+pauses, at the cost of write barriers.
+
+</Level>
+<Level name="Mindset">
+
+A GC bug shows up far from its cause. Make the failure happen early and
+deterministically, then bisect.
+
+</Level>
+<Level name="System design">
+
+Generational collection rests on the observation that most objects die
+young. V8, the JVM and .NET all use it; reference counting (Python, Swift)
+is the other family, and it needs cycle handling.
+
+</Level>
+<Level name="Strategy">
+
+Run the whole test suite with stress GC on and ASan on. Every failure is a
+missing root. Write each one into my bug log. Done when the full test suite passes with stress GC and ASan on together.
+
+</Level>
+</Levels>
+
+### 27. Classes and Instances
+
+**Covers:** Class objects and instance objects in C, fields stored in a per-instance
+hash table, and get/set property instructions.
+
+<Levels label="Chapter 27, Classes and Instances">
+<Level name="Beginner">
+
+A class becomes a heap object with a name; calling it makes an instance
+object with an empty field table.
+
+</Level>
+<Level name="Intermediate">
+
+`OP_GET_PROPERTY` and `OP_SET_PROPERTY` look up a field by interned name in
+the instance's hash table.
+
+</Level>
+<Level name="Advanced">
+
+Every new object type has to be taught to the GC (marking its fields) and
+to the printer. Forgetting the GC half is the classic mistake.
+
+</Level>
+<Level name="Edge cases">
+
+Property access on a non-instance, reading an undefined field.
+
+</Level>
+<Level name="Corner cases">
+
+Setting a field during evaluation of the value that will be stored: the
+instance must stay on the stack so the GC sees it.
+
+</Level>
+<Level name="Production level">
+
+Per-instance hash tables waste memory for objects with the same shape;
+hidden classes share the layout.
+
+</Level>
+<Level name="Mindset">
+
+A new runtime type is a checklist: allocate, print, mark, free, compare.
+
+</Level>
+<Level name="System design">
+
+Dynamic objects versus fixed structs is the same tension as schemaless
+versus schema-first data stores.
+
+</Level>
+<Level name="Strategy">
+
+Write the checklist above in the repo and tick it for each object type. Done when every object type has its allocate, print, mark and free entries ticked off in the checklist.
+
+</Level>
+</Levels>
+
+### 28. Methods and Initializers
+
+**Covers:** Method declarations stored in the class, bound method objects, `this` as
+slot 0, initializers called automatically, and an optimised invoke
+instruction that skips creating a bound method. The design note: a
+novelty budget.
+
+<Levels label="Chapter 28, Methods and Initializers">
+<Level name="Beginner">
+
+Methods are closures stored in the class's method table. Calling
+`obj.m()` looks up `m` and calls it with `obj` as `this`.
+
+</Level>
+<Level name="Intermediate">
+
+A bound method pairs the receiver with the method so it can be passed
+around. `this` lives in slot 0 of the method's frame.
+
+</Level>
+<Level name="Advanced">
+
+`OP_INVOKE` combines property lookup and call so the common case,
+`obj.m(args)`, does not allocate a bound method at all. A field holding a
+function must still take the slow path.
+
+</Level>
+<Level name="Edge cases">
+
+`init` must return `this` even if the body returns early; arity checks
+apply to `init` when the class is called.
+
+</Level>
+<Level name="Corner cases">
+
+A field with the same name as a method shadows it, so `OP_INVOKE` must
+check fields first and only then the method table.
+
+</Level>
+<Level name="Production level">
+
+Fast paths must preserve the slow path's semantics exactly. Test both,
+with the same inputs.
+
+</Level>
+<Level name="Mindset">
+
+A language has a limited budget for unfamiliar ideas. Spend it where it
+buys something.
+
+</Level>
+<Level name="System design">
+
+Specialised instructions for common patterns (superinstructions) are how
+interpreters get faster without a JIT.
+
+</Level>
+<Level name="Strategy">
+
+Benchmark method calls before and after `OP_INVOKE`; write the number and
+the allocation count. Done when method and field-shadowing tests pass on both the fast and slow paths, with the benchmark recorded.
+
+</Level>
+</Levels>
+
+### 29. Superclasses
+
+**Covers:** Inheritance in the VM by copying the superclass's methods into the
+subclass at class creation ("copy-down"), `super` access and `super`
+invocation through a captured upvalue.
+
+<Levels label="Chapter 29, Superclasses">
+<Level name="Beginner">
+
+When a class inherits, the VM copies the superclass's methods into the
+subclass's table, then the subclass's own methods overwrite them.
+
+</Level>
+<Level name="Intermediate">
+
+`super` is stored in a hidden local captured as an upvalue, so methods find
+the right superclass statically.
+
+</Level>
+<Level name="Advanced">
+
+Copy-down inheritance is correct only because Lox classes cannot be
+changed after creation. With mutable classes, copying would go stale.
+
+</Level>
+<Level name="Edge cases">
+
+Inheriting from a non-class value is a runtime error at class creation.
+
+</Level>
+<Level name="Corner cases">
+
+A subclass method that overrides then calls `super` on the same name must
+reach the superclass's version, which copy-down preserves because the
+upvalue points at the superclass, not the subclass table.
+
+</Level>
+<Level name="Production level">
+
+Copy-down makes lookups O(1) and class creation slower; that trade is
+right when methods are called far more than classes are created.
+
+</Level>
+<Level name="Mindset">
+
+An optimisation is valid under an invariant. Write the invariant next to
+the optimisation.
+
+</Level>
+<Level name="System design">
+
+Caching derived data (here, the flattened method table) is safe exactly
+when the source cannot change. The same rule applies to denormalised
+database columns.
+
+</Level>
+<Level name="Strategy">
+
+Run the inheritance tests against both my implementations and diff the
+outputs. Done when both of my implementations produce identical output on every inheritance test.
+
+</Level>
+</Levels>
+
+### 30. Optimization
+
+**Covers:** Profiling before optimising, a faster hash table probe using a bit mask
+instead of modulo, and NaN boxing: packing every value into a single
+64-bit double.
+
+<Levels label="Chapter 30, Optimization">
+<Level name="Beginner">
+
+Measure first. Run a benchmark under a profiler and find the hot
+function before changing anything.
+
+</Level>
+<Level name="Intermediate">
+
+When the capacity is a power of two, `hash % capacity` becomes
+`hash & (capacity - 1)`, which is much cheaper.
+
+</Level>
+<Level name="Advanced">
+
+NaN boxing hides pointers, booleans and `nil` inside the unused bits of a
+quiet NaN, so a value is 8 bytes instead of 16 and checks are bit masks.
+
+</Level>
+<Level name="Edge cases">
+
+NaN boxing assumes pointers fit in 48 bits and that real NaNs produced by
+arithmetic do not collide with the tag patterns.
+
+</Level>
+<Level name="Corner cases">
+
+`NaN == NaN` must still be false for real numbers even though boxed values
+are now compared as bits; the equality function needs a special case.
+
+</Level>
+<Level name="Production level">
+
+Keep both representations behind a compile-time switch so I can fall back
+when debugging. Every optimisation needs an off switch.
+
+</Level>
+<Level name="Mindset">
+
+The profiler is right and my intuition is not. Write the prediction down,
+then measure, then compare.
+
+</Level>
+<Level name="System design">
+
+Value representation affects memory, cache behaviour, GC and the FFI at
+once. JavaScriptCore and LuaJIT use NaN boxing; V8 uses pointer tagging.
+
+</Level>
+<Level name="Strategy">
+
+Profile my VM with `perf`, write down the top three functions, apply one
+optimisation at a time, and keep a table of before/after numbers. Done when I have a before-and-after table for each optimisation, and NaN boxing can be switched off at compile time.
+
+</Level>
+</Levels>
+
+## The backmatter
+
+### Appendix I. Lox Grammar
+
+The complete grammar of Lox in one place: syntactic rules and lexical
+rules. I use it as a checklist: every rule should have a parser function
+and at least one test.
+
+### Appendix II. Generated Syntax Tree Classes
+
+The syntax tree classes the part II metaprogram generates, printed in
+full. In my TypeScript port these become the `Expr` and `Stmt` unions.
+
+## Misreadings to avoid
+
+- **"I need to read the Dragon Book first."** No. This book is enough for
+  the phase-9 gate. The theory books are for the questions it raises.
+- **"The tree-walker is a throwaway."** It is the oracle. Part III is
+  checked against it.
+- **"Single-pass compilation is how real compilers work."** Many do not;
+  anything with static types or optimisation keeps a tree or an IR.
+- **"Garbage collection is an advanced extra."** Closures and strings make
+  it necessary; without it, the VM leaks on every concatenation.
+- **"Bytecode is faster because it is compiled."** It is faster mostly
+  because it is dense and avoids pointer chasing and per-node dispatch.
+
+## Done with this book when
+
+- My tree-walker and my VM both pass the shared test suite, and the phase 9 gate is met: a parser and an interpreter written from a blank file.
+- I can explain each stage of an implementation and what it hands to the next, and relate my scanner to a finite automaton.
+- I can write a grammar with precedence and associativity, and parse it by recursive descent and by Pratt parsing.
+- I can explain lexical scope, closures and the bug the resolver fixes, with a test that shows it.
+- I can trace my VM's stack by hand, draw the life of an upvalue, and find a missing collector root with stress mode.
+- I have measured, not guessed, the speed difference between the two implementations.

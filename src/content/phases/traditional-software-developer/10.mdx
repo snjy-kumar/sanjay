@@ -1,0 +1,857 @@
+---
+plan: traditional-software-developer
+phase: 10
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Figure from '../../../components/book/Figure.astro';
+import { withBase } from '../../../utils/base';
+
+Five weeks on what changes when one machine becomes many. The primary book is *Designing
+Data-Intensive Applications*; the textbook underneath it is
+<a href={withBase('/books/distributed-systems-tanenbaum-van-steen/')}>Distributed Systems</a> by van
+Steen and Tanenbaum, and the labs are MIT 6.5840 and the Raft paper. The build is a replicated
+key-value store with Raft, a job queue with idempotent workers, a failure-injection test and a trace
+across services.
+
+#### Phase 10: how I would learn it
+
+Everything in this phase runs on a simulated network first. I write a tiny TypeScript harness where
+nodes exchange messages through a network I control: it can delay, drop, duplicate and reorder
+messages, and partition nodes. Every algorithm is tested there before it touches real sockets,
+because real networks fail too rarely to teach me anything in a week. Each week ends with a written
+failure story: what I broke on purpose and what the system did.
+
+<Timeline
+  caption="Phase 10's five weeks"
+  items={[
+    { when: 'week 46', what: 'Failure models; timeouts, retries, backoff, idempotency. The simulated network harness. DDIA 8, van Steen 1 and 4.' },
+    { when: 'week 47', what: 'Clocks and causality; consistency models and CAP. DDIA 9, van Steen 5 and 7.' },
+    { when: 'week 48', what: 'Replication and partitioning; consistent hashing and hot keys. DDIA 5 and 6, van Steen 6.' },
+    { when: 'week 49', what: 'Raft: election and log replication, then persistence and snapshots. The Raft paper, 6.5840 labs.' },
+    { when: 'week 50', what: 'Transactions and sagas; queues and streams; observability; case studies. The failure matrix, then the gate.' },
+  ]}
+/>
+
+<Figure
+  caption="The test harness: every message passes through a network I can break on purpose"
+  art={`
+  +--------+      +----------------------+      +--------+
+  | node A | ---> |  simulated network   | ---> | node B |
+  +--------+      |  delay  drop  dup    |      +--------+
+                  |  reorder  partition  |
+  +--------+      |  seeded random       |
+  | node C | <--- |                      |
+  +--------+      +----------------------+
+`}
+/>
+
+No AI writes the first pass of election or log replication. Afterwards I ask it for failure
+scenarios I did not try, and run each one in the harness.
+
+#### Phase 10: Failure models: crash, omission, timing, Byzantine and partial failure
+
+<Levels label="Phase 10, failure models">
+
+<Level name="Beginner">
+
+In a distributed system, parts fail while the rest keeps running. A failure model says which ways a
+part is allowed to fail.
+
+</Level>
+
+<Level name="Intermediate">
+
+Crash: a node stops. Omission: messages are lost. Timing: answers come too late. Byzantine: a node
+says wrong things, possibly on purpose. Each needs stronger and more expensive protocols than the one
+before.
+
+</Level>
+
+<Level name="Advanced">
+
+From the outside, a crashed node, a slow node and a lost message look the same: silence. The
+impossibility of telling them apart is the root of most distributed design.
+
+</Level>
+
+<Level name="Edge cases">
+
+A node that crashes and restarts with its disk intact is a different model from one that loses its
+disk. Raft assumes the first.
+
+</Level>
+
+<Level name="Corner cases">
+
+A partial partition: A reaches B, B reaches C, A cannot reach C. Two views of who is alive, both
+correct.
+
+</Level>
+
+<Level name="Production level">
+
+Real failures are gray: a disk that is slow, not dead; a node that answers health checks but not
+requests. I check health with real work, not a ping.
+
+</Level>
+
+<Level name="Mindset">
+
+Silence is not information. Never conclude a node is dead because it did not answer in time.
+
+</Level>
+
+<Level name="System design">
+
+The failure model is the first line of a design doc. Every protocol choice follows from it.
+
+</Level>
+
+<Level name="Strategy">
+
+I make my harness inject each failure kind and write down how my store should behave under each.
+Done when every failure kind has a test and a written expected outcome.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Timeouts, retries, backoff, jitter and idempotency
+
+<Levels label="Phase 10, timeouts, retries, backoff, jitter and idempotency">
+
+<Level name="Beginner">
+
+A timeout gives up waiting; a retry tries again. Together they turn some failures into success.
+
+</Level>
+
+<Level name="Intermediate">
+
+Exponential backoff waits longer after each failure; jitter randomises the wait so clients do not
+retry in lockstep.
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, tries = 5): Promise<T> {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i >= tries - 1) throw e;
+      const cap = 100 * 2 ** i;
+      await new Promise((r) => setTimeout(r, Math.random() * cap)); // full jitter
+    }
+  }
+}
+```
+
+</Level>
+
+<Level name="Advanced">
+
+A retry after a timeout may repeat work that already happened. Idempotency makes repeating safe:
+the client sends a key, the server stores the result under it and returns the same result for
+repeats.
+
+</Level>
+
+<Level name="Edge cases">
+
+A timeout shorter than the normal tail latency turns slow successes into failures and retries.
+
+</Level>
+
+<Level name="Corner cases">
+
+Retries at every layer multiply: three layers of three retries is twenty-seven calls to an already
+struggling service. A retry storm.
+
+</Level>
+
+<Level name="Production level">
+
+I retry only idempotent operations, at one layer, with a budget, and I store idempotency keys in the
+same transaction as the effect.
+
+</Level>
+
+<Level name="Mindset">
+
+Every call over a network can happen zero, one or many times. Design for all three.
+
+</Level>
+
+<Level name="System design">
+
+Circuit breakers stop retries when a dependency is down. Retry budgets and breakers protect the
+system, not just one request.
+
+</Level>
+
+<Level name="Strategy">
+
+I build a payment-like endpoint, drop replies in the harness and show double execution, then add
+idempotency keys. Done when a thousand runs with random drops produce exactly one effect each.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: CAP, PACELC and consistency models
+
+<Levels label="Phase 10, CAP, PACELC and consistency models">
+
+<Level name="Beginner">
+
+A consistency model says what reads may return after writes. Stronger models are easier to reason
+about and cost more.
+
+</Level>
+
+<Level name="Intermediate">
+
+Linearizable: every operation appears to happen at one instant between its start and end. Sequential:
+one global order, consistent with each client's order. Causal: causes are seen before effects.
+Eventual: replicas converge if writes stop.
+
+</Level>
+
+<Level name="Advanced">
+
+CAP: during a partition, a system chooses between answering (availability) and staying
+linearizable. PACELC adds that, even without a partition, it chooses between latency and
+consistency.
+
+</Level>
+
+<Level name="Edge cases">
+
+Read-your-writes: a user saves a profile, refreshes, and sees the old one from a lagging replica.
+Eventual consistency, but a broken experience.
+
+</Level>
+
+<Level name="Corner cases">
+
+A history that is sequentially consistent but not linearizable: a write completes, then a later read
+from another client returns the old value. Each client's view is ordered; real time is not
+respected.
+
+</Level>
+
+<Level name="Production level">
+
+I choose per operation: balances and locks need linearizable reads; feeds and counters can be
+eventual. One system can offer both.
+
+</Level>
+
+<Level name="Mindset">
+
+"Consistent" means nothing until I say which model. Always name it.
+
+</Level>
+
+<Level name="System design">
+
+Consistency is a product decision: what may a user see after they act? The answer picks the
+database and its settings.
+
+</Level>
+
+<Level name="Strategy">
+
+For my store I write one history that my model allows and one it forbids, and a test checking each.
+Done when I can explain the model with that example and counterexample, which is part of the gate.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Replication: leader–follower, multi-leader, quorum and conflict resolution
+
+<Levels label="Phase 10, replication">
+
+<Level name="Beginner">
+
+Replication keeps copies of data on several nodes, for availability and read capacity.
+
+</Level>
+
+<Level name="Intermediate">
+
+Leader–follower: writes go to one leader, followers copy its log. Multi-leader: several nodes accept
+writes and sync. Leaderless with quorums: write to W nodes, read from R, and if W plus R is more
+than N, reads overlap writes.
+
+</Level>
+
+<Level name="Advanced">
+
+Concurrent writes in multi-leader or leaderless systems conflict. Resolution options: last writer
+wins (loses data), merge functions, or CRDTs that merge by construction.
+
+</Level>
+
+<Level name="Edge cases">
+
+Asynchronous replication and a leader crash: acknowledged writes not yet copied are lost on
+failover.
+
+</Level>
+
+<Level name="Corner cases">
+
+Last-writer-wins with clocks that skew: the "later" write by timestamp is actually the earlier one,
+and the real latest is silently dropped.
+
+</Level>
+
+<Level name="Production level">
+
+I monitor replication lag, alert on it, and decide which reads may go to followers.
+
+</Level>
+
+<Level name="Mindset">
+
+Every copy is a chance to disagree. Decide in advance how disagreements end.
+
+</Level>
+
+<Level name="System design">
+
+Replication topology follows the write pattern: one region writing suggests one leader; many regions
+writing need conflict handling.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement a quorum store in the harness and find the W, R and N where stale reads appear. Done
+when my measurements match the overlap rule.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Consensus: Raft, leader election, log replication and membership changes
+
+<Levels label="Phase 10, consensus and Raft">
+
+<Level name="Beginner">
+
+Consensus gets a group of nodes to agree on a sequence of values even when some fail. Raft does it
+with a leader that orders everything.
+
+</Level>
+
+<Level name="Intermediate">
+
+Election: a follower that hears nothing before its randomised timeout becomes a candidate, increments
+the term and asks for votes. A majority makes it leader. Log replication: the leader appends entries
+and commits once a majority has them.
+
+```ts
+type Role = 'follower' | 'candidate' | 'leader';
+interface NodeState { term: number; votedFor: string | null; log: { term: number; cmd: string }[]; commitIndex: number; role: Role }
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Safety comes from two rules: a node votes only for candidates whose log is at least as up to date,
+and a leader commits entries from earlier terms only by committing one from its own term.
+
+</Level>
+
+<Level name="Edge cases">
+
+Split votes: two candidates time out together and neither wins. Randomised timeouts make this rare
+and short.
+
+</Level>
+
+<Level name="Corner cases">
+
+An old leader in a minority partition keeps accepting writes it can never commit. When the partition
+heals, those entries are overwritten. Clients must not treat them as done.
+
+</Level>
+
+<Level name="Production level">
+
+Persist `term`, `votedFor` and the log before replying, or a restart breaks safety. Snapshots keep the
+log bounded. Membership changes need joint consensus or one-at-a-time changes.
+
+</Level>
+
+<Level name="Mindset">
+
+Majorities overlap. Any two majorities share a node, and that shared node carries the truth forward.
+
+</Level>
+
+<Level name="System design">
+
+etcd and many databases use Raft for metadata and leadership; the data path often uses something
+cheaper. Consensus is for what must never diverge.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement election and log replication and pass the 6.5840 Raft tests or my own equivalent under
+the harness with partitions and restarts. Done when a thousand randomised runs show no two leaders in
+one term and no committed entry lost.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Partitioning, rebalancing and hot keys
+
+<Levels label="Phase 10, partitioning, rebalancing and hot keys">
+
+<Level name="Beginner">
+
+Partitioning splits data across nodes so each holds a part. A key's partition is decided by its
+range or its hash.
+
+</Level>
+
+<Level name="Intermediate">
+
+Range partitioning keeps neighbouring keys together (good for scans); hash partitioning spreads them
+evenly (good for balance). Consistent hashing limits how many keys move when nodes join or leave.
+
+</Level>
+
+<Level name="Advanced">
+
+Rebalancing moves data while serving traffic. Fixed partitions (many more partitions than nodes,
+moved whole) make it predictable.
+
+</Level>
+
+<Level name="Edge cases">
+
+One celebrity key gets most of the traffic. Hashing cannot spread one key.
+
+</Level>
+
+<Level name="Corner cases">
+
+A rebalance during a traffic spike on the partition being moved: two loads on one node at once.
+
+</Level>
+
+<Level name="Production level">
+
+For hot keys I split them (append a suffix and fan out), cache them, or rate-limit. I watch
+per-partition load, not just totals.
+
+</Level>
+
+<Level name="Mindset">
+
+Averages hide hot spots. Look at the busiest partition.
+
+</Level>
+
+<Level name="System design">
+
+The partition key is one of the hardest decisions to change later. It shapes queries, transactions
+and scaling.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement consistent hashing with virtual nodes and measure key movement when a node joins. Done
+when the measured movement matches the expected fraction and a skewed workload shows the hot
+partition.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Clocks: physical, logical, Lamport, vector clocks and causality
+
+<Levels label="Phase 10, clocks and causality">
+
+<Level name="Beginner">
+
+Machine clocks drift and jump. Two timestamps from two machines cannot be compared exactly.
+
+</Level>
+
+<Level name="Intermediate">
+
+Lamport clocks give every event a counter that respects causality: if A caused B, A's number is
+smaller. Vector clocks keep one counter per node and can tell when two events are concurrent.
+
+```ts
+type VC = Record<string, number>;
+const happenedBefore = (a: VC, b: VC) =>
+  Object.keys({ ...a, ...b }).every((k) => (a[k] ?? 0) <= (b[k] ?? 0)) &&
+  Object.keys({ ...a, ...b }).some((k) => (a[k] ?? 0) < (b[k] ?? 0));
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Lamport order is total but invents an order for concurrent events. Vector clocks find concurrency
+and cost space per node. Hybrid logical clocks mix physical time with a logical counter.
+
+</Level>
+
+<Level name="Edge cases">
+
+A clock stepping backwards after an NTP correction makes durations negative. I use a monotonic clock
+for durations.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two concurrent writes stamped by skewed clocks under last-writer-wins: the result depends on whose
+clock is fast.
+
+</Level>
+
+<Level name="Production level">
+
+Logs from many machines are sorted by timestamp and are wrong at millisecond scale. Trace IDs and
+causal links show real order.
+
+</Level>
+
+<Level name="Mindset">
+
+"Before" means "could have influenced", not "has a smaller timestamp".
+
+</Level>
+
+<Level name="System design">
+
+Spanner bounds clock uncertainty with special hardware and waits it out. Without that, systems use
+logical time.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement Lamport and vector clocks in the harness and print which events are concurrent. Done
+when a test confirms the concurrent pairs I predicted by hand.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Distributed transactions, two-phase commit, sagas and compensation
+
+<Levels label="Phase 10, distributed transactions, two-phase commit and sagas">
+
+<Level name="Beginner">
+
+A distributed transaction changes data on several nodes so that all changes happen or none do.
+
+</Level>
+
+<Level name="Intermediate">
+
+Two-phase commit: the coordinator asks everyone to prepare, then tells everyone to commit if all
+said yes. A saga instead runs local steps in order and, on failure, runs compensating steps backwards.
+
+</Level>
+
+<Level name="Advanced">
+
+2PC blocks: if the coordinator dies after prepare, participants hold locks and cannot decide alone.
+Sagas never block but give up isolation; others can see intermediate states.
+
+</Level>
+
+<Level name="Edge cases">
+
+A compensation that itself fails, such as a refund rejected by the payment provider. Compensations
+need retries and a human path.
+
+</Level>
+
+<Level name="Corner cases">
+
+A saga step retried after a timeout that actually succeeded, followed by its compensation: both must
+be idempotent or money moves twice.
+
+</Level>
+
+<Level name="Production level">
+
+I record saga state durably, make each step and compensation idempotent, and alert on sagas stuck in
+the middle.
+
+</Level>
+
+<Level name="Mindset">
+
+Not every undo is possible. An email cannot be unsent; design the order so irreversible steps come
+last.
+
+</Level>
+
+<Level name="System design">
+
+Across services, sagas with an outbox table are the usual pattern. 2PC stays inside one database or a
+tightly coupled cluster.
+
+</Level>
+
+<Level name="Strategy">
+
+I build a three-step order saga with a failure injected at each step. Done when every injected
+failure ends in a fully compensated or fully completed state, and a test checks it.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Queues and streams: delivery guarantees and exactly-once
+
+<Levels label="Phase 10, queues and streams">
+
+<Level name="Beginner">
+
+A queue hands work from producers to consumers. A stream is an ordered log that many consumers can
+read at their own pace.
+
+</Level>
+
+<Level name="Intermediate">
+
+At-most-once may lose messages; at-least-once may repeat them. Exactly-once delivery over an
+unreliable network is not possible, because the sender cannot tell a lost message from a lost
+acknowledgement.
+
+</Level>
+
+<Level name="Advanced">
+
+Exactly-once processing is achieved by the consumer: at-least-once delivery plus deduplication or an
+idempotent effect, with the offset and the effect stored together.
+
+```ts
+await db.transaction(async (tx) => {
+  if (await tx.processed.exists(msg.id)) return; // duplicate
+  await applyEffect(tx, msg);
+  await tx.processed.insert(msg.id);
+});
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A poison message that always fails is retried forever. Dead-letter queues after N tries.
+
+</Level>
+
+<Level name="Corner cases">
+
+A consumer that commits its offset before processing and then crashes loses the message; one that
+commits after processing and crashes in between repeats it.
+
+</Level>
+
+<Level name="Production level">
+
+I watch consumer lag, size and age of the dead-letter queue, and the rate of duplicates caught.
+
+</Level>
+
+<Level name="Mindset">
+
+Delivery is the network's job and it will repeat. Correctness is the consumer's job.
+
+</Level>
+
+<Level name="System design">
+
+Kafka-style logs keep history and allow replays; job queues delete on success. Replays are a feature
+only if consumers are idempotent.
+
+</Level>
+
+<Level name="Strategy">
+
+I build a job queue with idempotent workers and kill workers mid-job in the harness. Done when every
+job's effect happens exactly once across a thousand runs, and I can explain why delivery is not.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Observability: traces, correlation IDs, metrics and logs
+
+<Levels label="Phase 10, observability">
+
+<Level name="Beginner">
+
+Logs say what happened, metrics say how much, traces say where a request went. In a distributed
+system I need all three.
+
+</Level>
+
+<Level name="Intermediate">
+
+A correlation ID created at the edge and passed on every call ties logs from many services to one
+request. Tracing standards such as OpenTelemetry carry it as context.
+
+```ts
+const traceId = req.headers['traceparent'] ?? newTraceparent();
+await fetch(url, { headers: { traceparent: traceId } });
+log.info({ traceId, msg: 'charged card' });
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Metrics are cheap aggregates for alerts; traces are expensive per-request detail, usually sampled.
+Keep high-cardinality values (user IDs) out of metric labels.
+
+</Level>
+
+<Level name="Edge cases">
+
+A request that fails before the ID is created has no trace. Create it as early as possible.
+
+</Level>
+
+<Level name="Corner cases">
+
+Sampling drops the rare slow request I most need. Tail-based sampling keeps traces after seeing
+their latency or error.
+
+</Level>
+
+<Level name="Production level">
+
+Alerts on symptoms users feel (error rate, latency), dashboards for causes, and a runbook linked
+from every alert.
+
+</Level>
+
+<Level name="Mindset">
+
+If I cannot answer "what happened to this request?" in minutes, the system is not finished.
+
+</Level>
+
+<Level name="System design">
+
+Observability is designed in: every service propagates context, logs structured fields and exposes
+the same core metrics.
+
+</Level>
+
+<Level name="Strategy">
+
+I trace one request across my store's client, leader and followers. Done when one trace view shows
+every hop with timings, and a deliberate slow follower is visible in it.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: Case studies: Kafka, etcd, Dynamo, Spanner and a simple replicated store
+
+<Levels label="Phase 10, case studies">
+
+<Level name="Beginner">
+
+Real systems combine the ideas above in specific ways. Reading their designs shows which tradeoffs
+were chosen.
+
+</Level>
+
+<Level name="Intermediate">
+
+Kafka: a partitioned, replicated log. etcd: Raft for a small, strongly consistent key-value store.
+Dynamo: leaderless, quorums, consistent hashing, eventual consistency. Spanner: synchronised clocks
+for external consistency at global scale.
+
+</Level>
+
+<Level name="Advanced">
+
+Each one is a point in a design space: consistency against latency, availability against coordination.
+Comparing them on the same questions is the lesson.
+
+</Level>
+
+<Level name="Edge cases">
+
+Each system's documented limits (etcd's data size, Kafka's per-partition order only) are where users
+get hurt.
+
+</Level>
+
+<Level name="Corner cases">
+
+Using a system outside its design, such as etcd as a general database, combines a size limit with a
+latency expectation it was never built for.
+
+</Level>
+
+<Level name="Production level">
+
+When I pick one, I read its failure-mode documentation and its known incidents before its feature
+list.
+
+</Level>
+
+<Level name="Mindset">
+
+Every system is a set of choices. Ask what it gave up.
+
+</Level>
+
+<Level name="System design">
+
+My replicated store sits closest to etcd. Writing down how it differs makes my own choices explicit.
+
+</Level>
+
+<Level name="Strategy">
+
+I write a one-page comparison table of the four systems and my store: model, replication,
+partitioning, consensus, failure behaviour. Done when every cell is filled from the system's own
+documentation or paper.
+
+</Level>
+
+</Levels>
+
+#### Phase 10: exercises
+
+- Build the simulated network harness with seeded delay, drop, duplication, reordering and partitions.
+- Implement Raft election and log replication, then persistence and snapshots, and run it under partitions and restarts.
+- Build a job queue with idempotent workers and retries, and kill workers mid-job.
+- Write a failure-injection test that kills a node and verifies recovery.
+- Trace one request across the client and every replica.
+- Write the failure matrix: each failure, what the system does, how I would notice, and the test that proves it.
+
+#### Phase 10: the gate
+
+Closed-book, no AI: I implement leader election and log replication and show them surviving a
+partition. I explain my store's consistency model with one history it allows and one it forbids. I
+hand over the failure matrix. And I explain why exactly-once delivery cannot be guaranteed and what I
+do instead: at-least-once delivery with idempotent, deduplicated processing.
