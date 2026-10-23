@@ -1,0 +1,888 @@
+---
+title: "One request, from the click to the row and back"
+series: "backend"
+seriesOrder: 1
+undated: true
+readTime: "about 25 min"
+description: "Follow one click from the browser through DNS, TCP, HTTP, a Node handler, a connection pool and a Postgres insert, then back to the screen, timing every hop."
+tags: ['http', 'databases', 'architecture']
+related: []
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+Every backend bug I have chased lived somewhere on one path: a click in a
+browser, a few bytes over a network, a function on a server, a row in a
+database, and the same path back. When I can't draw that path, I can't say
+where the time went or where the error came from. This note draws it once,
+end to end, with a real Node server and a real Postgres table, and times
+every hop.
+
+## Before you start
+
+After this note you will be able to:
+
+- name every hop a request makes from a click to a database row and back,
+  and say what can fail at each one;
+- read a raw HTTP/1.1 request and response byte by byte;
+- write a small Node server that reads a body, validates it, inserts a row
+  through a connection pool and answers with the right status code;
+- measure where the time goes with `Server-Timing` and explain why the
+  database hop is usually not the slow one on a laptop but often is in
+  production;
+- decide which layer should own a rule: the browser, the handler, or the
+  database.
+
+What you should already know: enough JavaScript to read `async` and
+`await`, and what a table and a row are. No framework knowledge is needed;
+the point is to see what frameworks hide.
+
+Reading time: about 25 minutes. Running the server and poking it with
+`curl` doubles that, and is worth it.
+
+## Note map
+
+<Flow steps={[
+  "Click: the browser turns a user action into a fetch call",
+  "Network: DNS finds the server, TCP and TLS open a connection, HTTP carries the bytes",
+  "Server: Node parses the request, routes it and runs a handler",
+  "Database: the handler borrows a pooled connection and the row is written",
+  "Back: the row becomes JSON, a status code and headers, and the page updates",
+]} caption="The whole trip as five hops. Each part of this note takes one or two of them; the last part times all of them at once." />
+
+## From the click to bytes on the wire
+
+### In one sentence
+
+A click does nothing on the server until the browser has turned it into a
+request: a method, a path, some headers and maybe a body, written as text
+onto a network connection.
+
+### The idea
+
+A **request** is a message the client sends to a server. In HTTP/1.1 it is
+plain text: a first line with a **method** (what to do: `GET`, `POST`), a
+**path** (which thing: `/notes`) and a version, then **headers** (named
+facts about the message, one per line), then a blank line, then an optional
+**body** (the payload, such as JSON). The server answers with a
+**response** in the same shape: a status line, headers, a blank line, a
+body.
+
+Before any of that text can travel, three things have to happen. **DNS**,
+the internet's phone book, turns a name like `api.example.com` into an IP
+address. **TCP** opens a reliable, ordered byte stream to that address with
+a three-step handshake. **TLS** then agrees on keys so the bytes are
+encrypted; that is what the "s" in `https` means.
+
+Those three steps cost round trips. A **round trip** is one message there
+and one back, and its time (the round-trip time, or RTT) is set by
+distance and network quality, not by how fast my code is. A fresh `https`
+request needs about one round trip for TCP and one more for TLS 1.3 before
+the first byte of HTTP goes out. That is why browsers keep connections
+open and reuse them.
+
+In the browser, the click handler is ordinary JavaScript. It reads the form,
+builds a body and calls `fetch`. `fetch` returns a promise; the browser does
+the network work on its own threads and resolves the promise when the
+response headers arrive.
+
+### Worked example
+
+The simple case is the client side of a "save note" button. It sends JSON
+and waits for the answer:
+
+```ts
+// in the browser
+async function saveNote(text: string) {
+  const res = await fetch('/notes', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ body: text }),
+  });
+  if (!res.ok) throw new Error(`save failed: ${res.status}`);
+  return res.json(); // the saved row, with its id
+}
+```
+
+Three facts are worth seeing. The `content-type` header tells the server
+how to read the body; without it, a strict server refuses the request.
+`res.ok` is true only for status codes 200 to 299, so a 422 does not throw
+by itself: `fetch` only rejects on network failure. And `res.json()` is a
+second wait, because the body may still be arriving after the headers.
+
+The realistic case is to look at the bytes themselves. I opened a raw TCP
+socket to a tiny Node server and wrote an HTTP/1.1 request by hand, then
+printed exactly what came back:
+
+```ts
+import net from 'node:net';
+const sock = net.connect(3002, 'localhost', () => {
+  sock.write('GET /notes/1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+});
+let out = '';
+sock.on('data', (d) => (out += d));
+sock.on('end', () => console.log(JSON.stringify(out)));
+```
+
+The real output, as one JSON string so the line endings show:
+
+```text
+"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nDate: Fri, 23 Oct 2026 13:57:21 GMT\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n2b\r\n{\"method\":\"GET\",\"url\":\"/notes/1\",\"ua\":null}\r\n0\r\n\r\n"
+```
+
+Every line ends in `\r\n`. A blank line separates the headers from the
+body. Because the server did not say how long the body was, Node used
+**chunked transfer encoding**: `2b` is the length of the next chunk in hex
+(43 bytes), and `0` marks the end. A framework hides all of this; it is
+still what goes over the wire.
+
+### Step by step
+
+Here is the trip from the click to the first byte of the request on a
+fresh `https` connection.
+
+<Trace
+  columns={["step", "who acts", "what happens", "cost"]}
+  rows={[
+    ["1", "page script", "click handler runs, builds JSON, calls fetch", "microseconds"],
+    ["2", "browser", "checks for an open connection to the origin; none", "none"],
+    ["3", "resolver", "DNS lookup of the host name, possibly cached", "0 to 1 RTT"],
+    ["4", "kernel", "TCP handshake: SYN, SYN-ACK, ACK", "1 RTT"],
+    ["5", "browser and server", "TLS 1.3 handshake agrees on keys", "1 RTT"],
+    ["6", "browser", "writes the request line, headers and body", "part of 1 RTT"],
+    ["7", "server", "first byte of the response comes back", "the rest of that RTT plus server time"],
+  ]}
+  caption="A cold request. Steps 3 to 5 are pure waiting on the network; a reused connection skips them, which is why keep-alive and HTTP/2 matter more than micro-optimising a handler."
+/>
+
+### Common mistake
+
+The common mistake is treating `fetch` as if it throws on errors. It does
+not: a 404, a 422 or a 500 all resolve normally. Code that only has a
+`try`/`catch` around `fetch` will happily call `res.json()` on an error
+body and show the user `undefined`.
+
+<Compare left="Assumes fetch throws" right="Checks the status" caption="Two ways to handle a failed save. The left one shows a blank note when the server answers 422; the right one surfaces the server's message." rows={[
+  ["try: await fetch(...); then res.json()", "const res = await fetch(...)"],
+  ["catch only network errors", "if (!res.ok) read the error body"],
+  ["a 422 looks like success", "a 422 shows the validation message"],
+  ["a 500 page parsed as JSON throws later", "the status decides which parse to run"],
+]} />
+
+The fix is to branch on `res.ok` or `res.status` first, and to treat the
+error body as data that can be shown.
+
+### In real systems
+
+In production, the cold-connection cost is the reason for connection
+reuse everywhere: browsers keep HTTP connections alive, HTTP/2 multiplexes
+many requests over one connection, and CDNs terminate TLS close to the
+user so the expensive handshakes happen over a short distance. When a page
+feels slow on mobile but fast on my desk, the difference is usually round
+trips, not server time.
+
+### Check yourself
+
+<details>
+<summary>1. Why does a 422 response not land in the `catch` block of a `fetch` call?</summary>
+
+`fetch` rejects only when no response arrives at all, such as a DNS failure
+or a dropped connection. Any HTTP response, whatever its status, is a
+successful exchange from the network's point of view, so the promise
+resolves and the code has to check the status itself.
+
+</details>
+
+<details>
+<summary>2. In the raw response above, what does `2b` mean?</summary>
+
+It is the length of the next chunk of the body in hexadecimal: 0x2b is 43
+bytes. Chunked encoding lets a server start sending before it knows the
+total length; a chunk of length `0` ends the body.
+
+</details>
+
+## The server: parse, route, handle
+
+### In one sentence
+
+The server's job before any business logic is to turn a stream of bytes
+into a request object, pick the code that owns that method and path, and
+refuse anything malformed early and cheaply.
+
+### The idea
+
+Node's `http` module does the first part. It reads the request line and
+headers, gives me `req.method`, `req.url` and `req.headers`, and hands me
+the body as a **stream**: a sequence of chunks that arrive over time. The
+body is not there yet when my handler starts; I have to read it.
+
+**Routing** is the decision of which code runs. At its simplest it is an
+`if` on the method and the path. A framework turns that `if` into a table,
+adds path parameters such as `/notes/:id`, and lets me stack
+**middleware**, which is code that runs before or after every handler, for
+logging, auth and parsing. The next notes in this series build that table
+by hand; here a single `if` is enough.
+
+Then comes **validation**: checking that the input has the shape and
+values the handler needs. A server must never trust what the browser
+sent, because the browser is not the only client; anyone can send bytes
+with `curl`. Validation decides between three outcomes: the bytes are not
+even JSON (400 Bad Request), the JSON is the wrong shape (422
+Unprocessable Content), or the input is good and the handler goes on.
+
+The order matters because each step is cheaper than the next. Parsing
+fails fast, validation fails fast, and only good input reaches the
+database, which is the most expensive and most shared resource on the
+path.
+
+### Worked example
+
+The simple case is a handler that reads the whole body and parses it:
+
+```ts
+const chunks: Buffer[] = [];
+for await (const c of req) chunks.push(c as Buffer);
+const raw = Buffer.concat(chunks).toString('utf8');
+
+let body: unknown;
+try { body = JSON.parse(raw); }
+catch { return send(res, 400, { error: 'invalid JSON' }); }
+```
+
+`for await` reads the stream chunk by chunk until it ends. Collecting
+`Buffer` objects and joining once at the end is important: concatenating
+strings chunk by chunk can split a multi-byte UTF-8 character across two
+chunks and corrupt it.
+
+The realistic case adds the shape check and the routing. This is the
+handler I ran for this note, in two pieces. First the route and the check:
+
+```ts
+if (req.method === 'POST' && req.url === '/notes') {
+  // ...body parsed as above...
+  const text = (body as { body?: unknown }).body;
+  if (typeof text !== 'string' || text.length === 0)
+    return send(res, 422, { error: 'body must be a non-empty string' });
+  // ...insert, below...
+}
+send(res, 404, { error: 'not found' });
+```
+
+Then the helper that every response goes through, so every answer has the
+same headers:
+
+```ts
+function send(res: http.ServerResponse, status: number, data: unknown) {
+  const json = JSON.stringify(data);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(json),
+  });
+  res.end(json);
+}
+```
+
+`Buffer.byteLength` and not `json.length`: the header counts bytes, and a
+string with an accented letter or an emoji has more bytes than characters.
+A wrong length makes the client wait for bytes that never come, or cut the
+body short.
+
+### Step by step
+
+I sent four bodies at the server. Here is what each one hit and where it
+stopped.
+
+<Trace
+  columns={["body sent", "parse", "shape check", "database", "status"]}
+  rows={[
+    ["{\"body\":\"buy milk\"}", "ok", "ok", "row 1 inserted", "201"],
+    ["{\"body\":\"\"}", "ok", "fails: empty string", "not reached", "422"],
+    ["{oops", "fails: not JSON", "not reached", "not reached", "400"],
+    ["{\"body\":\"second\"}", "ok", "ok", "row 2 inserted", "201"],
+  ]}
+  caption="Each bad input stops at the first layer that can recognise it. Only the two good bodies cost a database round trip."
+/>
+
+### Common mistake
+
+The common mistake is reading `req.body` in plain Node and getting
+`undefined`, then concluding that the client sent nothing. Plain Node has
+no `req.body`; that property is added by a body-parsing middleware in
+frameworks such as Express. The fix is to read the stream yourself, as
+above, or to know which middleware sets it and to make sure it runs before
+the handler.
+
+A second mistake hides in the same place: reading the body with no size
+limit. A client can send a gigabyte and the server will try to hold it in
+memory. The fix is to count bytes while reading and answer 413 Content Too
+Large once a limit is passed.
+
+### In real systems
+
+Frameworks such as Express, Fastify and Hono all do these same three steps,
+in this order, with more polish: a body parser with a size limit, a router
+that matches paths in a tree, and a validation layer, often generated from
+a schema. Knowing the steps lets me debug the framework when its error says
+something unhelpful like "Unexpected end of JSON input", which is the parse
+step failing on an empty or truncated body.
+
+### Check yourself
+
+<details>
+<summary>1. Why answer 400 for `{oops` but 422 for `{"body":""}`?</summary>
+
+The first is not valid JSON at all, so the request itself is malformed:
+400. The second is valid JSON that the server understood but cannot accept
+because a rule failed: 422. The split tells the client whether to fix its
+encoding or its data.
+
+</details>
+
+<details>
+<summary>2. What goes wrong if `content-length` is set to `json.length` for the body `{"body":"café"}`?</summary>
+
+`é` is two bytes in UTF-8, so the byte length is one more than the string
+length. The header under-counts, and the client stops reading one byte
+early, leaving a truncated JSON body that fails to parse.
+
+</details>
+
+## The database: a pooled connection and one row
+
+### In one sentence
+
+The handler does not talk to Postgres directly; it borrows one of a few
+long-lived connections from a pool, sends a parameterised statement, and
+gives the connection back, and the table's own rules have the last word on
+what a valid row is.
+
+### The idea
+
+A **database connection** is a TCP connection plus a server-side process
+(in Postgres, one backend process per connection) plus a login. Opening one
+costs several round trips and some memory on the database server, so
+opening one per request is slow and, under load, can exhaust the
+database's connection limit.
+
+A **connection pool** keeps a small set of connections open and lends them
+out. A request asks the pool for a connection, runs its query, and returns
+it. If every connection is busy, the request waits in a queue. The pool's
+size is therefore a throttle: it caps how many queries this process can
+have in flight at once.
+
+The query itself is sent as a **parameterised statement**: the SQL text
+has placeholders (`$1`, `$2`) and the values travel separately. The
+database never parses the user's text as SQL, which is what makes SQL
+injection impossible for that statement. It is the single most important
+habit on this whole path.
+
+Finally, the table has **constraints**: rules the database enforces on
+every write, whoever the writer is. A `not null`, a `check`, a unique key.
+The handler's validation is for friendly errors; the constraint is the
+guarantee. If a second service, a script or a future handler forgets the
+rule, the constraint still holds.
+
+### Worked example
+
+The simple case is the table. I gave it an identity key, a length check
+and a default timestamp:
+
+```sql
+create table notes (
+  id bigint generated always as identity primary key,
+  body text not null check (length(body) between 1 and 500),
+  created_at timestamptz not null default now()
+);
+```
+
+The insert sends the text as a parameter and asks for the row back with
+`returning`, so there is no second query to read what was just written:
+
+```ts
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+const { rows } = await pool.query(
+  'insert into notes (body) values ($1) returning id, body, created_at',
+  [text],
+);
+send(res, 201, rows[0]);
+```
+
+The real response for the first note was:
+
+```text
+201 {"id":"1","body":"buy milk","created_at":"2026-10-23T13:57:14.305Z"}
+```
+
+Look at `"id":"1"`. The id is a **string**, not a number. Postgres
+`bigint` can hold values past JavaScript's safe integer limit of 2 to the
+power 53, so the `pg` driver returns it as a string rather than silently
+losing precision. Every client of this API has to know that, which is why
+the response shape is a decision, not an accident.
+
+The realistic case is the pool under pressure. I made a pool with two
+connections and fired four queries that each sleep for 200 ms:
+
+```ts
+const pool = new pg.Pool({ connectionString: url, max: 2 });
+const t0 = performance.now();
+await Promise.all([1, 2, 3, 4].map(async (i) => {
+  await pool.query('select pg_sleep(0.2)');
+  console.log(`query ${i} done at ${Math.round(performance.now() - t0)} ms`);
+}));
+```
+
+```text
+query 1 done at 220 ms
+query 2 done at 221 ms
+query 3 done at 421 ms
+query 4 done at 422 ms
+```
+
+Queries 3 and 4 spent their first 200 ms waiting for a free connection.
+Nothing was wrong with the database; the pool was full. From the outside,
+that wait looks exactly like a slow query.
+
+### Step by step
+
+<Trace
+  columns={["time", "connection A", "connection B", "waiting in the pool"]}
+  rows={[
+    ["0 ms", "query 1 starts", "query 2 starts", "3, 4"],
+    ["~200 ms", "query 1 ends; query 3 starts", "query 2 ends; query 4 starts", "none"],
+    ["~400 ms", "query 3 ends", "query 4 ends", "none"],
+  ]}
+  caption="Four queries through a pool of two. Read the last column: the queue is where latency hides when the database looks idle."
+/>
+
+<Figure art={`
+  request handler         pool (max 2)            Postgres
+  ---------------         ------------            --------
+  connect() ----------->  idle conn? yes  ----->  backend process 1
+                          lend conn A
+  query($1, [text]) ------------------------->    parse, plan, execute
+                                                   check constraints
+                          <-----------------------  row returned
+  release() ----------->  conn A idle again
+`} caption="The life of one query. The handler holds the connection only between borrowing and releasing it; pool.query does both for me, which is why it is the safe default." />
+
+### Common mistake
+
+The worst mistake on this hop is building SQL with string templates:
+
+```ts
+// never do this
+await pool.query(`insert into notes (body) values ('${text}')`);
+```
+
+A note containing `it's` breaks the statement with a syntax error, and a
+note containing `'); drop table notes; --` turns into two statements. The
+fix is always the placeholder form with the value in the array. There is
+no input-escaping function that is as safe as not mixing code and data in
+the first place.
+
+The second mistake is leaking connections: calling `pool.connect()` to run
+a transaction and forgetting `client.release()` on the error path. After
+`max` errors the pool is empty forever and every request hangs. The fix is
+`try`/`finally` around every manual checkout.
+
+### In real systems
+
+In production the pool size is a capacity setting with real consequences.
+Postgres has a server-wide `max_connections`; ten app instances with a pool
+of twenty each ask for two hundred. Teams put a connection pooler such as
+PgBouncer in front of the database, size app pools small, and watch "time
+waiting for a connection" as its own metric, separate from query time.
+
+### Check yourself
+
+<details>
+<summary>1. Why does the API return `"id":"1"` instead of `"id":1`?</summary>
+
+The column is `bigint`, which can exceed `Number.MAX_SAFE_INTEGER`. The
+`pg` driver returns it as a string so no precision is lost. The API either
+passes that string through, as here, or converts it deliberately where it
+knows the values stay small.
+
+</details>
+
+<details>
+<summary>2. A request takes 400 ms but the query log says the insert took 2 ms. Where did the time go?</summary>
+
+Most likely waiting for a pooled connection, or waiting on a lock held by
+another transaction. Measure pool wait time separately from query time to
+tell them apart.
+
+</details>
+
+## The way back, and where the time went
+
+### In one sentence
+
+The response is the row turned into a status, headers and JSON, and the
+only way to know which hop was slow is to measure each one and send the
+measurements along.
+
+### The idea
+
+On the way back, the handler picks a **status code** that matches what
+happened: 201 Created for a new row, 200 for a read, 4xx when the client
+must change something, 5xx when the server failed. It sets headers that
+describe the body, serialises the row, and writes it. The browser parses
+the JSON, and the page's own code updates the screen.
+
+Timing is where most people guess. The honest way is to take a timestamp
+at each boundary on the server and report the differences.
+**`Server-Timing`** is a standard response header for exactly this; browser
+developer tools show its values in the network panel next to the
+network-side timings, so I can see server time and network time on one
+screen.
+
+The total time the user waits is roughly: network setup, plus request
+upload, plus server queueing, plus handler time (which includes database
+time and pool waits), plus response download, plus the page's own work to
+render the result. Each term has a different owner and a different fix.
+
+### Worked example
+
+The simple case is the timing header itself. Three timestamps, three
+differences:
+
+```ts
+const t0 = performance.now();      // request arrived
+// ...read body...
+const t1 = performance.now();      // body read
+// ...validate...
+const t2 = performance.now();      // validated
+// ...insert...
+const t3 = performance.now();      // row written
+res.setHeader('Server-Timing',
+  `read;dur=${(t1 - t0).toFixed(2)}, validate;dur=${(t2 - t1).toFixed(2)}, db;dur=${(t3 - t2).toFixed(2)}`);
+```
+
+The realistic case is the full run against the server and Postgres on my
+box, with every status and timing exactly as printed:
+
+```text
+201 read;dur=0.96, validate;dur=0.01, db;dur=2.11 {"id":"1","body":"buy milk","created_at":"2026-10-23T13:57:14.305Z"}
+422 - {"error":"body must be a non-empty string"}
+400 - {"error":"invalid JSON"}
+201 read;dur=0.13, validate;dur=0.01, db;dur=1.48 {"id":"2","body":"second","created_at":"2026-10-23T13:57:14.316Z"}
+404 {"error":"not found"}
+```
+
+On a laptop with the database on the same machine, the whole server side is
+a few milliseconds and the first request is slower than the second (the
+first read pays for warming up the code path, the first insert for the
+pool's first connection). In production the database is across a network,
+so every query adds at least one network round trip inside the data
+centre, and a handler that makes ten queries in sequence pays that ten
+times.
+
+### Step by step
+
+<Timeline items={[
+  { when: "0", what: "click handler calls fetch" },
+  { when: "+1 to 3 RTT", what: "DNS, TCP and TLS on a cold connection; zero on a warm one" },
+  { when: "+upload", what: "request line, headers and body reach the server" },
+  { when: "+read", what: "Node finishes reading the body stream" },
+  { when: "+validate", what: "parse and shape check, microseconds" },
+  { when: "+pool wait + db", what: "borrow a connection, one round trip to Postgres, release" },
+  { when: "+download", what: "status, headers and JSON reach the browser" },
+  { when: "+render", what: "page code parses JSON and updates the screen" },
+]} caption="The user's wait as a timeline. Server-Timing covers the middle four rows; the browser's network panel covers the rest. Only together do they add up to what the user felt." />
+
+### Common mistake
+
+The common mistake is to optimise the handler first. On a cold mobile
+connection the network setup alone can cost more than everything the
+server does, and on a busy server the pool queue can cost more than the
+query. The fix is to measure the hops first, as above, and spend effort on
+the biggest number.
+
+<Compare left="Guessing" right="Measuring" caption="Two ways to answer 'why is saving slow?'. The right column names the hop before anyone touches code." rows={[
+  ["rewrite the query", "read Server-Timing: db is 2 ms"],
+  ["add a cache", "read pool wait: 380 ms, pool max is 2"],
+  ["blame the framework", "read network panel: 600 ms before the request was sent"],
+  ["one big number", "one number per hop"],
+]} />
+
+### In real systems
+
+Production systems carry this idea further with **distributed tracing**: a
+trace id is created at the edge, passed in a header to every service and
+every database call, and each hop records a **span** with its start and
+duration. The picture is the same as the timeline above, only across many
+services. Starting with `Server-Timing` on one server is the small version
+of the same habit.
+
+### Check yourself
+
+<details>
+<summary>1. The network panel shows 900 ms total, and `Server-Timing` adds up to 15 ms. Name two places the other time could be.</summary>
+
+Connection setup (DNS, TCP and TLS on a cold connection) and time in
+transit (upload and download on a slow link). Queueing in front of the
+server, such as a load balancer or a busy event loop before the handler's
+first timestamp, is a third.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="One request, from the click to the row and back">
+<Level name="Beginner" depth={3}>
+
+At the beginner level the goal is a correct mental picture: a click becomes
+a request, the request becomes a function call on a server, the function
+writes a row, and the row comes back as JSON. Every piece is ordinary code
+or ordinary text. Nothing is magic, and every piece can be printed.
+
+A worked example: open the browser's network panel, click a save button on
+any app you built, and click the request. Read the method, the path, the
+request headers, the payload, the status and the response body. Then find
+the same request in your server's log. You have just followed the whole
+path with tools you already have.
+
+The mistake at this level is to treat the backend as one box. When
+something fails, "the backend is broken" gives no next step. The fix is to
+name the hop: did the request leave the browser, did it reach the server,
+did the handler run, did the query succeed, did the response arrive?
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you own each hop's contract. The client checks
+the status before parsing. The server limits the body size, parses,
+validates, and answers with a status that says whose fault an error is.
+The handler uses the pool and parameterised queries. The table has
+constraints that make bad rows impossible.
+
+A worked example: add a `title` field that must be unique per user. The
+handler checks the shape and length and answers 422 for a missing title.
+The table gets a unique constraint on `(user_id, title)`. When two saves
+race and both pass the handler's check, the database rejects the second
+with a unique-violation error, which the handler translates to 409
+Conflict.
+
+The mistake here is to rely on the handler's check alone for uniqueness.
+Two requests can both check "no such title" before either inserts. The fix
+is to let the constraint decide and to map its error code to a clean
+response.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level you reason about time and concurrency on the path.
+The event loop runs one piece of JavaScript at a time, so a CPU-heavy step
+in one handler delays every other request on that process. The pool caps
+concurrent queries. Postgres locks rows during writes, so two requests
+updating the same row run one after the other.
+
+A worked example: a handler that hashes a password synchronously with a
+slow algorithm blocks the event loop for tens of milliseconds per call.
+Under load, every request's "read" timing goes up, even those that do no
+hashing, because they are queued behind it. The fix is the asynchronous
+version of the hash function, which runs the work on Node's thread pool,
+and a measurement of event-loop delay to prove it.
+
+The mistake is to read a slow `read` span as a slow network. The fix is to
+measure event-loop lag alongside `Server-Timing`, so a blocked loop shows
+up as itself.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases on this path are specific inputs at single boundaries. An empty
+body with `content-type: application/json` is not valid JSON and should be
+400, not a crash. A body of exactly the size limit should pass and one byte
+more should be 413. A note of exactly 500 characters passes the check
+constraint, and 501 fails, but count what "character" means: Postgres
+`length` counts characters, while the size limit counts bytes.
+
+A worked example: the text `"é".repeat(500)` is 500 characters and 1,000
+bytes. It passes the database check but might fail a 512-byte body limit.
+That is fine if intended, but the error message should say which limit was
+hit.
+
+The mistake is to test only "normal" input. The fix is a short table of
+boundary inputs in the test suite: empty, one, the limit, the limit plus
+one, multi-byte text, and a missing field.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases are two boundaries at once. A client times out after 5
+seconds and retries, while the first request is still waiting in the pool;
+both succeed, and the user gets two notes. A deploy restarts the server
+between the insert and the response; the row exists, but the client saw a
+connection reset and shows "failed".
+
+A worked example of the fix for both: the client sends an **idempotency
+key**, a random id per user action, in a header. The table stores it with a
+unique constraint. A retry with the same key finds the existing row and
+returns it instead of inserting again. The next note covers this in
+detail.
+
+The mistake is to think retries are a client problem only. The fix is
+designing writes so a repeated request is harmless.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+At production level the path gains layers: a CDN or load balancer in front,
+TLS terminated there, several app instances, a pooler in front of the
+database, and a replica for reads. Each layer adds a hop, a timeout and a
+log. The question becomes "which layer answered?" as often as "which code
+ran?".
+
+A worked example: users see intermittent 502 Bad Gateway errors. The app
+logs show nothing, because the app never saw those requests. The load
+balancer logs show its idle timeout is shorter than Node's keep-alive
+timeout, so it sometimes reuses a connection Node has just closed. Setting
+Node's `keepAliveTimeout` above the balancer's idle timeout fixes it.
+
+The mistake is debugging only from app logs. The fix is a request id
+created at the edge, passed through every layer, and printed in every log
+line.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that every hop is a place where the request can be lost,
+duplicated, delayed or reordered, and that each layer should defend its own
+rules without trusting the one before. The browser validates for the
+user's convenience; the handler validates for correctness; the database
+constrains for truth.
+
+A worked example: a mobile app ships with a bug that sends negative
+quantities. If only the web form validated, the bad rows go straight in.
+If the handler and the table also check, the app's bug becomes a clear 422
+in a log instead of corrupted data.
+
+The mistake is "the frontend already checks that". The fix is to treat
+every client as untrusted and every rule as owned by the deepest layer that
+can enforce it.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design the request path is the first diagram on the whiteboard.
+Capacity planning reads off it: requests per second times handler time
+gives concurrent requests, which must fit the event loop; queries per
+request times requests per second must fit the pool and the database.
+
+A worked example: 200 requests per second, each making 3 queries of 4 ms,
+needs about 2.4 connections busy on average. A pool of 10 per instance
+across 3 instances leaves headroom, and the database sees at most 30
+connections. If a new feature makes each request do 30 queries, the same
+arithmetic shows the pool will queue.
+
+The mistake is adding instances to fix a database bottleneck, which only
+adds connections to an already busy database. The fix is to reduce queries
+per request, add read replicas, or cache, guided by the numbers.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is to make the path observable before making it fast or
+clever. Every service gets request ids, `Server-Timing` or tracing, pool
+metrics and slow-query logs from day one, because the first incident is a
+bad time to add them.
+
+A worked example: a small app starts with one server, one Postgres and
+these four signals. When it grows, the same signals show the first real
+bottleneck, which is usually the number of queries per request, and the
+fix is chosen from data.
+
+Done when: for any request in your app, you can name every hop it took,
+show the time spent at each from real measurements, and say which layer
+enforces each rule on its input.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Why not open a new database connection per request? It is simpler.** It
+costs several round trips and a server process each time, and under load
+it hits `max_connections`. A pool is one line of setup and removes both
+problems.
+
+**Should validation live in the frontend or the backend?** Both, for
+different reasons. The frontend validates so the user gets instant
+feedback. The backend validates because it cannot trust any client. The
+database constrains because it outlives every client.
+
+**Why 201 and not 200 for a new note?** 201 Created says a new resource
+exists. Clients and tools can rely on it, and it pairs with a `Location`
+header pointing at the new resource's address.
+
+**Is HTTP/2 or HTTP/3 different from what I saw on the wire?** The
+meaning is the same: methods, paths, headers, status codes and bodies. The
+encoding is binary, headers are compressed, and many requests share one
+connection. Node's `http` module speaks HTTP/1.1, which is the easiest to
+read.
+
+**Does the `pg` driver really return bigints as strings?** By default, yes,
+for `bigint` (type `int8`) columns. You can register a parser to turn them
+into numbers or `BigInt` values, but only do that deliberately.
+
+## Key takeaways
+
+- A request is text: a method, a path, headers, a blank line, and a body.
+- A cold `https` connection costs round trips before any code runs, so
+  connection reuse matters more than micro-optimising handlers.
+- `fetch` resolves on every HTTP status; the code must check `res.ok`.
+- The server reads the body as a stream, limits its size, parses, validates
+  and only then touches the database.
+- Parameterised queries are the only safe way to send user input to SQL.
+- A connection pool caps concurrency, and waiting for it looks like a slow
+  query unless you measure it separately.
+- Constraints in the table are the final guarantee of what a valid row is.
+- Measure each hop with `Server-Timing` before deciding what to optimise.
+
+## Glossary
+
+- **Request / response**: the two messages of one HTTP exchange.
+- **Method**: the verb of a request, such as `GET` or `POST`.
+- **Header**: a named fact about a message, one per line.
+- **Body**: the payload after the blank line.
+- **DNS**: the system that turns host names into IP addresses.
+- **TCP**: the protocol that gives a reliable, ordered byte stream.
+- **TLS**: the protocol that encrypts that stream.
+- **Round trip (RTT)**: one message there and back; its time is set by the
+  network.
+- **Chunked transfer encoding**: sending a body in length-prefixed pieces.
+- **Stream**: data that arrives in chunks over time.
+- **Routing**: choosing which code handles a method and path.
+- **Middleware**: code that runs around every handler.
+- **Connection pool**: a set of reusable database connections.
+- **Parameterised statement**: SQL with placeholders whose values are sent
+  separately.
+- **Constraint**: a rule the database enforces on every write.
+- **Server-Timing**: a response header carrying server-side durations.
+- **Span / trace**: one timed hop, and the tree of hops for a request.
+
+## Practice
+
+**Warm-up.** Pick one save action in an app you use. In the network panel,
+write down its method, path, request headers, status and response body.
+Then list the five hops of this note and guess which one is slowest.
+
+**Build.** Write the server from this note against a local Postgres: one
+`POST /notes` and one `GET /notes/:id`, with a body size limit, 400, 413,
+422 and 404 answers, parameterised queries, and `Server-Timing` on every
+response. Hit it with `curl -v` and read the raw exchange.
+
+**Stretch.** Set the pool to `max: 1`, add `select pg_sleep(0.1)` to the
+handler, and fire 20 concurrent requests with a small script. Add a
+`pool;dur=` entry to `Server-Timing` that measures only the wait for a
+connection, and show that the wait, not the query, explains the slow tail.
