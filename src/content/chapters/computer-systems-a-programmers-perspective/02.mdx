@@ -1,0 +1,1463 @@
+---
+book: computer-systems-a-programmers-perspective
+number: 2
+title: "Representing and Manipulating Information"
+description: "Bytes, hex and byte order, bit operations, unsigned and two's-complement integers, overflow, shifts for multiply and divide, and IEEE 754 floats, bit by bit."
+part: "Part I, Program Structure and Execution"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A computer has no numbers, letters or pictures inside it, only fixed-width
+rows of bits. This chapter is about how those rows are made to mean
+integers and fractions, what the arithmetic on them really computes, and
+where it quietly differs from the arithmetic I learned at school. Almost
+every surprising numeric bug I have met, from `0.1 + 0.2` to a loop that
+never ends, is explained here.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- Convert freely between binary, hexadecimal and decimal, and read a memory dump in either byte order.
+- Use the bit-level operators `&`, `|`, `^`, `~`, `<<` and `>>` to build masks, and tell them apart from the logical `&&`, `||` and `!`.
+- Explain unsigned and two's-complement encodings, convert between them, and predict what C does when the two meet in one expression.
+- Predict overflow in addition and multiplication, and write correct overflow checks.
+- Explain how compilers turn multiplication and division by constants into shifts and adds, including the rounding fix for negative numbers.
+- Decode an IEEE 754 float by hand, explain rounding to even, and explain why floating-point addition is not associative.
+
+What I should already know: <a href={withBase('/books/computer-systems-a-programmers-perspective/01-a-tour-of-computer-systems/')}>chapter 1</a>
+(information is bits plus context) and enough C to write a small program
+with `printf`. Powers of two up to 2 to the 10 help; I list the rest as I go.
+
+Reading time: about two hours for this page. Doing the examples at a
+terminal and the practice problems in the book is another six to eight hours;
+this is one of the longest chapters in the book and it rewards slowness.
+
+## Chapter map
+
+<Flow steps={["2.1 Information storage: bytes, hex, words, byte order, bit operations", "2.2 Integer representations: unsigned, two's complement, conversions, extension, truncation", "2.3 Integer arithmetic: addition, negation, multiplication, shifts as arithmetic", "2.4 Floating point: fractions in binary, IEEE 754, rounding, operations"]} caption="The four sections build on each other. Storage gives the raw bits, representations give them meaning as integers, arithmetic shows what operations do to those meanings, and floating point repeats the story for fractions." />
+
+## 2.1 Information Storage
+
+### In one sentence
+
+Memory is one huge array of bytes, each with an address, and every
+program object is some run of those bytes, written most compactly in
+hexadecimal and laid out in a byte order the machine chooses.
+
+### The idea
+
+Rather than touching individual bits, programs use blocks of eight bits
+called **bytes**, the smallest addressable unit of memory. A machine-level
+program sees memory as a very large array of bytes called **virtual
+memory**. Each byte has a unique number, its **address**, and the set of all
+addresses is the **virtual address space**. A C pointer's value is the
+address of the first byte of some object, whatever its type.
+
+#### 2.1.1 Hexadecimal Notation
+
+Writing bytes in binary is too long and in decimal is awkward, because the
+bit pattern is hidden. **Hexadecimal** (base 16, "hex") uses the digits 0 to
+9 and the letters A to F for values 10 to 15. Each hex digit is exactly four
+bits, so one byte is exactly two hex digits, from `00` to `FF`. In C a hex
+constant starts with `0x`.
+
+Converting is mechanical once the sixteen four-bit patterns are memorised:
+`0`=0000, `1`=0001, ... `9`=1001, `A`=1010, `B`=1011, `C`=1100, `D`=1101,
+`E`=1110, `F`=1111. To go from hex to binary, expand each digit to four
+bits. To go back, group bits in fours from the right, padding the left with
+zeros, and replace each group.
+
+A power of two, 2 to the n, is easy to write in hex: write n as i + 4j
+with i between 0 and 3, and the answer is the hex digit for 2 to the i
+(1, 2, 4 or 8) followed by j zeros. So 2 to the 11 = 2048: 11 = 3 + 4·2,
+giving `0x800`.
+
+Converting decimal to hex is repeated division by 16: the remainders,
+read from last to first, are the digits. Hex to decimal is multiplying each
+digit by its power of 16 and adding.
+
+#### 2.1.2 Data Sizes
+
+Every computer has a **word size**, the nominal size of pointers and of
+integer registers. With a w-bit word, virtual addresses range from 0 to
+2 to the w minus 1, so a 64-bit machine can in principle address 16
+exabytes. C's data types have sizes that depend on how a program is
+compiled. On x86-64 Linux (the **LP64** model), `char` is 1 byte, `short`
+2, `int` 4, `long` 8, pointers 8, `float` 4 and `double` 8. A 32-bit
+program has 4-byte `long`s and pointers. To get exact sizes, C99's
+`<stdint.h>` gives `int32_t`, `uint64_t` and friends.
+
+#### 2.1.3 Addressing and Byte Ordering
+
+An object bigger than a byte occupies a contiguous run of bytes, and its
+address is the smallest of them. The open question is which byte of the
+value goes first. A **little-endian** machine stores the least significant
+byte at the lowest address; x86-64 and most ARM systems in practice do
+this. A **big-endian** machine stores the most significant byte first; the
+network protocols of the internet use this order ("network byte order").
+
+For the 4-byte `int` 0x01234567 at address 0x100:
+
+<Figure art={`
+ address:        0x100  0x101  0x102  0x103
+ big endian:      01     23     45     67     most significant first
+ little endian:   67     45     23     01     least significant first
+`} caption="The same int in two byte orders. Read each row left to right as rising addresses; only the order of the bytes changes, never the bits inside a byte." />
+
+Byte order is invisible inside one program on one machine. It shows up in
+three places: when bytes cross a network or a file between machines, when
+reading a memory dump or disassembly, and when a program reinterprets an
+object's bytes through a pointer of another type (a **cast**).
+
+#### 2.1.4 Representing Strings
+
+A C string is an array of characters ending in a byte with value 0, the
+**null terminator**. Each character is stored in some encoding, usually
+ASCII or UTF-8 (which is ASCII for the first 128 characters). Text is
+byte-order independent: a string's bytes are the same on any machine,
+because each character is one byte (or a defined sequence of bytes in
+UTF-8). That is one reason text formats travel so well.
+
+#### 2.1.5 Representing Code
+
+Machine code is bytes too, and those bytes differ completely between
+instruction sets and even between operating systems on the same chip. A
+function compiled for x86-64 Linux will not run on ARM, and a binary built
+for Linux will not load on Windows. From the machine's point of view a
+program is just a sequence of bytes with no memory of its source.
+
+#### 2.1.6 Introduction to Boolean Algebra
+
+George Boole's algebra treats 1 as true and 0 as false. Its operations on
+single bits are **NOT** (`~`, flips the bit), **AND** (`&`, 1 only if both
+are 1), **OR** (`|`, 1 if either is 1) and **EXCLUSIVE-OR** (`^`, 1 if
+exactly one is 1). Claude Shannon later saw that the same algebra describes
+relay circuits, which is why it is the basis of every digital circuit
+(chapter 4).
+
+These operations extend to **bit vectors**, strings of w bits, by applying
+them to each position. Two useful facts: `&` distributes over `|` (as
+multiplication distributes over addition), and every value is its own
+inverse under `^`, so `a ^ a` is 0 and `(a ^ b) ^ a` is `b`.
+
+A bit vector can also encode a **set**: bit i is 1 if element i is in the
+set. Then `|` is union, `&` is intersection and `~` is complement. Unix
+signal masks (chapter 8) and permission bits work exactly this way.
+
+#### 2.1.7 Bit-Level Operations in C
+
+C provides `|`, `&`, `~` and `^` on any integer type. The common use is
+**masking**: a **mask** is a bit pattern that selects some bits. `x & 0xFF`
+keeps the low byte and zeros the rest. `x | 0xFF` sets the low byte to all
+ones. `x ^ ~0xFF` flips every bit except the low byte. The expression `~0`
+is all ones whatever the word size, which makes masks portable.
+
+#### 2.1.8 Logical Operations in C
+
+C also has **logical** operators `||`, `&&` and `!`, which look similar and
+behave differently. They treat any nonzero argument as true and zero as
+false, and always return 1 or 0. They also **short-circuit**: if the first
+argument decides the result, the second is not evaluated. So `p && *p` is
+safe when `p` is null, and `a && 5 / a` never divides by zero.
+
+#### 2.1.9 Shift Operations in C
+
+`x << k` shifts the bits of x left by k places, dropping the k high bits
+and filling the right with zeros. `x >> k` shifts right, and here there are
+two kinds. A **logical** right shift fills the left with zeros. An
+**arithmetic** right shift fills with copies of the most significant bit,
+which preserves the sign of a two's-complement number. In C, unsigned
+values always shift logically; signed values shift arithmetically on
+practically every compiler (C does not strictly require it, and C23 still
+leaves it implementation-defined for negative values; Java's `>>>` makes the
+choice explicit).
+
+Shifting by k at least the word size is **undefined** in C. On x86-64 the
+hardware uses only the low 5 or 6 bits of the count, so `1 << 32` on a
+32-bit `int` might give 1, but the compiler may assume it never happens. A
+last trap is precedence: `1 << 2 + 3 << 4` means `1 << (2 + 3) << 4`, because
+addition binds tighter than shift. When in doubt, parenthesise.
+
+### Worked example
+
+My own `show_bytes` prints the bytes of any object in address order:
+
+```c
+typedef unsigned char *byte_pointer;
+
+static void show_bytes(const char *label, void *start, size_t len) {
+    byte_pointer p = start;
+    printf("%-10s", label);
+    for (size_t i = 0; i < len; i++) printf(" %02x", p[i]);
+    printf("\n");
+}
+```
+
+Calling it on four objects that all "mean" 12345:
+
+```text
+$ gcc -Og show_bytes.c -o show_bytes && ./show_bytes
+int        39 30 00 00
+float      00 e4 40 46
+pointer    fc 0d 2e ba fc 7f 00 00
+string     31 32 33 34 35 00
+sizes: char 1 short 2 int 4 long 8 void* 8 float 4 double 8
+```
+
+Read the lines one at a time. 12345 is `0x3039`, and the `int` line starts
+with `39`: the low byte first, so this machine is little-endian. The
+`float` holds the same number in a completely different pattern (decoded in
+section 2.4). The pointer is an 8-byte stack address, its high bytes zero.
+The string is six bytes, the ASCII codes for the digits `1` to `5` (`0x31`
+to `0x35`) and the null terminator. Same number, four contexts, four byte
+patterns.
+
+The bit operators, on two bytes:
+
+```text
+$ ./bits
+a&b=41 a|b=7d a^b=3c ~a=96
+!0x41=0 !!0x41=1 0x69&&0x55=1
+-8>>1 = -4 (arithmetic)  0xF0000000u>>4 = 0x0f000000 (logical)
+low byte 0x00000021  complement-but-low 0x789abc21  set-low 0x876543ff
+xor swap: p=9 q=3
+```
+
+`0x69 & 0x55` is `0x41`, but `0x69 && 0x55` is 1. The arithmetic shift
+kept −8 negative; the logical shift brought in zeros. The last line swaps
+two variables with three XORs and no temporary, a classic trick that works
+because `a ^ a` is 0 (and fails if both names refer to the same object: it
+zeroes it).
+
+A realistic example: Unix file permissions. `0755` is octal for the bits
+`111 101 101`: read, write and execute for the owner, read and execute for
+group and others. The test "can others write?" is `mode & 0002`, and
+removing group write is `mode & ~0020`.
+
+### Step by step
+
+The masking trace for `0x69 & 0x55`, bit by bit:
+
+<Trace
+  columns={["Bit", "7", "6", "5", "4", "3", "2", "1", "0", "Hex"]}
+  rows={[
+    ["a = 0x69", "0", "1", "1", "0", "1", "0", "0", "1", "69"],
+    ["b = 0x55", "0", "1", "0", "1", "0", "1", "0", "1", "55"],
+    ["a & b", "0", "1", "0", "0", "0", "0", "0", "1", "41"],
+    ["a | b", "0", "1", "1", "1", "1", "1", "0", "1", "7d"],
+    ["a ^ b", "0", "0", "1", "1", "1", "1", "0", "0", "3c"],
+    ["~a", "1", "0", "0", "1", "0", "1", "1", "0", "96"],
+  ]}
+  caption="Bitwise operations work column by column. Read down a column to see one bit's fate; read across to rebuild the hex result."
+/>
+
+Converting 314156 to hex by repeated division:
+
+<Trace
+  columns={["Step", "Divide", "Quotient", "Remainder (hex digit)"]}
+  rows={[
+    ["1", "314156 / 16", "19634", "12 (C)"],
+    ["2", "19634 / 16", "1227", "2"],
+    ["3", "1227 / 16", "76", "11 (B)"],
+    ["4", "76 / 16", "4", "12 (C)"],
+    ["5", "4 / 16", "0", "4"],
+  ]}
+  caption="Decimal to hex: divide until the quotient is zero, then read the remainders from the bottom up. The answer is 0x4CB2C."
+/>
+
+### Common mistake
+
+The most common mistake in this section is confusing `&` with `&&`. The
+condition `if (flags & READ && flags & WRITE)` works, but
+`if (flags & READ == READ)` does not, because `==` binds tighter than `&`:
+it computes `flags & (READ == READ)`, which is `flags & 1`. The fix is to
+parenthesise every bitwise expression inside a comparison.
+
+The second is assuming byte order. Code that writes an `int` to a file
+with `fwrite(&x, 4, 1, f)` and reads it on another machine gets garbage if
+the orders differ. The fix is to choose an order for the format and convert
+explicitly, with `htonl` and `ntohl` or by building the value byte by byte.
+
+### In real systems
+
+In JavaScript, a `DataView` makes the byte order an explicit argument:
+`view.getUint32(0, true)` reads little-endian. Binary protocols such as
+Protocol Buffers use little-endian varints; TCP/IP headers are big-endian.
+Feature flags packed into an integer, Linux `epoll` event masks, and
+database bitmap indexes are all bit vectors used as sets. Bit operations in
+JavaScript convert their operands to 32-bit signed integers first, so
+`(2 ** 31) | 0` is −2147483648 and `1 << 32` is 1: the count is masked to
+five bits.
+
+### Check yourself
+
+1. Write 0x3A7 in binary, and 2 to the 19 in hex.
+2. What does `x & -x` compute? Try it on 12.
+3. On a little-endian machine, an `int` holding 0x12345678 is stored at 0x200. Which byte is at 0x201?
+
+<details>
+<summary>Answer</summary>
+
+1. `0011 1010 0111`, and 19 = 3 + 4·4, so `0x80000`.
+2. The lowest set bit. 12 is `1100`, −12 is `...0100`, so `12 & -12` is `0100` = 4.
+3. `0x56`. The low byte `0x78` is at 0x200, then `0x56`, `0x34`, `0x12`.
+
+</details>
+
+## 2.2 Integer Representations
+
+### In one sentence
+
+A w-bit pattern can be read as an unsigned number (every bit a positive
+power of two) or as a two's-complement signed number (the top bit
+negative), C converts between the two by keeping the bits and changing the
+reading, and widening or narrowing a number follows simple bit rules.
+
+### The idea
+
+#### 2.2.1 Integral Data Types
+
+C has several integer types, each in a signed and an unsigned version,
+each with a range fixed by its size. On x86-64 Linux, `signed char` runs
+from −128 to 127 and `unsigned char` from 0 to 255; `int` from about −2.1
+billion to 2.1 billion and `unsigned` from 0 to about 4.3 billion; `long`
+from about −9.2 × 10 to the 18 to the same positive value. The ranges are
+not symmetric: there is one more negative value than positive. The C
+standard guarantees only minimum ranges (an `int` might be 16 bits on some
+embedded chip), which is why `<stdint.h>` exists.
+
+#### 2.2.2 Unsigned Encodings
+
+Write a w-bit vector as x with bits x(w−1) down to x(0). Its **unsigned**
+value, which the book writes B2U (binary to unsigned), weights bit i by 2
+to the i and adds:
+
+```text
+B2U(x) = sum over i of x(i) · 2^i
+```
+
+So `1011` is 8 + 0 + 2 + 1 = 11. The smallest value is all zeros, 0; the
+largest is all ones, 2 to the w minus 1 (`UMax`). The mapping is a
+**bijection**: every w-bit pattern has exactly one value between 0 and
+UMax, and every such value exactly one pattern.
+
+#### 2.2.3 Two's-Complement Encodings
+
+For signed numbers, almost every machine uses **two's complement**, which
+gives the most significant bit a **negative** weight:
+
+```text
+B2T(x) = −x(w−1) · 2^(w−1) + sum over i below w−1 of x(i) · 2^i
+```
+
+So in 4 bits, `1011` is −8 + 0 + 2 + 1 = −5, and `0101` is 5. The top
+bit is called the **sign bit**: 1 means negative. The smallest value
+(`TMin`) is `1000...0`, −2 to the w−1; the largest (`TMax`) is
+`0111...1`, 2 to the w−1 minus 1. So |TMin| = TMax + 1: there is no
+positive twin for TMin. All ones, `1111`, is −1. Zero is all zeros, with
+only one representation.
+
+<Figure art={`
+ 4-bit pattern:  0000 0001 ... 0111 | 1000 1001 ... 1110 1111
+ unsigned:         0    1  ...   7  |   8    9  ...  14   15
+ two's compl.:     0    1  ...   7  |  -8   -7  ...  -2   -1
+
+ number line (two's complement), weights -8  4  2  1:
+   -8 -7 -6 -5 -4 -3 -2 -1  0  1  2  3  4  5  6  7
+  1000            ... 1111 0000             ... 0111
+`} caption="All sixteen 4-bit patterns read both ways. Patterns with the top bit 0 mean the same in both; patterns with the top bit 1 differ by exactly 16, which is 2 to the 4." />
+
+Two other signed encodings exist and are mostly history: **ones'
+complement**, where the top bit weighs −(2 to the w−1 minus 1), and
+**sign-magnitude**, where the top bit is just a sign. Both have two zeros.
+Floating point uses sign-magnitude (section 2.4).
+
+#### 2.2.4 Conversions between Signed and Unsigned
+
+When C casts between a signed and an unsigned type of the same size, it
+keeps the bits and changes the interpretation. So the effect on the
+number follows from the two formulas: the readings differ only in the top
+bit's weight, +2 to the w−1 or −2 to the w−1, a difference of 2 to the w.
+
+```text
+T2U(x) = x + 2^w   if x is negative,   x   otherwise
+U2T(u) = u − 2^w   if u > TMax,         u   otherwise
+```
+
+So `(unsigned)-1` is 2 to the 32 minus 1, which is 4294967295, and
+`(short)53191` is 53191 − 65536 = −12345.
+
+#### 2.2.5 Signed versus Unsigned in C
+
+C treats a constant like `12345` as signed and `12345U` as unsigned. The
+danger is mixing them: when an operation has one signed and one unsigned
+operand of the same size, C **implicitly converts the signed one to
+unsigned**, and then does an unsigned operation. For comparisons this gives
+answers that look absurd.
+
+```text
+-1 < 0u                       is 0 (false): -1 becomes 4294967295
+2147483647u > -2147483647-1   is 0 (false): TMin becomes 2147483648
+2147483647 > (int)2147483648u is 1 (true):  the cast makes it TMin
+```
+
+A subtle point from the book: writing TMin as `-2147483648` in C is
+tricky, because the literal 2147483648 does not fit in an `int`, so its type
+becomes `long`. That is why `<limits.h>` defines `INT_MIN` as
+`(-INT_MAX - 1)`.
+
+#### 2.2.6 Expanding the Bit Representation of a Number
+
+To widen a number to more bits while keeping its value: an unsigned number
+gets zeros added on the left, **zero extension**. A two's-complement number
+gets copies of its sign bit added on the left, **sign extension**. Sign
+extension works because of one small identity. When a negative number
+grows by one bit, the new top bit weighs −2 to the w, and the old top bit,
+no longer on top, now weighs +2 to the w−1. Together they are worth
+−2 to the w + 2 to the w−1 = −2 to the w−1, which is exactly what the old
+top bit was worth alone. The value is unchanged.
+
+When a conversion changes both size and signedness, C changes the size
+first, then the signedness. So `(unsigned)(short)-12345` sign-extends to
+`0xffffcfc7` first, giving 4294954951, not 53191.
+
+#### 2.2.7 Truncating Numbers
+
+To narrow a number, C drops the high bits. For unsigned, that is the value
+modulo 2 to the k, where k is the new width. For two's complement, it is
+the same bits, reread as signed: take the value mod 2 to the k, then apply
+U2T. So `(short)53191` keeps the low 16 bits of `0x0000cfc7`, which are
+`0xcfc7`, and reread as signed that is −12345.
+
+#### 2.2.8 Advice on Signed versus Unsigned
+
+The book's advice is to be wary of unsigned. Implicit conversion causes
+bugs that are hard to see, such as a loop `for (unsigned i = n - 1; i >= 0;
+i--)` that never ends, because an unsigned value is always at least 0. A
+classic case is a length parameter of type `size_t` (unsigned) mixed with
+an `int` that can be negative. Unsigned is right for bit vectors, for
+modular arithmetic (hashes, checksums), and for multiprecision arithmetic.
+Java chose to have only signed integers for this reason.
+
+### Worked example
+
+The conversion program, showing every rule above on real values:
+
+```c
+short sx = -12345;
+unsigned short usx = sx;  /* same bits, read unsigned */
+int x = sx;               /* sign extension           */
+unsigned ux = usx;        /* zero extension           */
+```
+
+```text
+$ ./conv
+sx=-12345 usx=53191 x=-12345 (0xffffcfc7) ux=53191 (0x0000cfc7)
+(unsigned)-1 = 4294967295
+-1 < 0u is 0
+2147483647u > -2147483647-1 is 0
+2147483647 > (int)2147483648u is 1
+(short)53191 = -12345
+INT_MIN=-2147483648 -INT_MIN(wrapped)=-2147483648
+255+1 as unsigned char = 0
+100+100 as int8_t = -56
+```
+
+Every line is predictable from the formulas. −12345 + 65536 = 53191.
+Sign extension put `ffff` in front of `cfc7`; zero extension put `0000`.
+The comparisons show the implicit conversion. Negating TMin wraps back to
+TMin. 255 + 1 in 8 unsigned bits is 256 mod 256 = 0. 100 + 100 = 200, which
+in 8-bit two's complement is 200 − 256 = −56.
+
+A realistic example: the `memcpy`-length bug. A function takes
+`int maxlen` and calls `memcpy(dst, src, maxlen)`. `memcpy`'s length is
+`size_t`, unsigned. A caller who passes −1 gets a copy of
+18446744073709551615 bytes, a crash or a security hole. The book tells of this exact pattern in real operating-system code, in a
+function that copied kernel data out to user programs.
+The fix is to make the parameter `size_t` and check it against the buffer
+size, or to reject negative values before the call.
+
+### Step by step
+
+Decoding the 8-bit pattern `1100 1001` both ways:
+
+<Trace
+  columns={["Bit position", "Bit", "Unsigned weight", "Two's-complement weight"]}
+  rows={[
+    ["7", "1", "+128", "-128"],
+    ["6", "1", "+64", "+64"],
+    ["5", "0", "0", "0"],
+    ["4", "0", "0", "0"],
+    ["3", "1", "+8", "+8"],
+    ["2", "0", "0", "0"],
+    ["1", "0", "0", "0"],
+    ["0", "1", "+1", "+1"],
+    ["Total", "", "201", "-55"],
+  ]}
+  caption="One byte, two readings. Only row 7 differs, and 201 minus 256 equals -55: the difference is always 2 to the w."
+/>
+
+Sign-extending −5 from 4 bits to 8, and checking the value is kept:
+
+<Trace
+  columns={["Width", "Pattern", "Weights of the 1 bits", "Value"]}
+  rows={[
+    ["4", "1011", "-8 + 2 + 1", "-5"],
+    ["5", "1 1011", "-16 + 8 + 2 + 1", "-5"],
+    ["6", "11 1011", "-32 + 16 + 8 + 2 + 1", "-5"],
+    ["8", "1111 1011", "-128 + 64 + 32 + 16 + 8 + 2 + 1", "-5"],
+  ]}
+  caption="Each extra copy of the sign bit adds a new negative weight and turns the old one positive. The two changes cancel, so the value never moves."
+/>
+
+### Common mistake
+
+The mistake is `strlen(a) - strlen(b) > 0` to test which string is longer.
+`strlen` returns `size_t`, so the subtraction is unsigned and never
+negative; the test is true unless the lengths are equal. The fix is
+`strlen(a) > strlen(b)`. Compilers warn about many of these with
+`-Wsign-compare` (part of `-Wextra`), which is a strong reason to build with
+it.
+
+### In real systems
+
+JavaScript has no unsigned integers except through `>>>` and typed arrays.
+`-1 >>> 0` is 4294967295, the same T2U conversion. A `Uint8Array` silently
+wraps 256 to 0 (like `unsigned char`) while a `Uint8ClampedArray`, used for
+canvas pixels, clamps to 255. Database columns with `UNSIGNED INT` meet
+application languages without unsigned types, and IDs over 2 to the 31
+become negative in the client. Image and network parsers are where sign
+bugs become security bugs: a negative length read from a file and used as a
+size.
+
+### Check yourself
+
+1. In 6 bits, what are TMin, TMax and the value of `110100` as signed?
+2. What does `(unsigned char)(signed char)-1` evaluate to?
+3. Why does `for (size_t i = n - 1; i >= 0; i--)` never stop?
+
+<details>
+<summary>Answer</summary>
+
+1. TMin is −32, TMax is 31, and `110100` is −32 + 16 + 4 = −12.
+2. 255. The bits `11111111` are kept and read as unsigned.
+3. Because `i` is unsigned, so `i >= 0` is always true. When `i` is 0, `i--` wraps to the largest `size_t`.
+
+</details>
+
+## 2.3 Integer Arithmetic
+
+### In one sentence
+
+Computer integer arithmetic is arithmetic modulo 2 to the w: results that
+do not fit wrap around, which makes addition and multiplication obey most
+of the familiar algebra while producing answers that look wrong, and it lets
+multiplication and division by constants become cheap shifts.
+
+### The idea
+
+#### 2.3.1 Unsigned Addition
+
+Adding two w-bit unsigned numbers can need w + 1 bits. C keeps only the
+low w, which is the sum **modulo 2 to the w**. If x + y is below 2 to the w
+the answer is exact; otherwise 2 to the w is subtracted, and we say the sum
+**overflowed**. The overflow is easy to detect: the computed sum s is
+smaller than x (or than y). That works because when overflow happens,
+s = x + y − 2 to the w, and since y is below 2 to the w, s is below x.
+
+Unsigned addition forms an **abelian group**: it is commutative and
+associative, 0 is the identity, and every value has an inverse. The inverse
+of x (its unsigned negation) is 2 to the w minus x, except for 0, which is
+its own.
+
+#### 2.3.2 Two's-Complement Addition
+
+Signed addition uses the same hardware: add the bit patterns as if they
+were unsigned, keep w bits, reinterpret as signed. The result is the true
+sum, or the true sum minus 2 to the w (**positive overflow**, two
+positives giving a negative), or plus 2 to the w (**negative overflow**,
+two negatives giving a non-negative). Overflow is detected by signs: it
+happened exactly when both operands have the same sign and the result has
+the other.
+
+In C, signed overflow is **undefined behaviour**, not wrap-around. The
+hardware wraps, but the compiler is allowed to assume overflow never
+happens and optimise on that basis. That is a modern twist the book's
+model does not dwell on, and I show it below.
+
+#### 2.3.3 Two's-Complement Negation
+
+Every value except TMin has a negation that is just −x. TMin's negation is
+TMin itself, because +2 to the w−1 does not fit. The bit-level recipe is
+**complement and increment**: `-x == ~x + 1`. A second recipe: find the
+rightmost 1 bit, keep it and everything to its right, and flip every bit to
+its left.
+
+#### 2.3.4 Unsigned Multiplication
+
+Two w-bit numbers multiply to as many as 2w bits. C keeps the low w: the
+product modulo 2 to the w.
+
+#### 2.3.5 Two's-Complement Multiplication
+
+Signed multiplication truncates to the low w bits too, and those low bits
+are identical to the unsigned product's low bits. The hardware can use one
+multiplier for both. The result: the true product, reduced modulo 2 to the
+w, reinterpreted as signed.
+
+This has a famous consequence. In 2002 a library function in Sun's XDR
+code computed a buffer size as `count * size` without checking overflow;
+for large counts the product wrapped to a small number, `malloc` allocated
+too little, and a later copy overran the heap. The book tells this story.
+The fix is to check before multiplying, or use the compiler builtins below.
+
+#### 2.3.6 Multiplying by Constants
+
+Integer multiplication used to cost ten or more cycles; on modern x86-64
+it is about three, still more than an add or shift at one. So compilers
+replace multiplication by a constant with shifts and adds. Multiplying by
+2 to the k is a left shift by k, for unsigned and two's complement alike,
+including when it overflows: both wrap the same way. A constant like 14 is
+`1110` in binary, 8 + 4 + 2, so x·14 = (x shifted 3) + (x shifted 2) +
+(x shifted 1), or more cheaply (x shifted 4) − (x shifted 1).
+
+#### 2.3.7 Dividing by Powers of 2
+
+Division is slower still, often thirty cycles or more. Dividing by 2 to
+the k is a right shift, with a catch. For unsigned, a logical shift gives
+the floor, which is correct. For two's complement, an arithmetic shift also
+gives the floor, but C division **rounds toward zero**. For positive x
+these agree. For negative x they differ: −7 / 4 is −1 in C, but −7 shifted
+right 2 is −2.
+
+The fix is a **bias**: add 2 to the k minus 1 before shifting, but only
+when x is negative. Then the shift rounds up instead of down, which for
+negative numbers is toward zero. In C: `(x < 0 ? x + (1 << k) - 1 : x) >> k`.
+This does not generalise to division by arbitrary constants; for those,
+compilers multiply by a "magic" reciprocal and shift, which is a story the
+book leaves aside.
+
+#### 2.3.8 Final Thoughts on Integer Arithmetic
+
+Integer arithmetic on a computer is modular arithmetic, and its
+peculiarities all come from the finite width. Unsigned and two's complement
+share the same bit-level operations for addition, subtraction,
+multiplication, and even division by powers of two up to rounding. The
+programmer's job is to know where the wrap is and to check for it where it
+matters.
+
+### Worked example
+
+Overflow checks that actually work, and what wrapping looks like:
+
+```c
+/* 1 if a + b does not overflow as unsigned */
+static int uadd_ok(unsigned a, unsigned b) { return a + b >= a; }
+
+/* 1 if a + b does not overflow as int (sum computed unsigned: no UB) */
+static int tadd_ok(int a, int b) {
+    int s = (int)((unsigned)a + (unsigned)b);
+    int neg_over = a < 0 && b < 0 && s >= 0;
+    int pos_over = a >= 0 && b >= 0 && s < 0;
+    return !neg_over && !pos_over;
+}
+```
+
+```text
+$ ./arith
+uadd_ok(4000000000u, 500000000u)=0 sum=205032704
+tadd_ok(INT_MAX, 1)=0 wrapped=-2147483648
+tadd_ok(-5, 3)=1
+int8 5*7 = 35, int8 -100*3 = -44
+unsigned 3e9*2 = 1705032704, mod 2^32 check 1705032704
+v*14 = 518, (v<<4)-(v<<1) = 518
+-7/4 = -1, -7>>2 = -2, (-7+3)>>2 = -1
+7/4 = 1, 7>>2 = 1
+```
+
+4,000,000,000 + 500,000,000 = 4,500,000,000, minus 2 to the 32
+(4,294,967,296) is 205,032,704. −100 × 3 = −300; mod 256 that is 212, and
+212 − 256 = −44. The shift line shows the rounding problem and its fix.
+
+What the compiler emits for these, with `gcc -O2`:
+
+```text
+0000000000000000 <mul14>:
+   0:   lea    0x0(,%rdi,8),%rax      # rax = x * 8
+   8:   sub    %rdi,%rax              # rax = x * 7
+   b:   add    %rax,%rax              # rax = x * 14
+   e:   ret
+0000000000000010 <div8>:
+  10:   test   %rdi,%rdi              # is x negative?
+  13:   lea    0x7(%rdi),%rax         # rax = x + 7 (the bias)
+  17:   cmovns %rdi,%rax              # if not negative, rax = x
+  1b:   sar    $0x3,%rax              # arithmetic shift right 3
+  1f:   ret
+0000000000000020 <udiv8>:
+  20:   mov    %rdi,%rax
+  23:   shr    $0x3,%rax              # logical shift: no bias needed
+  27:   ret
+```
+
+No multiply and no divide instruction at all. `mul14` computes 8x − x =
+7x and doubles it. `div8` is exactly the biased shift from 2.3.7, written
+without a branch (the conditional move is chapter 3's subject). Unsigned
+division is a bare shift.
+
+And the modern twist, signed overflow as undefined behaviour:
+
+```c
+int always_bigger(int x) { return x + 1 > x; }
+```
+
+```text
+$ gcc -O2 ub.c && ./a.out        # always_bigger(INT_MAX)
+always_bigger(INT_MAX) = 1
+$ gcc -O2 -fwrapv ub.c && ./a.out
+always_bigger(INT_MAX) = 0
+$ gcc -O0 -fsanitize=undefined ub.c && ./a.out
+ub.c:5:59: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+```
+
+At `-O2` GCC compiles the whole function to `movl $1, %eax; ret`. Since
+signed overflow "cannot happen", x + 1 is always greater than x. With
+`-fwrapv`, which tells GCC to treat signed overflow as wrapping, the honest
+answer 0 comes back. The sanitizer catches the overflow at run time.
+
+### Step by step
+
+Adding 4-bit two's-complement numbers, one case of each kind:
+
+<Trace
+  columns={["x", "y", "x + y (true)", "Low 4 bits", "Read as signed", "Case"]}
+  rows={[
+    ["-8 (1000)", "-5 (1011)", "-13", "0011", "3", "negative overflow: +16"],
+    ["-8 (1000)", "-8 (1000)", "-16", "0000", "0", "negative overflow: +16"],
+    ["-8 (1000)", "5 (0101)", "-3", "1101", "-3", "exact"],
+    ["2 (0010)", "5 (0101)", "7", "0111", "7", "exact"],
+    ["5 (0101)", "5 (0101)", "10", "1010", "-6", "positive overflow: -16"],
+  ]}
+  caption="Two's-complement addition in 4 bits. In every overflow row the operands share a sign and the result has the other: that is the detection rule."
+/>
+
+Dividing −7 by 4 with and without the bias, in 8 bits:
+
+<Trace
+  columns={["Step", "Without bias", "With bias 3"]}
+  rows={[
+    ["x", "1111 1001 (-7)", "1111 1001 (-7)"],
+    ["add bias", "(none)", "1111 1100 (-4)"],
+    ["arithmetic shift right 2", "1111 1110 (-2)", "1111 1111 (-1)"],
+    ["C's -7 / 4", "-1", "-1"],
+    ["matches?", "no: rounded down", "yes: rounded toward zero"],
+  ]}
+  caption="Why the bias works. Adding 3 pushes any negative value that is not a multiple of 4 past the next multiple, so the floor of the shift lands on the truncated quotient."
+/>
+
+### Common mistake
+
+The mistake is checking signed overflow after the fact with the overflowed
+value: `if (a + b < a)` for signed `int`s. Because overflow is undefined,
+the compiler may delete the check entirely. The fix is to check before
+adding (`if (b > 0 && a > INT_MAX - b)`), compute in unsigned as
+`tadd_ok` does, or use GCC and Clang's `__builtin_add_overflow(a, b, &sum)`,
+which returns 1 on overflow and compiles to an add and a jump on the
+overflow flag.
+
+The second is `n * sizeof(T)` in an allocation. The fix is
+`calloc(n, sizeof(T))`, which checks the product, or
+`__builtin_mul_overflow`.
+
+### In real systems
+
+Integer overflow is a recurring source of security bugs: image decoders
+computing `width * height * 4`, length fields read from network packets,
+and the parser bugs that fuzzers keep finding. Rust
+panics on overflow in debug builds and wraps in release unless asked;
+Swift traps. JavaScript numbers are doubles, so they do not wrap at 32
+bits, but they lose exactness above 2 to the 53, and `Math.imul` exists to
+get 32-bit wrapping multiplication for hash functions.
+
+### Check yourself
+
+1. In 8 bits, what is `-x` for x = −128, and why?
+2. How would a compiler compute x·17 with one shift and one add?
+3. Why does `div8` need `cmovns` but `udiv8` does not?
+
+<details>
+<summary>Answer</summary>
+
+1. −128 again. `~x + 1` is `0111 1111 + 1` = `1000 0000`. +128 does not fit in 8-bit two's complement.
+2. `(x << 4) + x`.
+3. Signed division must round toward zero, so negative values need the bias first; unsigned values are never negative, so the plain logical shift already rounds correctly.
+
+</details>
+
+## 2.4 Floating Point
+
+### In one sentence
+
+A floating-point number stores a sign, an exponent and a fraction so that
+it can cover tiny and huge magnitudes with a fixed number of bits, at the
+price of rounding almost every result, which breaks familiar algebra such as
+associativity.
+
+### The idea
+
+Integers cannot hold 3.75 or 6.02 × 10 to the 23. Before 1985 every
+manufacturer had its own floating-point format, with its own rounding
+rules, so a program could give different answers on different machines.
+The **IEEE 754** standard, led by William Kahan, fixed one format and one
+set of rules. Every modern processor follows it, and JavaScript's `number`
+is its 64-bit format.
+
+#### 2.4.1 Fractional Binary Numbers
+
+Decimal 12.34 means 1·10 + 2·1 + 3·(1/10) + 4·(1/100). Binary works the
+same way with powers of two: bits right of the **binary point** weigh 1/2,
+1/4, 1/8 and so on. So `101.11` is 4 + 1 + 1/2 + 1/4 = 5.75. Shifting the
+binary point left divides by 2; shifting right multiplies.
+
+The key limit: a binary fraction can only exactly represent numbers of the
+form x / 2 to the k. One fifth, one tenth and one third have infinite binary
+expansions, as one third does in decimal. 0.1 in binary is
+`0.000110011001100...` forever, so any finite format stores an
+approximation.
+
+#### 2.4.2 IEEE Floating-Point Representation
+
+IEEE 754 writes a number as V = (−1) to the s × M × 2 to the E, and packs
+three fields into the bits:
+
+- the **sign** s, one bit: 1 for negative;
+- the **exponent field** exp, k bits, which encodes E;
+- the **fraction field** frac, n bits, which encodes the **significand** M.
+
+Single precision (`float`) has k = 8 and n = 23, 32 bits in all. Double
+precision (`double`) has k = 11 and n = 52, 64 bits.
+
+<Figure art={`
+ float (32 bits)
+ +---+----------+-------------------------+
+ | s |   exp    |          frac           |
+ +---+----------+-------------------------+
+  31  30      23 22                      0
+
+ double (64 bits)
+ +---+-------------+----------------------------------------+
+ | s |     exp     |                  frac                  |
+ +---+-------------+----------------------------------------+
+  63  62        52  51                                     0
+`} caption="The two IEEE formats. Read left to right: one sign bit, then the exponent field, then the fraction. The fields are unsigned bit patterns; their meaning depends on the exponent field's value." />
+
+The exponent field's value chooses one of three cases.
+
+**Normalized values** (exp neither all zeros nor all ones). The exponent is
+E = e − Bias, where e is exp read as unsigned and **Bias** is 2 to the k−1
+minus 1 (127 for `float`, 1023 for `double`). So E runs from −126 to +127
+for `float`. The significand is M = 1 + f, where f is the fraction field
+read as a binary fraction `0.frac`. The leading 1 is not stored, an
+**implied leading 1**, which buys one free bit of precision.
+
+**Denormalized values** (exp all zeros). Here E = 1 − Bias (not 0 − Bias)
+and M = f, with no implied 1. Denormals do two jobs. They represent zero
+(all fields zero gives +0.0; the sign bit alone gives −0.0, which IEEE
+treats as a distinct value that compares equal to +0.0). And they fill the
+gap between zero and the smallest normalized number with evenly spaced
+values, called **gradual underflow**. The choice E = 1 − Bias is what makes
+the step from the largest denormal to the smallest normal seamless.
+
+**Special values** (exp all ones). With frac zero, the value is **infinity**,
++∞ or −∞ by the sign, the result of overflow or of dividing a nonzero
+number by zero. With frac nonzero, it is **NaN**, "not a number", the
+result of operations like 0/0 or the square root of −1.
+
+#### 2.4.3 Example Numbers
+
+A tiny made-up format makes every case visible. With 6 bits (1 sign bit,
+k = 3 exponent bits, so Bias = 3, and n = 2 fraction bits), here are all the
+non-negative values:
+
+<Trace
+  columns={["exp", "frac", "Case", "E", "M", "Value"]}
+  rows={[
+    ["000", "00", "denormal", "-2", "0", "0"],
+    ["000", "01", "denormal", "-2", "1/4", "1/16"],
+    ["000", "10", "denormal", "-2", "2/4", "2/16"],
+    ["000", "11", "denormal", "-2", "3/4", "3/16 (largest denormal)"],
+    ["001", "00", "normal", "-2", "4/4", "4/16 (smallest normal)"],
+    ["001", "11", "normal", "-2", "7/4", "7/16"],
+    ["010", "00", "normal", "-1", "4/4", "1/2"],
+    ["011", "00", "normal", "0", "4/4", "1"],
+    ["011", "11", "normal", "0", "7/4", "7/4"],
+    ["100", "01", "normal", "1", "5/4", "5/2"],
+    ["101", "10", "normal", "2", "6/4", "6"],
+    ["110", "11", "normal", "3", "7/4", "14 (largest normal)"],
+    ["111", "00", "special", "", "", "+infinity"],
+    ["111", "01 to 11", "special", "", "", "NaN"],
+  ]}
+  caption="A 6-bit IEEE-style format. Watch the Value column: the gaps double each time the exponent goes up, and the denormals continue the smallest normals' spacing (1/16) down to zero."
+/>
+
+Three properties follow. The values are dense near zero and sparse far
+from it: between 8 and 14 the step is 2, between 1 and 7/4 it is 1/4.
+Denormals and the smallest normals share the same spacing, so there is no
+gap at zero. And, a design gift, the non-negative values in increasing
+order have increasing bit patterns when read as unsigned integers, so
+floats can be sorted with integer comparisons (after handling the sign).
+
+Real `float` values from my machine, decoded field by field:
+
+```text
+$ ./fp
+1.0          1              bits=3f800000 s=0 e=127 (E=   0) f=0x000000
+-0.0         -0             bits=80000000 s=1 e=  0 (E=-127) f=0x000000
+0.1          0.100000001    bits=3dcccccd s=0 e=123 (E=  -4) f=0x4ccccd
+12345.0      12345          bits=4640e400 s=0 e=140 (E=  13) f=0x40e400
+min denorm   1.40129846e-45 bits=00000001 s=0 e=  0 (E=-127) f=0x000001
+min norm     1.17549435e-38 bits=00800000 s=0 e=  1 (E=-126) f=0x000000
+max          3.40282347e+38 bits=7f7fffff s=0 e=254 (E= 127) f=0x7fffff
+inf          inf            bits=7f800000 s=0 e=255 (E= 128) f=0x000000
+nan          nan            bits=7fc00000 s=0 e=255 (E= 128) f=0x400000
+```
+
+My printer computes E as e − 127 for every row, so for the two rows with
+e = 0 (−0.0 and the smallest denormal) read E as the denormal rule gives
+it, 1 − 127 = −126. The smallest denormal is 2 to the −23 × 2 to the −126 =
+2 to the −149, about 1.4 × 10 to the −45.
+
+Decoding 12345.0 by hand shows a lovely link to the integer. 12345 in
+binary is `11000000111001`, 14 bits. Normalised, that is
+`1.1000000111001` × 2 to the 13. So E = 13, e = 13 + 127 = 140 =
+`10001100`. The fraction is the 13 bits after the point, padded with ten
+zeros: `10000001110010000000000` = `0x40E400`. Those 13 bits are exactly
+the low 13 bits of the integer 12345: the float's fraction is the integer's
+bits with the leading 1 dropped and moved left.
+
+#### 2.4.4 Rounding
+
+Since most real numbers have no exact representation, every operation
+must **round** its exact result to a representable one. IEEE defines four
+**rounding modes**. The default is **round-to-even** (also called round to
+nearest): pick the nearest representable value, and if the exact result is
+exactly halfway, pick the one whose last bit is 0 (even). The other three
+are **round toward zero**, **round down** (toward −∞) and **round up**
+(toward +∞), used for interval arithmetic.
+
+Why even, and not "halves go up" as at school? Because always rounding
+halves up adds a small upward bias that accumulates over millions of
+operations. Rounding to even goes up half the time and down half the time,
+so averages stay honest. In binary, "even" means the bit at the rounding
+position is 0. For example, rounding to the nearest quarter (two bits after the point):
+`1.01011` is below halfway, so it rounds down to `1.01`; `1.10101` is
+above, so up to `1.11`; `1.01100` is exactly halfway between `1.01` and
+`1.10`, and `1.10` ends in 0, so it rounds up; `1.10100` is exactly halfway
+between `1.10` and `1.11`, and `1.10` is even, so it rounds down.
+
+#### 2.4.5 Floating-Point Operations
+
+IEEE defines each operation's result as the exact result, rounded. That is
+a clean rule, but the consequences are not. Addition is **commutative** but
+**not associative**: `(3.14 + 1e10) - 1e10` in single precision is 0,
+because 3.14 is lost when added to 1e10, while `3.14 + (1e10 - 1e10)` is
+3.14. Multiplication is not associative either, and does not distribute
+over addition. Addition is **monotonic**: if a is at least b, then a + x is
+at least b + x for any x that is not NaN, which is a property integer
+addition does not have (because of wrap-around).
+
+Every value except infinities and NaN has an additive inverse, and NaN
+poisons everything it touches: any arithmetic with NaN gives NaN, and NaN
+is unequal to everything, including itself.
+
+The practical consequence is that compilers must not reorder
+floating-point arithmetic the way they do integer arithmetic, since the
+answer would change. Scientific code relies on the exact order. GCC's
+`-ffast-math` lifts that restriction, trading exactness for speed.
+
+#### 2.4.6 Floating Point in C
+
+C gives `float` and `double`; x86-64 runs both in SSE vector registers
+(section 3.11 of chapter 3). Conversions follow the rules above, with these in
+particular:
+
+- `int` to `float`: cannot overflow, but may round (`float` has only 24
+  bits of significand; 16777217 becomes 16777216).
+- `int` or `float` to `double`: exact, since `double` has 53 significant
+  bits and a much wider range.
+- `double` to `float`: may overflow to infinity and may round.
+- `float` or `double` to `int`: rounds toward zero (3.99 to 3, −3.99 to
+  −3). If the value is out of range or NaN, C leaves the result undefined;
+  on x86-64 the hardware gives TMin (`0x80000000`), called the **integer
+  indefinite** value.
+
+C has no standard way before C99 to get infinity, NaN or −0.0 directly;
+`<math.h>` now gives `INFINITY` and `NAN`.
+
+### Worked example
+
+The famous one first, in C and in JavaScript (both use IEEE double):
+
+```text
+$ ./fp | tail -7
+0.1+0.2 == 0.3 (double): 0, sum=0.30000000000000004
+...
+16777216f+1 = 16777216.0
+(int)3.99=3 (int)-3.99=-3 (int)1e10 = -2147483648
+rint: 1.5->2 2.5->2 -1.5->-2 0.5->0
+1/0.0=inf -1/0.0=-inf 0/0.0=-nan nan==nan 0
+(double)(float)0.1 = 0.10000000149011612
+$ node -e 'console.log(0.1+0.2, 2**53+1, Math.round(-2.5), (2.5).toFixed(0))'
+0.30000000000000004 9007199254740992 -2 3
+```
+
+0.1 and 0.2 are both rounded on input, their sum is rounded again, and the
+result is the double just above the double nearest 0.3. `2**53 + 1` in
+JavaScript gives 2 to the 53, because doubles have 53 significant bits and
+the 1 falls off, the same as 16777216 + 1 in `float`. `rint` rounds to even:
+2.5 goes to 2. JavaScript's `Math.round` is not IEEE round-to-even but
+"round half toward +∞", so −2.5 gives −2. `(int)1e10` produced the integer
+indefinite value. And `(double)(float)0.1` shows that converting through
+`float` is lossy: the extra digits are `float`'s error, made visible.
+
+Associativity, measured:
+
+```text
+$ ./assoc
+(3.14f + 1e10f) - 1e10f = 0
+3.14f + (1e10f - 1e10f) = 3.14
+harmonic 1e7 forward=15.4036827 backward=16.6860313
+```
+
+The harmonic sum 1 + 1/2 + ... + 1/10,000,000 is about 16.695. Adding
+forward, from big terms to small, the running total grows large and the
+small terms fall below its precision and are lost; adding backward, small
+terms accumulate first. Same numbers, same operation, an answer that
+differs in the first digit after the point. That is the most practical
+lesson of this section.
+
+### Step by step
+
+Encoding 0.1 as a `float`, by hand:
+
+<Trace
+  columns={["Step", "Work", "Result"]}
+  rows={[
+    ["1", "0.1 in binary", "0.0001100110011001100110011..."],
+    ["2", "normalise: move the point to after the first 1", "1.100110011001100110011001100... × 2^-4"],
+    ["3", "E = -4, so e = -4 + 127", "123 = 0111 1011"],
+    ["4", "take 23 fraction bits", "100 1100 1100 1100 1100 1100"],
+    ["5", "next bits are 1100...: above halfway, round up", "100 1100 1100 1100 1100 1101"],
+    ["6", "assemble s, exp, frac", "0 01111011 10011001100110011001101"],
+    ["7", "group in fours", "0x3DCCCCCD"],
+    ["8", "decode back", "0.100000001490116..."],
+  ]}
+  caption="Encoding 0.1. Step 5 is where the error enters: the infinite pattern is cut and rounded, so the stored float is slightly above 0.1, which the decoded value in step 8 shows."
+/>
+
+Adding with different magnitudes, in my 6-bit format, 4 + 1/4:
+
+<Flow steps={["4 = 1.00 × 2^2, 1/4 = 1.00 × 2^-2", "align exponents: 1/4 = 0.0001 × 2^2", "add significands: 1.0001 × 2^2", "only 2 fraction bits: 1.00|01, below halfway", "round to 1.00 × 2^2", "result 4: the 1/4 vanished"]} caption="Why big plus small loses the small. The smaller number's bits are shifted right to line up exponents, and the ones that fall past the fraction's width are rounded away." />
+
+### Common mistake
+
+Mistake one: comparing floats with `==`. After any arithmetic, compare with
+a tolerance that suits the magnitudes: `fabs(a - b) <= 1e-9 * fmax(fabs(a),
+fabs(b))`. Mistake two: using floats for money. Store integer cents (or a
+decimal type), because 0.1 dollars has no exact binary form and sums drift.
+Mistake three: `x != x` surprises (it is true only for NaN), and sorting
+arrays that contain NaN breaks comparison-based sorts, because NaN compares
+false with everything.
+
+### In real systems
+
+JavaScript has one number type, the IEEE double, so every lesson here is
+daily JavaScript: `Number.MAX_SAFE_INTEGER` is 2 to the 53 minus 1, and
+64-bit database IDs must travel as strings or `BigInt`. Machine learning
+uses narrower formats on purpose: 16-bit `float16` and `bfloat16` (which
+keeps `float`'s 8-bit exponent and cuts the fraction to 7 bits, trading
+precision for range). Financial systems use decimal types. Summing many
+floats in parallel (as GPUs and Spark do) gives slightly different answers
+run to run, because the order of additions changes; Kahan summation is the
+classic fix.
+
+### Check yourself
+
+1. What `float` bit pattern is −2.5?
+2. Why is the gap between consecutive floats near 1 about 1.2 × 10 to the −7, but near 1,000,000 about 0.06?
+3. What does `(float)16777217` give, and why?
+
+<details>
+<summary>Answer</summary>
+
+1. −2.5 = −1.01 × 2 to the 1. s = 1, e = 128 = `10000000`, frac = `0100...0`. Bits: `1 10000000 01000000000000000000000` = `0xC0200000`.
+2. The gap is 2 to the (E − 23). Near 1, E = 0, gap 2 to the −23. Near a million, E = 19, gap 2 to the −4 = 0.0625. Relative precision stays fixed; absolute precision shrinks with size.
+3. 16777216. 16777217 needs 25 significant bits; `float` has 24, and the exact halfway case rounds to even.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 2, Representing and Manipulating Information">
+
+<Level name="Beginner" depth={3}>
+
+The smallest version of this chapter is: a number in a computer is a row
+of bits of fixed width, and the same row means different numbers depending
+on how you read it. Read `1111 1111` as unsigned and it is 255; as signed it
+is −1. Add 1 and the row becomes `0000 0000`, which is 0 either way.
+
+My first worked example is counting in 4 bits on paper: write the sixteen
+patterns, label each with its unsigned and signed value, and then add 1 to
+the last row. The wrap from 15 to 0 (or from −1 to 0, or from 7 to −8) is
+the whole of integer overflow in one picture.
+
+The beginner mistake is thinking there is a "real" number inside and the
+bits are its disguise. There is no number inside, only bits. The fix is to
+always name the reading: "these 8 bits, as unsigned", "these 32 bits, as a
+float".
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level the pieces combine in real C. Here is a function
+that packs an RGBA colour into a 32-bit word and unpacks it, using shifts
+and masks, and prints both byte orders:
+
+```c
+uint32_t pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (uint32_t)r << 24 | (uint32_t)g << 16 | (uint32_t)b << 8 | a;
+}
+uint8_t green(uint32_t c) { return (c >> 16) & 0xFF; }
+/* pack(0x12, 0x34, 0x56, 0x78) == 0x12345678; in memory: 78 56 34 12 */
+```
+
+The casts to `uint32_t` matter: without them, `r << 24` promotes `r` to a
+signed `int`, and shifting a value with the top bit set into the sign
+position is undefined. The intermediate mistake is relying on integer
+promotion to "just work"; the fix is to cast to the unsigned width first,
+then shift.
+
+In TypeScript the same packing is `((r << 24) | (g << 16) | (b << 8) | a) >>> 0`;
+the final `>>> 0` converts the signed 32-bit result back to an unsigned
+number.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+The exact rules: unsigned arithmetic is the ring of integers modulo 2 to
+the w; two's-complement arithmetic is the same ring with a different
+choice of representatives (from −2 to the w−1 to 2 to the w−1 minus 1). That
+is why one adder and one multiplier serve both: the low w bits of sums and
+products are the same whichever reading you use. Only comparison,
+division, right shift and widening depend on the reading, which is why x86
+has both `ja`/`jg`, `div`/`idiv`, `shr`/`sar` and `movz`/`movs`.
+
+In C, the standard adds a layer the hardware does not have: signed overflow
+is undefined, so the optimiser may assume x + 1 is greater than x. That is
+what lets it turn a loop `for (int i = 0; i <= n; i++)` into a counted loop
+with a known trip count, and it is also why the overflow check I write
+afterward can be deleted.
+
+Floating point has its own exact rule: every operation returns the exact
+result rounded by the current rounding mode. Errors are therefore bounded
+per operation (half a unit in the last place for round-to-nearest), but they
+compound across operations, and the order of operations determines how.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Single boundaries, each with what happens:
+
+- **TMin.** `-INT_MIN`, `abs(INT_MIN)` and `INT_MIN / -1` are all undefined in C; on x86-64 the division actually traps with a floating-point exception signal (SIGFPE), even though it is integer division.
+- **Zero width.** Shifting by 0 is fine; shifting by 32 on a 32-bit type is undefined. In JavaScript `x << 32` is `x << 0`.
+- **Empty string.** Its only byte is the terminator, so `strlen("")` is 0 and `strlen("") - 1` as `size_t` is 18446744073709551615.
+- **Negative zero.** `-0.0 == 0.0` is true, but `1 / -0.0` is −∞ and `Object.is(-0, 0)` is false in JavaScript.
+- **NaN.** `NaN == NaN` is false; `NaN != NaN` is true; `Math.max(1, NaN)` is NaN.
+- **Largest exact integer in a double.** 2 to the 53 is exact; 2 to the 53 + 1 is not representable and rounds to 2 to the 53.
+- **Float to int out of range.** `(int)1e10` is undefined in C; x86-64 gives −2147483648.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once, or a boundary plus a side effect:
+
+- **Size and sign change in one cast.** `(unsigned)(short)-1` is 4294967295 (sign-extend first, then reinterpret), not 65535.
+- **Signed loop counter compared to unsigned length.** `for (int i = 0; i < len - 1; i++)` with `size_t len = 0`: `len - 1` wraps to the maximum, so the loop runs off the end of the array.
+- **Overflow inside a narrower type, then widening.** `int a = 100000; long b = a * a;` overflows in `int` before widening; the fix is `(long)a * a`.
+- **Denormals and speed.** Operations on denormal floats can be many times slower on some x86 processors, so an audio filter whose state decays toward zero can suddenly slow down. The fix is flushing denormals to zero (a CPU mode) or adding a tiny offset.
+- **NaN as a map key or in a sort.** `[3, NaN, 1].sort((a, b) => a - b)` gives an order that depends on the engine's algorithm, because the comparator returns NaN.
+- **Converting a large `long` to `double` and back.** 2 to the 62 + 1 becomes 2 to the 62, so a round trip through JSON numbers silently changes IDs.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production these rules decide correctness at boundaries. JSON numbers
+are parsed as doubles by default in JavaScript, so a 64-bit Twitter-style
+ID loses its low bits; APIs send them as strings for that reason. Payment
+systems store amounts as integers in the smallest currency unit, and round
+explicitly at the edges with a named rule (banker's rounding is
+round-half-to-even).
+
+Binary protocols and file formats need a fixed byte order. In Node,
+`buf.readUInt32BE(0)` and `buf.writeInt32LE(x, 0)` make the choice visible;
+forgetting it is a cross-platform bug that shows up only when a service is
+moved to a different architecture.
+
+Allocation sizes computed from untrusted input (`width * height * bytesPerPixel`)
+are a recurring security issue. Production C code uses checked arithmetic
+(`__builtin_mul_overflow`), `calloc`, and fuzzers with UBSan to find the
+rest. The mistake is trusting tests with normal inputs; the fix is to test
+at the boundaries listed above and to run sanitizers in CI.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to see the finite width behind every
+number. Before I trust a computation, I ask: what is the largest value this
+can reach, does it fit, and what happens if it does not? That habit
+transfers everywhere: timeouts stored in 32-bit milliseconds overflow after
+about 24.8 days, which has crashed real systems; a counter in a metrics
+system wraps; a percentage computed with integer division truncates to 0.
+
+The second habit is to distrust equality on floats and to think about the
+order of operations when summing. When a total looks wrong by a tiny
+amount, my first question is now "how was it rounded, and in what order?"
+
+The mindset mistake is to treat these as rare. They are rare per operation
+and certain at scale.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+At system scale, representation choices are interface choices. A concrete
+example is a ledger service. Amounts are stored as 64-bit integers of the
+smallest unit; that gives about 9.2 × 10 to the 18 units, enough for any
+real ledger. Exchange rates are stored as decimals with a fixed scale.
+Every service boundary (the REST API, the event stream, the analytics
+warehouse) passes amounts as strings or integers, never as floats, so a
+JavaScript front end cannot round them.
+
+A second example is a time-series database. It stores timestamps as
+integer nanoseconds since 1970 in 64 bits, which lasts until about the year
+2262, and it uses float64 for values but sums with compensated (Kahan)
+summation so that downsampled totals match the raw data.
+
+The design mistake is choosing a representation for convenience in one
+language and discovering the cost at the boundary with another. The fix is
+to write down the representation in the interface contract.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+To learn this chapter I work with my hands. I write `show_bytes` and run it
+on everything. I fill in a 4-bit table of patterns, unsigned values and
+signed values from memory. I decode five floats by hand, then check with a
+C program. I do the book's Data Lab, which asks for bit-level functions
+under strict operator limits; it is the best possible drill for this
+chapter.
+
+I keep a list of every rule with one example each: T2U, U2T, sign
+extension, truncation, the overflow tests, the division bias, the three
+float cases, round-to-even. I rewrite the list from memory a week later.
+
+Done when I can, without notes, convert any byte between binary, hex and
+decimal in my head, predict the output of every line of the `conv`, `arith`
+and `fp` programs on this page before running them, and encode and decode
+a `float` by hand, including a denormal.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Why did two's complement win over sign-magnitude?**
+Because one adder works for both signed and unsigned numbers, there is only
+one zero, and negation is a cheap complement and increment.
+
+**Is right shift of a negative number arithmetic in C?**
+On every mainstream compiler, yes. The C standard leaves it to the
+implementation for negative values, so portable code that needs floor
+division of negative numbers should say so explicitly.
+
+**Why is signed overflow undefined but unsigned overflow defined?**
+History: C was designed when machines used several signed encodings, and
+each would overflow differently. Unsigned arithmetic was the same
+everywhere. Compilers now use the freedom to optimise loops.
+
+**Why does JavaScript have `>>>` but no unsigned types?**
+Because bit operations convert to 32-bit signed integers, and `>>>` is the
+one operator that converts the result as unsigned, which is enough for
+hashing and bit tricks.
+
+**How many decimal digits does a double hold?**
+About 15 to 17 significant digits: 53 bits times log10(2) is about 15.95.
+
+**Should I ever use `float` instead of `double`?**
+When memory or bandwidth matters more than precision: large arrays,
+graphics, machine learning. For general arithmetic, `double`.
+
+## Key takeaways
+
+- Memory is an array of bytes; every object is a run of them, and byte order decides which end comes first.
+- Hex is four bits per digit, the natural notation for bit patterns.
+- Bitwise operators work on each bit; logical operators treat whole values as true or false and short-circuit.
+- Unsigned and two's complement read the same bits with the top bit worth +2 to the w−1 or −2 to the w−1.
+- C converts signed to unsigned when they meet, which makes comparisons such as `-1 < 0u` false.
+- Widening sign-extends signed values and zero-extends unsigned ones; narrowing drops high bits.
+- Integer arithmetic is modulo 2 to the w; signed overflow in C is undefined, so check before it happens.
+- Compilers turn multiplication and division by constants into shifts and adds, with a bias for negative division.
+- IEEE floats are sign, exponent and fraction, with normalized, denormalized and special cases.
+- Every float operation rounds, so floating-point addition is not associative and order matters.
+
+## Glossary
+
+- **Byte:** eight bits, the smallest addressable unit.
+- **Hexadecimal:** base 16; one digit per four bits.
+- **Word size:** the nominal width of pointers and integer registers; 64 bits on x86-64.
+- **Little-endian, big-endian:** least or most significant byte at the lowest address.
+- **Null terminator:** the zero byte that ends a C string.
+- **Bit vector:** a fixed-width string of bits, often used as a set.
+- **Mask:** a bit pattern used with `&` or `|` to select or set bits.
+- **Short-circuit evaluation:** not evaluating the second operand of `&&` or `||` when the first decides the result.
+- **Logical, arithmetic right shift:** filling with zeros, or with copies of the sign bit.
+- **Unsigned encoding (B2U):** each bit i weighs 2 to the i.
+- **Two's complement (B2T):** the top bit weighs −2 to the w−1.
+- **TMin, TMax, UMax:** the smallest and largest signed values, and the largest unsigned value.
+- **Sign extension, zero extension:** widening by copying the sign bit, or by adding zeros.
+- **Truncation:** narrowing by dropping high bits.
+- **Overflow:** a result that does not fit in w bits, so it wraps.
+- **Undefined behaviour:** a case the C standard leaves unconstrained, which compilers may assume never happens.
+- **Bias (division):** the 2 to the k minus 1 added before an arithmetic shift so negative quotients round toward zero.
+- **Binary point:** the binary equivalent of the decimal point.
+- **IEEE 754:** the floating-point standard.
+- **Sign, exponent field, fraction field, significand:** the three stored fields and the value M they encode.
+- **Bias (exponent):** 2 to the k−1 minus 1, subtracted from the exponent field.
+- **Normalized, denormalized, special values:** the three cases chosen by the exponent field.
+- **Implied leading 1:** the unstored 1 in front of a normalized fraction.
+- **Gradual underflow:** the evenly spaced denormals between zero and the smallest normal.
+- **NaN:** not a number, the result of invalid operations.
+- **Round-to-even:** the default rounding, choosing the even neighbour on ties.
+- **Integer indefinite:** TMin, the value x86-64 gives for an out-of-range float-to-int conversion.
+
+## Exercises and self-check
+
+**Warm-up**
+
+1. Convert 0xDEADBEEF to binary and to decimal, by hand.
+2. In 5-bit two's complement, list TMin, TMax and the patterns of −1 and −16.
+3. Decode the `float` bit pattern `0x41200000` by hand.
+
+**Build**
+
+4. Write `int is_little_endian(void)` without any library call, and test it.
+5. Write `int sat_add(int a, int b)` that returns `INT_MAX` or `INT_MIN` on overflow instead of wrapping, without undefined behaviour, and test it at the four corners.
+6. Write a program that prints every positive value of an 8-bit IEEE-style format with k = 4 and n = 3, and marks the largest denormal and smallest normal.
+7. In TypeScript, write `float32Bits(x: number): string` using a `DataView` that returns the sign, exponent and fraction fields of `Math.fround(x)`.
+
+**Stretch**
+
+8. Implement `float_twice(unsigned uf)` that computes the bit pattern of 2 × f for the float with bits `uf`, using only integer operations, and handle denormals, infinity and NaN.
+9. Sum the first ten million terms of the harmonic series in `float` forward, backward and with Kahan summation, and explain the three results.
+
+**Self-check**
+
+<details>
+<summary>1. What does 0x00FF & 0x0F0F give?</summary>
+
+`0x000F`.
+
+</details>
+
+<details>
+<summary>2. What is the 8-bit two's-complement pattern of -1, and its unsigned value?</summary>
+
+`1111 1111`, which is 255 unsigned.
+
+</details>
+
+<details>
+<summary>3. Why is -1 less than 0u false in C?</summary>
+
+The signed −1 is converted to unsigned, becoming 4294967295, which is greater than 0.
+
+</details>
+
+<details>
+<summary>4. How do you detect unsigned addition overflow?</summary>
+
+The sum is less than either operand: `s < x`.
+
+</details>
+
+<details>
+<summary>5. What instruction sequence computes x / 4 for signed x without a divide?</summary>
+
+Add 3 if x is negative, then shift right arithmetically by 2.
+
+</details>
+
+<details>
+<summary>6. What are E and M for a denormal float?</summary>
+
+E = 1 − 127 = −126 and M = f, the fraction with no implied leading 1.
+
+</details>
+
+<details>
+<summary>7. Round 1.0110 to one bit after the point, using round-to-even.</summary>
+
+The remaining bits `110` are above halfway, so round up to 1.1. (1.0100 would be exactly halfway and stay at 1.0, the even choice.)
+
+</details>
+
+<details>
+<summary>8. Why can the compiler not change (a + b) + c to a + (b + c) for doubles?</summary>
+
+Because floating-point addition is not associative; the result can differ, as the 3.14 and 1e10 example shows.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter is week 24 of
+<a href={withBase('/plans/traditional-software-developer/#strategy-5')}>phase
+5 of the traditional core</a>, together with chapter 1, and it is the
+reading for the Data Lab. I would give it five sessions and not hurry.
+
+<Timeline caption="Five sessions for chapter 2. Each ends with code I wrote and outputs I predicted before running." items={[
+  { when: "Session 1", what: "2.1: hex drills until conversions are automatic; write show_bytes and run it on ints, floats, pointers and strings; bit operations and masks." },
+  { when: "Session 2", what: "2.2: build the 4-bit table from memory; write the conv program and predict every line; the signed and unsigned comparison traps." },
+  { when: "Session 3", what: "2.3: overflow rules and checks; read gcc -O2 output for multiply and divide by constants; the undefined-behaviour demo with -fwrapv and UBSan." },
+  { when: "Session 4", what: "2.4: encode and decode floats by hand; build the tiny-format table; rounding to even; associativity and the harmonic sum." },
+  { when: "Session 5", what: "Data Lab, or my own version: bit puzzles under operator limits. Redo the self-check without looking." },
+]} />
+
+I do the practice problems inside each section as I go, since their
+answers are at the chapter's end and correct me immediately. I keep one C
+file per section and a small TypeScript file that repeats the same
+experiments with `DataView`, `>>>` and `Math.fround`, because seeing the
+same rule in both languages fixes it in memory.
+
+Done when I can predict every output on this page before running it, pass
+the Data Lab puzzles, and explain to someone else, at a whiteboard, why
+`0.1 + 0.2` is not `0.3` and why `-1 < 0u` is false.
