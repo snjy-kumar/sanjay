@@ -1,0 +1,851 @@
+---
+title: "Design tokens before components"
+series: "ui"
+seriesOrder: 2
+undated: true
+readTime: "about 30 min"
+description: "Why named design decisions come before any component: primitive, semantic and component tokens, CSS custom properties, theming, an alias resolver and a lint for hard-coded values."
+tags: ['design-systems', 'architecture']
+related: ['ui/01']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+Every interface is built from a few hundred small decisions: this grey for
+secondary text, this much space between a label and its field, this radius on
+a card. When those decisions live as raw values scattered through CSS, a
+change to one of them is a search-and-replace across the codebase, and the
+search always misses something. A design token is a decision with a name.
+This note is about why tokens come before components, how to layer them, and
+how to keep them honest with two small scripts.
+
+## Before you start
+
+After this note you will be able to:
+
+- say what a design token is, and what it is not;
+- split tokens into primitive, semantic and component tiers, and say which
+  tier a component should read from;
+- ship tokens as CSS custom properties and theme a page by overriding a few
+  of them;
+- write a resolver that turns aliases into values, and catches cycles and
+  missing names;
+- write a lint that flags hard-coded colours and sizes that should be tokens.
+
+What you should already know: CSS selectors and custom properties
+(`--name: value` and `var(--name)`), and JavaScript objects. The
+[first note in this series](/sanjay/posts/ui/01/) is about structure; this
+one is about the values that style it.
+
+Reading time: about 30 minutes, plus ten if you run the scripts.
+
+## Note map
+
+<Flow steps={[
+  "Raw values scattered through CSS",
+  "Primitive tokens: every value the palette allows, named",
+  "Semantic tokens: what each value is for",
+  "Component tokens: the few a component needs",
+  "Output: CSS custom properties, one source, checked by a lint",
+]} caption="From scattered values to a token system. Each tier narrows the choice: many primitives, fewer semantic roles, a handful per component." />
+
+## What a token is
+
+### In one sentence
+
+A design token is a named design decision, such as "the colour of muted
+text", stored once and referenced everywhere instead of the raw value.
+
+### The idea
+
+Start with the problem. A product's CSS says `#6b6b6b` in forty places.
+Thirty of them mean "secondary text". Six mean "a border". Four are a
+coincidence: someone picked a grey that happened to match. When the design
+changes secondary text to a darker grey for contrast, nobody can tell which
+forty of the `#6b6b6b` values to change. The value has lost its *meaning*.
+
+A token puts the meaning back. Instead of `#6b6b6b`, the CSS says
+`var(--color-muted)`. The value is defined once. Changing secondary text is
+now a one-line change, and the borders, which use `var(--color-border)`,
+stay put even though they had the same grey.
+
+So a token is not "a variable for a colour". It is a **decision with a
+name**, and the name says what the decision is for. Two tokens can have the
+same value today and different values tomorrow, which is precisely why they
+are two tokens.
+
+Tokens cover more than colour: spacing, font families, font sizes, line
+heights, radii, shadows, border widths, durations, easing curves, breakpoints
+and z-index layers. Anything a designer decides once and wants applied
+consistently is a candidate.
+
+Why do tokens come **before** components? Because a component is a bundle of
+decisions. A button is a colour, a padding, a radius, a font size and a focus
+ring. If the button is built first with raw values, every later component
+re-decides the same things slightly differently, and the inconsistency is
+baked in. If the tokens exist first, every component draws from the same
+small set, and consistency is the default.
+
+### Worked example
+
+The simple example is one value with one meaning:
+
+```css
+/* before: a raw value with an unstated meaning */
+.note-meta { color: #6b6b6b; }
+.card-date { color: #6b6b6b; }
+.divider   { border-color: #6b6b6b; }
+
+/* after: two decisions, named */
+:root {
+  --color-muted: #6b6b6b;
+  --color-border: #6b6b6b;
+}
+.note-meta { color: var(--color-muted); }
+.card-date { color: var(--color-muted); }
+.divider   { border-color: var(--color-border); }
+```
+
+The two tokens have the same value, and that is fine. When the muted text
+needs more contrast, `--color-muted` changes and the divider does not.
+
+The realistic example is this site. It is monochrome: ink, text, muted and
+line colours, IBM Plex fonts, and one layout. The stylesheet defines those
+as custom properties (`--ink`, `--muted`, `--line`, `--code-bg`) and the
+components read them. That is a token system, even though nobody called it
+one. The diagram components in these notes use `var(--line)` and
+`var(--muted)` rather than raw greys, which is why they match the rest of
+the site without anyone checking by eye.
+
+### Step by step
+
+What happens when a design change lands, with and without tokens:
+
+<Trace
+  columns={["step", "without tokens", "with tokens"]}
+  rows={[
+    ["1. the change", "secondary text gets darker", "secondary text gets darker"],
+    ["2. find usages", "search for #6b6b6b: 40 hits", "open the token file: 1 line"],
+    ["3. decide each hit", "read 40 contexts, guess the meaning", "nothing to decide"],
+    ["4. edit", "change 30, hopefully the right 30", "change --color-muted"],
+    ["5. review", "a 30-file diff", "a 1-line diff"],
+    ["6. what was missed", "the 4 coincidences, or 2 real ones", "nothing: borders have their own token"],
+  ]}
+  caption="One design change, two codebases. The token version moves the decision about meaning to the moment the value was first used, when it was cheap."
+/>
+
+### Common mistake
+
+The common mistake is naming tokens after their value: `--gray-6b`,
+`--blue-light`, `--sixteen`. These are aliases for the raw value. They save
+typing but carry no meaning, so the original problem comes back. When the
+grey changes, `--gray-6b` either lies about its value or gets renamed
+everywhere.
+
+The fix is to name by **role** where a role exists (`--color-muted`,
+`--space-stack`, `--radius-control`) and keep value-like names only for the
+bottom tier of the palette, which the next section covers.
+
+### In real systems
+
+In real products the token file is often the contract between design and
+engineering. Design tools can export tokens as JSON, and a build step turns
+the JSON into CSS custom properties, platform constants for mobile, or
+TypeScript types. The Design Tokens Community Group has a shared JSON format
+(each token is an object with a `$value` and a `$type`), and tools such as
+Style Dictionary transform one source into many outputs.
+
+Even without tooling, a single CSS file of custom properties is a token
+system. Start there, and add a JSON source only when a second platform needs
+the same values.
+
+### Check yourself
+
+<details>
+<summary>1. Two tokens have the same value. Should they be merged?</summary>
+
+Not if they mean different things. `--color-muted` and `--color-border` can
+share a grey today and diverge tomorrow. Merge tokens only when they are the
+same decision.
+
+</details>
+
+<details>
+<summary>2. Why is --gray-6b a weak token name for secondary text?</summary>
+
+It names the value, not the role. When secondary text changes colour, the
+name either lies or has to change everywhere it is used, which is the
+problem tokens were meant to solve.
+
+</details>
+
+## Three tiers: primitive, semantic, component
+
+### In one sentence
+
+Primitive tokens list every value the design allows, semantic tokens say
+what each value is for, and component tokens give one component the few
+semantic choices it needs.
+
+### The idea
+
+One flat list of tokens grows into hundreds of names quickly, and it mixes
+two different questions: "which greys exist?" and "which grey is muted
+text?". Splitting the list into tiers keeps the questions apart.
+
+- **Primitive tokens** (also called base, core or global tokens) are the
+  palette: `gray.50` to `gray.900`, `space.1` to `space.12`, `font.size.1`
+  to `font.size.7`. They are named by position on a scale, and they are the
+  only place raw values live.
+- **Semantic tokens** (also called alias or decision tokens) point at
+  primitives and are named by role: `color.text`, `color.muted`,
+  `color.surface`, `color.border`, `space.stack`, `space.inset`. They are
+  what most CSS should use.
+- **Component tokens** point at semantic tokens and belong to one
+  component: `button.bg`, `button.fg`, `button.padding`. They exist so a
+  component can be adjusted without touching the meaning of
+  `color.text` everywhere.
+
+The rule that makes the tiers work: **each tier only points at the tier
+below it**. Components read component or semantic tokens, never primitives.
+Semantic tokens point at primitives. Primitives hold values.
+
+<Layers layers={[
+  { name: "component: button.bg, button.fg, button.padding", note: "one component's choices" },
+  { name: "semantic: color.text, color.surface, space.inset", note: "what a value is for" },
+  { name: "primitive: gray.50 ... gray.900, space.1 ... space.12", note: "every value allowed" },
+  { name: "raw values: #111111, #f7f7f5, 8px", note: "only primitives hold these" },
+]} caption="The token tiers as a stack. Each layer points only at the layer below. A component that skips to a primitive has hard-coded a decision the semantic layer was meant to own." />
+
+The tiers pay off when something changes. A rebrand changes primitives. A
+contrast fix changes which primitive a semantic token points at. A
+component tweak changes one component token. Each change has exactly one
+place to happen.
+
+### Worked example
+
+The simple example is the three tiers for one button, written as an object
+with aliases in braces:
+
+```js
+const tokens = {
+  gray:   { 50: '#f7f7f5', 500: '#6b6b6b', 900: '#111111' },
+  space:  { 1: '4px', 2: '8px', 4: '16px' },
+  color:  { text: '{gray.900}', muted: '{gray.500}', surface: '{gray.50}' },
+  button: { fg: '{color.surface}', bg: '{color.text}', padding: '{space.2}' },
+};
+```
+
+`button.bg` points at `color.text`, which points at `gray.900`, which is
+`#111111`. A reader of the button's CSS sees "the button's background is
+the text colour", which is a design statement, not a hex code.
+
+The realistic example is a dark theme. In the tiered system, a dark theme
+is a second mapping of the **semantic** tier: `color.text` points at
+`gray.50` and `color.surface` at `gray.900`. The primitives do not change,
+and the components do not change. A good test of a token system is how many
+lines a new theme takes; with clean tiers, it is roughly the number of
+semantic colour tokens.
+
+### Step by step
+
+Resolving `button.bg` through the tiers, one hop at a time:
+
+<Trace
+  columns={["hop", "token", "its value", "is it an alias?"]}
+  rows={[
+    ["1", "button.bg", "{color.text}", "yes: follow it"],
+    ["2", "color.text", "{gray.900}", "yes: follow it"],
+    ["3", "gray.900", "#111111", "no: this is the answer"],
+  ]}
+  caption="Resolving one component token. Every hop moves down one tier, and the chain ends at a primitive holding a raw value."
+/>
+
+### Common mistake
+
+The common mistake is the **skip**: a component reads a primitive directly,
+`background: var(--gray-900)`. It works on day one. Then the dark theme
+remaps `color.text`, and this one component stays dark-on-dark, because it
+never went through the semantic layer.
+
+The second mistake is the opposite, **too many component tokens**: every
+property of every component gets its own token, and the token file becomes
+a second copy of the CSS. Component tokens are worth it for values a theme
+or a variant might change; a fixed `display: flex` does not need one.
+
+### In real systems
+
+Large design systems publish all three tiers but document only the semantic
+tier for everyday use. The primitives are an implementation detail of the
+palette, and the component tokens are an implementation detail of the
+component. Product engineers learn the twenty to forty semantic names and
+rarely need anything else.
+
+Linting enforces the tiers. A rule that forbids primitive names in
+component CSS (anything matching `--gray-` or `--space-` followed by a
+number) catches the skip at review time instead of at the first theme.
+
+### Check yourself
+
+<details>
+<summary>1. A new dark theme changes which tier?</summary>
+
+The semantic tier: `color.text`, `color.surface` and friends point at
+different primitives. Primitives and components stay the same.
+
+</details>
+
+<details>
+<summary>2. Why should a component not read gray.900 directly?</summary>
+
+Because it skips the semantic decision. When a theme remaps `color.text`,
+the component does not follow, and it ends up wrong in that theme.
+
+</details>
+
+## Tokens as CSS custom properties
+
+### In one sentence
+
+On the web, tokens are usually shipped as CSS custom properties, which
+cascade and inherit like any other property, so a theme is a few overrides
+on the right element.
+
+### The idea
+
+A CSS custom property is a property whose name starts with two dashes.
+Declared on `:root` (the `html` element), it is inherited by every element,
+and `var(--name)` reads it. Unlike a preprocessor variable, it exists at
+runtime: change it, and every element that reads it updates, with no new
+CSS shipped.
+
+That makes custom properties a natural home for tokens, with one decision to
+make: should an alias be **resolved** to its final value at build time, or
+kept as a **reference** with `var()`?
+
+- **Resolved**: `--button-bg: #111111`. Simple, and the value is visible in
+  dev tools. But overriding `--color-text` later does nothing to the
+  button, because the link between them was cut at build time.
+- **Referenced**: `--button-bg: var(--color-text)`. Overriding
+  `--color-text` flows through to the button. This is what theming needs.
+
+There is one rule of custom properties that surprises almost everyone, and
+it matters for theming. A `var()` inside a custom property is substituted
+**on the element where that property is declared**, and the result is what
+children inherit. So `--button-bg: var(--color-text)` declared on `:root`
+becomes `#111111` at `:root`, and every descendant inherits `#111111`, not
+the reference. Overriding `--color-text` on a `section` lower down does not
+reach `--button-bg`, because that was already computed above.
+
+### Worked example
+
+The simple example is a resolver that flattens the token object, follows
+aliases, and emits resolved CSS:
+
+```js
+// tokens.mjs
+export function flatten(tree, prefix = []) {
+  const out = {};
+  for (const [key, value] of Object.entries(tree)) {
+    const path = [...prefix, key];
+    if (typeof value === 'object') Object.assign(out, flatten(value, path));
+    else out[path.join('.')] = value;
+  }
+  return out;
+}
+
+export function resolve(flat) {
+  const done = {};
+  const visit = (name, chain) => {
+    if (name in done) return done[name];
+    if (chain.includes(name)) throw new Error(`cycle: ${[...chain, name].join(' -> ')}`);
+    const raw = flat[name];
+    if (raw === undefined) throw new Error(`unknown token "${name}" (from ${chain.at(-1)})`);
+    const ref = String(raw).match(/^\{(.+)\}$/);
+    done[name] = ref ? visit(ref[1], [...chain, name]) : raw;
+    return done[name];
+  };
+  for (const name of Object.keys(flat)) visit(name, []);
+  return done;
+}
+```
+
+A third small function, `toCss`, writes each resolved token as a line
+`--name: value;` inside `:root`. Run on the token object from the previous
+section, it prints:
+
+```text
+:root {
+  --gray-50: #f7f7f5;
+  --gray-500: #6b6b6b;
+  --gray-900: #111111;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-4: 16px;
+  --color-text: #111111;
+  --color-muted: #6b6b6b;
+  --color-surface: #f7f7f5;
+  --button-fg: #f7f7f5;
+  --button-bg: #111111;
+  --button-padding: 8px;
+}
+```
+
+The resolver also guards the two ways a token file goes wrong. Fed a cycle
+and then a missing name, it prints:
+
+```text
+cycle: color.text -> color.ink -> color.text
+unknown token "color.brand" (from button.bg)
+```
+
+Both messages name the chain, so the fix is obvious from the error alone.
+
+The realistic example keeps references instead, so themes work. A variant
+emitter writes `var()` for aliases:
+
+```js
+// refs.mjs
+export const toCssRefs = (flat, selector = ':root') =>
+  `${selector} {\n${Object.entries(flat).map(([name, value]) => {
+    const ref = String(value).match(/^\{(.+)\}$/);
+    const css = ref ? `var(--${ref[1].replaceAll('.', '-')})` : value;
+    return `  --${name.replaceAll('.', '-')}: ${css};`;
+  }).join('\n')}\n}`;
+```
+
+Its output for a light root and a dark override:
+
+```text
+:root {
+  --gray-50: #f7f7f5;
+  --gray-900: #111111;
+  --color-text: var(--gray-900);
+  --color-surface: var(--gray-50);
+  --button-bg: var(--color-text);
+  --button-fg: var(--color-surface);
+}
+[data-theme="dark"] {
+  --color-text: var(--gray-50);
+  --color-surface: var(--gray-900);
+}
+```
+
+With `data-theme="dark"` on the `html` element itself, both rules match the
+same element, so `--button-bg` is computed there after the override and the
+button flips. That is the setup to use.
+
+### Step by step
+
+Why the placement of `data-theme` matters, traced through the cascade:
+
+<Trace
+  columns={["where data-theme sits", "element", "--color-text", "--button-bg computed as"]}
+  rows={[
+    ["on html", "html", "gray-50 (dark wins)", "var(--color-text) = gray-50"],
+    ["on html", "button inside body", "inherited gray-50", "inherited gray-50: flips"],
+    ["on a section", "html", "gray-900", "var(--color-text) = gray-900"],
+    ["on a section", "the section", "gray-50 (override)", "inherited gray-900: computed above"],
+    ["on a section", "button inside it", "inherited gray-50", "inherited gray-900: does not flip"],
+  ]}
+  caption="Custom properties inherit computed values. A component token declared on :root is computed at :root, so a theme applied lower down must re-declare the component tokens there too, or the component will not follow."
+/>
+
+### Common mistake
+
+The common mistake is a "dark section" built by overriding semantic tokens
+on a nested element, followed by confusion about why some components
+follow and some do not. The ones that read `--color-text` directly follow;
+the ones that read `--button-bg`, computed at the root, do not.
+
+There are two fixes. Apply themes on the root element only, which covers
+whole-page themes. Or, for nested themes, re-declare component tokens at the
+theme selector too, or declare component tokens on the component's own
+selector (`.button { --button-bg: var(--color-text); }`), so they are
+computed where the component is and pick up the nearest override.
+
+### In real systems
+
+Real token pipelines usually emit both forms: resolved values for platforms
+without a cascade (iOS, Android, email templates) and references for the
+web. They also emit a theme file per theme, so a page loads the base tokens
+and swaps one attribute to change theme.
+
+Custom properties also give a cheap path to user preferences. A media query
+for `prefers-color-scheme: dark` can set the dark semantic mapping on
+`:root`, and an explicit `data-theme` attribute can override it when the
+user picks a theme by hand.
+
+### Check yourself
+
+<details>
+<summary>1. Why does a resolved --button-bg ignore a later override of --color-text?</summary>
+
+Because resolving cut the link: `--button-bg` holds a raw value, not a
+reference, so nothing about `--color-text` affects it any more.
+
+</details>
+
+<details>
+<summary>2. Where should data-theme go for a whole-page theme, and why?</summary>
+
+On the `html` element, the same element `:root` matches, so the semantic
+override and the component tokens that reference it are computed on the
+same element and the components follow.
+
+</details>
+
+## Keeping tokens honest: one source and a lint
+
+### In one sentence
+
+A token system only works if values come from it, so the last step is a
+check that flags raw values in CSS that should have been tokens.
+
+### The idea
+
+Tokens decay the same way structure does. A deadline arrives, someone types
+`padding: 16px` because they know `--space-4` is 16px, and now that padding
+will not move when the spacing scale changes. Nobody sees it, because the
+page looks identical.
+
+A lint catches it. The simplest one scans stylesheets for raw colours and
+pixel sizes outside token definitions and reports each one with its line.
+It does not need to understand CSS deeply. A few values are legitimately
+raw, such as `0` and a `1px` hairline border, so the lint takes an
+allow-list.
+
+### Worked example
+
+```js
+// lint-hardcoded.mjs
+export function lint(css, allowed = new Set(['0', '1px'])) {
+  const problems = [];
+  css.split('\n').forEach((line, index) => {
+    if (line.trim().startsWith('--')) return; // token definitions themselves
+    for (const m of line.matchAll(/#[0-9a-f]{3,8}\b|\b\d+px\b/gi)) {
+      if (!allowed.has(m[0])) problems.push(`line ${index + 1}: ${m[0]} in "${line.trim()}"`);
+    }
+  });
+  return problems;
+}
+```
+
+Run on a card rule that mixes tokens and raw values, it prints:
+
+```text
+line 3: #fafafa in "background: #fafafa;"
+line 4: 16px in "padding: 16px;"
+```
+
+The `1px` border passes, because it is on the allow-list, and the token
+reads pass, because `var()` contains no raw value.
+
+<Compare left="Hard-coded" right="Tokenised" caption="The same card rule before and after the lint. The right column changes when the design changes; the left column has to be found first." rows={[
+  ["background: #fafafa", "background: var(--color-surface)"],
+  ["padding: 16px", "padding: var(--space-4)"],
+  ["border: 1px solid #6b6b6b", "border: 1px solid var(--color-border)"],
+  ["font-size: 13px", "font-size: var(--font-size-small)"],
+]} />
+
+### Step by step
+
+How the lint treats each line of the card rule:
+
+<Trace
+  columns={["line", "content", "matches", "reported?"]}
+  rows={[
+    ["1", ".card {", "none", "no"],
+    ["2", "color: var(--color-text);", "none", "no"],
+    ["3", "background: #fafafa;", "#fafafa", "yes"],
+    ["4", "padding: 16px;", "16px", "yes"],
+    ["5", "border: 1px solid var(--gray-500);", "1px", "no: allowed"],
+    ["6", "gap: var(--space-2);", "none", "no"],
+  ]}
+  caption="The lint, line by line. Line 5 passes the raw-value rule, but it reads a primitive token directly: a second rule that forbids --gray- names outside the token file would catch that skip."
+/>
+
+### Common mistake
+
+The common mistake is a lint so strict that people disable it. Flagging
+every number, including `z-index: 1`, `flex: 1` and `line-height: 1.5`,
+produces noise, and noise gets ignored. The fix is to start with the two
+categories that matter most, colours and spacing, run the lint as a warning
+for a week to see the real hits, then make it an error.
+
+### In real systems
+
+Production setups use Stylelint with rules that disallow raw colours and
+restrict units, plus a custom rule for primitive names. The token source is
+JSON, the build emits CSS, TypeScript and platform files, and the CI job
+fails when the emitted files are out of date with the source. Tokens are
+versioned like code: renaming a semantic token is a breaking change for
+every component that reads it, which the last note in this series covers.
+
+### Check yourself
+
+<details>
+<summary>1. Why does the lint skip lines that start with --?</summary>
+
+Those are the token definitions, where raw values belong. Flagging them
+would flag the token file itself.
+
+</details>
+
+<details>
+<summary>2. The lint passes border: 1px solid var(--gray-500). What is still wrong?</summary>
+
+It reads a primitive directly, skipping the semantic tier. A theme that
+remaps the border colour will not reach it. It should read
+`var(--color-border)`.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Design tokens before components">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, a token is a CSS custom property with a meaningful
+name. Before styling anything, write the handful of values the page uses:
+text colour, muted colour, background, border, two or three spacing steps,
+one radius, one font. Then write every rule using `var()`.
+
+A worked example: a small personal site. The `:root` block has eight custom
+properties. The header, the article and the footer read only those. When
+the background colour changes, one line changes, and the whole site follows.
+
+The mistake at this level is defining tokens and then not using them, so the
+token block sits at the top of the file while rules below repeat the raw
+values. The fix is to search the stylesheet for `#` and `px` after writing
+it, and replace every match that is not a token definition.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level you split tokens into tiers. Primitives describe
+the palette, semantic tokens describe roles, and components read semantic
+tokens. You keep the semantic list short enough to remember: twenty to
+forty names covers most products.
+
+A worked example is adding a "danger" style for a delete button. Without
+tiers, someone picks a red and hard-codes it. With tiers, there is a
+primitive `red.600`, a semantic `color.danger` pointing at it, and the
+button's danger variant reads `color.danger`. The next danger state, an
+error message, reuses `color.danger` and is the same red automatically.
+
+The mistake at this level is semantic names that are secretly visual, such
+as `color.dark-text`. When the theme flips, dark text is light, and the name
+lies. Name by role (`color.text`) and let the theme decide the shade.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level you know how custom properties behave exactly. They
+are inherited. `var()` is substituted at computed-value time on the element
+where the property is declared, and children inherit the computed result.
+An invalid substitution makes the property "invalid at computed-value
+time", which falls back to the inherited or initial value, not to the
+previous declaration in the cascade.
+
+A worked example of that last rule: `color: var(--color-txt)`, with a typo,
+does not keep the colour from an earlier rule. It becomes the inherited
+colour, often black, with no error in the console. A fallback,
+`var(--color-txt, var(--color-text))`, or a lint that checks every `var()`
+name against the token list, catches it.
+
+The mistake at this level is relying on `@property` registration everywhere.
+Registering a custom property with a syntax lets it animate and gives it a
+type, but a registered property with `inherits: false` stops theme overrides
+from flowing down. Register only the properties that need it.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries:
+
+- **A token with no value.** `--space-4:` with nothing after it is a valid
+  declaration with an empty value in many cases, and every `var(--space-4)`
+  becomes empty, so `padding: var(--space-4)` is invalid and falls back.
+  The resolver should reject empty values.
+- **An alias to itself.** `color.text: {color.text}` is a cycle of length
+  one. The resolver's chain check catches it on the first hop.
+- **A primitive scale with a gap.** `space.1`, `space.2`, `space.4`, with no
+  `space.3`, is deliberate in many systems, but someone will write
+  `var(--space-3)` and get nothing. Document the scale, and lint `var()`
+  names.
+- **A percentage or `calc()` value.** `--gutter: calc(var(--space-4) * 2)`
+  is fine, but a resolver that only understands whole-value aliases will
+  pass it through unresolved, which is the right behaviour for CSS and the
+  wrong one for a native platform. Mark such tokens as web-only.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **A nested theme plus a component token on the root.** As traced above,
+  a dark section inside a light page does not flip components whose tokens
+  were computed on `:root`. Declare component tokens on the component's
+  selector so they compute where the component is.
+- **A user preference plus an explicit choice.** The page follows
+  `prefers-color-scheme` by default, and the user also picks "light" by
+  hand. The explicit attribute must win, so its selector needs equal or
+  higher specificity and must come later than the media query rule.
+- **A rename plus a cached stylesheet.** `--color-muted` is renamed to
+  `--color-subtle` in a release, but some pages still load an older cached
+  component stylesheet that reads the old name. Those components lose their
+  colour silently. Ship the old name as an alias for one release.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, tokens are a shared dependency, and they need the same care
+as one. They live in one source, usually JSON, with a build that emits CSS
+and any other platform's format. The emitted files are either generated in
+CI and published as a package, or committed and checked for freshness.
+
+Three checks earn their place: the resolver (no cycles, no missing names),
+the lint (no raw colours or spacing in component CSS, no primitive names
+outside the token package), and a visual regression run on a few key pages,
+because a token change is by definition a change that affects many screens
+at once.
+
+The mistake in production is changing a semantic token's value as a "small
+fix" with no review, because it is one line. That one line repaints every
+screen. Treat a semantic value change like a dependency upgrade: a review,
+screenshots of the affected components, and a changelog entry.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset this note teaches is to **name a decision at the moment it is
+made**. The cost of naming is lowest when the decision is fresh: I know why
+this grey is this grey right now. A month later nobody knows, and the value
+has to be reverse-engineered from its usages.
+
+That habit applies far beyond CSS. A magic number in code (`if (retries >
+3)`) is a raw value with a hidden meaning; a named constant
+(`MAX_RETRIES`) is a token. A timeout, a page size, a price threshold, a
+feature flag: each is a decision that deserves a name and one home.
+
+The mistake in mindset is thinking tokens are a design-team concern. They
+are an engineering concern too: they are how a codebase stays changeable.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, tokens are the bottom layer of the UI architecture,
+and everything above depends on them. The dependency arrow points one way:
+tokens know nothing about components, components know tokens, pages know
+components.
+
+A concrete system: a product with a web app, a marketing site and a mobile
+app. One token repository holds JSON. A build publishes a CSS package for
+the web app and the marketing site, and a native package for the mobile
+app. Each product pins a version. A rebrand is a new major version of the
+token package, adopted by each product on its own schedule.
+
+The mistake at this level is letting each product keep its own copy of the
+values, synced by hand. They drift within weeks. The fix is one source and
+generated outputs, with the version as the contract.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+How I learn this and how I know I have. I start by extracting tokens from a
+site I already have: list every colour, spacing value and font size in the
+stylesheet, group them, and name the groups by role. The extraction teaches
+more than designing from scratch, because it shows how many near-duplicates
+creep in.
+
+Then I build the two scripts in this note: the resolver with its cycle and
+missing-name errors, and the lint. I wire the lint into the build as a
+warning, read a week of hits, and then make it an error. Finally I add a
+dark theme by remapping only the semantic tier, and count the lines it
+takes.
+
+Done when: my site's component CSS has no raw colours or spacing, a dark
+theme is under thirty lines of semantic overrides, and the resolver and
+lint run on every build.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Do I need a tool like Style Dictionary to have tokens?** No. A block of
+custom properties in one CSS file is a token system. A tool helps when one
+source has to produce output for more than one platform.
+
+**How many tokens is too many?** When product engineers cannot remember the
+semantic names, there are too many. Keep the semantic tier small; the
+primitive tier can be larger because only the token file reads it.
+
+**Should spacing tokens be named by size or by role?** Both have a place.
+A spacing scale (`space.1` to `space.12`) is a primitive tier; role names
+(`space.inset`, `space.stack`) are semantic. Many teams use the scale
+directly for spacing and roles only for colour, which is a reasonable
+compromise.
+
+**Are Tailwind classes tokens?** Tailwind's theme is a token system, and its
+utility classes read from it. The same tiering advice applies: configure the
+theme with semantic names so classes say `text-muted` rather than
+`text-gray-500`.
+
+**What about tokens in JavaScript?** Export the resolved values as a typed
+module for code that needs them, such as a chart library. Read CSS custom
+properties at runtime only when a value must follow the current theme.
+
+## Key takeaways
+
+- A design token is a named decision, and the name should say what the
+  value is for.
+- Two tokens with the same value are still two tokens if they mean
+  different things.
+- Primitives hold raw values, semantic tokens name roles, component tokens
+  serve one component; each tier points only at the tier below.
+- Ship tokens as CSS custom properties, and keep aliases as `var()`
+  references when themes must flow through.
+- Custom properties inherit computed values, so put whole-page themes on the
+  root element.
+- A resolver catches cycles and missing names; a lint catches raw values
+  that should be tokens.
+
+## Glossary
+
+- **Design token**: a named design decision stored once and referenced
+  everywhere.
+- **Primitive token**: a token holding a raw value on a scale, such as
+  `gray.900`.
+- **Semantic token**: a token named by role that points at a primitive, such
+  as `color.text`.
+- **Component token**: a token for one component that points at a semantic
+  token, such as `button.bg`.
+- **Alias**: a token whose value is a reference to another token.
+- **CSS custom property**: a property whose name starts with `--`, read with
+  `var()`, inherited and live at runtime.
+- **Computed value**: the value a property has on an element after the
+  cascade and `var()` substitution; it is what children inherit.
+- **Theme**: an alternative mapping of semantic tokens to primitives.
+- **Lint**: an automatic check that flags code breaking a rule.
+
+## Practice
+
+**Warm-up.** Open one stylesheet you wrote and list every distinct colour
+and spacing value with how many times it appears. Group the colours by what
+they are used for, and name each group.
+
+**Build.** Write the resolver from this note, add a check that rejects empty
+values, and make it emit both resolved CSS and `var()` CSS. Then write the
+lint and run it over your stylesheet; fix every hit.
+
+**Stretch.** Add a dark theme by remapping only semantic tokens, applied on
+the `html` element. Then build a dark *section* inside a light page, see
+which components fail to flip, and fix them by moving their component
+tokens onto the component selector.
