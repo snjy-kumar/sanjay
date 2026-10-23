@@ -1,0 +1,1571 @@
+---
+book: data-structures-and-algorithm-analysis
+number: 5
+title: "Hashing"
+description: "Hash functions, separate chaining, linear, quadratic and double probing, rehashing, cuckoo and hopscotch tables, universal and extendible hashing, measured in TypeScript."
+part: "The core structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Search trees find a key in O(log n) and keep everything in order. Hash
+tables give up the order and, in exchange, find a key in O(1) on average:
+compute a number from the key, use it as an array index, look there. This
+chapter is about everything that makes that simple idea work in practice:
+choosing the hash function, handling two keys that land in the same slot,
+growing the table, guaranteeing constant time even in the worst case, and
+defending against inputs chosen to make it slow. I measured each design
+in TypeScript, and the measurements match the book's formulas closely
+enough to trust them.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Explain why a hash table gives O(1) average lookup and what it cannot do
+  (ordered operations).
+- Judge a hash function for strings and pick a table size, with measured
+  evidence for both.
+- Implement separate chaining and open addressing (linear, quadratic and
+  double hashing), and predict their probe counts from the load factor.
+- Implement rehashing and explain why it costs O(1) amortised per insert.
+- Describe cuckoo hashing, hopscotch hashing and perfect hashing, and when
+  worst-case O(1) lookup matters.
+- Explain universal hashing as a defence against adversarial keys, and
+  extendible hashing for data on disk.
+
+What you should already know: arrays and linked lists from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/03-lists-stacks-and-queues/')}>chapter 3</a>,
+amortised cost from the growable array there, and ordered maps from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/04-trees/')}>chapter 4</a>
+for contrast.
+
+Reading time: about 90 minutes, plus two evenings to build and measure.
+
+## Chapter map
+
+<Layers caption="The chapter as layers. The top is the idea and the function; the middle handles collisions and growth; the bottom adds guarantees: worst-case lookup, protection from adversaries, and disk." layers={[
+  { name: "5.1–5.2 Idea and hash function", note: "key → index; spread keys evenly; table size" },
+  { name: "5.3 Separate chaining", note: "a list per slot; load factor around 1" },
+  { name: "5.4 Open addressing", note: "linear, quadratic, double hashing; load factor below 0.5–0.7" },
+  { name: "5.5–5.6 Rehashing and the library", note: "grow and reinsert; unordered_map, JS Map" },
+  { name: "5.7 Worst-case O(1)", note: "perfect, cuckoo and hopscotch hashing" },
+  { name: "5.8 Universal hashing", note: "random function from a family; no bad input" },
+  { name: "5.9 Extendible hashing", note: "a directory of disk blocks that grows by doubling" },
+]} />
+
+## 5.1 General idea
+
+### In one sentence
+
+A hash table stores items in an array, and a hash function turns each
+key into an array index, so that insert, delete and find take constant
+time on average.
+
+### The idea
+
+The **hash table** is an array of some fixed size, the **table size**,
+which I will call M. Each key is mapped by a **hash function** to an index
+between 0 and M − 1, and the item is stored at that index. Ideally the
+function is fast and sends different keys to different slots.
+
+There are many more possible keys than slots (all strings, versus ten
+thousand slots), so different keys must sometimes map to the same slot.
+That is a **collision**, and the rest of the chapter is about what to do
+when it happens. The two families are: keep a list at each slot (separate
+chaining), or look for another slot in the same array (open addressing).
+
+What hash tables give up is order. There is no efficient way to find the
+minimum key, print keys in sorted order, or find all keys in a range,
+because a good hash function deliberately scatters nearby keys. If a
+problem needs those, it needs a search tree.
+
+### Worked example
+
+Simple: a table of size 10 for integer keys, with the hash function
+`key mod 10`. Key 42 goes to slot 2, key 17 to slot 7, key 92 to slot 2: a
+collision with 42.
+
+Realistic: a web server caching user sessions by session ID. The ID is a
+random 128-bit string, so it is already well spread; the hash function
+can be nearly trivial. Lookup is one hash, one array index, one string
+comparison: constant time, independent of whether the cache holds a
+thousand sessions or ten million. A balanced tree would need about 23
+comparisons at ten million, each a string comparison that may touch a
+different cache line.
+
+### Step by step
+
+<Flow caption="A hash table lookup. Steps 1 and 2 are the same for every design; step 3 is where the designs in this chapter differ." steps={[
+  "compute h = hash(key), an integer",
+  "reduce it to an index: i = h mod M",
+  "look in slot i (or its chain, or its probe sequence)",
+  "compare stored keys with the search key for equality",
+  "found: return the value; empty or end of sequence: absent",
+]} />
+
+### Common mistake
+
+The mistake is assuming a hash table is O(1) unconditionally. It is O(1)
+on average, given a good hash function and a bounded load. With a bad
+function every key can land in one slot and the table becomes a linked
+list: O(n) per operation. Section 5.2 shows a real function that does
+almost that.
+
+### In real systems
+
+Hash tables are the most used data structure after the array: language
+dictionaries and objects (JavaScript objects and `Map`, Python `dict`),
+database hash joins and hash indexes, caches (Memcached, Redis's main
+keyspace), compilers' symbol tables, routers' flow tables, and
+deduplication in every pipeline. The `Set` in an interview answer is a
+hash table.
+
+### Check yourself
+
+1. Why can a hash table not answer "the smallest key" quickly?
+
+<details>
+<summary>Answer</summary>
+
+A good hash function scatters keys with no relation to their order, so the
+smallest key could be in any slot. Finding it means scanning the whole
+table.
+
+</details>
+
+2. Why are collisions unavoidable?
+
+<details>
+<summary>Answer</summary>
+
+There are more possible keys than slots, so by the pigeonhole principle
+some keys must share a slot.
+
+</details>
+
+## 5.2 Hash function
+
+### In one sentence
+
+A good hash function is fast to compute and spreads keys evenly across the
+table, which for strings means mixing every character with its position,
+and the table size should be a prime so that patterns in keys do not line
+up with it.
+
+### The idea
+
+For integer keys, `key mod M` is reasonable as long as M is chosen well.
+If M is 100 and every key ends in 0, only ten slots are ever used. Making
+M a prime avoids most such patterns, because keys with a common factor
+still spread over every residue.
+
+For strings, the naive function adds the character codes. It has two
+flaws. Anagrams ("stop", "pots", "tops") collide, because addition ignores
+order. And the sums of short strings fall in a narrow range: eight
+lowercase letters sum to between 776 and 976, so a table of 10,000 slots
+uses only about two hundred of them.
+
+The better approach treats the string as a number in some base. With base
+31 (or 37, or any odd number), h = (((c₀ × 31) + c₁) × 31 + c₂)..., which
+is evaluated left to right with Horner's rule: one multiply and one add
+per character. Overflow is allowed (it wraps around), which is fine as
+long as the result is kept non-negative. Order now matters, and the full
+range of the integer is used.
+
+Some implementations hash only part of a long key for speed, for example
+every other character. The book warns that this can backfire: keys that
+differ only in the skipped characters (such as URLs or file paths with a
+long common prefix) all collide.
+
+### Worked example
+
+Three string hash functions, measured on 10,000 random eight-letter
+strings in a table of 10,007 slots (a prime):
+
+```ts
+const sumHash  = (s: string, M: number) => { let h = 0; for (const c of s) h += c.charCodeAt(0); return h % M; };
+const polyHash = (s: string, M: number) => {
+  let h = 0;
+  for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0;   // >>> 0 keeps it a 32-bit unsigned int
+  return h % M;
+};
+const fnv1a = (s: string, M: number) => {
+  let h = 0x811c9dc5;
+  for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h % M;
+};
+```
+
+```text
+sum:     buckets used   135/10007   longest chain 204   indexes 801..948
+poly31:  buckets used 6,366/10007   longest chain   6   indexes 0..10004
+fnv1a:   buckets used 6,374/10007   longest chain   7   indexes 0..10006
+```
+
+The sum hash put 10,000 keys into 135 slots, so a lookup scans about 74
+keys on average and up to 204. The polynomial and FNV-1a hashes are
+indistinguishable from random: with 10,000 keys in 10,007 slots, a random
+function leaves about 1/e of slots empty and uses about 6,330, which is
+what both achieve.
+
+Anagrams under each function:
+
+```text
+sum:     stop 454   pots 454   tops 454
+poly31:  stop 8523  pots 4566  tops 3522
+```
+
+And the table size effect for keys 0, 10, 20, ..., 9990:
+
+```text
+mod 100: 10 distinct slots used
+mod 101: 101 distinct slots used
+```
+
+### Step by step
+
+<Trace columns={["char", "code", "h = h × 31 + code (32-bit)"]} rows={[
+  ["(start)", "", "0"],
+  ["s", "115", "115"],
+  ["t", "116", "115 × 31 + 116 = 3681"],
+  ["o", "111", "3681 × 31 + 111 = 114222"],
+  ["p", "112", "114222 × 31 + 112 = 3540994"],
+  ["mod 10007", "", "3540994 − 353 × 10007 = 8523"],
+]} caption="Horner's rule for the polynomial hash of 'stop'. Each step multiplies by the base and adds the next character, so position affects the result; the final value mod 10007 is 8523." />
+
+For longer strings the value passes 2³² and wraps around, which is why the
+code applies `>>> 0` after every step: it keeps h an unsigned 32-bit
+integer, the same as C's overflow behaviour.
+
+<Compare left="Weak hash" right="Good hash" rows={[
+  ["sum of characters", "polynomial (base 31) or FNV-1a"],
+  ["anagrams collide", "order changes the value"],
+  ["values in a narrow band", "values across the whole integer range"],
+  ["135 of 10,007 slots used (measured)", "about 6,370 of 10,007 (the random ideal)"],
+  ["table size can hide patterns or show them", "prime table size still recommended"],
+]} caption="What separates a usable string hash from a broken one. The measured row is the one that matters." />
+
+### Common mistake
+
+The mistake is writing a hash function and never measuring its
+distribution. The sum hash passes every correctness test (equal strings
+hash equally) and quietly makes the table a set of long lists. The fix is
+a two-line histogram, as above, on realistic keys.
+
+A JavaScript-specific mistake is letting the hash grow as a floating-point
+number. `h = h * 31 + c` without `>>> 0` or `Math.imul` loses precision
+after a dozen characters, because doubles hold only 53 bits exactly. The
+result is still deterministic, but low-order bits become poorly mixed.
+
+### In real systems
+
+Java's `String.hashCode` is exactly the base-31 polynomial. Modern
+runtimes use stronger functions: Python, Rust and Ruby default to SipHash
+for strings, a keyed hash designed to resist the attacks in section 5.8;
+V8 seeds its string hash randomly per process. Non-cryptographic fast
+hashes (FNV-1a, MurmurHash, xxHash) are used where inputs are trusted.
+Cryptographic hashes (SHA-256) are far slower and are for integrity, not
+for tables.
+
+### Check yourself
+
+1. Why does the sum-of-characters hash use so few slots for short
+   strings?
+
+<details>
+<summary>Answer</summary>
+
+The sum of eight lowercase letters lies between 8 × 97 and 8 × 122, a
+range of about 200 values, no matter how large the table.
+
+</details>
+
+2. Why choose a prime table size?
+
+<details>
+<summary>Answer</summary>
+
+Keys often share factors (multiples of 10, aligned addresses). With a
+prime size, those keys still spread over all residues instead of a few.
+
+</details>
+
+## 5.3 Separate chaining
+
+### In one sentence
+
+Separate chaining keeps a list at every slot of the table, puts each key
+in the list for its hash, and stays fast as long as the load factor (keys
+per slot) is kept around 1.
+
+### The idea
+
+In **separate chaining**, each slot holds a list (the book uses the
+library's linked `list`; a small array works as well). To find a key,
+hash it and search that slot's list. To insert, search the list and
+append if absent. To delete, search and remove.
+
+The **load factor**, λ, is the number of keys divided by the table size.
+It is the average list length. An unsuccessful search examines a whole
+list: λ nodes on average. A successful search examines about half the
+other keys in its list, plus itself: about 1 + λ / 2. So the cost depends
+on λ, not on n, which is why chaining is O(1): keep λ bounded and every
+operation is constant on average, however many keys there are.
+
+The book's rule is λ ≈ 1, and table size a prime. When λ grows past the
+threshold, the table is rehashed into a bigger one (section 5.5). The
+table size does not need to be larger than n; chaining works even with λ
+above 1, only more slowly.
+
+The cost is memory: a list per slot, plus a node per key in linked
+versions. And following list pointers touches scattered memory, which is
+why open addressing (next section) is often faster in practice.
+
+### Worked example
+
+My chained map with string keys, rehashing to the next prime above double
+when λ passes 1:
+
+```ts
+class ChainMap<V> {
+  #b: [string, V][][]; #n = 0;
+  constructor(size = 11) { this.#b = Array.from({ length: nextPrime(size) }, () => []); }
+  #h(k: string) {                                  // FNV-1a, reduced mod table size
+    let h = 0x811c9dc5;
+    for (let i = 0; i < k.length; i++) { h ^= k.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0) % this.#b.length;
+  }
+  get(k: string) { for (const [kk, v] of this.#b[this.#h(k)]) if (kk === k) return v; return undefined; }
+  set(k: string, v: V) {
+    const b = this.#b[this.#h(k)];
+    for (const e of b) if (e[0] === k) { e[1] = v; return; }
+    b.push([k, v]);
+    if (++this.#n > this.#b.length) this.#rehash();
+  }
+  #rehash() {
+    const old = this.#b;
+    this.#b = Array.from({ length: nextPrime(2 * old.length) }, () => []);
+    for (const b of old) for (const [k, v] of b) this.#b[this.#h(k)].push([k, v]);
+  }
+}
+```
+
+Inserting 100,000 keys `user:0` to `user:99999`:
+
+```text
+size 100000  buckets 102877  rehashes 13  keys moved 102810 (1.03 per insert)
+longest chain 7   empty buckets 38432
+```
+
+The table grew through the primes 11, 23, 47, 97, 197, 397, 797, 1597,
+3203, 6421, 12853, 25717, 51437, 102877, each just above double the last.
+At λ just under 1, about 37% of buckets are empty (1/e again) and the
+longest chain is 7, which is the typical maximum for random placement at
+this size, growing only like log n / log log n.
+
+### Step by step
+
+<Figure caption="A chained table of size 7 with keys 15, 8, 22, 4 and 11 hashed by key mod 7. Slot 1 holds a chain of three and slot 4 a chain of two; an unsuccessful search for 29 (also slot 1) walks all three nodes." art={`
+   slot 0 │ ·
+   slot 1 │ ──▶ [15] ──▶ [8] ──▶ [22]      15, 8, 22 all ≡ 1 (mod 7)
+   slot 2 │ ·
+   slot 3 │ ·
+   slot 4 │ ──▶ [4] ──▶ [11]               4, 11 ≡ 4
+   slot 5 │ ·
+   slot 6 │ ·
+                                           λ = 5 / 7 ≈ 0.71
+`} />
+
+Three of five keys sharing slot 1 is what a small table and an unlucky set
+of keys look like. With a good hash and a table of realistic size, the
+measured longest chain above was 7 among 100,000 keys.
+
+### Common mistake
+
+The mistake is never rehashing. A chained table created with 16 slots and
+filled with a million keys still "works", but every list has 60,000 keys
+and the table is a slow linked list. The second mistake is using a
+mutable object as a key and changing it after insertion: its hash
+changes, so it is in the wrong chain and can never be found again.
+
+### In real systems
+
+Java's `HashMap` uses chaining with a load factor of 0.75 and turns a
+chain into a small balanced tree once it holds eight entries, so even an
+attack that forces collisions costs O(log n) per lookup instead of O(n).
+C++'s `unordered_map` is required by the standard's iterator rules to be
+essentially a chained table. Redis's main dictionary is chained and
+rehashes incrementally, moving a few buckets per operation so no single
+command pays for the whole resize.
+
+### Check yourself
+
+1. With 3,000 keys in 1,000 buckets, how many keys does an unsuccessful
+   search examine on average?
+
+<details>
+<summary>Answer</summary>
+
+λ = 3, so about 3 keys: the average chain length.
+
+</details>
+
+2. Why does chaining still work with λ greater than 1, unlike open
+   addressing?
+
+<details>
+<summary>Answer</summary>
+
+Chains can grow without limit; only the cost per operation grows. Open
+addressing stores keys in the array itself, so it cannot hold more keys
+than slots.
+
+</details>
+
+## 5.4 Hash tables without linked lists
+
+### In one sentence
+
+Open addressing stores every key in the array itself and, on a collision,
+tries other slots in a fixed probe sequence (linear, quadratic or double
+hashing), which avoids lists but needs the load factor kept well below 1.
+
+### The idea
+
+In **open addressing** (also called probing hash tables), all keys live
+in the table. To insert key x, try slots h₀(x), h₁(x), h₂(x), ... where
+hᵢ(x) = (hash(x) + f(i)) mod M and f(0) = 0, until an empty slot is
+found. To search, follow the same sequence until the key or an empty slot
+is found. Because a search stops at an empty slot, deletion cannot simply
+empty a slot (it would cut the sequence for keys placed after it); it uses
+**lazy deletion**, marking the slot deleted.
+
+The table needs more slots than keys, and the book's guideline is λ below
+0.5 for these schemes. The three choices of f give different behaviour.
+
+#### 5.4.1 Linear probing
+
+f(i) = i: try the next slot, then the next. It is simple and cache
+friendly, but suffers **primary clustering**: occupied slots form runs,
+any key hashing into a run lengthens it, and long runs grow faster than
+short ones. The expected number of probes is about
+½(1 + 1/(1 − λ)²) for an insertion or unsuccessful search, and
+½(1 + 1/(1 − λ)) for a successful search. At λ = 0.5 that is 2.5 and 1.5;
+at λ = 0.9 it is 50.5 and 5.5.
+
+For comparison, a hypothetical scheme with no clustering (each probe a
+fresh random slot) would need 1/(1 − λ) probes for an unsuccessful search
+and (1/λ) ln(1/(1 − λ)) for a successful one. Linear probing's squared
+term is the price of clustering.
+
+#### 5.4.2 Quadratic probing
+
+f(i) = i²: try offsets 1, 4, 9, 16, ... away. This breaks up primary
+clustering. Its weakness is that it may not try every slot. The book
+proves the key fact: if the table size is prime and the table is at least
+half empty, a new key can always be inserted, because the first ⌈M/2⌉
+probe positions are all distinct. With a non-prime size, the guarantee
+fails badly. Keys with the same hash still follow the same sequence, a
+milder effect called **secondary clustering**.
+
+#### 5.4.3 Double hashing
+
+f(i) = i × hash₂(x): the step size comes from a second hash function. A
+popular choice is hash₂(x) = R − (x mod R) with R a prime smaller than
+M. The step must never be 0, and M should be prime so that every step size
+eventually reaches every slot. Different keys with the same first hash now
+take different paths, so double hashing behaves close to the no-clustering
+ideal, at the cost of computing a second hash.
+
+### Worked example
+
+I measured all three on a table of 100,003 slots (a prime) with random
+integer keys, counting probes during insertion (which equals the cost of
+a later successful search) and for 20,000 unsuccessful searches:
+
+```text
+            linear          quadratic       double          no-clustering ideal
+λ = 0.5     1.49 / 2.46     1.43 / 2.14     1.44 / 2.21     1.39 / 2.00
+λ = 0.75    2.48 / 8.51     1.96 / 4.47     2.01 / 4.69     1.85 / 4.00
+λ = 0.9     5.40 / 48.52    2.80 / 11.30    2.85 / 10.98    2.56 / 10.00
+            (successful / unsuccessful probes)
+```
+
+The linear-probing formula predicts 1.50 / 2.50, 2.50 / 8.50 and
+5.50 / 50.50: the measurements agree to within a few percent. Quadratic and
+double hashing sit close to the ideal, and at λ = 0.9 an unsuccessful
+search under linear probing costs four times as much as under the others.
+
+A lesson from my first run: I generated keys with a weak linear
+congruential generator and got 5.24 / 15.49 at λ = 0.5, three to six
+times the theory. Consecutive outputs of that generator are correlated,
+and the correlation survived the mod. With a decent generator the numbers
+fell into line. Hash table analysis assumes the keys (or the hash) look
+random; when measurements disagree with the formula, suspect the input.
+
+The quadratic probing guarantee, checked directly:
+
+```text
+offsets i² mod 16 for all i:      0, 1, 4, 9      (only 4 distinct slots ever probed)
+offsets i² mod 17 for i = 0..8:   9 distinct
+```
+
+With size 16, a key whose four slots are full cannot be inserted even
+though the table has 12 empty slots. With 17, the first nine probes are
+distinct, which is the half-table guarantee.
+
+### Step by step
+
+<Trace columns={["insert", "hash (mod 10)", "linear probes", "slot", "quadratic probes", "slot"]} rows={[
+  ["23", "3", "3", "3", "3", "3"],
+  ["43", "3", "3, 4", "4", "3, 4", "4"],
+  ["13", "3", "3, 4, 5", "5", "3, 4, 7", "7"],
+  ["27", "7", "7", "7", "7 (taken), 8", "8"],
+  ["33", "3", "3, 4, 5, 6", "6", "3, 4, 7, 2 (3 + 9)", "2"],
+]} caption="Five keys into a table of size 10 (non-prime, for readability). Linear probing builds one run, slots 3 to 7; quadratic probing scatters the colliding keys to 4, 7 and 2." />
+
+<Compare left="Separate chaining" right="Open addressing" rows={[
+  ["a list per slot; keys outside the array", "keys inside the array"],
+  ["works at λ above 1", "needs λ below about 0.5–0.7"],
+  ["deletion is easy", "deletion needs tombstones (lazy deletion)"],
+  ["pointer chasing per lookup", "contiguous probes; cache friendly (linear)"],
+  ["extra memory per key for nodes", "extra empty slots instead"],
+]} caption="The two families of collision handling. Modern high-performance tables mostly choose open addressing for its memory locality." />
+
+### Common mistake
+
+The mistake is deleting from an open-addressing table by emptying the
+slot. In the trace, deleting 43 from slot 4 would make a search for 13
+(linear) stop at the empty slot 4 and report 13 absent. Mark it deleted
+instead, and let inserts reuse marked slots. Over time tombstones
+accumulate and lengthen searches, so rehashing also cleans them out.
+
+The second mistake is quadratic probing with a power-of-two table size,
+which probes as few as a handful of distinct slots.
+
+### In real systems
+
+Python's `dict` uses open addressing with a perturbed probe sequence
+(mixing in higher hash bits at each step) and resizes at two-thirds full.
+Google's SwissTable (`absl::flat_hash_map`), and Rust's standard `HashMap`
+based on it, use open addressing with groups of 16 slots probed at once
+using SIMD instructions and a byte of hash metadata per slot. V8's
+internal dictionaries use open addressing too. Linear probing with a good
+hash function is the fastest choice on modern hardware despite clustering,
+because the next slot is usually in the same cache line.
+
+### Check yourself
+
+1. At λ = 0.8, how many probes does linear probing expect for an
+   unsuccessful search?
+
+<details>
+<summary>Answer</summary>
+
+½(1 + 1/0.04) = ½ × 26 = 13.
+
+</details>
+
+2. Why must the second hash function never return 0?
+
+<details>
+<summary>Answer</summary>
+
+A step of 0 would probe the same slot forever.
+
+</details>
+
+3. Why does lazy deletion exist?
+
+<details>
+<summary>Answer</summary>
+
+Searches stop at an empty slot. Emptying a deleted key's slot would cut
+the probe sequence of keys inserted after it, making them unfindable.
+
+</details>
+
+## 5.5 Rehashing
+
+### In one sentence
+
+When a hash table gets too full, build a new table about twice the size
+(the next prime above double) and reinsert every key, which costs O(n) but
+happens rarely enough to be O(1) amortised per insert.
+
+### The idea
+
+Open addressing degrades sharply as λ rises, and chaining degrades
+steadily. Either way, the table must grow. **Rehashing** allocates a new
+table of roughly double size, computes each key's hash for the new size
+(the slot depends on M, so keys move), inserts them, and frees the old
+table. Deleted markers from lazy deletion are dropped on the way.
+
+When to rehash is a policy choice, and the book lists three: as soon as
+the table is half full; only when an insertion fails; or when λ passes a
+chosen threshold. The threshold is the usual answer. The amortised
+argument is the same as the growable array's in chapter 3: rehashing at
+size n costs O(n), but follows at least n / 2 cheap inserts since the
+last rehash, so each insert pays a constant share.
+
+Shrinking can be handled the same way, when λ falls well below the
+threshold (a quarter of it, to avoid thrashing).
+
+### Worked example
+
+The chained map in section 5.3 rehashed 13 times on the way to 100,000
+keys and moved 102,810 keys in total: 1.03 moves per insert, the
+geometric series again.
+
+The cost of a single rehash is real latency, though. I timed every
+individual `Map.set` while inserting two million integer keys into a
+JavaScript `Map`:
+
+```text
+worst single Map.set: 72.92 ms, at size 1,048,576 (2²⁰)
+```
+
+Almost every insert took well under a microsecond. The worst one, at
+exactly the moment the table passed a power of two, took 73 milliseconds,
+because it rehashed a million entries. Amortised O(1) and a 73 ms pause
+are both true at once.
+
+Realistic: a service that builds a large in-memory index at startup and
+then serves requests sees no problem. A service that grows a map during
+request handling sees one request in a million pause, and if that request
+was on a latency-sensitive path, the tail latency graph shows a spike. The
+fixes are to size the table up front when the count is known, or to use
+a table that rehashes incrementally.
+
+### Step by step
+
+<Timeline caption="A table's life under a load-factor threshold of 1 with doubling. Each rehash costs about the current size, but the gaps between them double too, so the total stays linear." items={[
+  { when: "size 11", what: "keys 1–11 inserted cheaply" },
+  { when: "rehash → 23", what: "11 keys moved" },
+  { when: "rehash → 47", what: "23 keys moved" },
+  { when: "rehash → 97", what: "47 keys moved" },
+  { when: "…", what: "each move count roughly doubles" },
+  { when: "rehash → 102,877", what: "51,437 keys moved; 102,810 moved in total for 100,000 inserts" },
+]} />
+
+<Flow caption="Incremental rehashing, as Redis does it. The old and new tables coexist, and every operation moves a few buckets, so no single command pays for the whole move." steps={[
+  "λ passes the threshold: allocate the new table, keep the old",
+  "each insert goes into the new table",
+  "each lookup checks the new table, then the old one",
+  "each operation also migrates the next few old buckets",
+  "when the old table is empty, free it",
+]} />
+
+### Common mistake
+
+The mistake is reusing the old index after a resize. Every key's slot is
+hash mod M, and M changed, so a key's new slot is different; copying the
+array cell by cell into a bigger array leaves keys where lookups will
+never look. Rehashing means re-hashing: compute every slot again.
+
+### In real systems
+
+Every hash table library rehashes: Java's `HashMap` at 0.75, Python's
+`dict` at two-thirds, Go's maps at an average of 6.5 entries per bucket
+(and Go also migrates incrementally). Redis's incremental rehash is the
+textbook example of trading a little constant overhead for no latency
+spikes. Distributed systems face the same problem at a larger scale:
+adding a server to a hash-partitioned cache would move nearly every key
+under `hash mod N`, which is why they use consistent hashing instead,
+which moves only about 1/N of the keys.
+
+### Check yourself
+
+1. Why do keys move to new slots during a rehash?
+
+<details>
+<summary>Answer</summary>
+
+The slot is hash mod M, and M changes. The same hash value gives a
+different remainder for the new size.
+
+</details>
+
+2. If rehashing at size n costs n, why is insertion still O(1) amortised?
+
+<details>
+<summary>Answer</summary>
+
+Doubling means at least about n / 2 inserts happened since the previous
+rehash, so the n units of work spread over them at a constant each. The
+total over all rehashes is a geometric series bounded by about 2n.
+
+</details>
+
+## 5.6 Hash tables in the standard library
+
+### In one sentence
+
+C++ provides `unordered_set` and `unordered_map` as hash tables, with the
+same interface as `set` and `map` minus ordering, and user-defined keys
+need a hash function object and an equality test.
+
+### The idea
+
+The library's hash containers are `unordered_set` and `unordered_map`.
+They support insert, find, erase, `count`, `operator[]` (for maps, with
+the same insert-on-read behaviour as `map`) and iteration in an
+unspecified order. They are chained, with a maximum load factor that can
+be read and changed, and `rehash` and `reserve` to size the table
+explicitly.
+
+For built-in types and `string`, the library supplies a hash. For your
+own types, you supply a function object that computes a hash and,
+consistently with it, an equality comparison: two equal keys *must* have
+equal hashes. The book's example is a hash for case-insensitive strings,
+which must lower-case before hashing so that "Apple" and "apple", being
+equal, hash equally.
+
+Whether to use an ordered map (chapter 4) or an unordered one is the
+choice between O(log n) with order and O(1) average without it.
+
+### Worked example
+
+JavaScript's `Map` and `Set` are hash tables keyed by **SameValueZero**
+equality: primitives by value, objects by identity. There is no way to
+supply a custom hash. So two objects with the same contents are different
+keys:
+
+```ts
+const m = new Map<object, number>();
+m.set({ x: 1, y: 2 }, 5);
+console.log(m.get({ x: 1, y: 2 }));        // undefined: a different object
+const byKey = new Map<string, number>();
+const key = (p: { x: number; y: number }) => `${p.x},${p.y}`;
+byKey.set(key({ x: 1, y: 2 }), 5);
+console.log(byKey.get(key({ x: 1, y: 2 }))); // 5
+```
+
+The usual fix is to derive a string or number key from the object's
+contents, which is the "hash function object" written by hand. A
+case-insensitive map does the same with `s.toLowerCase()` as the key.
+
+Realistic: deduplicating API events by (userId, eventType, minute). A
+composite string key such as `"42|click|2026-10-23T10:15"` is unique per
+combination and lets a `Set` drop duplicates in O(1) each.
+
+### Step by step
+
+<Compare left="Ordered: map, set, TreeMap" right="Unordered: unordered_map, HashMap, JS Map" rows={[
+  ["balanced tree", "hash table"],
+  ["O(log n) worst case", "O(1) average, O(n) worst"],
+  ["keys need a less-than comparison", "keys need a hash and equality"],
+  ["sorted iteration, ranges, floor/ceiling", "no ordering"],
+  ["stable performance under any input", "can be attacked with colliding keys (5.8)"],
+]} caption="The library offers both. The right column is the default for lookups; the left is chosen whenever order or guaranteed worst case matters." />
+
+### Common mistake
+
+The mistake is defining equality and hashing inconsistently: a
+case-insensitive equality with a case-sensitive hash puts "Apple" and
+"apple" in different buckets, so the table holds both even though it
+considers them equal. In JavaScript the matching mistake is using objects
+as `Map` keys and expecting content equality.
+
+### In real systems
+
+Composite string keys are everywhere in practice: cache keys
+(`user:42:profile`), Redis key naming, idempotency keys for payment APIs,
+and deduplication in stream processing. Java's records and Kotlin's data
+classes generate consistent `equals` and `hashCode` automatically, which
+removes the inconsistency bug; Rust derives `Hash` and `Eq` together for
+the same reason.
+
+### Check yourself
+
+1. What rule must a custom hash and equality satisfy together?
+
+<details>
+<summary>Answer</summary>
+
+Equal keys must have equal hashes. (Unequal keys may share a hash; that
+is just a collision.)
+
+</details>
+
+2. Why does `new Map().get({ a: 1 })` miss after `set({ a: 1 }, ...)`?
+
+<details>
+<summary>Answer</summary>
+
+`Map` compares objects by identity, and the two literals are different
+objects.
+
+</details>
+
+## 5.7 Hash tables with worst-case O(1) access
+
+### In one sentence
+
+Perfect hashing, cuckoo hashing and hopscotch hashing guarantee that a
+lookup inspects only a constant number of slots in the worst case, by
+doing more work at build or insert time.
+
+### The idea
+
+Everything so far is O(1) on average; an unlucky lookup can still walk a
+long chain or probe sequence. For some uses (network routers, real-time
+systems, hardware tables) the worst case is what counts. The trade is to
+make insertion more complex so that lookup is bounded.
+
+#### 5.7.1 Perfect hashing
+
+If the set of keys is known in advance and does not change, it is
+possible to build a table with no collisions at all. Putting n keys into
+n² slots with a random hash function gives no collision with probability
+above one half, so a few random tries find a collision-free function. But
+n² space is too much. The two-level scheme (due to Fredman, Komlós and
+Szemerédi) hashes the n keys into n primary buckets, and then gives each
+bucket with nᵢ keys its own secondary table of nᵢ² slots with its own
+collision-free function. The expected total of the nᵢ² is under 2n, so
+the space is linear, and every lookup is two hashes and one comparison.
+
+#### 5.7.2 Cuckoo hashing
+
+**Cuckoo hashing** uses two tables (or one table and two hash functions),
+and each key may live in exactly one of two places: slot h₁(x) of table 1
+or slot h₂(x) of table 2. Lookup checks both: worst case two probes.
+Insertion puts the new key in its table-1 slot; if that slot was taken,
+the old occupant is kicked out (like a cuckoo chick pushing out eggs) and
+moved to its alternative slot in the other table, possibly kicking out
+another key, and so on. If the chain of kicks gets too long (a cycle),
+choose new hash functions and rebuild.
+
+The analysis shows that as long as the total load stays below one half
+(each table under half full), the expected kicks per insertion are
+constant and rebuilds are rare. Above that, cycles become likely.
+
+#### 5.7.3 Hopscotch hashing
+
+**Hopscotch hashing** is linear probing with a bound: every key must sit
+within a fixed distance H (for example 32) of its home slot. To insert,
+find the nearest empty slot by linear probing; if it is too far, move
+keys closer to their own homes to "hop" the empty slot backwards, until
+it is within H of the new key's home. If no such move is possible, the
+table is rehashed. Each slot keeps a small bitmap of which nearby slots
+hold its keys, so a lookup checks at most H slots, all usually in one or
+two cache lines.
+
+### Worked example
+
+My cuckoo table with two tables of 10,000 slots and random keys,
+measuring kicks per insertion at different total loads:
+
+```ts
+insert(k: number): boolean {
+  if (this.has(k)) return true;
+  let cur = k, side = 0;
+  for (let n = 0; n < 50; n++) {            // bound on the kick chain
+    const p = this.h(side, cur);
+    const evicted = this.t[side][p];
+    this.t[side][p] = cur;
+    if (evicted === null) return true;
+    this.kicks++; cur = evicted; side = 1 - side;
+  }
+  return this.rebuildWithNewSeeds(cur);     // likely a cycle
+}
+```
+
+```text
+total load 0.30:  0.279 kicks per insert, 0 rebuilds
+total load 0.45:  0.536 kicks per insert, 0 rebuilds
+total load 0.49:  0.662 kicks per insert, 0 rebuilds
+```
+
+Kicks grow with load but stay well below one per insert up to the 0.5
+threshold, and every lookup was exactly at most two probes throughout.
+
+For perfect hashing, two quick simulations of the numbers behind it.
+Putting 5 keys into 25 slots at random had no collision in 65% of
+trials, so a couple of attempts find a good secondary function. And for
+100,000 keys in 100,000 primary buckets, the sum of nᵢ² was 1.996 × n:
+the secondary tables together need about twice as many slots as keys.
+
+### Step by step
+
+<Trace columns={["step", "place", "table 1 slot", "table 2 slot", "evicted"]} rows={[
+  ["insert A", "A at h1(A) = 2", "2: A", "", "–"],
+  ["insert B", "B at h1(B) = 2", "2: B", "", "A"],
+  ["move A", "A to h2(A) = 5", "2: B", "5: A", "–"],
+  ["insert C", "C at h1(C) = 2", "2: C", "5: A", "B"],
+  ["move B", "B to h2(B) = 5", "2: C", "5: B", "A"],
+  ["move A", "A to h1(A) = 2", "2: A", "5: B", "C"],
+  ["move C", "C to h2(C) = 5 …", "", "", "cycle: rebuild"],
+]} caption="A cuckoo cycle with three keys that share both slots. Two keys fit; the third causes an endless chain of evictions, which the insert bound detects and answers by choosing new hash functions." />
+
+<Compare left="Cuckoo hashing" right="Hopscotch hashing" rows={[
+  ["two possible slots per key", "a neighbourhood of H slots per key"],
+  ["lookup: 2 probes, possibly far apart in memory", "lookup: up to H probes, usually in one cache line"],
+  ["needs load below 0.5 (basic two-table form)", "works at high load (0.9 and above)"],
+  ["insertion may cascade or rebuild", "insertion moves keys backwards or rehashes"],
+]} caption="Two worst-case-constant designs. Cuckoo bounds the number of places; hopscotch bounds the distance, which suits caches." />
+
+### Common mistake
+
+The mistake is running basic cuckoo hashing above half load and seeing
+insertions loop. The bound on the kick chain is not optional: without it,
+a cycle is an infinite loop. Variants with more hash functions or several
+slots per bucket raise the usable load to above 90%.
+
+For perfect hashing, the mistake is using it on a changing key set. It
+is for static sets: keywords of a language, a fixed dictionary, a routing
+table rebuilt offline.
+
+### In real systems
+
+GNU `gperf` generates perfect hash functions for fixed keyword sets, used
+in compilers and parsers to recognise reserved words. Cuckoo hashing (with
+four-way buckets) appears in network switches' exact-match tables, in
+MemC3 (a Memcached variant) and in cuckoo filters, a compact alternative
+to Bloom filters that also supports deletion. Hopscotch hashing is used in
+concurrent hash maps, because its bounded neighbourhood makes locking
+small regions practical.
+
+### Check yourself
+
+1. In cuckoo hashing, how many slots does a lookup inspect in the worst
+   case?
+
+<details>
+<summary>Answer</summary>
+
+Two: h₁(x) in the first table and h₂(x) in the second.
+
+</details>
+
+2. Why does the two-level perfect scheme use nᵢ² slots for a bucket of nᵢ
+   keys?
+
+<details>
+<summary>Answer</summary>
+
+With nᵢ² slots, a random function has no collision with probability above
+one half, so a collision-free function is found in a few tries; and the
+sum of nᵢ² is expected to be under 2n, so space stays linear.
+
+</details>
+
+## 5.8 Universal hashing
+
+### In one sentence
+
+Universal hashing picks the hash function at random from a family in which
+any two distinct keys collide with probability at most 1/M, so no fixed
+input can be bad for every run, and expected performance holds for every
+input.
+
+### The idea
+
+Any single fixed hash function has bad inputs: someone who knows it can
+choose keys that all collide. With `key mod M`, the keys 0, M, 2M, 3M, ...
+all land in slot 0. For a public web service, that is not a thought
+experiment. An attacker can send request parameters whose hashes collide
+and turn every lookup into a linear scan.
+
+The defence is randomness chosen by the table, not the input. A family H
+of hash functions is **universal** if, for any two distinct keys x and y,
+a function picked at random from H makes them collide with probability
+at most 1/M. Then, for any set of keys, the expected chain length is at
+most λ, whatever the keys are. The randomness is over the choice of
+function, not the input.
+
+The classic family (Carter and Wegman) works for integer keys: pick a
+prime p larger than any key, pick random a in 1..p − 1 and b in 0..p − 1,
+and define h(x) = ((a × x + b) mod p) mod M. The book proves that this
+family is universal. For strings, the same idea applies to a polynomial
+hash with a random base, or to keyed hashes such as SipHash. The
+multiplication must not overflow, which in practice means computing with
+a prime like 2³¹ − 1 or 2⁶¹ − 1 and careful arithmetic.
+
+### Worked example
+
+An adversarial key set: 2,000 keys that are all multiples of M = 1,000.
+
+```ts
+const p = 2147483647;                          // 2^31 − 1, prime
+const a = 1 + Math.floor(rand() * (p - 1)), b = Math.floor(rand() * p);
+const uh = (k: number) => Number((BigInt(a) * BigInt(k) + BigInt(b)) % BigInt(p)) % M;
+```
+
+```text
+k mod 1000:   all 2,000 keys in 1 bucket
+universal:    975 buckets used, longest chain 3
+```
+
+Under the fixed function the table is one list of 2,000 keys. Under a
+randomly chosen member of the universal family, the same keys spread as
+if random. (`BigInt` keeps the product exact; a production version uses
+64-bit multiply-high tricks instead.)
+
+Realistic: in 2011, researchers showed that the web frameworks of PHP,
+Java, Python, Ruby and ASP.NET could be stalled by a single POST request
+with many form fields chosen to collide in the request-parameter hash
+table. The fixes shipped across languages were randomised (keyed) hash
+functions per process, limits on the number of parameters, and Java's
+tree-shaped buckets.
+
+### Step by step
+
+<Flow caption="Using a universal family. The random choice happens once per table, before any keys arrive, so the input cannot depend on it." steps={[
+  "choose prime p larger than any key",
+  "at table creation, draw random a (1..p − 1) and b (0..p − 1)",
+  "hash every key as ((a·x + b) mod p) mod M",
+  "on rehash, optionally draw new a and b",
+  "never expose a and b to clients",
+]} />
+
+### Common mistake
+
+The mistake is thinking a "good" fixed hash protects against attacks. A
+fixed function, however well mixed, can be inverted or brute-forced to
+find colliding keys. Protection needs a secret random component. The
+second mistake is leaking that component, for example through iteration
+order of a hash map returned in an API response, which can let an
+attacker infer the seed.
+
+### In real systems
+
+SipHash, keyed with a random 128-bit secret per process, is the default
+string hash in Python, Rust, Ruby and Perl for exactly this reason. Node
+and V8 randomise their hash seed at startup. Universal hashing also
+underlies hash-based sketches (count-min sketch, HyperLogLog) and the
+proofs that Bloom filters and load balancers behave as their analyses
+claim.
+
+### Check yourself
+
+1. In a universal family, what is the collision probability of two given
+   distinct keys?
+
+<details>
+<summary>Answer</summary>
+
+At most 1/M, over the random choice of function.
+
+</details>
+
+2. Why must the random parameters be chosen before the keys arrive?
+
+<details>
+<summary>Answer</summary>
+
+If the input could depend on the chosen function, an adversary could pick
+colliding keys for it. The guarantee is over a choice the input cannot
+see.
+
+</details>
+
+## 5.9 Extendible hashing
+
+### In one sentence
+
+Extendible hashing keeps data in disk-block leaves and a small directory
+indexed by the first D bits of each key's hash, splitting one leaf (and
+doubling the directory only when needed) as data grows, so a lookup costs
+two block reads.
+
+### The idea
+
+Section 4.7's B-trees handle data on disk with ordered keys and depth
+log_M n. When only exact lookups are needed, hashing can do better: about
+two disk accesses, regardless of size. Plain hash tables do not suit disk
+because rehashing would rewrite the whole file.
+
+**Extendible hashing** stores items in **leaves**, each one disk block
+holding up to M items. A **directory** of 2ᴰ entries, small enough to keep
+in memory, maps the first D bits of a key's hash to a leaf. Several
+directory entries may point to the same leaf. Each leaf records its own
+**local depth** dₗ, the number of leading bits all its keys share, which is
+at most D.
+
+To insert, use the first D bits to find the leaf. If it has room, done.
+If it is full:
+
+1. If dₗ is less than D, split the leaf into two with local depth dₗ + 1,
+   by the next bit of each key, and repoint the directory entries that
+   pointed to it. The directory does not change size.
+2. If dₗ equals D, double the directory first (D becomes D + 1, each entry
+   duplicated), then split as in step 1.
+
+Lookups read the directory entry (in memory) and one leaf: one disk
+access, or two if the directory is on disk. The expected number of leaves
+is about (n / M) log₂ e, so leaves are about 69% full on average. The
+directory can grow faster than linearly if hashes are skewed, which is
+why the hash must be good.
+
+### Worked example
+
+My extendible table with 8-bit keys (treated as their own hash) and leaf
+capacity 2, using leading bits:
+
+```text
++00101100   0→[00101100] d1   1→[] d1
++10010010   0→[00101100] d1   1→[10010010] d1
++01110001   0→[00101100 01110001] d1   1→[10010010] d1
++00011010   leaf 0 is full and d1 = D: directory doubles to 4 (D = 2), leaf splits
+            00→[00101100 00011010] d2   01→[01110001] d2   10→[10010010] d1   11→(same as 10)
++11000101   10→[10010010 11000101] d1   (room in the shared leaf)
++00110111   leaf 00 full, d2 = D: directory doubles to 8 (D = 3), leaf splits
+            000→[00011010] d3   001→[00101100 00110111] d3   010, 011→[01110001] d2
+            100, 101, 110, 111→[10010010 11000101] d1
+```
+
+The leaf with local depth 1 (keys starting with 1) is shared by four
+directory entries and was never split. Only the region of the key space
+that filled up was refined.
+
+### Step by step
+
+<Figure caption="After the last insertion. The directory (D = 3) has eight entries; the leaves have local depths 3, 3, 2 and 1, so several entries share leaves. A lookup reads one entry and one leaf." art={`
+   directory (D = 3)                 leaves
+   000 ─────────────────────▶ [00011010]            d = 3
+   001 ─────────────────────▶ [00101100 00110111]   d = 3
+   010 ─┐
+   011 ─┴───────────────────▶ [01110001]            d = 2
+   100 ─┐
+   101 ─┤
+   110 ─┤
+   111 ─┴───────────────────▶ [10010010 11000101]   d = 1
+`} />
+
+<Compare left="B+ tree (4.7)" right="Extendible hashing" rows={[
+  ["about log_M n block reads", "1–2 block reads"],
+  ["ordered: range scans", "exact match only"],
+  ["grows by splitting nodes up to the root", "grows by splitting leaves, doubling the directory"],
+  ["handles skewed keys fine", "skewed hashes blow up the directory"],
+]} caption="The two disk structures. Databases default to B+ trees because range queries are common; hash indexes exist for pure equality lookups." />
+
+### Common mistake
+
+The mistake is using hash bits that are not well mixed, such as raw keys
+with common prefixes. If many keys share their first 20 bits, the
+directory doubles to a million entries to separate a few leaves. A second
+mistake is splitting a leaf whose keys all share the next bit too: the
+split leaves one new leaf full and one empty, and must repeat. Many
+duplicates of the same hash cannot be split at all and need overflow
+blocks.
+
+### In real systems
+
+Extendible hashing and its cousin linear hashing are used for hash
+indexes in databases and file systems: PostgreSQL's hash index is a
+linear-hashing variant, and Berkeley DB offers a linear hash access
+method. The doubling-directory idea also appears in memory: some
+concurrent hash maps grow by splitting segments independently, and
+distributed key-value stores split hash ranges the same way when one
+partition gets hot.
+
+### Check yourself
+
+1. When does the directory double?
+
+<details>
+<summary>Answer</summary>
+
+Only when a full leaf's local depth equals the directory's global depth
+D, so there is no unused bit to split on.
+
+</details>
+
+2. How many leaves does a lookup read?
+
+<details>
+<summary>Answer</summary>
+
+One. The directory, usually in memory, gives the leaf directly.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 5, Hashing">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the chapter teaches that a hash table answers "have
+I seen this?" and "what is stored under this key?" in constant time on
+average, by turning the key into an array index. In TypeScript that is
+`Set` and `Map`, and they replace a surprising number of nested loops.
+
+A worked example: finding which of 50,000 uploaded email addresses are
+already registered, out of 2 million users. Comparing every upload with
+every user is 10¹¹ comparisons. Putting the registered addresses in a
+`Set` and checking each upload is 2,050,000 operations.
+
+```ts
+const registered = new Set(existingEmails.map(e => e.toLowerCase()));
+const dupes = uploads.filter(e => registered.has(e.toLowerCase()));
+```
+
+The beginner mistake is forgetting normalisation: `"A@x.com"` and
+`"a@x.com"` are different keys unless the code lower-cases both. A hash
+table finds exact matches only, so "equal" must be decided before
+hashing.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can build a hash table both ways and predict
+its behaviour from λ. Chaining: about λ per unsuccessful search, keep λ
+near 1. Linear probing: ½(1 + 1/(1 − λ)²), keep λ below about 0.7.
+Quadratic and double hashing: close to 1/(1 − λ). Rehash by doubling
+to the next prime.
+
+A worked example: the two-sum problem, finding two numbers in an array
+that add to a target, in one pass.
+
+```ts
+function twoSum(xs: number[], target: number): [number, number] | null {
+  const seen = new Map<number, number>();           // value → index
+  for (let i = 0; i < xs.length; i++) {
+    const j = seen.get(target - xs[i]);
+    if (j !== undefined) return [j, i];
+    seen.set(xs[i], i);
+  }
+  return null;
+}
+console.log(twoSum([8, 3, 11, 5, 2], 13));           // [ 0, 3 ]: 8 + 5
+```
+
+It prints `[ 0, 3 ]` (8 + 5): index 0 is stored when 8 is seen, and when 5
+arrives its complement 8 is found. The intermediate mistake is checking
+`if (j)` instead of `j !== undefined`, which treats index 0 as missing.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+The advanced level is the analysis and its assumptions. Every average-case
+formula assumes the hash values behave as if random. Universal hashing
+makes that true by construction, for any input. The linear probing
+formula comes from a careful analysis of cluster sizes (Knuth's); the
+no-clustering formulas come from a simple geometric argument.
+
+A precise derivation for the no-clustering case: when a fraction λ of
+slots is full, each probe hits a full slot with probability λ, so the
+number of probes until an empty one is geometric with mean 1/(1 − λ).
+Successful searches cost the average of the insertion costs at the time
+each key was inserted, which integrates 1/(1 − x) from 0 to λ and divides
+by λ: (1/λ) ln(1/(1 − λ)). At λ = 0.5 that is 1.39, and I measured 1.43
+for quadratic probing.
+
+The advanced mistake is applying the formulas to inputs that are not
+random relative to the hash. My weak random generator gave three to six
+times the predicted probe counts. Measure on real keys.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+The boundary inputs to decide on purpose:
+
+- **Empty table lookup.** Must return "absent" without probing forever;
+  open addressing stops at the first empty slot, and an empty table has
+  one immediately.
+- **Table full of tombstones.** A table that has had many deletes can be
+  "empty" but have no truly empty slot, so an unsuccessful search loops
+  through the whole table. Count tombstones toward λ.
+- **Updating an existing key.** `set` must replace, not add a second
+  entry; both my implementations search first.
+- **Key 0, empty string, NaN.** JavaScript's `Map` treats `NaN` as equal
+  to itself (SameValueZero) and `+0` equal to `-0`. A hand-built table
+  using `===` would never find a `NaN` key.
+- **Table size 1 or 2.** Quadratic probing's guarantee needs a prime size;
+  start at a small prime like 11 or 17.
+
+The mistake is testing only random keys in a half-full table. The bugs
+live at full, empty, deleted and odd keys.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases come from the language and the hash.
+
+- **Precision.** Building a polynomial hash with doubles in JavaScript
+  loses low bits after about 53 bits of value. Use `Math.imul` and `>>> 0`
+  or `BigInt`.
+- **Negative remainders.** In JavaScript, `-7 % 10` is −7. A signed hash
+  must be made non-negative before indexing.
+- **Mutable keys.** A key object changed after insertion sits in the slot
+  for its old hash and cannot be found under its new one.
+- **Iteration during modification.** Rehashing during a loop over the
+  table can move entries the loop has not reached. JavaScript's `Map`
+  defines this behaviour; hand-built tables usually do not.
+- **Hash flooding.** Keys from users must go through a keyed or randomised
+  hash, or a table that degrades gracefully (tree buckets).
+
+The mistake is trusting that "it works on my tests". These bugs appear
+only with long strings, negative numbers or hostile input.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level, the questions are memory, latency spikes and
+attacks. A JavaScript `Map` entry costs tens of bytes beyond the key and
+value; a million entries is tens of megabytes. Resizes cause pauses (73
+ms measured at a million entries). Inputs from users must not be able to
+force collisions.
+
+A worked example: a rate limiter keyed by client IP in a gateway. Without
+a cap, a scan from many addresses grows the map without limit, and each
+resize pauses the event loop. The production design is a bounded map
+(evicting the least recently used entries, chapter 3's LRU), pre-sized
+for the expected peak, keyed with the runtime's randomised hash.
+
+For distributed caches, `hash(key) mod N` remaps almost every key when a
+node joins or leaves. Consistent hashing (keys and nodes on a ring) or
+rendezvous hashing moves only the keys of the affected node.
+
+The production mistake is an unbounded map in a long-lived process: a
+slow memory leak that eventually dominates heap and GC time.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that hashing trades order for speed, and that "average"
+means "on inputs that look random to the hash". Whenever I use a hash
+table I ask two questions: do I ever need order, and could anyone choose
+the keys?
+
+The second habit is to think of a hash table as the default cache for any
+computation: memoisation is a map from inputs to outputs, deduplication
+is a set, grouping is a map from key to list, counting is a map from key
+to number. Most "make this faster" changes in application code are one
+of these four.
+
+A worked example of the mindset: a report job was slow because it looked
+up each order's customer with `customers.find(c => c.id === order.customerId)`.
+One `Map` from id to customer, built once, turned an O(n × m) job into
+O(n + m), and it ran in seconds instead of an hour.
+
+The mindset mistake is reaching for a hash table when the keys are small
+integers in a known range: a plain array indexed by the key is simpler
+and faster.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design, hashing is how data is partitioned and found across
+machines. Sharding by hash of the user ID spreads load evenly; consistent
+hashing lets the cluster grow. Content-addressed storage (Git, IPFS,
+Docker layers) names data by a cryptographic hash of its contents, so
+duplicates are stored once and integrity is checkable. Bloom filters, an
+array of bits set by several hashes, answer "definitely not present"
+cheaply, and databases like Cassandra and RocksDB use them to skip disk
+reads.
+
+A worked example: deduplicating uploads in a file storage service. Hash
+each file's contents with SHA-256; store the blob under its hash; store
+per-user metadata pointing to the hash. Uploading a file that already
+exists costs one hash computation and one lookup, and storage is paid
+once.
+
+The system design mistake is sharding by a key with poor distribution
+(country, or a timestamp prefix), creating hot partitions. Hash the key,
+or add a random suffix, so load spreads.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy for this chapter is to build two tables and measure them
+against the formulas, then stop building and get fluent with the four
+patterns (memoise, dedupe, group, count) using the built-in `Map` and
+`Set`.
+
+The plan, in order: write the three string hashes and the histogram;
+build the chained map with rehashing; build a linear-probing table with
+lazy deletion and measure probe counts at λ of 0.5, 0.75 and 0.9; read
+cuckoo and universal hashing closely and implement the Carter–Wegman
+function; then go through my own code for `find` inside loops and replace
+them with maps.
+
+The strategic mistake is chasing exotic tables (hopscotch, Robin Hood,
+SwissTable internals) before the basics are reflexive. Those are for when
+a profiler points at a hash table.
+
+Done when my tables' probe counts match the formulas within a few
+percent, I can explain a hash flooding attack and its defences, and I
+replace a nested search with a map without thinking about it.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Is a JavaScript object a hash table?**
+Mostly, but engines optimise objects with stable shapes into fixed
+layouts (hidden classes), and fall back to dictionary mode when keys are
+added and removed often. For dynamic keys, use `Map`.
+
+**Why is hash table lookup O(1) if a chain can be long?**
+It is O(1) on average with a good hash and bounded load factor. A single
+lookup can be slower; universal hashing makes the average hold for any
+input.
+
+**Which is faster in practice, chaining or open addressing?**
+Usually open addressing with linear probing, because consecutive probes
+share cache lines. Chaining degrades more gracefully at high load and
+makes deletion simple.
+
+**What load factor should I use?**
+About 1 for chaining, 0.5 to 0.75 for open addressing. Libraries pick for
+you: Java 0.75, Python two-thirds.
+
+**Why prime table sizes when many libraries use powers of two?**
+Primes protect against patterned keys with a weak hash. Powers of two
+make the reduction a fast bit mask, and libraries using them first mix
+the hash thoroughly so the low bits are random.
+
+**What is the difference between a hash table and a hash function like
+SHA-256?**
+Table hash functions need to be fast and spread keys; cryptographic
+hashes must also make collisions infeasible to find, which makes them
+much slower. Use the right one for the job.
+
+**Can a hash table have worst-case O(1) lookups?**
+Yes: perfect hashing for fixed key sets, cuckoo hashing (two probes), and
+hopscotch hashing (a bounded neighbourhood), each paying at insert time.
+
+**When should I use a tree instead?**
+When you need order, ranges, minimum or maximum, or guaranteed O(log n)
+regardless of input.
+
+## Key takeaways
+
+- A hash table maps keys to array slots; O(1) average, no ordering.
+- The hash function decides everything: the sum hash used 135 of 10,007
+  slots; polynomial and FNV-1a used about 6,370, the random ideal.
+- Prime table sizes defeat patterned keys (10 slots versus 101 for
+  multiples of 10).
+- Chaining costs about λ per unsuccessful search; keep λ near 1.
+- Linear probing matched ½(1 + 1/(1 − λ)²) within a few percent: 48.5
+  probes at λ = 0.9 versus about 11 for quadratic and double hashing.
+- Rehashing doubles the table; amortised O(1), but a 73 ms pause at a
+  million entries.
+- Cuckoo, hopscotch and perfect hashing give worst-case O(1) lookups.
+- Universal hashing randomises the function to defeat chosen inputs;
+  extendible hashing brings hashing to disk.
+
+## Glossary
+
+- **Hash function:** maps a key to an integer, reduced to a table index.
+- **Table size (M):** the number of slots.
+- **Collision:** two keys mapping to the same slot.
+- **Load factor (λ):** keys divided by table size.
+- **Separate chaining:** a list of keys at each slot.
+- **Open addressing:** all keys in the table; collisions resolved by
+  probing other slots.
+- **Linear, quadratic probing:** probe offsets i and i².
+- **Double hashing:** probe offsets i × hash₂(x).
+- **Primary clustering:** runs of occupied slots that grow under linear
+  probing.
+- **Secondary clustering:** keys with the same hash following the same
+  probe sequence.
+- **Lazy deletion (tombstone):** marking a slot deleted so probe
+  sequences stay intact.
+- **Rehashing:** building a larger table and reinserting every key.
+- **Perfect hashing:** a collision-free function for a fixed key set.
+- **Cuckoo hashing:** each key in one of two slots; inserts evict.
+- **Hopscotch hashing:** each key within a fixed distance of its home
+  slot.
+- **Universal family:** a set of hash functions in which distinct keys
+  collide with probability at most 1/M.
+- **Extendible hashing:** a directory of 2ᴰ entries pointing to disk
+  leaves, split as they fill.
+
+## Exercises and self-check
+
+### Warm-up
+
+1. Insert 31, 4, 15, 28, 17, 66, 59 into a table of size 13 with hash
+   `key mod 13`, using linear probing. Then repeat with quadratic probing.
+2. Compute the expected unsuccessful-search probes for linear probing and
+   for the no-clustering ideal at λ = 0.6.
+3. Explain why deleting 4 from your linear-probing table by emptying its
+   slot could break a later search.
+
+### Build
+
+4. Implement a linear-probing map with lazy deletion and rehashing that
+   counts tombstones toward the load factor. Reproduce my probe table.
+5. Make the chained map shrink when λ falls below 0.25, and test that
+   alternating inserts and deletes at the boundary do not thrash.
+6. Implement Carter–Wegman hashing for integers with `BigInt`, and show
+   that the adversarial multiples-of-M input spreads.
+7. Write a function that finds the first non-repeating character in a
+   string in O(n) with a map.
+
+### Stretch
+
+8. Implement cuckoo hashing with a kick bound and rebuilds, and find the
+   load at which rebuilds start for two tables of 10,000.
+9. Implement extendible hashing with 16-bit hashed keys and leaf capacity
+   4, and print the directory after each insert.
+10. Build a Bloom filter with k hash functions and measure its
+    false-positive rate against the formula (1 − e^(−kn/m))ᵏ.
+
+### Self-check
+
+<details>
+<summary>Answers to the warm-ups</summary>
+
+1. Linear: 31→5, 4→4, 15→2, 28→2 taken so 3, 17→4 taken, 5 taken, so 6;
+   66→1, 59→7. Quadratic: 31→5, 4→4, 15→2, 28→3 (2 + 1), 17→4 taken,
+   5 taken (4 + 1), 8 (4 + 4); 66→1, 59→7.
+2. Linear: ½(1 + 1/0.16) = 3.625. Ideal: 1/0.4 = 2.5.
+3. 17 probed slots 4, 5 and 6 to land in 6. If slot 4 were emptied, a
+   search for 17 would stop at slot 4 and report it absent.
+
+</details>
+
+## How I'd study this chapter
+
+I give this chapter three sessions of about ninety minutes.
+
+Session one is sections 5.1 to 5.3. I write the three string hashes, run
+the histogram on realistic keys (random words, then real file paths from
+my own disk), and build the chained map with rehashing, logging each
+resize.
+
+Session two is open addressing and rehashing. I build a linear-probing
+table with lazy deletion, then add quadratic and double hashing as
+options, and reproduce the probe table at three load factors next to the
+formulas. I time the worst single insert of a large `Map` to see the
+resize pause myself.
+
+Session three is sections 5.7 to 5.9. I build the cuckoo table with its
+kick bound, implement Carter–Wegman with `BigInt` and run the adversarial
+input, and trace extendible hashing on paper before running my version.
+
+This chapter supports
+<a href={withBase('/plans/traditional-software-developer/#strategy-3')}>phase 3 of the traditional roadmap</a>,
+and the same material appears in
+<a href={withBase('/books/introduction-to-algorithms/')}>Introduction to Algorithms</a>
+(hash tables and universal hashing). The next chapter page is chapter 6,
+Priority Queues (Heaps).
+
+Done when my measured probe counts match the formulas, my tables survive
+tests with deletions, full tables and hostile keys, and I can explain
+each design's trade in one sentence.
