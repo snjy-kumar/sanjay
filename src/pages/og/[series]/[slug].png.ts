@@ -27,7 +27,10 @@ export const GET: APIRoute = async ({ props }) => {
   const png = await renderOgCard({
     title: post.data.title,
     kicker: seriesName,
-    meta: dateFormatter.format(post.data.date),
+    // An undated note has no day to show, so the card says which note it is.
+    meta: post.data.date && !post.data.undated
+      ? dateFormatter.format(post.data.date)
+      : `Note ${String(post.data.seriesOrder).padStart(2, '0')}`,
     footer: 'Sanjay Kumar Thakur',
   });
 
