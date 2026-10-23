@@ -1,0 +1,1546 @@
+---
+book: data-structures-and-algorithm-analysis
+number: 3
+title: "Lists, Stacks, and Queues"
+description: "Abstract data types, growable arrays and sentinel linked lists with iterators, then stacks for brackets, postfix and infix, and circular queues, built in TypeScript."
+part: "The core structures"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+This chapter builds the three simplest data structures in computing, and
+the ones used most: the list, the stack and the queue. It separates what a
+structure promises (its abstract data type) from how it is built, builds
+the list twice (as a growable array and as a doubly linked list), and then
+shows that stacks and queues are restricted lists with surprisingly many
+uses: checking brackets, evaluating expressions, running function calls,
+and buffering work between a producer and a consumer.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Say what an abstract data type is and why the same one can have
+  implementations with very different costs.
+- Build a growable array with amortised constant-time append, and explain
+  exactly why doubling the capacity makes it cheap.
+- Build a doubly linked list with sentinel nodes and iterators, and erase
+  while iterating without skipping or crashing.
+- Use a stack to check balanced brackets, evaluate a postfix expression and
+  convert infix to postfix with correct precedence and associativity.
+- Build a circular-array queue that tells full from empty, and say why
+  `Array.prototype.shift` is the wrong queue in JavaScript.
+
+What you should already know: classes, generics and the copy-or-view
+question from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/01-programming-a-general-overview/')}>chapter 1</a>,
+and the running-time rules from
+<a href={withBase('/books/data-structures-and-algorithm-analysis/02-algorithm-analysis/')}>chapter 2</a>.
+
+Reading time: about 80 minutes, plus two evenings to build and test the
+structures.
+
+## Chapter map
+
+<Layers caption="The chapter as layers. The ADT idea sits on top; the list is built two ways underneath; stacks and queues are lists with fewer operations, each with its own applications." layers={[
+  { name: "3.1 Abstract data types", note: "what a structure promises, separate from how it is built" },
+  { name: "3.2 The list ADT", note: "array version and linked version, with their costs" },
+  { name: "3.3 vector and list in the library", note: "iterators, erasing while walking, read-only iterators" },
+  { name: "3.4–3.5 Building them", note: "a growable array; a doubly linked list with sentinels" },
+  { name: "3.6 Stacks", note: "push/pop at one end: brackets, postfix, infix, function calls" },
+  { name: "3.7 Queues", note: "add at the back, remove at the front: circular array, uses" },
+]} />
+
+## 3.1 Abstract data types (ADTs)
+
+### In one sentence
+
+An abstract data type is a set of values together with the operations
+allowed on them, described by what the operations do and not by how they
+are implemented.
+
+### The idea
+
+Integers, real numbers and booleans are data types we use without thinking
+about their bits. We know the operations (add, compare, negate) and what
+they mean. An **abstract data type (ADT)** extends that idea to anything:
+a set of objects plus a set of operations, specified by behaviour alone.
+"A set with add, remove and contains" is an ADT. Whether it is built from
+an array, a linked list, a tree or a hash table is not part of the ADT.
+
+The separation is useful for two reasons. Callers can be written against
+the ADT and never change when the implementation does. And designers can
+choose an implementation to make the most frequent operations cheap. The
+whole of this book is a catalogue of implementations for a small number of
+ADTs: lists, stacks, queues, search trees (ordered sets and maps), hash
+tables (unordered sets and maps), priority queues and disjoint sets.
+
+The C++ class is the natural way to write an ADT, because the public
+member functions are the operations and the private members are the
+implementation. In TypeScript the ADT is an `interface` and each
+implementation is a class that satisfies it.
+
+The ADT does not dictate which operations exist. That is a design choice.
+A set might or might not offer "union with another set", "smallest
+element", or "iterate in order". The more operations, the fewer
+implementations can do them all cheaply.
+
+### Worked example
+
+Simple: a `Stack<T>` ADT in TypeScript, and two implementations.
+
+```ts
+interface Stack<T> {
+  push(x: T): void;
+  pop(): T | undefined;     // undefined when empty
+  peek(): T | undefined;
+  readonly size: number;
+}
+class ArrayStack<T> implements Stack<T> {
+  #a: T[] = [];
+  push(x: T) { this.#a.push(x); }
+  pop() { return this.#a.pop(); }
+  peek() { return this.#a[this.#a.length - 1]; }
+  get size() { return this.#a.length; }
+}
+```
+
+A linked version would have the same four members with a node chain
+inside. Code that takes a `Stack<number>` works with either.
+
+Realistic: a key–value store used by an app. The ADT is "get(key),
+set(key, value), delete(key)". In tests it is a `Map` in memory. In
+production it is Redis. The code that uses it is written once against the
+interface. If a new requirement adds "list all keys in order", the ADT has
+grown, and the choice of implementation changes (a hash table cannot do
+ordered iteration cheaply; a tree can). That is the ADT doing its job:
+making the cost of a new operation visible.
+
+### Step by step
+
+<Flow caption="Designing with an ADT. Notice that the implementation is chosen last, after the operations and their frequencies are known." steps={[
+  "list the operations callers need (and only those)",
+  "state what each does, including on empty input",
+  "estimate how often each is called",
+  "pick the implementation that makes the frequent ones cheap",
+  "write callers against the interface, not the class",
+  "swap implementations later without changing callers",
+]} />
+
+### Common mistake
+
+The mistake is leaking the implementation through the interface. A
+`getItems(): T[]` that returns the internal array lets callers mutate it,
+and now the "ADT" is really the array. A second leak is promising an order
+the ADT does not guarantee: callers start relying on a `Set` iterating in
+insertion order (which JavaScript does guarantee, but a hash set in
+another language does not). The fix is to return copies or iterators, and
+to document exactly what is promised.
+
+### In real systems
+
+APIs between services are ADTs. A REST endpoint promises behaviour; the
+database behind it is the implementation. When clients start depending on
+an accident of the implementation (the order of results, a field that was
+never documented), the implementation can no longer change. That is
+Hyrum's law, the observation that with enough users every observable
+behaviour becomes depended on, and it is the ADT idea failing at scale.
+
+### Check yourself
+
+1. Is "a sorted array" an ADT?
+
+<details>
+<summary>Answer</summary>
+
+No, it is an implementation. The ADT it might implement is an ordered set
+or a list; "sorted array" describes how the data is stored.
+
+</details>
+
+2. Why can adding one operation to an ADT change the best implementation?
+
+<details>
+<summary>Answer</summary>
+
+Each implementation makes some operations cheap and others expensive. A
+new operation (say, ordered iteration) may be expensive for the current
+choice (a hash table) and cheap for another (a balanced tree).
+
+</details>
+
+## 3.2 The list ADT
+
+### In one sentence
+
+A list is a sequence A₀, A₁, ..., Aₙ₋₁ with operations to print, find,
+insert and remove at any position; an array makes indexing cheap and
+middle insertion expensive, a linked list the reverse.
+
+### The idea
+
+The **list ADT** is a sequence of n elements in a definite order. A₀ is
+first, Aₙ₋₁ last, and the list of size 0 is the **empty list**. Element Aᵢ
+**follows** Aᵢ₋₁ and **precedes** Aᵢ₊₁. The operations the book lists are
+`printList`, `makeEmpty`, `find` (return the position of the first
+occurrence), `insert` and `remove` (at a position), and `findKth`
+(return the element at position k). Which ones are cheap depends on the
+implementation.
+
+#### 3.2.1 Simple array implementation of lists
+
+Store the elements in consecutive slots of an array. `findKth` is a single
+index: constant time. `printList` and `find` are linear, as they must be.
+`insert` at position 0 must shift every element right by one, which is
+linear; insert at the end is constant. `remove` at the front shifts every
+element left: linear. On average, inserting or removing at a random
+position shifts half the list.
+
+The array also needs a capacity. A fixed-size array must be big enough for
+the largest list ever, which wastes memory or fails. The fix is to grow:
+when full, allocate a bigger array and copy. Section 3.4 shows that
+doubling makes this cheap on average.
+
+#### 3.2.2 Simple linked lists
+
+A **linked list** stores each element in its own **node**, which also holds
+a pointer to the next node. The nodes can be anywhere in memory. To insert
+after a known node, create a node and redirect two pointers: constant time.
+To remove the node after a known one, redirect one pointer: constant time.
+But `findKth` must follow k pointers from the start: linear. A **doubly
+linked list** adds a pointer to the previous node in each node, so that
+removing a node you hold, or walking backwards, is also constant time.
+
+The key word is *known*. A linked list is fast at insertion and removal
+only when you already hold a pointer to the place. If you must first search
+for the place, the search is linear and dominates.
+
+### Worked example
+
+Simple: insert "B" at position 1 of the list A, C, D.
+
+With an array of capacity 4 holding `A C D _`: move D to slot 3, C to slot
+2, write B to slot 1. Three moves for a four-element list; for a million
+elements, a million moves.
+
+With a linked list `A → C → D`: make a node B, set B.next to C, set
+A.next to B. Two pointer writes, regardless of length, but only because I
+already had A. Finding A by position would have been a walk.
+
+Realistic: a text editor's buffer. Users type in the middle of documents.
+A single array means every keystroke near the start of a long file shifts
+the rest of the file. A linked list of characters makes inserts cheap but
+uses a pointer or two per character and makes "go to line 5,000" a walk.
+Real editors use a **gap buffer** (an array with a movable empty gap at the
+cursor) or a **piece table** or **rope**, which are hybrids designed
+precisely because neither simple version wins. This chapter's costs are
+the reason those hybrids exist.
+
+### Step by step
+
+<Figure caption="Inserting B after A. In the array, three items move; in the linked list, only the two arrows marked * change. Look at which cost depends on the list's length." art={`
+  array (before)  [ A | C | D | _ ]
+  shift right     [ A | _ | C | D ]    D moved, C moved
+  write B         [ A | B | C | D ]    3 writes for 4 items: O(n)
+
+  linked (before) A ──▶ C ──▶ D ──▶ null
+  new node        B
+  B.next = C      A ──▶ C       B ──*──▶ C
+  A.next = B      A ──*──▶ B ──▶ C ──▶ D ──▶ null   2 writes: O(1)
+`} />
+
+<Compare left="Array list" right="Linked list" rows={[
+  ["findKth(k): O(1)", "findKth(k): O(k)"],
+  ["insert/remove at end: O(1) (amortised)", "insert/remove at end: O(1) with a tail pointer"],
+  ["insert/remove at front: O(n)", "insert/remove at front: O(1)"],
+  ["insert/remove at a known middle spot: O(n)", "insert/remove at a known node: O(1)"],
+  ["memory: one block, no per-item overhead", "memory: one or two pointers per item"],
+  ["scanning: cache-friendly, fast", "scanning: pointer chasing, slower"],
+]} caption="The two list implementations side by side. Each row is a trade: neither column wins everywhere, which is why both exist." />
+
+### Common mistake
+
+The mistake is choosing a linked list because "insertion is O(1)" and then
+inserting by position, which first walks to the position. The total is
+linear, the same as the array, with worse constants. The fix is to use a
+linked list only when the code holds node references (an LRU cache's map
+from key to node is the standard example), and an array otherwise.
+
+### In real systems
+
+Dynamic arrays are the default list in nearly every language: JavaScript
+arrays, Python lists, Java's `ArrayList`, C++ `vector`, Rust's `Vec`.
+Linked lists appear where node references are held: the recency list of
+an LRU cache, the run queues and free lists inside operating system
+kernels, and allocator free lists. Editors, as above, use hybrids.
+
+### Check yourself
+
+1. What is the cost of removing the first element of an array list of n
+   items?
+
+<details>
+<summary>Answer</summary>
+
+O(n): every remaining element shifts one slot left.
+
+</details>
+
+2. When is a linked list's O(1) insertion actually O(1)?
+
+<details>
+<summary>Answer</summary>
+
+When you already hold a reference to the node next to the insertion
+point. Finding that node by position or value is a linear walk.
+
+</details>
+
+## 3.3 vector and list in the STL
+
+### In one sentence
+
+The C++ standard library ships both list implementations, `vector` and
+`list`, and gives them a common way to walk and edit them, the iterator,
+which is a movable position inside a container.
+
+### The idea
+
+The **Standard Template Library (STL)** is the part of the C++ library
+that holds containers and algorithms. Its `vector` is the growable array
+and its `list` the doubly linked list. Both support `size`, `clear`,
+`empty`, `push_back`, `pop_back`, `back` and `front`. The `list` also has
+`push_front` and `pop_front` in constant time; the `vector` has indexing
+with `operator[]` and `at` (which checks bounds), plus `capacity` and
+`reserve`.
+
+#### 3.3.1 Iterators
+
+Many operations need a *position*: "insert here", "remove this one". An
+integer index is a position for an array but not for a linked list, where
+reaching index k is a walk. The STL's answer is the **iterator**: an object
+that represents a position in a container. `begin()` gives an iterator at
+the first element, `end()` an iterator one *past* the last. `++itr`
+advances, `*itr` reads the element, and two iterators compare equal when
+they are at the same position. Then `insert(pos, x)` and `erase(pos)` take
+iterators, and each container makes them as cheap as it can.
+
+The "one past the end" convention is deliberate. A range is written
+`[begin, end)`: the start is included, the end is not. An empty range has
+`begin == end`, the loop condition is always `itr != end`, and the length
+is `end − begin`. The same half-open convention runs through JavaScript's
+`slice(start, end)` and most of this book.
+
+#### 3.3.2 Example: using erase on a list
+
+The book's example removes every other item from a list, walking with an
+iterator. The trick is that `erase` returns an iterator to the element
+*after* the erased one, so the loop uses that return value instead of
+advancing a now-invalid iterator. On a linked list this is linear overall.
+On a `vector` the same code is quadratic, because each erase shifts the
+rest of the array. Same code, same ADT, different cost: the chapter's
+theme in five lines.
+
+#### 3.3.3 const_iterators
+
+A `const_iterator` is an iterator that can read but not write the element.
+A function that takes a container by constant reference can only obtain
+const iterators from it, so the compiler guarantees it cannot modify the
+container. It is the iterator version of `const` member functions from
+chapter 1.
+
+### Worked example
+
+Simple: JavaScript's iterators. Every `for...of` loop uses the iterator
+protocol: an object with `next()` returning `{ value, done }`. A generator
+function makes one easily, and spreading `[...list]` drains it.
+
+Realistic: removing every odd value while walking my linked list (built
+in section 3.5). `erase` returns the next node, exactly like the STL.
+
+```ts
+const L = new List<number>();
+for (let i = 1; i <= 8; i++) L.pushBack(i);
+L.pushFront(0);
+for (let p = L.head.next!; p !== L.tail; )
+  p = p.value % 2 === 1 ? L.erase(p) : p.next!;
+console.log([...L], L.size);   // [ 0, 2, 4, 6, 8 ] 5
+```
+
+The same task on a JavaScript array, done the obvious way, is wrong:
+
+```ts
+const arr = [1, 3, 5, 6, 7];
+for (let i = 0; i < arr.length; i++) if (arr[i] % 2) arr.splice(i, 1);
+console.log(arr);     // [ 3, 6 ]   — 3 survived
+const arr2 = [1, 3, 5, 6, 7];
+for (let i = arr2.length - 1; i >= 0; i--) if (arr2[i] % 2) arr2.splice(i, 1);
+console.log(arr2);    // [ 6 ]
+```
+
+Removing index 0 shifts 3 into index 0, and then `i++` moves past it. That
+is the array version of using an invalidated iterator. Walking backwards
+fixes the skipping; `arr.filter(x => x % 2 === 0)` fixes both the bug and
+the quadratic cost by building a new array in one pass.
+
+### Step by step
+
+<Trace columns={["i", "arr before", "arr[i]", "action", "arr after"]} rows={[
+  ["0", "1 3 5 6 7", "1", "odd: splice(0, 1)", "3 5 6 7"],
+  ["1", "3 5 6 7", "5", "odd: splice(1, 1)  (3 was skipped)", "3 6 7"],
+  ["2", "3 6 7", "7", "odd: splice(2, 1)", "3 6"],
+  ["3", "3 6", "–", "loop ends", "3 6"],
+]} caption="The forward-splice bug. Row 1 is the problem: after a removal the next element slides into the current index, and i++ jumps over it." />
+
+### Common mistake
+
+The mistake is using an iterator (or index) after the container changed
+underneath it. In C++, erasing from a `vector` invalidates every iterator
+at or after the erased position, and inserting may invalidate all of them
+if it reallocates; using one is undefined behaviour. In JavaScript the
+equivalent is the skipped element above, or modifying a `Map` while
+iterating it (allowed, but entries added during iteration are visited and
+deleted ones are not, which surprises people). The fix is to use the
+returned iterator, walk backwards, or build a new container.
+
+### In real systems
+
+Iterators are how libraries expose traversal without exposing storage:
+database cursors, paginated API results (a "next page token" is an
+iterator over a remote list), streams in Node, and async iterators over
+message queues. Half-open ranges are how pagination and time windows are
+specified without overlaps or gaps: `[from, to)`.
+
+### Check yourself
+
+1. Why does `end()` point one past the last element?
+
+<details>
+<summary>Answer</summary>
+
+So that ranges are half-open: an empty range has begin equal to end, loops
+test `!= end`, and the length is end minus begin, with no special cases.
+
+</details>
+
+2. Why is "erase every other item" linear on a `list` but quadratic on a
+   `vector`?
+
+<details>
+<summary>Answer</summary>
+
+Each list erase is a constant-time pointer change. Each vector erase
+shifts all later elements, which is linear, and there are about n/2
+erases.
+
+</details>
+
+## 3.4 Implementation of vector
+
+### In one sentence
+
+A growable array keeps a size, a capacity and a fixed array underneath,
+and doubles the capacity when it fills, so that n appends cost O(n) in
+total.
+
+### The idea
+
+The vector the book builds has three data members: the number of elements
+in use (size), the length of the underlying array (capacity), and the
+array itself. Indexing reads the array directly. Appending writes to slot
+`size` and increments it. When size equals capacity, the vector
+**reserves** a larger array, copies (or, in modern C++, moves) the
+elements across, and frees the old one.
+
+The interesting question is how much to grow. If it grew by one slot each
+time, every append to a full vector would copy everything: 1 + 2 + ... + n
+copies, which is quadratic. Doubling instead makes the copies
+1 + 2 + 4 + ... up to n, a geometric series bounded by 2n. So the total cost
+of n appends is linear and the average per append is constant. This is an
+**amortised** bound: individual appends can be slow (the one that triggers
+a resize copies everything) but the average over any sequence is O(1).
+Chapter 11 makes amortised analysis formal.
+
+The book's class also includes the Big-Five from chapter 1, because it owns
+a raw array; `resize` (change size, filling or truncating); `reserve`
+(change capacity only); `operator[]` with no bounds check for speed;
+`back`, `pop_back`; and `begin`/`end` returning plain pointers, since a
+pointer into an array already behaves like an iterator.
+
+### Worked example
+
+My own `Vec<T>` with bounds checks, a copy counter and doubling:
+
+```ts
+class Vec<T> {
+  #data: (T | undefined)[]; #size = 0; copies = 0;
+  constructor(capacity = 1) { this.#data = new Array(Math.max(1, capacity)); }
+  get size() { return this.#size; }
+  get capacity() { return this.#data.length; }
+  get(i: number): T {
+    if (i < 0 || i >= this.#size) throw new RangeError(`index ${i} out of 0..${this.#size - 1}`);
+    return this.#data[i] as T;
+  }
+  // continued below
+}
+```
+
+The mutating half of the same class:
+
+```ts
+  push(x: T) {
+    if (this.#size === this.#data.length) this.reserve(2 * this.#data.length);
+    this.#data[this.#size++] = x;
+  }
+  pop(): T {
+    if (this.#size === 0) throw new RangeError('pop from empty');
+    const x = this.#data[--this.#size] as T;
+    this.#data[this.#size] = undefined;   // drop the reference so it can be collected
+    return x;
+  }
+  reserve(cap: number) {
+    if (cap <= this.#data.length) return;
+    const d = new Array(cap);
+    for (let i = 0; i < this.#size; i++) { d[i] = this.#data[i]; this.copies++; }
+    this.#data = d;
+  }
+}
+```
+
+Pushing a million items and counting:
+
+```text
+resizes 20 final cap 1048576 copies 1048575 per push 1.049
+```
+
+Twenty doublings (2²⁰ is 1,048,576), and the copies sum to 2²⁰ − 1, just
+as the geometric series from chapter 1 predicts: about one copy per push.
+And reading past the end throws instead of returning `undefined`:
+
+```text
+index 1000000 out of 0..999999
+```
+
+Realistic: if I know I will push a million items, `reserve(1_000_000)` up
+front avoids all twenty resizes and all the copying. Real code does this
+when the final size is known: `new Array(n)` in JavaScript, `reserve` in
+C++, `ArrayList(n)` in Java. In a hot loop it removes both the copying and
+the memory spikes, because during a resize the old and new arrays exist at
+once.
+
+### Step by step
+
+<Trace columns={["push #", "size before", "capacity before", "resize?", "copies this push", "total copies"]} rows={[
+  ["1", "0", "1", "no", "0", "0"],
+  ["2", "1", "1", "yes → 2", "1", "1"],
+  ["3", "2", "2", "yes → 4", "2", "3"],
+  ["4", "3", "4", "no", "0", "3"],
+  ["5", "4", "4", "yes → 8", "4", "7"],
+  ["6–8", "5–7", "8", "no", "0", "7"],
+  ["9", "8", "8", "yes → 16", "8", "15"],
+]} caption="The first nine pushes into a vector of capacity 1. The 'total copies' column is always one less than a power of two and never more than the number of pushes: that is the amortised O(1)." />
+
+Why doubling and not growing by a fixed amount, as a derivation:
+
+1. Grow by a constant k each time. A resize happens every k pushes and
+   copies the current size: k, 2k, 3k, ..., n. The sum is about n² / (2k).
+   Quadratic, with a smaller constant.
+2. Grow by a factor r greater than 1. The copies are n/r, n/r², ..., a
+   geometric series summing to less than n / (r − 1). Linear for any r.
+3. r equal to 2 gives at most n copies. Smaller factors such as 1.5 copy
+   more (up to 2n) but waste less memory; several libraries use 1.5 for
+   that reason.
+
+### Common mistake
+
+The mistake is growing by a fixed amount ("add 100 slots"), which makes
+appends quadratic over time, or shrinking as soon as size falls below
+half the capacity. The second causes thrashing: alternate push and pop at
+the boundary and every operation resizes. The standard fix is to shrink
+only when size falls to a quarter of capacity, which keeps every operation
+amortised constant.
+
+A JavaScript-specific mistake is leaving references in popped slots. If
+`pop` only decrements size, the object stays reachable from the array and
+the garbage collector cannot free it: a memory leak. Setting the slot to
+`undefined` fixes it.
+
+### In real systems
+
+Every dynamic array in every runtime uses geometric growth. The resize is
+a latency spike: appending to a huge array in a request handler
+occasionally copies hundreds of megabytes. Systems that cannot afford the
+spike pre-size, use chunked arrays (a list of fixed blocks, so growth never
+copies), or grow incrementally. Go's slices, Rust's `Vec`, V8's array
+backing stores and the buffers inside Node streams all follow this design.
+
+### Check yourself
+
+1. How many resizes does a vector starting at capacity 1 need to hold a
+   billion items under doubling?
+
+<details>
+<summary>Answer</summary>
+
+About 30, since 2³⁰ is just over a billion.
+
+</details>
+
+2. Why shrink at one quarter full rather than one half?
+
+<details>
+<summary>Answer</summary>
+
+Shrinking at one half lets a push and pop at the boundary resize every
+time. Shrinking at one quarter leaves a gap, so after any resize many cheap
+operations must happen before the next.
+
+</details>
+
+## 3.5 Implementation of list
+
+### In one sentence
+
+A doubly linked list is easiest to get right with two sentinel nodes, a
+header before the first element and a tail after the last, so that every
+insert and erase is the same four pointer updates with no special cases.
+
+### The idea
+
+The book's `list` class has three parts: the `Node` (an element plus
+`prev` and `next` pointers), the list itself (size plus pointers to the
+header and tail), and the iterator classes (a wrapper around a node
+pointer with `++`, `--`, `*` and comparison).
+
+The key design choice is **sentinel nodes**: an extra node at each end
+that holds no data. Without them, inserting at the front, inserting into
+an empty list, and removing the last node are all special cases with their
+own `if` statements, and each is a chance for a bug. With them, every real
+node always has a real `prev` and a real `next`, so one piece of code
+handles every position. `begin()` is the node after the header; `end()` is
+the tail sentinel, which is exactly the "one past the last" position the
+iterator convention wants.
+
+Inserting x before node p: make a node whose prev is p.prev and next is p;
+point p.prev.next at it; point p.prev at it. Four pointer writes. Erasing
+node p: point p.prev.next at p.next and p.next.prev at p.prev; return
+p.next. Two pointer writes plus cleanup.
+
+The book's iterator classes also show error checking: an iterator remembers
+which list it belongs to, so that using it on a different list, or
+advancing past `end`, can be detected.
+
+### Worked example
+
+My own sentinel list:
+
+```ts
+class Node<T> {
+  constructor(public value: T, public prev: Node<T> | null = null,
+              public next: Node<T> | null = null) {}
+}
+class List<T> {
+  head = new Node<T>(undefined as T);  // header sentinel
+  tail = new Node<T>(undefined as T);  // tail sentinel
+  size = 0;
+  constructor() { this.head.next = this.tail; this.tail.prev = this.head; }
+  insertBefore(p: Node<T>, x: T): Node<T> {
+    const n = new Node(x, p.prev, p);
+    p.prev!.next = n; p.prev = n; this.size++;
+    return n;
+  }
+  pushBack(x: T) { return this.insertBefore(this.tail, x); }
+  pushFront(x: T) { return this.insertBefore(this.head.next!, x); }
+  erase(p: Node<T>): Node<T> {
+    const nxt = p.next!;
+    p.prev!.next = nxt; nxt.prev = p.prev;
+    p.prev = p.next = null; this.size--;   // detach so stale use fails loudly
+    return nxt;
+  }
+  *[Symbol.iterator]() {
+    for (let p = this.head.next!; p !== this.tail; p = p.next!) yield p.value;
+  }
+}
+```
+
+The empty-list and single-element cases need no special code:
+
+```ts
+const one = new List<string>();
+const only = one.pushBack('x');
+one.erase(only);
+console.log([...one], one.size, one.head.next === one.tail); // [] 0 true
+```
+
+Realistic: an LRU (least recently used) cache. A `Map` from key to node
+gives O(1) lookup; the list keeps nodes in order of last use. On every
+access, erase the node and push it to the front (both O(1) because the map
+gives the node). When the cache is full, erase `tail.prev`, the least
+recently used. This is the canonical case where a linked list beats an
+array, and it only works because the map holds node references.
+
+### Step by step
+
+<Figure caption="Inserting X before node B with sentinels. The four numbered pointer writes are the whole operation; the same four lines work when B is the tail sentinel (append) or the list is empty." art={`
+   [H] <──> [A] <──> [B] <──> [T]        H, T: sentinels, no data
+
+   n = new Node(X, prev = A, next = B)   (1) n.prev = A   (2) n.next = B
+   A.next = n                            (3)
+   B.prev = n                            (4)
+
+   [H] <──> [A] <──> [X] <──> [B] <──> [T]
+`} />
+
+<Trace columns={["operation", "list (between sentinels)", "pointer writes"]} rows={[
+  ["new List()", "(empty)  H.next = T, T.prev = H", "2"],
+  ["pushBack(1)", "1", "4"],
+  ["pushBack(2)", "1 2", "4"],
+  ["pushFront(0)", "0 1 2", "4"],
+  ["erase(node 1)", "0 2", "2 (+2 to detach)"],
+  ["erase(node 0)", "2", "2 (+2)"],
+  ["erase(node 2)", "(empty) H.next = T again", "2 (+2)"],
+]} caption="A list's life with sentinels. The 'pointer writes' column never changes with position or size: no special case for front, back or last element." />
+
+### Common mistake
+
+The commonest linked-list bug is updating pointers in the wrong order and
+losing the rest of the list: writing `p.prev.next = n` after already
+changing `p.prev`. The fix is to create the new node with both its
+pointers first, then update the neighbours, as above, and to draw the four
+arrows before coding.
+
+The second is using a node after erasing it. My `erase` sets the erased
+node's pointers to `null`, so using it afterwards throws a
+`TypeError: Cannot read properties of null` at once, instead of silently
+walking through a detached node. In C++ the erased node is freed, and
+using it is undefined behaviour.
+
+### In real systems
+
+Linux's kernel lists are doubly linked and circular with a single
+sentinel, and they are *intrusive*: the `prev`/`next` pointers live inside
+the data structure itself, so one object can sit on several lists without
+extra allocation. Memory allocators keep free blocks on such lists. Redis
+used doubly linked lists for its list type before switching to compact
+array-based encodings, because pointer overhead and cache misses cost more
+than the O(1) inserts saved. That switch is section 3.2's trade-off
+decided by measurement.
+
+### Check yourself
+
+1. What does the tail sentinel give the iterator design?
+
+<details>
+<summary>Answer</summary>
+
+A real node for `end()` to point at, one past the last element, so the
+half-open range convention works without null checks.
+
+</details>
+
+2. In an LRU cache, why must the map store nodes rather than indexes?
+
+<details>
+<summary>Answer</summary>
+
+Because erasing and moving to the front must be O(1). An index into a
+linked list would need a walk; a node reference lets the list unlink it
+directly.
+
+</details>
+
+## 3.6 The stack ADT
+
+### In one sentence
+
+A stack is a list where insertion and removal happen only at one end, the
+top, so the last item pushed is the first popped; that single rule
+underlies bracket matching, expression evaluation and every function call
+your program makes.
+
+### The idea
+
+#### 3.6.1 Stack model
+
+A **stack** supports `push` (insert at the top), `pop` (remove the most
+recently pushed item) and `top` (look at it without removing it). It is
+called a **LIFO** list: last in, first out. Popping an empty stack is an
+error in the ADT; pushing onto a full one is an implementation limit, not
+part of the model. Everything is constant time, because nothing but the
+top is ever touched.
+
+#### 3.6.2 Implementation of stacks
+
+Any list implementation works, because a stack only uses one end. A linked
+list pushes and pops at the front. An array pushes and pops at the back,
+with an index `topOfStack` that starts at −1 for empty. The array version
+is what almost everyone uses: a `vector` with `push_back`, `back` and
+`pop_back` is a stack. In JavaScript, a plain array with `push` and `pop`
+is a stack with amortised O(1) operations.
+
+The two errors are popping when empty and, for fixed arrays, pushing when
+full. The book notes that production code often skips the empty check on
+the fast path for speed, but a stack exposed to user input must check.
+
+#### 3.6.3 Applications
+
+The book gives four applications. Each relies on the same property: the
+most recent unfinished thing is the one that must be finished first.
+
+**Balancing symbols.** Read a text character by character. On an opening
+symbol (`(`, `[`, `{`), push it. On a closing symbol, the stack must not
+be empty and its top must be the matching opener; pop it. At the end, the
+stack must be empty. One pass, linear time, and it reports the first
+error.
+
+**Postfix expressions.** In **postfix** (or reverse Polish) notation the
+operator comes after its operands: `4 7 2 - 3 * +` means 4 + (7 − 2) × 3.
+No parentheses or precedence rules are needed. To evaluate: on a number,
+push it; on an operator, pop two operands (the second popped is the left
+one), apply, push the result. At the end exactly one value remains.
+
+**Infix to postfix conversion.** Ordinary **infix** expressions
+(`1 + 2 * 3`) can be converted to postfix with a stack of operators.
+Operands go straight to the output. An operator first pops to the output
+every stacked operator of higher precedence, or of equal precedence if the
+new one is left-associative, then is pushed. An opening parenthesis is
+pushed; a closing one pops to the output until its opener. At the end,
+pop everything. This is Dijkstra's **shunting-yard algorithm**.
+
+**Function calls.** When a function calls another, the caller's local
+variables and the place to return to must be saved, and restored when the
+callee returns. The most recent call is always the first to return, so
+the saved state lives on a stack: the **call stack**, and each entry is a
+**stack frame** or **activation record**. Recursion is just many frames of
+the same function. Too many frames overflow the fixed-size stack, and the
+book's point is that a recursion that does not need to be one (tail
+recursion over a long list) should become a loop.
+
+### Worked example
+
+Bracket checking with the position and reason for each error:
+
+```ts
+function balanced(s: string): { ok: true } | { ok: false; at: number; why: string } {
+  const pairs: Record<string, string> = { ')': '(', ']': '[', '}': '{' };
+  const st: { ch: string; at: number }[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[' || c === '{') st.push({ ch: c, at: i });
+    else if (c in pairs) {
+      const top = st.pop();
+      if (!top) return { ok: false, at: i, why: 'nothing to close' };
+      if (top.ch !== pairs[c]) return { ok: false, at: i, why: `expected ${({'(':')','[':']','{':'}'} as any)[top.ch]}` };
+    }
+  }
+  const left = st.pop();
+  return left ? { ok: false, at: left.at, why: 'never closed' } : { ok: true };
+}
+```
+
+Results:
+
+```text
+'f(a[i], {k: 1})'  ok
+'(]'               fails at 1: expected )
+'(()'              fails at 0: never closed
+'())'              fails at 2: nothing to close
+```
+
+Postfix evaluation, my own expression `4 7 2 - 3 * +`:
+
+```ts
+function evalPostfix(tokens: string[]): number {
+  const st: number[] = [];
+  for (const t of tokens) {
+    if (/^\d+(\.\d+)?$/.test(t)) { st.push(Number(t)); continue; }
+    if (st.length < 2) throw new Error(`not enough operands for ${t}`);
+    const b = st.pop()!, a = st.pop()!;           // b popped first: it is the right operand
+    st.push(t === '+' ? a + b : t === '-' ? a - b : t === '*' ? a * b
+          : t === '/' ? a / b : a ** b);
+  }
+  if (st.length !== 1) throw new Error(`malformed: ${st.length} values left`);
+  return st[0];
+}
+```
+
+It returns 19. Other results: `7 2 3 * -` gives 1, `2 3 2 ^ ^` gives 512,
+and `['1', '+']` throws "not enough operands for +".
+
+### Step by step
+
+<Trace columns={["token", "action", "stack after (bottom → top)"]} rows={[
+  ["4", "push", "4"],
+  ["7", "push", "4 7"],
+  ["2", "push", "4 7 2"],
+  ["-", "pop 2, pop 7, push 7 − 2", "4 5"],
+  ["3", "push", "4 5 3"],
+  ["*", "pop 3, pop 5, push 5 × 3", "4 15"],
+  ["+", "pop 15, pop 4, push 4 + 15", "19"],
+]} caption="Evaluating 4 7 2 - 3 * + with a stack. Notice in the '-' row that the first value popped is the right operand: 7 − 2, not 2 − 7." />
+
+The conversion from infix, for `4 + 6 * (5 - 2) / 3`:
+
+<Trace columns={["token", "rule", "operator stack", "output"]} rows={[
+  ["4", "operand → output", "", "4"],
+  ["+", "stack empty: push", "+", "4"],
+  ["6", "operand", "+", "4 6"],
+  ["*", "top + is lower: push", "+ *", "4 6"],
+  ["(", "always push", "+ * (", "4 6"],
+  ["5", "operand", "+ * (", "4 6 5"],
+  ["-", "top is (: push", "+ * ( -", "4 6 5"],
+  ["2", "operand", "+ * ( -", "4 6 5 2"],
+  [")", "pop until (", "+ *", "4 6 5 2 -"],
+  ["/", "top * is equal, left-assoc: pop it; + is lower: push", "+ /", "4 6 5 2 - *"],
+  ["3", "operand", "+ /", "4 6 5 2 - * 3"],
+  ["end", "pop all", "", "4 6 5 2 - * 3 / +"],
+]} caption="Shunting-yard conversion. The '/' row is the subtle one: an operator of equal precedence on the stack is popped first, which is what makes 6 × 3 / 3 group left to right." />
+
+The postfix evaluates to 10, the same as the infix. A few more conversions
+my code produced, each checked by evaluating both forms:
+
+```text
+1 + 2 * 3       →  1 2 3 * +     = 7
+(1 + 2) * 3     →  1 2 + 3 *     = 9
+8 - 3 - 2       →  8 3 - 2 -     = 3     left-associative: (8 − 3) − 2
+2 ^ 3 ^ 2       →  2 3 2 ^ ^     = 512   right-associative: 2 ^ (3 ^ 2)
+```
+
+The conversion loop itself:
+
+```ts
+const prec: Record<string, number> = { '+': 1, '-': 1, '*': 2, '/': 2, '^': 3 };
+const rightAssoc = new Set(['^']);
+function toPostfix(tokens: string[]): string[] {
+  const out: string[] = [], ops: string[] = [];
+  for (const t of tokens) {
+    if (t in prec) {
+      while (ops.length && ops.at(-1)! in prec &&
+        (prec[ops.at(-1)!] > prec[t] ||
+         (prec[ops.at(-1)!] === prec[t] && !rightAssoc.has(t)))) out.push(ops.pop()!);
+      ops.push(t);
+    } else if (t === '(') ops.push(t);
+    else if (t === ')') {
+      while (ops.length && ops.at(-1) !== '(') out.push(ops.pop()!);
+      if (!ops.pop()) throw new Error('unmatched )');
+    } else out.push(t);
+  }
+  while (ops.length) { const o = ops.pop()!; if (o === '(') throw new Error('unmatched ('); out.push(o); }
+  return out;
+}
+```
+
+The call stack, measured: a recursive length function on a 200,000-node
+linked list throws `RangeError: Maximum call stack size exceeded` in Node,
+while the loop version returns 200000. Each recursive call is a frame;
+the default stack holds roughly ten thousand frames of this kind. A loop
+uses one frame no matter how long the list.
+
+<Figure caption="The call stack during fact(3) at its deepest point. Each frame holds its own n and the place to return to; frames are popped in the reverse order they were pushed." art={`
+   top ─▶ ┌───────────────────────┐
+          │ fact  n = 1  → return 1│   pushed last, popped first
+          ├───────────────────────┤
+          │ fact  n = 2  waiting   │   resumes: 2 × 1
+          ├───────────────────────┤
+          │ fact  n = 3  waiting   │   resumes: 3 × 2
+          ├───────────────────────┤
+          │ main         waiting   │   receives 6
+          └───────────────────────┘
+`} />
+
+### Common mistake
+
+In postfix evaluation, the mistake is popping in the wrong order, so that
+`7 2 -` gives −5. The first value popped is the right operand. In infix
+conversion, the mistake is treating every operator as left-associative,
+which turns `2 ^ 3 ^ 2` into `(2 ^ 3) ^ 2` = 64 instead of 512. And in
+bracket checking, forgetting the end-of-input check accepts `(()`.
+
+The broader mistake is writing deep recursion in JavaScript on inputs that
+might be long. Engines do not reliably eliminate tail calls, so a "tail
+recursive" walk over a long list still overflows. Use a loop or an
+explicit stack.
+
+### In real systems
+
+The JVM and WebAssembly are stack machines: their bytecode is essentially
+postfix, with instructions that push and pop an operand stack. Every
+compiler and calculator parses infix with a precedence algorithm related
+to shunting-yard (or its cousin, precedence climbing). Editors use bracket
+stacks for highlighting and auto-closing; linters report "unclosed brace"
+from exactly the end-of-input check. Browser history's back button is a
+stack, and undo is a stack (with redo as a second one). Explicit stacks
+replace recursion in production tree walkers precisely to avoid the
+overflow measured above.
+
+### Check yourself
+
+1. What is the postfix form of `(3 + 4) * (5 - 1)`?
+
+<details>
+<summary>Answer</summary>
+
+`3 4 + 5 1 - *`, which evaluates to 28.
+
+</details>
+
+2. Why does an operator of equal precedence get popped before pushing a
+   left-associative operator?
+
+<details>
+<summary>Answer</summary>
+
+Because the earlier operator must be applied first: `8 - 3 - 2` means
+`(8 - 3) - 2`, so the first minus must reach the output before the second.
+
+</details>
+
+3. Why is a `(` never popped by an incoming operator?
+
+<details>
+<summary>Answer</summary>
+
+It marks the start of a subexpression; only the matching `)` may close it.
+The popping loop stops at it.
+
+</details>
+
+## 3.7 The queue ADT
+
+### In one sentence
+
+A queue inserts at the back and removes from the front, first in first
+out, and the efficient array version is a circular buffer whose front and
+back indexes wrap around.
+
+### The idea
+
+#### 3.7.1 Queue model
+
+A **queue** supports `enqueue` (insert at the back, or rear) and `dequeue`
+(remove and return the item at the front). It is a **FIFO** list: first
+in, first out. Both operations are constant time in a good implementation.
+
+#### 3.7.2 Array implementation of queues
+
+A linked list with a tail pointer works directly. The array version needs
+a trick. Keep an array, a `front` index, a `back` index and a size. Enqueue
+advances `back` and writes there; dequeue reads at `front` and advances
+it. Both indexes only move forward, so the queue drifts towards the end of
+the array even when it holds few items. The fix is **circular array
+implementation**: when an index reaches the end it wraps to 0, so the
+array is used as a ring.
+
+The subtle part is telling full from empty. In a ring, front and back
+indexes are in the same relative position in both states. The book keeps
+an explicit `currentSize`, which settles it. (The alternative is to leave
+one slot always empty.)
+
+#### 3.7.3 Applications of queues
+
+Whenever things are served in arrival order, there is a queue: jobs sent
+to a printer, calls waiting for an operator, requests waiting for a server
+thread, users waiting for a file server. The book notes that a whole
+branch of mathematics, **queueing theory**, predicts how long users wait
+and how long queues get, given arrival and service rates. Queues also
+drive algorithms: breadth-first search in chapter 9 is a queue of nodes to
+visit.
+
+### Worked example
+
+My ring buffer with capacity 4:
+
+```ts
+class Ring<T> {
+  #a: (T | undefined)[]; #front = 0; #back = -1; #size = 0;
+  constructor(cap: number) { this.#a = new Array(cap); }
+  enqueue(x: T): boolean {
+    if (this.#size === this.#a.length) return false;     // full: caller decides
+    this.#back = (this.#back + 1) % this.#a.length;
+    this.#a[this.#back] = x; this.#size++;
+    return true;
+  }
+  dequeue(): T | undefined {
+    if (this.#size === 0) return undefined;
+    const x = this.#a[this.#front]; this.#a[this.#front] = undefined;
+    this.#front = (this.#front + 1) % this.#a.length; this.#size--;
+    return x;
+  }
+}
+```
+
+Running `+A +B +C - - +D +E +F +G -` (plus means enqueue, minus dequeue)
+logs `got:A got:B full:G got:C`: G is refused because the ring is full.
+
+Realistic: JavaScript arrays are often used as queues with `push` and
+`shift`. `shift` removes index 0 and moves every other element down, so
+it is linear. Draining 100,000 items measured 712.9 ms with `shift` and
+3.8 ms with the ring: about 190 times slower, and the gap grows with n.
+(For contrast, summing a million numbers took 6.37 ms in an array and
+12.06 ms in a linked list: arrays win at scanning, which is why the right
+answer is a ring buffer and not a linked list.)
+
+### Step by step
+
+<Trace columns={["op", "front", "back", "size", "slots 0 1 2 3"]} rows={[
+  ["start", "0", "−1", "0", ". . . ."],
+  ["+A", "0", "0", "1", "A . . ."],
+  ["+B", "0", "1", "2", "A B . ."],
+  ["+C", "0", "2", "3", "A B C ."],
+  ["− (A)", "1", "2", "2", ". B C ."],
+  ["− (B)", "2", "2", "1", ". . C ."],
+  ["+D", "2", "3", "2", ". . C D"],
+  ["+E", "2", "0 (wrapped)", "3", "E . C D"],
+  ["+F", "2", "1", "4", "E F C D"],
+  ["+G", "2", "1", "4", "full: refused"],
+  ["− (C)", "3", "1", "3", "E F . D"],
+]} caption="A capacity-4 ring buffer. In the +E row the back index wraps from 3 to 0. In the +F and +G rows front and back are in the same relative position as when nearly empty; only size tells them apart." />
+
+<Compare left="Array with shift()" right="Circular buffer" rows={[
+  ["dequeue moves every remaining item: O(n)", "dequeue moves one index: O(1)"],
+  ["100k drain: 712.9 ms (measured)", "100k drain: 3.8 ms (measured)"],
+  ["unbounded, grows freely", "fixed capacity (or doubles and unrolls)"],
+  ["simple to write", "needs wraparound and full/empty logic"],
+]} caption="Two queues in JavaScript. The ring wins on cost; its extra complexity is ten lines, once." />
+
+### Common mistake
+
+The mistake is distinguishing full from empty using only front and back,
+which gets one of the two wrong. Keep a size, or keep one slot empty. The
+second mistake is growing a ring by copying the array as-is: the items
+must be unrolled starting at `front`, or the order breaks after a wrap.
+The third, in JavaScript, is `shift` in a loop on a large array, which is
+quadratic overall, as measured.
+
+### In real systems
+
+Ring buffers are everywhere a producer and consumer run at different
+speeds: network card receive rings, audio buffers, the kernel's `io_uring`
+submission and completion queues, log buffers that keep the last N lines,
+and the LMAX Disruptor in trading systems. Message brokers (RabbitMQ,
+SQS) are queues as a service. Queueing theory explains why a server at 90%
+utilisation has long waits and one at 99% has enormous ones: waiting time
+grows as 1 / (1 − utilisation) in the simplest model.
+
+### Check yourself
+
+1. In a ring of capacity 8 with front 6 and size 4, which slots hold the
+   items?
+
+<details>
+<summary>Answer</summary>
+
+6, 7, 0 and 1: the indexes wrap after 7.
+
+</details>
+
+2. Why is a linked-list queue not the obvious fix for `shift`?
+
+<details>
+<summary>Answer</summary>
+
+It is O(1) per operation but allocates a node per item and scans slowly,
+as the summing measurement shows. A ring buffer is O(1) and stays a
+compact array.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 3, Lists, Stacks, and Queues">
+
+<Level name="Beginner" depth={3}>
+
+At the beginner level, the chapter teaches three shapes of collection and
+the one question to ask before choosing: where do items go in, and where
+do they come out? Anywhere, by position: a list. Only at one end, newest
+first: a stack. In at one end, out at the other, oldest first: a queue.
+
+A worked example: an app's "recently viewed" feature. New items go on top
+and the top is shown first, so it is a stack in spirit, capped at ten.
+Customer support tickets are served oldest first, so they are a queue. A
+playlist where users drag songs to any position is a list.
+
+```ts
+const recent: string[] = [];
+function view(id: string) {
+  recent.push(id);
+  if (recent.length > 10) recent.shift(); // fine at size 10; slow at size 100,000
+}
+```
+
+The beginner mistake is using one array for everything without noticing
+the cost of `shift` and `splice` at the front. At ten items it does not
+matter. At a hundred thousand it was 190 times slower in my measurement.
+Know which operations move the whole array.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, I can build each structure and say its costs.
+A growable array: amortised O(1) append because of doubling, O(n) front
+insert. A doubly linked list with sentinels: O(1) insert and erase at a
+held node, O(n) to reach position k. A stack: array with push and pop. A
+queue: ring buffer with a size field.
+
+A worked example: implementing undo and redo in an editor with two stacks.
+
+```ts
+const undo: string[] = [], redo: string[] = [];
+let doc = '';
+function type(s: string) { undo.push(doc); doc += s; redo.length = 0; }
+function doUndo() { if (undo.length) { redo.push(doc); doc = undo.pop()!; } }
+function doRedo() { if (redo.length) { undo.push(doc); doc = redo.pop()!; } }
+type('ab'); type('c'); doUndo(); doUndo(); doRedo();
+console.log(doc); // 'ab'
+```
+
+Each edit pushes the old document on `undo` and clears `redo`, because a
+new edit makes the old redo history meaningless. The intermediate mistake
+is forgetting that clear, so that redo after a fresh edit jumps to an
+unrelated state.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+The advanced level is the precise analysis and the variants. Doubling
+gives amortised O(1) by a geometric series; any factor greater than 1
+does, trading memory for copies. Shrinking must lag growing (shrink at a
+quarter) to avoid thrashing. A **deque** (double-ended queue) supports
+push and pop at both ends in O(1), built as a ring buffer or, in C++, as a
+list of fixed blocks so that growth never moves existing items.
+
+A precise example of a lower-level variant: a stack that also returns its
+minimum in O(1). Push onto a second stack the minimum so far with each
+push; pop both together.
+
+```ts
+class MinStack {
+  #a: number[] = []; #mins: number[] = [];
+  push(x: number) { this.#a.push(x); this.#mins.push(Math.min(x, this.#mins.at(-1) ?? x)); }
+  pop() { this.#mins.pop(); return this.#a.pop(); }
+  min() { return this.#mins.at(-1); }
+}
+```
+
+The advanced mistake is believing amortised means "every operation is
+fast". A latency-sensitive service sees the resize as a single slow
+request. If that matters, pre-size or use a block-based structure.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Each structure has boundary inputs to settle on purpose.
+
+- **Pop or dequeue when empty.** Throw, return `undefined`, or return an
+  option type. Decide and document; my stack returns `undefined`, my
+  `Vec` throws.
+- **Erase the only node.** With sentinels it leaves `head.next === tail`,
+  verified above. Without sentinels it must also reset head and tail.
+- **Ring at exactly full.** Front and back look the same as nearly empty;
+  only the size distinguishes them. Test enqueue at size equal to
+  capacity.
+- **Wraparound.** Test a ring after enough operations that both indexes
+  have wrapped at least once.
+- **Empty expression.** `evalPostfix([])` must fail with "0 values left",
+  not return `undefined`.
+- **Unary minus.** `-3 + 4` breaks the simple converter, which reads the
+  minus as binary. Real parsers tokenise it as a separate operator.
+
+The mistake is testing only the middle. Every bug in this chapter's code
+that I have ever written was at an end: empty, full, first or last.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Corner cases are where two boundaries meet or the language interferes.
+
+- **Erasing while iterating.** The forward-splice bug turned `[1,3,5,6,7]`
+  into `[3,6]`. Walk backwards, use the returned iterator, or filter.
+- **Growing a ring after a wrap.** Copying slots 0..n−1 as they are breaks
+  the order. Unroll from `front`.
+- **Sparse arrays in JavaScript.** `new Array(4)` has holes, and
+  `.map` skips holes, so debugging output can show fewer slots than exist.
+  Use `Array.from({ length: 4 })` when every slot must be visited.
+- **Division by zero in postfix.** JavaScript returns `Infinity` instead
+  of throwing. Decide whether that is acceptable.
+- **Recursion depth.** The recursive length of a 200,000-node list
+  overflows; 5,000 nodes does not. A test suite with small lists passes
+  and production fails.
+
+The mistake is assuming the language will report these. Most of them run
+silently and give a wrong answer.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+At production level the questions are memory, latency and concurrency.
+Linked lists cost one or two pointers per item plus an allocation, and
+they scan at about half the speed of arrays in my measurement (12.06 ms
+vs 6.37 ms for a million items); in lower-level languages the gap is
+larger because of cache misses. So the default is an array, and a linked
+list needs a reason, usually held node references.
+
+Queues in production are bounded. An unbounded in-memory queue between a
+fast producer and a slow consumer grows until the process runs out of
+memory. A bounded ring that refuses or blocks when full applies
+**backpressure**: it pushes the slowness back to the producer, which is
+what my `Ring.enqueue` returning `false` models. Node streams do the same
+with their `highWaterMark`.
+
+A worked example: a log shipper that keeps the most recent 10,000 lines
+in a ring, overwriting the oldest when full, so a crash dump always has
+recent context and memory never grows.
+
+The production mistake is a queue with no limit and no metric. Export the
+queue length; a growing queue is the earliest warning that a consumer is
+falling behind.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The mindset is that a data structure is a promise about costs, and the
+code should make the promise visible. When I read `arr.shift()` in a loop,
+I hear "quadratic". When I read `list.find(...)` followed by an insert, I
+hear "the O(1) insert is a lie here". The habit is to say each
+operation's cost out loud while reading code.
+
+The second habit is drawing pointers before writing pointer code. Four
+boxes and arrows on paper catch the wrong-order bug before it exists.
+
+A worked example of the mindset: a teammate proposes a linked list for a
+feed because "we insert at the top a lot". I ask what else we do. If the
+answer is "render the first 50" and "jump to item 1,000", an array with
+insertion at the end (shown reversed) wins on every count.
+
+The mindset mistake is choosing from memory of Big-O tables instead of the
+actual operation mix.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+In system design the same three shapes reappear at the scale of services.
+A message queue (SQS, RabbitMQ, Kafka) is a FIFO between services, with
+the same full-versus-empty and backpressure questions as my ring buffer.
+A job scheduler's work queue, a rate limiter's sliding window of
+timestamps (a deque), and a request's call chain across services (a stack
+of spans in a tracing system) are this chapter at a larger scale.
+
+A worked example: a sliding-window rate limiter, allowing 100 requests
+per minute per user. Keep a queue of request timestamps; on each request,
+dequeue timestamps older than a minute, then allow the request if fewer
+than 100 remain. Each timestamp is enqueued once and dequeued once, so the
+cost is amortised O(1) per request.
+
+The system design mistake is forgetting that a distributed queue offers
+weaker promises than an in-memory one: messages can be delivered twice or
+out of order. The ADT changes, and consumers must be idempotent.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+The strategy for this chapter is to build each structure once, test its
+ends, measure it against the built-in, and then stop building and start
+choosing. In real work I almost never write a linked list; I use arrays,
+`Map`, and a small ring or deque. But having built them is what lets me
+read a profile and know that `shift` is the cause.
+
+The plan, in order: write `Vec`, `List` with sentinels, `Ring`, and the
+three stack applications in TypeScript; write tests for empty, single,
+full and wrapped states; time `shift` against the ring and array against
+list scans; then rewrite one real piece of my code that misuses an array
+as a queue.
+
+The strategic mistake is spending weeks perfecting a hand-built list.
+The value is in the costs and the boundary cases, not in the class.
+
+Done when my four structures pass boundary tests, my timings reproduce the
+shift-versus-ring gap, and I can explain each structure's costs and pick
+one for a described workload in under a minute.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Is a JavaScript array a list, a stack or a queue?**
+It is a growable array, so it is a good list for indexing and appending,
+and a good stack with `push` and `pop`. It is a poor queue: `shift` is
+linear. V8 has some optimisations for small arrays, but the 100,000-item
+drain still took 712.9 ms.
+
+**When should I actually use a linked list?**
+When you hold references to nodes and need O(1) removal or reordering of
+them: an LRU cache, a scheduler's run list, an intrusive list inside an
+allocator. Otherwise an array is faster and smaller.
+
+**Why do sentinel nodes matter if they hold no data?**
+They remove special cases. Every real node always has neighbours, so
+insert and erase are the same few lines everywhere, and `end()` has a node
+to point at.
+
+**What does amortised O(1) mean for one push?**
+Nothing on its own. It means any sequence of n pushes costs O(n). One push
+may copy the whole array.
+
+**Why convert infix to postfix at all?**
+Postfix has no precedence or parentheses, so it can be evaluated with one
+stack in one pass. Compilers turn source expressions into stack-machine
+code for the same reason.
+
+**What is the difference between a queue and a deque?**
+A queue adds at the back and removes from the front. A deque allows both
+operations at both ends. A deque can serve as a stack or a queue.
+
+**Why does recursion overflow on a long list but not a loop?**
+Each recursive call pushes a frame onto a fixed-size call stack; a loop
+reuses one frame. JavaScript engines do not reliably remove tail calls.
+
+**Is a priority queue a kind of queue?**
+It shares the name and the enqueue/dequeue shape, but it removes the
+smallest (or highest-priority) item instead of the oldest. Chapter 6
+builds it with heaps.
+
+## Key takeaways
+
+- An ADT is operations and their meaning; implementations make different
+  operations cheap.
+- Array lists index in O(1) and insert at the front in O(n); linked lists
+  insert at a held node in O(1) and index in O(n).
+- Doubling the capacity makes appends amortised O(1): a million pushes
+  cost about 1.05 copies each.
+- Iterators are positions; half-open ranges remove special cases; using an
+  iterator after the container changed is a bug.
+- Sentinel nodes make every linked-list operation the same few pointer
+  writes.
+- A stack checks brackets, evaluates postfix, converts infix with
+  precedence and associativity, and runs every function call.
+- A ring buffer is the right array queue; keep a size to tell full from
+  empty.
+- Measure: `shift` drained 100k items 190 times slower than a ring.
+
+## Glossary
+
+- **Abstract data type (ADT):** a set of values and operations, specified
+  by behaviour, not implementation.
+- **List:** a sequence of elements with operations at any position.
+- **Linked list:** a list whose elements are nodes connected by pointers.
+- **Doubly linked list:** a linked list whose nodes point both forward and
+  backward.
+- **Sentinel node:** a dummy node at an end of a list that holds no data
+  and removes special cases.
+- **Iterator:** an object representing a position in a container.
+- **Half-open range:** a range including its start and excluding its end.
+- **Capacity:** the number of slots allocated in a growable array, as
+  opposed to its size.
+- **Amortised cost:** the average cost per operation over any sequence of
+  operations.
+- **Stack:** a list with insertion and removal only at the top (LIFO).
+- **Postfix notation:** operators after their operands; also called
+  reverse Polish.
+- **Shunting-yard algorithm:** the stack-based conversion from infix to
+  postfix.
+- **Stack frame:** the saved state of one function call on the call stack.
+- **Queue:** a list with insertion at the back and removal at the front
+  (FIFO).
+- **Circular buffer (ring buffer):** an array queue whose indexes wrap
+  around.
+- **Deque:** a double-ended queue with O(1) operations at both ends.
+- **Backpressure:** slowing a producer when the consumer's queue is full.
+
+## Exercises and self-check
+
+### Warm-up
+
+1. Write the postfix form of `(2 + 3) * 4 - 5` and evaluate it by hand
+   with a stack trace.
+2. Trace a ring of capacity 3 through `+1 +2 - +3 +4 - - +5`, writing
+   front, back, size and slots after each step.
+3. For each of these, name the cost on an array list and a linked list:
+   append, remove first, read the 500th item, remove a node you hold.
+
+### Build
+
+4. Add `insertAt(i, x)` and `removeAt(i)` to `Vec`, with bounds checks,
+   and test them at 0, at size, and in the middle.
+5. Add a `reverse()` method to the sentinel `List` that swaps every node's
+   pointers in one pass. Test on empty, one and many items.
+6. Make `Ring` grow by doubling when full, unrolling from `front`. Test it
+   after a wrap.
+7. Extend the infix converter with unary minus and a `max(a, b)` function
+   with two arguments.
+
+### Stretch
+
+8. Implement an LRU cache with `get` and `put` in O(1), using a `Map` and
+   the sentinel list. Test eviction order.
+9. Implement a deque as a ring buffer with `pushFront`, `pushBack`,
+   `popFront` and `popBack`, and use it for a sliding-window maximum over
+   an array in O(n).
+10. Write an iterative in-order tree walk with an explicit stack and use it
+    on a deliberately deep, unbalanced tree that makes the recursive
+    version overflow.
+
+### Self-check
+
+<details>
+<summary>Answers to the warm-ups</summary>
+
+1. `2 3 + 4 * 5 -`. The stack goes 2; 2 3; 5; 5 4; 20; 20 5; 15.
+2. +1: front 0, back 0, size 1, `1 . .`. +2: back 1, size 2, `1 2 .`.
+   −: returns 1, front 1, size 1, `. 2 .`. +3: back 2, size 2, `. 2 3`.
+   +4: back wraps to 0, size 3, `4 2 3`. −: returns 2, front 2, size 2.
+   −: returns 3, front wraps to 0, size 1. +5: back 1, size 2, `4 5 .`.
+3. Append: O(1) amortised vs O(1) with a tail. Remove first: O(n) vs
+   O(1). Read 500th: O(1) vs O(500). Remove held node: O(n) for the shift
+   vs O(1).
+
+</details>
+
+## How I'd study this chapter
+
+I give this chapter three sessions of about ninety minutes.
+
+Session one is sections 3.1 to 3.4. I write the `Stack` interface and two
+implementations, then `Vec` with a copy counter, and confirm the 20
+resizes and roughly 1.05 copies per push for a million items. I write down
+why a fixed growth step would be quadratic.
+
+Session two is section 3.5. I draw the sentinel list on paper, with the
+four arrows of an insert, before typing it. Then I write tests for the
+empty list, erasing the only node, and erasing while iterating, and I
+reproduce the forward-splice bug on purpose so I recognise it later.
+
+Session three is the stack and queue sections. I build the bracket
+checker, postfix evaluator and shunting-yard converter, checking each
+conversion by evaluating both forms. I build the ring, trace it by hand
+through a wrap, and rerun the `shift` timing on my own machine.
+
+This chapter supports
+<a href={withBase('/plans/traditional-software-developer/#strategy-3')}>phase 3 of the traditional roadmap</a>,
+and the same structures appear in
+<a href={withBase('/books/introduction-to-algorithms/')}>Introduction to Algorithms</a>
+under elementary data structures. The next chapter page is chapter 4,
+Trees.
+
+Done when my `Vec`, `List`, `Ring` and stack applications pass their
+boundary tests, my timings show the `shift` gap, and I can draw a
+sentinel insert and a ring wraparound from memory.
