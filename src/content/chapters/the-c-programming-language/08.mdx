@@ -1,0 +1,2154 @@
+---
+book: the-c-programming-language
+number: 8
+title: "The UNIX System Interface"
+description: "K&R chapter 8 in depth: file descriptors, read and write, open, creat, close and unlink, lseek, a working fopen and getc, a directory walker and a free-list malloc."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+
+Chapter 8 goes one layer below the standard library, to the **system
+calls** a Unix kernel offers every program: open a file, read bytes, write
+bytes, move the position, close. It then rebuilds pieces of the library on
+top of them, a `fopen` and `getc`, a directory lister and a `malloc`, so
+the library stops being magic and becomes ordinary C code I could have
+written.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- explain what a file descriptor is and where descriptors 0, 1 and 2 come from;
+- copy data with `read` and `write`, and say why the buffer size matters so much;
+- open, create, close and delete files with `open`, `creat`, `close` and `unlink`, and handle every error they can return;
+- read and write anywhere in a file with `lseek`, including past its end;
+- write a working buffered `fopen` and `getc` from nothing but system calls;
+- walk a directory tree with `stat`, `opendir` and `readdir`, and write a first-fit `malloc` and `free` with a circular free list.
+
+What you should already know: <a href={withBase('/books/the-c-programming-language/07-input-and-output/')}>chapter 7</a>
+for the library view of the same operations, <a href={withBase('/books/the-c-programming-language/06-structures/')}>chapter 6</a>
+for structures, unions and `typedef`, and <a href={withBase('/books/the-c-programming-language/05-pointers-and-arrays/')}>chapter 5</a>
+for pointer arithmetic, which the allocator uses heavily.
+
+Reading time: about two hours, plus three evenings for the programs. The
+allocator alone deserves an evening with paper and pencil.
+
+## Chapter map
+
+<Layers caption="Chapter 8 read from the bottom up: the kernel's interface first, then three pieces of the library rebuilt on top of it." layers={[
+  { name: "8.1 File descriptors", note: "small integers naming open files; 0, 1 and 2 are already open" },
+  { name: "8.2 read and write", note: "the two calls every byte of I/O goes through" },
+  { name: "8.3 open, creat, close, unlink", note: "getting, releasing and deleting files" },
+  { name: "8.4 lseek", note: "random access: move the file position" },
+  { name: "8.5 fopen and getc", note: "the stdio buffer, built from 8.1 to 8.4" },
+  { name: "8.6 Listing directories", note: "stat and directory entries, a recursive walker" },
+  { name: "8.7 A storage allocator", note: "malloc and free over a circular free list" },
+]} />
+
+<Figure art={`
+   your program        printf  getc  fopen  malloc        (chapter 7)
+        |                 |      |      |      |
+   C library  ------------+------+------+------+---- buffers, FILE, free list
+        |                 |      |      |      |
+   system calls         write  read   open   sbrk/mmap     (chapter 8)
+        |                 |      |      |      |
+   kernel  ------------------------------------------------ files, devices,
+                                                            processes, memory
+`} caption="Where chapter 8 sits. Chapter 7 used the middle layer; this chapter uses the bottom layer directly and then shows how the middle layer is made from it." />
+
+A word on titles: the section names below follow the book's contents. The
+book writes for the Unix of its day. Where Linux or modern POSIX behaves
+differently, most visibly in 8.6, I say so and show the version that works
+today.
+
+## 8.1 File Descriptors
+
+### In one sentence
+
+A **file descriptor** is a small non-negative integer the kernel hands a
+program when it opens a file, and every later operation on that file names
+it by that number.
+
+### The idea
+
+On Unix, almost everything a program reads or writes is a **file**:
+regular files on disk, but also terminals, pipes, sockets and devices like
+`/dev/null`. That uniformity is the point. One set of calls, `read` and
+`write`, works for all of them, so a program that copies its input to its
+output works the same whether the input is a file, a keyboard or another
+program.
+
+Before a program can use a file, it asks the kernel to **open** it. The
+kernel checks that the file exists and that the program is allowed to use
+it, then records the open file in a per-process table and returns the
+index into that table. That index is the file descriptor. The program never
+sees the kernel's record; it only holds the number.
+
+Three descriptors are already open when `main` starts: 0 is **standard
+input**, 1 is **standard output** and 2 is **standard error**. The shell
+sets them up before it starts the program. With no redirection all three
+are the terminal. `prog < in > out` makes the shell open `in` as
+descriptor 0 and `out` as descriptor 1 before running `prog`, which is why
+the program does not need to know about redirection at all.
+
+The kernel always hands out the **lowest** free number. That rule is small
+but it matters: it is how the shell implements redirection (close 1, then
+open the file, which lands on 1), and it explains a class of bugs where a
+program closes a standard descriptor by mistake and the next file it opens
+silently becomes its "standard output".
+
+### Worked example
+
+The simplest example is to watch the numbers the kernel gives out.
+
+```c
+/* fdinfo.c: which descriptor numbers does open hand out? */
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int a = open("nums.txt", O_RDONLY);
+    int b = open("nums.txt", O_RDONLY);
+    printf("a=%d b=%d\n", a, b);
+    close(a);
+    int c = open("copy.txt", O_RDONLY);  /* lowest free number is reused */
+    printf("after close(a): c=%d\n", c);
+    printf("bad fd read: %zd\n", read(99, (char[1]){0}, 1));
+    return 0;
+}
+```
+
+```text
+$ ./fdinfo
+a=3 b=4
+after close(a): c=3
+bad fd read: -1
+```
+
+The first file gets 3, because 0, 1 and 2 are taken. Opening the same file
+twice gives two independent descriptors, each with its own position. After
+`close(a)`, number 3 is free again and the next `open` reuses it. Reading
+descriptor 99, which is not open, fails with -1.
+
+The realistic example is the same program started with standard input
+closed, which the shell syntax `0<&-` does:
+
+```text
+$ ./fdinfo 0<&-
+a=0 b=3
+after close(a): c=0
+bad fd read: -1
+```
+
+Now the lowest free number is 0, so the first `open` lands there. Any code
+in this program that read "standard input" would now be reading
+`nums.txt`. Daemons and careful servers guard against exactly this by
+opening `/dev/null` on 0, 1 and 2 if they are closed at start-up.
+
+### Step by step
+
+<Trace columns={["step", "call", "descriptor table after it", "returns"]} rows={[
+  ["start", "(shell set up 0, 1, 2)", "0 tty, 1 tty, 2 tty", "-"],
+  ["1", "open nums.txt", "0 tty, 1 tty, 2 tty, 3 nums.txt", "3"],
+  ["2", "open nums.txt", "... 3 nums.txt, 4 nums.txt", "4"],
+  ["3", "close 3", "... 3 free, 4 nums.txt", "0"],
+  ["4", "open copy.txt", "... 3 copy.txt, 4 nums.txt", "3"],
+  ["5", "read 99", "unchanged", "-1, errno EBADF"],
+]} caption="The per-process descriptor table during fdinfo. Look at step 4: the lowest free slot is always chosen, so a closed number is reused at once." />
+
+Underneath, each table slot points at a kernel **open file description**,
+which holds the current position and the mode. Two `open` calls make two
+descriptions, so `a` and `b` move independently. A `fork` or `dup` instead
+makes two descriptors share one description, and then reading from one
+moves the other's position too. The book does not need `dup`, but knowing
+the two levels explains why a parent and child writing to the same log
+file do not overwrite each other.
+
+<Figure art={`
+  process descriptor table      kernel open file          file on disk
+  +---+------------------+      descriptions
+  | 0 | ---------------------->  tty, pos -           -> /dev/pts/0
+  | 1 | ---------------------->  tty, pos -           -> /dev/pts/0
+  | 2 | ---------------------->  tty, pos -           -> /dev/pts/0
+  | 3 | ---------------------->  read, pos 120        -> nums.txt
+  | 4 | ---------------------->  read, pos 0          -> nums.txt
+  +---+------------------+
+`} caption="Two levels behind a descriptor. Descriptors 3 and 4 name the same file but have separate positions, because each open made its own description." />
+
+### Common mistake
+
+Treating a descriptor and a `FILE *` as interchangeable, or mixing them on
+the same file. `fprintf(stdout, ...)` puts bytes in a buffer in the
+program, while `write(1, ...)` sends bytes to the kernel at once. Mixing
+the two on one file reorders output: the `write` text appears first, and
+the `printf` text appears later when the buffer is flushed.
+
+```text
+$ cat mix.c   (printf("one\n"); write(1, "two\n", 4);)
+$ ./mix | cat
+two
+one
+```
+
+The fix is to pick one layer per file, or call `fflush(stdout)` before
+switching to `write`. If a `FILE *` is needed for an existing descriptor,
+`fdopen` wraps one; `fileno(fp)` goes the other way.
+
+### In real systems
+
+Every network server is a descriptor juggler: each accepted connection is
+a descriptor, and the server waits on thousands of them with `poll`,
+`epoll` or `kqueue`. The per-process limit on open descriptors (often 1024
+by default on Linux, raised with `ulimit -n`) is a real production limit,
+and "too many open files" is the error a server leaking descriptors
+eventually hits. Tools like `ls -l /proc/PID/fd` on Linux show exactly
+which descriptors a running process holds.
+
+### Check yourself
+
+**A program closes descriptor 1 and then opens a log file. What number
+does the log file get, and what happens to its next `printf`?**
+
+<details>
+<summary>Answer</summary>
+
+It gets 1, the lowest free number, so `printf` output, which goes to
+descriptor 1, now lands in the log file. This is exactly how the shell
+implements `> file`.
+
+</details>
+
+**Why do two `open` calls on the same file not share a position?**
+
+<details>
+<summary>Answer</summary>
+
+Each `open` creates its own open file description in the kernel, and the
+position lives there, not in the file.
+
+</details>
+
+## 8.2 Low Level I/O—Read and Write
+
+### In one sentence
+
+`read(fd, buf, n)` asks the kernel for up to `n` bytes and `write(fd,
+buf, n)` hands it `n` bytes, and each returns how many it actually moved.
+
+### The idea
+
+All input and output on Unix goes through two system calls. A **system
+call** is a request from a program to the kernel; it looks like a C
+function call, but it switches the processor into the kernel, which makes
+it far more expensive than an ordinary call.
+
+`read(fd, buf, n)` copies up to `n` bytes from the file into `buf` and
+returns the number copied. It may return fewer than `n`, and that is
+normal: a terminal returns one line at a time, a pipe returns what is
+available, and a file returns what is left. A return of 0 means **end of
+file**, and -1 means an error, with the reason in `errno`.
+
+`write(fd, buf, n)` copies `n` bytes from `buf` to the file and returns
+the number written. For regular files that is normally all of them; for
+pipes, sockets and full disks it can be fewer, and a careful program loops
+until everything is written. There is no "line" or "character" here, only
+bytes: the meaning of a newline belongs to the layer above.
+
+The size of each request is the program's choice, and it dominates the
+cost. Reading one byte per call is correct but makes one kernel crossing
+per byte. Reading in blocks of a few kilobytes, matched to the disk's and
+kernel's block sizes, is how the library gets its speed. `BUFSIZ` in
+`stdio.h` is a reasonable size the library itself uses; on glibc it is
+8192.
+
+### Worked example
+
+The simple example copies standard input to standard output in blocks,
+which is the core of `cat`.
+
+```c
+/* rwcopy.c: copy input to output with read and write */
+#include <stdio.h>      /* BUFSIZ */
+#include <unistd.h>     /* read, write */
+
+int main(void)
+{
+    char buf[BUFSIZ];
+    ssize_t n;
+    long calls = 0;
+    while ((n = read(0, buf, sizeof buf)) > 0) {
+        calls++;
+        if (write(1, buf, n) != n) return 1;
+    }
+    fprintf(stderr, "read returned data %ld times, BUFSIZ is %d\n", calls, BUFSIZ);
+    return n < 0;
+}
+```
+
+```text
+$ seq 1 20000 > nums.txt        (108,894 bytes)
+$ ./rwcopy < nums.txt | wc -c
+read returned data 14 times, BUFSIZ is 8192
+108894
+$ printf 'hi\n' | ./rwcopy
+hi
+read returned data 1 times, BUFSIZ is 8192
+```
+
+The loop writes exactly `n` bytes each time, not `sizeof buf`, because the
+last block is short. It ends when `read` returns 0. The exit status is 1
+if the loop ended on an error.
+
+The realistic example is the book's next step: building `getchar` on top
+of `read`. The first version reads one byte per call; the second reads a
+whole buffer and hands out bytes from it.
+
+```c
+/* mygetchar.c: getchar built on read, unbuffered and buffered */
+#include <stdio.h>
+#include <unistd.h>
+
+static long syscalls;
+
+static int getchar_unbuf(void)
+{
+    unsigned char c;
+    syscalls++;
+    return read(0, &c, 1) == 1 ? c : EOF;
+}
+```
+
+```c
+/* mygetchar.c, continued: the buffered version */
+static int getchar_buf(void)
+{
+    static unsigned char buf[BUFSIZ];
+    static unsigned char *bufp;
+    static ssize_t n = 0;
+    if (n == 0) {                       /* buffer empty: refill it */
+        syscalls++;
+        n = read(0, buf, sizeof buf);
+        bufp = buf;
+    }
+    return (--n >= 0) ? *bufp++ : EOF;
+}
+```
+
+A small `main` counts characters with either version and prints how many
+system calls it made:
+
+```text
+$ ./mygetchar < nums.txt
+unbuffered: 108894 chars, 108895 read calls
+$ ./mygetchar -b < nums.txt
+buffered: 108894 chars, 15 read calls
+```
+
+The same 108,894 characters cost 108,895 kernel crossings one way and 15
+the other: one per byte plus the final end-of-file read, against one per
+8 KB block plus the final read. That ratio is the whole reason the
+standard library buffers.
+
+### Step by step
+
+<Trace columns={["call", "n before", "action", "n after", "returns"]} rows={[
+  ["1st getchar_buf", "0", "read fills 8192 bytes", "8191", "'1'"],
+  ["2nd", "8191", "take next byte", "8190", "newline"],
+  ["...", "...", "...", "...", "..."],
+  ["8192nd", "1", "take last byte", "0", "a byte"],
+  ["8193rd", "0", "read fills next block", "8191", "a byte"],
+  ["last call", "0", "read returns 0", "-1, then stays", "EOF"],
+]} caption="The buffered getchar on nums.txt. Look at the n column: it counts down through each block, and a read happens only when it reaches 0." />
+
+Two details are worth slowing down for. The buffer and its counters are
+`static`, so they keep their values between calls; that is what makes this
+a buffer and not a fresh array each time. And the bytes are returned as
+`unsigned char` converted to `int`, so a byte of 255 comes back as 255,
+not as -1, which would look like `EOF`.
+
+There is one wrinkle the book's version shares: after end of file, `n` is
+-1 rather than 0, so a later call does not call `read` again. That is
+convenient for files but wrong for a terminal, where the user may type
+more after a Ctrl-D. The real `stdio` handles it with an explicit
+end-of-file flag, which 8.5 adds.
+
+### Common mistake
+
+Assuming `read` fills the buffer. Code that reads a 16-byte header with
+one `read(fd, hdr, 16)` and uses it without checking the return works on
+files and fails intermittently on pipes and sockets, where the 16 bytes
+may arrive as 10 and then 6. The fix is a loop that keeps reading until it
+has what it needs or sees 0 or -1:
+
+```c
+/* readn: read exactly n bytes unless EOF or error comes first */
+ssize_t readn(int fd, void *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, (char *)buf + got, n - got);
+        if (r == 0) break;                  /* end of file */
+        if (r == -1) return -1;             /* error: see errno */
+        got += r;
+    }
+    return got;
+}
+```
+
+The same goes for `write` on pipes and sockets, plus one more case: a call
+interrupted by a signal returns -1 with `errno` set to `EINTR`, which is
+not a real error and should be retried.
+
+### In real systems
+
+`strace -c ./prog` on Linux counts a program's system calls, and running
+it on an unbuffered program is the quickest way to find why it is slow.
+Databases and web servers go further than `stdio`: they choose buffer
+sizes to match pages and network segments, use `readv` and `writev` to
+move several buffers in one call, and use `sendfile` or `splice` so the
+kernel copies file data to a socket without bringing it into the program
+at all.
+
+### Check yourself
+
+**`read(fd, buf, 4096)` returns 100. Is that an error?**
+
+<details>
+<summary>Answer</summary>
+
+No. Fewer bytes than requested is normal: the file had only 100 left, or a
+pipe had only 100 available. Only 0 (end of file) and -1 (error) are
+special.
+
+</details>
+
+**Why does the unbuffered `getchar` make one more call than there are
+characters?**
+
+<details>
+<summary>Answer</summary>
+
+The last call is the `read` that returns 0, which is how the program
+learns the input has ended.
+
+</details>
+
+## 8.3 Open, Creat, Close, Unlink
+
+### In one sentence
+
+`open` turns a file name into a descriptor, `creat` makes a new file (or
+empties an old one), `close` gives the descriptor back, and `unlink`
+removes a name from the file system.
+
+### The idea
+
+Descriptors 0, 1 and 2 come for free; every other file must be opened.
+`open(name, flags)` returns a descriptor, or -1 if it fails. The **flags**
+say how the file will be used: `O_RDONLY`, `O_WRONLY` or `O_RDWR`, combined
+with `|` and options such as `O_CREAT` (create it if it does not exist),
+`O_TRUNC` (empty it) and `O_APPEND` (every write goes to the end). With
+`O_CREAT`, a third argument gives the new file's permissions.
+
+`creat(name, perms)` is the older way to create a file, and is exactly
+`open(name, O_WRONLY | O_CREAT | O_TRUNC, perms)`. If the file exists,
+`creat` truncates it to zero length, throwing away its contents; it does
+not change its permissions.
+
+**Permissions** are nine bits: read, write and execute for the owner, for
+the owner's group, and for everyone else. They are usually written in
+octal, three bits per digit, so `0644` is read and write for the owner
+(6), and read only for group (4) and others (4). The process's **umask**
+then removes bits: with the common umask `022`, asking for `0666` gives
+`0644`. That is why programs ask for `0666` and let the user's umask
+decide.
+
+`close(fd)` releases the descriptor, so its number can be reused, and
+lets the kernel free its record when no descriptor refers to it. On exit
+every descriptor is closed automatically. `unlink(name)` removes a
+directory entry; the file's storage is freed when no names and no open
+descriptors remain. That last rule allows a useful trick: open a temporary
+file, unlink it at once, and keep using it, knowing it will vanish when
+the program exits, even after a crash.
+
+<Flow caption="What open checks, in order. Each failure is a different errno, which is why a good error message prints strerror(errno) and not a generic 'cannot open'." steps={[
+  "Resolve the path: each directory must exist and be searchable (ENOENT, ENOTDIR, EACCES)",
+  "If the file is missing: create it only with O_CREAT and write permission on the directory",
+  "Check the file's permission bits against the requested mode (EACCES)",
+  "Apply O_TRUNC or O_APPEND; refuse a directory for writing (EISDIR)",
+  "Take the lowest free descriptor (EMFILE if none) and return it",
+]} />
+
+### Worked example
+
+The book's example is a `cp` that copies one file to another. Mine keeps
+its shape, with one error function that names the file and the reason.
+
+```c
+/* mycp.c: copy one file to another with open, creat, read, write */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define PERMS 0666      /* rw for owner, group, others; umask trims it */
+
+static void fail(const char *what, const char *name)
+{
+    fprintf(stderr, "mycp: %s %s: %s\n", what, name, strerror(errno));
+    exit(1);
+}
+```
+
+```c
+/* mycp.c, continued */
+int main(int argc, char *argv[])
+{
+    if (argc != 3) { fprintf(stderr, "usage: mycp from to\n"); return 2; }
+    int in = open(argv[1], O_RDONLY);
+    if (in == -1) fail("can't open", argv[1]);
+    int out = creat(argv[2], PERMS);
+    if (out == -1) fail("can't create", argv[2]);
+    char buf[BUFSIZ];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, n) != n) fail("write error on", argv[2]);
+    if (n == -1) fail("read error on", argv[1]);
+    if (close(out) == -1) fail("close failed on", argv[2]);
+    close(in);
+    return 0;
+}
+```
+
+```text
+$ umask 022; ./mycp nums.txt copy.txt && ls -l copy.txt | cut -c1-10
+-rw-r--r--
+$ cmp nums.txt copy.txt && echo same
+same
+$ ./mycp nope.txt x; echo "status $?"
+mycp: can't open nope.txt: No such file or directory
+status 1
+$ ./mycp nums.txt /root/x; echo "status $?"
+mycp: can't create /root/x: Permission denied
+status 1
+$ ./mycp; echo "status $?"
+usage: mycp from to
+status 2
+```
+
+The file was created with `0666` and came out as `-rw-r--r--`, which is
+`0644`, because the umask removed the group and other write bits. The
+three failures each give a different message and the usage error a
+different status, so a script can tell them apart.
+
+The realistic example is the temporary-file trick from the idea above. A
+program that needs scratch space creates a file, unlinks it and keeps the
+descriptor:
+
+```c
+/* scratch.c: a file that disappears by itself */
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int fd = open("scratch.tmp", O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd == -1) { perror("scratch.tmp"); return 1; }
+    unlink("scratch.tmp");                /* the name is gone now */
+    write(fd, "still here\n", 11);
+    lseek(fd, 0, SEEK_SET);
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof buf);
+    printf("read back %zd bytes; name exists? %s\n", n,
+           access("scratch.tmp", F_OK) == 0 ? "yes" : "no");
+    return 0;
+}
+```
+
+```text
+$ ./scratch
+read back 11 bytes; name exists? no
+```
+
+`O_EXCL` with `O_CREAT` fails if the file already exists, which stops two
+copies of the program, or an attacker, from sharing the file. Its mode is
+`0600` so nobody else can read it. The data stays readable through the
+descriptor after the name is gone. The library's `tmpfile` does the same
+thing for you.
+
+### Step by step
+
+<Trace columns={["step", "call", "result", "why"]} rows={[
+  ["1", "open nums.txt, O_RDONLY", "3", "exists and is readable"],
+  ["2", "creat copy.txt, 0666", "4", "created; umask 022 leaves 0644"],
+  ["3", "read 3 (x14)", "8192, ..., 2398", "full blocks, then the short last one"],
+  ["4", "write 4 (x14)", "same counts", "each write equals the read before it"],
+  ["5", "read 3", "0", "end of file ends the loop"],
+  ["6", "close 4", "0", "the last chance to see a write error"],
+  ["7", "close 3, exit", "0", "status 0: success"],
+]} caption="mycp copying nums.txt. Read down the result column: the copy is a dialogue of reads and equal-sized writes, and only close confirms the data was accepted." />
+
+The permission arithmetic deserves its own trace, because octal confuses
+people the first time. Each octal digit is three bits: read is 4, write is
+2, execute is 1. The umask is subtracted bit by bit (precisely, the result
+is `perms & ~umask`).
+
+<Trace columns={["", "owner", "group", "others", "octal"]} rows={[
+  ["requested", "rw- (6)", "rw- (6)", "rw- (6)", "0666"],
+  ["umask", "--- (0)", "-w- (2)", "-w- (2)", "0022"],
+  ["result", "rw- (6)", "r-- (4)", "r-- (4)", "0644"],
+]} caption="How creat's 0666 becomes 0644. Look at the group and others columns: the umask removes only the write bit." />
+
+### Common mistake
+
+Using `creat` (or `O_TRUNC`) when the target might be the source.
+`mycp file file` opens `file` for reading, then `creat` truncates it to
+zero bytes, and the copy loop reads nothing: the file is now empty, and
+the program reports success. Real `cp` checks whether both names refer to
+the same file (same device and inode number, from `stat`) before
+truncating anything.
+
+A second mistake is forgetting the third argument of `open` with
+`O_CREAT`. `open(name, O_WRONLY | O_CREAT)` compiles, because `open` is
+variadic, and then reads whatever garbage is in the register where the
+mode should be, giving the new file random permissions. gcc with
+`-D_FORTIFY_SOURCE=2` and optimisation catches this at compile time; the
+fix is to always pass the mode.
+
+### In real systems
+
+Writing a file safely is harder than `creat` suggests. If the program
+crashes halfway through, the file is left truncated and half-written.
+Editors, package managers and databases therefore write to a temporary
+file in the same directory, `fsync` it so the data is on disk, and then
+`rename` it over the old name, which replaces it atomically: readers see
+the old file or the new one, never half of each. `O_CLOEXEC` is the other
+modern habit, so descriptors are not leaked into programs started with
+`exec`.
+
+### Check yourself
+
+**A program calls `creat("out", 0777)` with umask `027`. What permissions
+does `out` get?**
+
+<details>
+<summary>Answer</summary>
+
+`0750`: `0777 & ~027`. Owner keeps everything, group loses write, others
+lose everything.
+
+</details>
+
+**After `unlink(name)` while a descriptor is still open, can the program
+keep reading the file?**
+
+<details>
+<summary>Answer</summary>
+
+Yes. The storage is freed only when no names and no open descriptors
+remain, so the data stays reachable through the descriptor until it is
+closed.
+
+</details>
+
+## 8.4 Random Access—Lseek
+
+### In one sentence
+
+`lseek(fd, offset, origin)` moves a descriptor's file position, so the
+next `read` or `write` happens anywhere in the file instead of only after
+the last one.
+
+### The idea
+
+Input and output are normally **sequential**: each `read` or `write`
+starts where the previous one stopped, because the kernel keeps a current
+position for every open file description and advances it by the number of
+bytes moved. That suits streams of text, but many files are collections of
+fixed-size records, and reading record 5,000 by reading the 4,999 before
+it would be absurd.
+
+`lseek(fd, offset, origin)` sets the position without moving any data.
+`origin` says what `offset` is relative to: `SEEK_SET` (0) the start of
+the file, `SEEK_CUR` (1) the current position, or `SEEK_END` (2) the end.
+It returns the new position, measured from the start, or -1 on error. So
+`lseek(fd, 0, SEEK_END)` both moves to the end, ready to append, and tells
+you the file's size.
+
+Two rules surprise people. Seeking past the end is allowed, and writing
+there creates a **hole**: the bytes in between read as zeros, and on most
+file systems they take no disk space, which makes a **sparse file**. And
+not every descriptor can seek: pipes, terminals and sockets have no
+position, and `lseek` on them fails with `ESPIPE`.
+
+The standard library's equivalent is `fseek`, which works on a `FILE *`
+and must also discard or flush the stream's buffer. That is the reason
+the C standard insists on an `fseek` or `fflush` between reading and
+writing the same stream.
+
+### Worked example
+
+The simple example is the book's `get` function, which reads `n` bytes at
+any position. Mine reads a fixed-size record by number.
+
+```c
+/* records.c: fixed-size records, read at any position with lseek */
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+struct rec { int id; char name[12]; };
+
+/* read record number i into r; return 1 on success, 0 otherwise */
+static int get(int fd, long i, struct rec *r)
+{
+    if (lseek(fd, i * (long)sizeof *r, SEEK_SET) == -1) return 0;
+    return read(fd, r, sizeof *r) == sizeof *r;
+}
+```
+
+The realistic part writes four records, reads one back, measures the
+file, and then writes far past the end:
+
+```c
+/* records.c, continued */
+int main(void)
+{
+    const char *names[] = {"ada", "brian", "dennis", "ken"};
+    int fd = open("recs.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    for (int i = 0; i < 4; i++) {
+        struct rec r = {100 + i, ""};
+        strncpy(r.name, names[i], sizeof r.name - 1);
+        write(fd, &r, sizeof r);
+    }
+    struct rec r;
+    if (get(fd, 2, &r)) printf("record 2: %d %s\n", r.id, r.name);
+    printf("size via lseek: %ld bytes\n", (long)lseek(fd, 0, SEEK_END));
+    printf("record 9 found? %d\n", get(fd, 9, &r));
+    lseek(fd, 1000000, SEEK_SET);              /* past the end... */
+    write(fd, "x", 1);                         /* ...leaves a hole */
+    printf("size now: %ld bytes\n", (long)lseek(fd, 0, SEEK_END));
+    close(fd);
+    return 0;
+}
+```
+
+```text
+$ ./records && du -k recs.bin
+record 2: 102 dennis
+size via lseek: 64 bytes
+record 9 found? 0
+size now: 1000001 bytes
+8	recs.bin
+```
+
+Each record is 16 bytes (a 4-byte `int` and 12 characters), so four make
+64. Record 2 starts at byte 32. Record 9 would start at byte 144, past the
+end: the seek succeeds, but `read` returns 0, so `get` reports failure.
+The final write at byte 1,000,000 makes a file that claims a million bytes
+but uses about 8 KB of disk, because the hole costs nothing.
+
+### Step by step
+
+<Trace columns={["call", "position before", "position after", "returns"]} rows={[
+  ["4 x write(16 bytes)", "0", "64", "16 each"],
+  ["lseek(32, SEEK_SET)", "64", "32", "32"],
+  ["read(16)", "32", "48", "16: record 2"],
+  ["lseek(0, SEEK_END)", "48", "64", "64: the size"],
+  ["lseek(144, SEEK_SET)", "64", "144", "144: allowed"],
+  ["read(16)", "144", "144", "0: nothing there"],
+  ["lseek(1000000), write 1", "144", "1000001", "1"],
+]} caption="The file position through records.c. Look at the lseek rows: seeking moves the position without touching data, and seeking past the end is not an error by itself." />
+
+<Figure art={`
+  byte 0        16        32        48        64           1000000
+  +---------+---------+---------+---------+- - - - - - - -+---+
+  | 100 ada |101 brian|102 denn.| 103 ken |   hole:       | x |
+  +---------+---------+---------+---------+  reads as 0,  +---+
+                                             no disk blocks
+  record i starts at byte  i * sizeof(struct rec)
+`} caption="recs.bin after the program. The four records sit at multiples of 16; the hole between byte 64 and the final x is part of the file's size but not of its disk usage." />
+
+### Common mistake
+
+Writing records with `write(fd, &r, sizeof r)` and reading them on another
+machine or with a program built by another compiler. The layout of
+`struct rec`, its padding and its byte order are not fixed by the language,
+so the file is only portable between identical builds. File formats meant
+to last define every field's size and byte order and write fields one at
+a time, or use a serialisation format.
+
+A smaller trap is the type of the offset. `lseek` takes an `off_t`, which
+is 64 bits on modern Linux but was 32 bits on older 32-bit builds, where
+files over 2 GB needed `-D_FILE_OFFSET_BITS=64`. Computing the offset as
+`i * sizeof *r` in plain `int` can overflow first; doing it in `long` or
+`off_t`, as `get` does, avoids that.
+
+### In real systems
+
+Every database storage engine is built on positioned reads and writes:
+a table or index is a file of fixed-size pages, and page `n` lives at
+offset `n` times the page size. Modern code usually uses `pread` and
+`pwrite`, which take the offset as an argument and do not move the shared
+position, so several threads can read one descriptor at once. Sparse files
+are used for virtual machine disk images and for preallocating space
+cheaply.
+
+### Check yourself
+
+**How do you find a file's size with `lseek`, and what is the catch?**
+
+<details>
+<summary>Answer</summary>
+
+`lseek(fd, 0, SEEK_END)` returns it, but it also moves the position to the
+end, so save the old position with `lseek(fd, 0, SEEK_CUR)` first and
+restore it. `fstat` gives the size without moving anything.
+
+</details>
+
+**What does `lseek` do on a pipe?**
+
+<details>
+<summary>Answer</summary>
+
+It fails with -1 and `errno` set to `ESPIPE`, because a pipe has no
+position to move.
+
+</details>
+
+## 8.5 Example—An Implementation of Fopen and Getc
+
+### In one sentence
+
+A `FILE` is a small structure holding a descriptor, a buffer and a count,
+and `getc` is a macro that takes the next byte from the buffer and calls a
+refill function only when the buffer is empty.
+
+### The idea
+
+Sections 8.1 to 8.4 give everything needed to build the standard I/O
+library. The book shows how, with a cut-down `stdio.h`, and this section
+is the payoff of the chapter: the `FILE *` from chapter 7 turns out to be
+a pointer to an ordinary structure, and `getc` turns out to be one line of
+pointer arithmetic.
+
+The structure needs five things. A **descriptor** for the kernel. A
+**buffer**, allocated on first use. A **pointer** to the next unread byte
+in it. A **count** of bytes left. And **flags** recording the mode (read
+or write), whether the stream is unbuffered, and whether end of file or an
+error has been seen. The library keeps a fixed array of these structures,
+and `stdin`, `stdout` and `stderr` are simply the first three, set up to
+use descriptors 0, 1 and 2.
+
+`getc` is a **macro** so that the common case, a byte waiting in the
+buffer, costs a decrement, a comparison and a pointer step, with no
+function call. Only when the count drops below zero does it call the
+**fill function**, which allocates the buffer if needed, calls `read`,
+resets the pointer and count, and returns the first byte. `fopen` finds a
+free structure, opens the file with `open`, `creat` or (for append) `open`
+plus `lseek`, and fills in the fields.
+
+<Figure art={`
+  MFILE for nums.txt, after 3 getc calls on a fresh 1024-byte buffer
+
+   flag: READ     fd: 3
+   base ----+
+            v
+            +---+---+---+---+---+------------------------------+
+   buffer   | 1 |\\n | 2 |\\n | 3 |  ... 1019 more bytes ...      |
+            +---+---+---+---+---+------------------------------+
+                        ^
+   ptr -----------------+         cnt: 1021  (bytes not yet taken)
+`} caption="The five fields of the stream structure in action. Each getc returns the byte at ptr, then moves ptr right and cnt down; the refill happens only when cnt runs out." />
+
+### Worked example
+
+My version uses `M` names so it can sit beside the real library in one
+program. First the header: the structure, the flags and the macro.
+
+```c
+/* mstdio.h: a tiny stdio in the spirit of section 8.5 */
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#define MEOF (-1)
+#define MBUFSIZ 1024
+#define MOPEN_MAX 20
+
+enum flags { M_READ = 01, M_WRITE = 02, M_UNBUF = 04, M_EOF = 010, M_ERR = 020 };
+
+typedef struct mfile {
+    int cnt;            /* characters left in the buffer */
+    char *ptr;          /* next character position */
+    char *base;         /* where the buffer starts */
+    int flag;           /* mode of access, see enum flags */
+    int fd;             /* the file descriptor underneath */
+} MFILE;
+
+extern MFILE m_iob[MOPEN_MAX];
+int m_fillbuf(MFILE *fp);
+long m_fills;           /* test counter: how many refills happened */
+#define m_getc(p) (--(p)->cnt >= 0 ? (unsigned char)*(p)->ptr++ : m_fillbuf(p))
+```
+
+Then `m_fopen`. It looks for a slot whose flags show it is not in use,
+opens the file according to the mode, and initialises the structure with
+an empty buffer, so the first `m_getc` triggers a fill.
+
+```c
+/* mfopen.c */
+#include "mstdio.h"
+MFILE m_iob[MOPEN_MAX];
+
+MFILE *m_fopen(const char *name, const char *mode)
+{
+    MFILE *fp;
+    int fd;
+    if (*mode != 'r' && *mode != 'w' && *mode != 'a') return NULL;
+    for (fp = m_iob; fp < m_iob + MOPEN_MAX; fp++)
+        if ((fp->flag & (M_READ | M_WRITE)) == 0) break;   /* free slot */
+    if (fp >= m_iob + MOPEN_MAX) return NULL;               /* no slots */
+    if (*mode == 'w')      fd = creat(name, 0666);
+    else if (*mode == 'a') {
+        if ((fd = open(name, O_WRONLY)) == -1) fd = creat(name, 0666);
+        lseek(fd, 0L, SEEK_END);
+    } else                 fd = open(name, O_RDONLY);
+    if (fd == -1) return NULL;
+    fp->fd = fd; fp->cnt = 0; fp->base = NULL;
+    fp->flag = (*mode == 'r') ? M_READ : M_WRITE;
+    return fp;
+}
+```
+
+Then the fill function, the only place `read` is called:
+
+```c
+/* m_fillbuf: allocate the buffer on first use, then refill it */
+int m_fillbuf(MFILE *fp)
+{
+    int bufsize;
+    if ((fp->flag & (M_READ | M_EOF | M_ERR)) != M_READ) return MEOF;
+    bufsize = (fp->flag & M_UNBUF) ? 1 : MBUFSIZ;
+    if (fp->base == NULL && (fp->base = malloc(bufsize)) == NULL)
+        return MEOF;                        /* can't get a buffer */
+    fp->ptr = fp->base;
+    m_fills++;
+    fp->cnt = read(fp->fd, fp->ptr, bufsize);
+    if (--fp->cnt < 0) {
+        fp->flag |= (fp->cnt == -1) ? M_EOF : M_ERR;
+        fp->cnt = 0;
+        return MEOF;
+    }
+    return (unsigned char)*fp->ptr++;
+}
+```
+
+And a test that counts characters and lines through the new stream:
+
+```c
+/* mtest.c */
+#include <stdio.h>
+int main(int argc, char *argv[])
+{
+    MFILE *fp = m_fopen(argc > 1 ? argv[1] : "nums.txt", "r");
+    if (fp == NULL) { fprintf(stderr, "can't open\n"); return 1; }
+    long chars = 0, lines = 0;
+    int c;
+    while ((c = m_getc(fp)) != MEOF) {
+        chars++;
+        if (c == '\n') lines++;
+    }
+    printf("%ld chars, %ld lines, %ld refills, eof flag %s\n", chars, lines,
+           m_fills, (fp->flag & M_EOF) ? "set" : "clear");
+    return 0;
+}
+```
+
+```text
+$ ./mtest && wc -lc nums.txt
+108894 chars, 20000 lines, 108 refills, eof flag set
+ 20000 108894 nums.txt
+$ ./mtest missing
+can't open
+```
+
+The counts match `wc`. 108,894 bytes in 1,024-byte blocks is 106 full
+blocks and one partial one, 107 reads with data, plus one read that
+returns 0 and sets the end-of-file flag: 108 refills.
+
+### Step by step
+
+The macro is dense, so it is worth expanding by hand. `m_getc(fp)`
+becomes:
+
+```c
+(--fp->cnt >= 0 ? (unsigned char)*fp->ptr++ : m_fillbuf(fp))
+```
+
+<Trace columns={["call", "cnt on entry", "after --cnt", "branch", "effect"]} rows={[
+  ["1st m_getc", "0 (fresh)", "-1", "fill", "read 1024 bytes; cnt 1023; return byte 0"],
+  ["2nd", "1023", "1022", "buffer", "return byte 1, ptr moves on"],
+  ["...", "...", "...", "...", "..."],
+  ["1024th", "1", "0", "buffer", "return byte 1023, the last one"],
+  ["1025th", "0", "-1", "fill", "read next block; return its byte 0"],
+  ["after the last byte", "0", "-1", "fill", "read returns 0; cnt -1: set EOF, return MEOF"],
+  ["any later call", "0", "-1", "fill", "EOF flag set: return MEOF at once, no read"],
+]} caption="m_getc's two paths. Look at the 'after --cnt' column: the buffer path runs while it stays at or above zero, and every refill is triggered by it reaching -1." />
+
+Inside `m_fillbuf`, the subtle line is `if (--fp->cnt < 0)`. After `read`,
+`cnt` holds the number of bytes read; decrementing it accounts for the
+byte about to be returned. If `read` returned 0, `cnt` is now -1: end of
+file. If `read` returned -1, `cnt` is now -2: an error. Both reset `cnt`
+to 0 and return `MEOF`, and the flag remembers which it was, which is
+exactly the difference between `feof` and `ferror` in the real library.
+
+Writing works the same way in reverse. A `putc` macro stores into the
+buffer while there is room and calls a **flush function** when it is
+full; that function calls `write` and resets the buffer. `fclose` flushes,
+closes the descriptor, frees the buffer and clears the flags so the slot
+can be reused. The book leaves `_flushbuf`, `fflush` and `fclose` as
+exercises, and they are the best exercises in the chapter.
+
+### Common mistake
+
+Passing an expression with side effects to `getc`. Because `getc` is a
+macro that mentions its argument several times, `getc(files[i++])`
+increments `i` more than once. The standard allows `getc` to be a macro
+for exactly this speed, and warns that its argument may be evaluated more
+than once. The fix is to pass a plain variable, or use `fgetc`, which is
+guaranteed to be a real function.
+
+```c
+/* With the macro above, this advances i three times per character: */
+c = m_getc(files[i++]);
+/* Safe: */
+MFILE *fp = files[i++];
+c = m_getc(fp);
+```
+
+The second mistake is in the fill function itself: returning
+`*fp->ptr++` without the `unsigned char` cast. A byte of 0xFF would then
+come back as -1 on a signed-`char` machine and end the read early, the
+same bug as storing `getchar` in a `char`.
+
+### In real systems
+
+Real `stdio` implementations add what this one leaves out: line buffering
+for terminals, `ungetc` space, locks so two threads can share a stream,
+wide-character orientation, and `setvbuf` to choose the buffer. glibc's
+`FILE` has many more fields, and musl's is quite readable if you want to
+see a production version. The design is the same everywhere, and it is
+copied by every buffered reader since: Go's `bufio.Reader`, Java's
+`BufferedInputStream` and Node's stream internals all keep a buffer, a
+position and a count.
+
+### Check yourself
+
+**Why is `getc` a macro but `m_fillbuf` a function?**
+
+<details>
+<summary>Answer</summary>
+
+`getc` runs once per byte, so avoiding a call matters; the fill runs once
+per buffer, so a call costs nothing noticeable, and keeping it out of line
+keeps every use of `getc` small.
+
+</details>
+
+**How does the fill function tell end of file from an error?**
+
+<details>
+<summary>Answer</summary>
+
+By the value `read` returned: 0 means end of file and -1 means error.
+After the decrement those become -1 and -2, and it sets the EOF or ERR
+flag accordingly.
+
+</details>
+
+## 8.6 Example—Listing Directories
+
+### In one sentence
+
+A directory is a file of names, and a program can list it, ask the kernel
+for each name's details with `stat`, and recurse into subdirectories to
+walk a whole tree.
+
+### The idea
+
+A Unix **directory** is a list of entries, each pairing a file name with
+an **inode number**. The **inode** is the kernel's record of the file
+itself: its type, size, permissions, owner, times and where its data
+lives. The name lives only in the directory, which is why a file can have
+several names (hard links) and why `unlink` removes a name, not a file.
+
+`stat(name, &st)` fills a `struct stat` with the inode's information:
+`st_mode` holds the type and permission bits, `st_size` the size,
+`st_mtime` the modification time, and so on. The macro `S_ISDIR(st_mode)`
+tests whether it is a directory (the book masks with `S_IFMT` and compares
+with `S_IFDIR`, which is the same test spelled out). `lstat` is the
+variant that describes a symbolic link itself rather than what it points
+to.
+
+The book's program, `fsize`, prints the size of every file named on the
+command line and, for a directory, of everything inside it, recursively.
+It separates the job into two functions: `fsize` handles one name, and
+`dirwalk` applies a function to every entry of a directory. That split,
+passing `fsize` to `dirwalk` as a function pointer, is the reusable idea.
+
+The book reads directories with `read`, because on the systems of the time
+a directory was a plain file of fixed-size entries, and it wraps that in
+its own `opendir`, `readdir` and `closedir` to hide the format. That is
+the honest modern difference: today `read` on a directory fails, and
+POSIX provides those three functions in `<dirent.h>`. The book's design
+anticipated exactly the interface that became standard.
+
+### Worked example
+
+The simple example shows why the book's raw approach no longer works:
+
+```c
+/* readdir_raw.c */
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(void)
+{
+    char buf[64];
+    int fd = open(".", O_RDONLY);
+    printf("open: %d\n", fd);
+    if (read(fd, buf, sizeof buf) == -1) perror("read on a directory");
+    return 0;
+}
+```
+
+```text
+$ ./readdir_raw
+read on a directory: Is a directory
+open: 3
+```
+
+The `open` succeeds, but `read` fails with `EISDIR`. (The error line comes
+first because `stderr` is unbuffered and `stdout` here is a pipe.)
+
+The realistic example is `fsize` with the POSIX directory functions:
+
+```c
+/* fsize.c: print file sizes, descending into directories */
+#include <dirent.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static void fsize(const char *name);
+
+/* apply fn to every entry of directory dir except . and .. */
+static void dirwalk(const char *dir, void (*fn)(const char *))
+{
+    char path[1024];
+    DIR *dp = opendir(dir);
+    if (dp == NULL) { perror(dir); return; }
+    for (struct dirent *d; (d = readdir(dp)) != NULL; ) {
+        if (strcmp(d->d_name, ".") == 0 || strcmp(d->d_name, "..") == 0)
+            continue;                         /* skip self and parent */
+        if (snprintf(path, sizeof path, "%s/%s", dir, d->d_name) >= (int)sizeof path)
+            fprintf(stderr, "dirwalk: name %s/%s too long\n", dir, d->d_name);
+        else
+            fn(path);
+    }
+    closedir(dp);
+}
+```
+
+```c
+/* fsize.c, continued */
+static void fsize(const char *name)
+{
+    struct stat st;
+    if (lstat(name, &st) == -1) { perror(name); return; }
+    if (S_ISDIR(st.st_mode)) dirwalk(name, fsize);
+    printf("%8lld %s\n", (long long)st.st_size, name);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc == 1) fsize(".");
+    else while (--argc > 0) fsize(*++argv);
+    return 0;
+}
+```
+
+```text
+$ mkdir -p demo/sub && printf 'hello\n' > demo/a.txt
+$ printf '12345678901234567890' > demo/sub/b.dat && ln -s a.txt demo/link
+$ ./fsize demo | sort -k2
+    4096 demo
+       6 demo/a.txt
+       5 demo/link
+    4096 demo/sub
+      20 demo/sub/b.dat
+$ ./fsize nothere
+nothere: No such file or directory
+```
+
+The output is sorted because `readdir` returns entries in whatever order
+the file system stores them, which is not alphabetical. The link reports
+5 bytes, the length of its target name `a.txt`, because `lstat` describes
+the link itself. A directory's own size is the space its entry list takes,
+4096 bytes here.
+
+### Step by step
+
+<Trace columns={["call", "name", "is a directory?", "what happens"]} rows={[
+  ["fsize", "demo", "yes", "dirwalk(demo, fsize)"],
+  ["  fsize", "demo/a.txt", "no", "print 6"],
+  ["  fsize", "demo/sub", "yes", "dirwalk(demo/sub, fsize)"],
+  ["    fsize", "demo/sub/b.dat", "no", "print 20"],
+  ["  (back)", "demo/sub", "-", "print 4096 after its contents"],
+  ["  fsize", "demo/link", "no (a link)", "print 5"],
+  ["(back)", "demo", "-", "print 4096 last"],
+]} caption="The recursion of fsize over demo, in one possible readdir order. Look at when the directories print: after their contents, because the print comes after the dirwalk call." />
+
+<Figure art={`
+                 fsize("demo")
+                      |
+              dirwalk("demo", fsize)
+          /           |              \\
+  fsize("demo/a.txt") |         fsize("demo/link")
+                fsize("demo/sub")
+                      |
+           dirwalk("demo/sub", fsize)
+                      |
+           fsize("demo/sub/b.dat")
+`} caption="fsize and dirwalk calling each other. The function pointer is what lets dirwalk stay general: pass a different function and the same walker deletes, counts or searches." />
+
+### Common mistake
+
+Following symbolic links with `stat` in a recursive walk. A link that
+points to a parent directory, such as `ln -s .. loop`, makes `stat` report
+a directory, the walk descends into it, and it never ends (in practice it
+stops when the path buffer fills or the stack overflows). Using `lstat`,
+as above, treats the link as a link. Tools that do follow links, like
+`find -L`, keep a set of device and inode pairs already visited and skip
+repeats.
+
+The other classic mistake is forgetting to skip `.` and `..`. Every
+directory contains both, and recursing into `.` is an instant infinite
+loop.
+
+### In real systems
+
+Recursive walks are everywhere: `du`, `find`, `rsync`, backup tools, build
+systems and file watchers. POSIX offers `nftw` and BSD offers `fts` so
+programs do not each write their own. Large trees also show the cost of
+`stat`: one system call per file, which is why tools like `git status`
+cache inode information in an index and why modern Linux adds `statx` and
+`getdents64` for bulk work. Node's `fs.readdir(dir, { withFileTypes: true })` exposes the
+entry type from the directory itself, saving a `stat` per name.
+
+### Check yourself
+
+**Why does `fsize` print a directory after its contents, not before?**
+
+<details>
+<summary>Answer</summary>
+
+The `printf` comes after the `dirwalk` call in `fsize`, so the whole
+subtree is printed first. Moving the `printf` above the call would print
+the directory first.
+
+</details>
+
+**Where is a file's name stored, and where is its size?**
+
+<details>
+<summary>Answer</summary>
+
+The name is in the directory entry; the size, like everything else about
+the file, is in the inode, which `stat` reads.
+
+</details>
+
+## 8.7 Example—A Storage Allocator
+
+### In one sentence
+
+`malloc` keeps the free memory as a circular linked list of blocks, each
+starting with a header giving its size, hands out the first block big
+enough, and `free` puts blocks back, merging them with free neighbours.
+
+### The idea
+
+`malloc` must hand out blocks of any size, in any order, and take them
+back in any order. It gets large chunks of memory from the operating
+system (the book uses `sbrk`, which grows the process's data segment;
+modern allocators also use `mmap`) and carves those chunks up itself,
+because asking the kernel for every small block would be slow.
+
+The free space is a **free list**: a linked list of the blocks not in use.
+Each block begins with a **header** holding a pointer to the next free
+block and the block's size. Sizes are counted in **units** of one header,
+not in bytes, so every block is a whole number of headers long. The list
+is **circular** and kept in **address order**, which makes it easy to see
+when a freed block sits right next to a free neighbour.
+
+`malloc(n)` rounds `n` up to whole units, adds one unit for the header,
+and walks the list from where the last search stopped, taking the first
+block big enough (**first fit**). An exact fit is unlinked; a bigger block
+is split, and the allocator hands out its **tail** so the remaining free
+part keeps its header and its place in the list. If the walk goes all the
+way round without success, it asks the system for more with `morecore`
+and tries again.
+
+`free(p)` steps back one unit from `p` to find the header, walks the list
+to the place where the block belongs by address, and links it in. If the
+block ends exactly where the next free block starts, the two are
+**coalesced** into one; likewise with the block before. Without coalescing,
+memory would break into ever smaller pieces, which is called
+**fragmentation**.
+
+The last idea is **alignment**. Every block must be suitably aligned for
+any type the caller might store in it. The book makes the header a
+`union` of the real fields and a member of the most restrictive type, so
+the header's size is a multiple of that type's alignment, and since every
+block is a whole number of headers, every address handed out is aligned
+too. This is the same union trick as chapter 6, used for layout rather
+than for storing alternatives.
+
+### Worked example
+
+My version draws its memory from a fixed static arena instead of `sbrk`,
+so every run is the same and the trace below can show real offsets. The
+header and the list's starting point:
+
+```c
+/* kalloc: a first-fit free-list allocator in the style of section 8.7 */
+#include <stddef.h>
+#include <stdio.h>
+
+typedef long double Align;          /* the most restrictive type here */
+
+union header {                      /* block header */
+    struct {
+        union header *next;         /* next block on the free list */
+        size_t size;                /* size of this block, in units */
+    } s;
+    Align x;                        /* never used: forces alignment */
+};
+typedef union header Header;
+
+static Header base;                 /* empty list to get started */
+static Header *freep = NULL;        /* where the last search ended */
+```
+
+`morecore` gets at least `NALLOC` units, gives the new block a header,
+and frees it into the list, so `free` does all the linking:
+
+```c
+/* morecore: here from a fixed arena, so runs are repeatable */
+#define NALLOC 64                   /* minimum units to request */
+static Header arena[1024];
+static size_t arena_used;
+void kfree(void *ap);
+
+static Header *morecore(size_t nu)
+{
+    if (nu < NALLOC) nu = NALLOC;
+    if (arena_used + nu > sizeof arena / sizeof arena[0]) return NULL;
+    Header *up = arena + arena_used;     /* real version: sbrk or mmap */
+    arena_used += nu;
+    up->s.size = nu;
+    kfree(up + 1);                       /* hand it to the free list */
+    return freep;
+}
+```
+
+`kmalloc` is the first-fit search:
+
+```c
+void *kmalloc(size_t nbytes)
+{
+    size_t nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
+    Header *prevp = freep, *p;
+    if (prevp == NULL) {                 /* first call: list of one */
+        base.s.next = freep = prevp = &base;
+        base.s.size = 0;
+    }
+    for (p = prevp->s.next; ; prevp = p, p = p->s.next) {
+        if (p->s.size >= nunits) {           /* big enough */
+            if (p->s.size == nunits)         /* exactly: unlink it */
+                prevp->s.next = p->s.next;
+            else {                           /* carve off the tail end */
+                p->s.size -= nunits;
+                p += p->s.size;
+                p->s.size = nunits;
+            }
+            freep = prevp;
+            return p + 1;                    /* the space after the header */
+        }
+        if (p == freep && (p = morecore(nunits)) == NULL)
+            return NULL;                     /* wrapped round: none left */
+    }
+}
+```
+
+`kfree` finds the gap in the address-ordered list where the block belongs
+and merges with either neighbour:
+
+```c
+void kfree(void *ap)
+{
+    Header *bp = (Header *)ap - 1, *p;   /* point at the block's header */
+    for (p = freep; !(bp > p && bp < p->s.next); p = p->s.next)
+        if (p >= p->s.next && (bp > p || bp < p->s.next))
+            break;                       /* freed block at an end of the list */
+    if (bp + bp->s.size == p->s.next) {  /* join to the upper neighbour */
+        bp->s.size += p->s.next->s.size;
+        bp->s.next = p->s.next->s.next;
+    } else
+        bp->s.next = p->s.next;
+    if (p + p->s.size == bp) {           /* join to the lower neighbour */
+        p->s.size += bp->s.size;
+        p->s.next = bp->s.next;
+    } else
+        p->s.next = bp;
+    freep = p;
+}
+```
+
+A test allocates three blocks, frees them in a mixed order and prints the
+free list after each step, as arena unit numbers and sizes:
+
+```text
+$ ./ktest
+sizeof(Header) = 16
+a at unit 56, b at 52, c at 50
+after 3 allocs free list: [unit 0, size 50]
+free b         free list: [unit 0, size 50] [unit 52, size 4]
+free a         free list: [unit 0, size 50] [unit 52, size 12]
+free c         free list: [unit 0, size 64]
+```
+
+Everything is back in one 64-unit block at the end, which shows that both
+kinds of merge worked.
+
+### Step by step
+
+First the unit arithmetic. With 16-byte headers, a request of `n` bytes
+needs `(n + 15) / 16` units of space plus one for the header.
+
+<Trace columns={["request", "space units", "plus header", "block units", "bytes reserved"]} rows={[
+  ["a: 100 bytes", "(100+15)/16 = 7", "+1", "8", "128"],
+  ["b: 40 bytes", "(40+15)/16 = 3", "+1", "4", "64"],
+  ["c: 1 byte", "(1+15)/16 = 1", "+1", "2", "32"],
+]} caption="How kmalloc sizes a block. Look at c: a one-byte request still costs two units, 32 bytes, which is the price of headers and alignment." />
+
+Then the list itself through the run:
+
+<Trace columns={["step", "operation", "free list after it", "what happened"]} rows={[
+  ["1", "kmalloc(100)", "[0, 64] then [0, 56]", "list empty, so morecore adds 64 units; tail 56..63 given to a"],
+  ["2", "kmalloc(40)", "[0, 52]", "first fit is the same block; tail 52..55 to b"],
+  ["3", "kmalloc(1)", "[0, 50]", "tail 50..51 to c"],
+  ["4", "kfree(b)", "[0, 50] [52, 4]", "b's neighbours are c and a, both in use: no merge"],
+  ["5", "kfree(a)", "[0, 50] [52, 12]", "a starts where b's free block ends: merge downward"],
+  ["6", "kfree(c)", "[0, 64]", "c ends at 52 and starts at 50: merge both ways"],
+]} caption="The free list during ktest, as [start unit, size]. Look at steps 5 and 6: coalescing is what turns three scattered frees back into one block." />
+
+<Figure art={`
+ arena units:  0                          50  52      56              64
+ after allocs: [ free, size 50 ........... ][c ][ b    ][ a              ]
+ after free b: [ free, size 50 ........... ][c ][free 4][ a              ]
+ after free a: [ free, size 50 ........... ][c ][ free, size 12          ]
+ after free c: [ free, size 64 .................................. ]
+`} caption="The arena as a strip of 64 units. Allocation takes from the right end of the free block, so the free block keeps its header at unit 0 throughout." />
+
+The `kfree` loop condition is the hardest line in the chapter, so here it
+is in words. The loop walks `p` round the list until the freed block `bp`
+lies strictly between `p` and `p->next`. That fails in one place: where the
+list wraps from the highest address back to the lowest. There `p` is at or
+above `p->next`, and the block belongs in the gap if it is above the
+highest free block or below the lowest one. The `if` inside the loop
+catches exactly that case.
+
+### Common mistake
+
+Freeing a pointer that did not come from this `malloc`, or freeing the
+same block twice. `free` trusts the header one unit before the pointer.
+For a stack array or a pointer into the middle of a block, that "header"
+is unrelated data, and the size it reads can link a nonsense block into the
+list, so the damage appears much later, in some other `malloc`. A double
+free links the same block in twice, after which two later allocations can
+return the same memory.
+
+```c
+char *p = kmalloc(10);
+kfree(p);
+kfree(p);          /* same block linked twice: later mallocs overlap */
+char local[16];
+kfree(local);      /* no header there: the list is now corrupt */
+```
+
+The fix is discipline (one owner per block, and setting the pointer to
+`NULL` after freeing) and tools: AddressSanitizer reports both mistakes
+at the faulty `free`, with the stack trace of where the block was
+allocated.
+
+### In real systems
+
+Production allocators keep the ideas of this section and add speed. glibc's
+`malloc` keeps many free lists sorted by size ("bins") so a search does
+not walk every block, stores the size of the previous block so freeing can
+merge in constant time, gives each thread its own arena to avoid locking,
+and serves large requests directly with `mmap`. jemalloc, tcmalloc and
+mimalloc go further with per-size slabs and per-thread caches. The header
+before every block is still there in most of them, which is why a buffer
+overflow that writes past the end of one block corrupts the next block's
+header and crashes the allocator.
+
+### Check yourself
+
+**Why does `kmalloc` give out the tail of a free block rather than the
+head?**
+
+<details>
+<summary>Answer</summary>
+
+The free part keeps its header where it was, so only its size changes and
+the list's links stay untouched. Giving out the head would mean writing a
+new header for the remainder and relinking it.
+
+</details>
+
+**Why is the header a `union` with a `long double` member that is never
+used?**
+
+<details>
+<summary>Answer</summary>
+
+To force the header's size and alignment to suit the most demanding type.
+Every block is a whole number of headers, so every address returned is
+correctly aligned for any type.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 8, The UNIX System Interface">
+<Level name="Beginner" depth={3}>
+
+The beginner's core is four calls and one number. A program opens a file
+and gets a descriptor, reads or writes bytes through it, and closes it.
+`read` returns how many bytes it got, 0 at the end and -1 on error, and
+that return value drives every loop in the chapter. Descriptors 0, 1 and 2
+are already open, which is why a program that reads 0 and writes 1 works
+with files, pipes and the keyboard without changes.
+
+A beginner's worked example: count the bytes in each named file, the way
+`wc -c` does, using nothing but `open`, `read` and `close`.
+
+```c
+/* countb.c: count the bytes of each named file with open and read */
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    char buf[4096];
+    for (int i = 1; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY);
+        if (fd == -1) { perror(argv[i]); continue; }
+        long total = 0;
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof buf)) > 0) total += n;
+        printf("%7ld %s\n", total, argv[i]);
+        close(fd);
+    }
+    return 0;
+}
+```
+
+```text
+$ ./countb nums.txt empty.txt nope
+nope: No such file or directory
+ 108894 nums.txt
+      0 empty.txt
+```
+
+The empty file is handled with no special case: the first `read` returns
+0 and the loop body never runs. The missing file is reported and skipped.
+(The error appears first because `stderr` is unbuffered and `stdout` was a
+pipe.)
+
+The beginner's mistake is to write `while (read(fd, buf, sizeof buf))`,
+treating any non-zero result as success. On an error `read` returns -1,
+which is non-zero, so the loop spins forever adding -1 to the total. The
+fix is to compare with 0 explicitly, as above, and to check for -1 after
+the loop.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+The intermediate step is combining calls into real tools and seeing why
+the library exists. A program that copies, appends or seeks is a few lines
+longer than the beginner's, but it must handle short reads, short writes
+and every error, and it must choose a buffer size.
+
+Here is the buffer size question measured, reading the same 108,894-byte
+file with four buffer sizes and counting the calls (including the final
+one that returns 0):
+
+```c
+/* bufsizes.c: how many read calls does a file cost per buffer size? */
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void)
+{
+    size_t sizes[] = {1, 64, 4096, 65536};
+    for (int i = 0; i < 4; i++) {
+        char *buf = malloc(sizes[i]);
+        int fd = open("nums.txt", O_RDONLY);
+        long calls = 0;
+        while (read(fd, buf, sizes[i]) > 0) calls++;
+        printf("buffer %6zu: %6ld reads\n", sizes[i], calls + 1);
+        close(fd);
+        free(buf);
+    }
+    return 0;
+}
+```
+
+```text
+buffer      1: 108895 reads
+buffer     64:   1703 reads
+buffer   4096:     28 reads
+buffer  65536:      3 reads
+```
+
+Each call is a kernel crossing, so the one-byte version does nearly
+109,000 crossings to move the same data that 4 KB buffers move in 28.
+Past a few kilobytes the gains shrink, because the copying itself starts
+to dominate. That is why `BUFSIZ` sits in the kilobytes.
+
+The intermediate mistake is to mix layers: reading a file with `fgets`
+and then calling `read` on its descriptor. `fgets` has already pulled a
+whole buffer into the `FILE`, so `read` skips data that the program never
+saw. The fix is to stay in one layer per file.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+The advanced level is the exact semantics underneath. A descriptor indexes
+a per-process table; each entry points at an open file description holding
+the position and status flags; that points at the inode. `open` makes a
+new description; `dup` and `fork` share one. So two processes that
+inherited the same descriptor share a position, while two that opened the
+file separately do not.
+
+Writes have their own rules. With `O_APPEND`, the kernel moves the
+position to the end immediately before every write, as one atomic step, so
+`lseek` cannot send a write anywhere else:
+
+```c
+/* appendrace.c: O_APPEND ignores lseek for writes */
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int fd = open("log.txt", O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    write(fd, "first\n", 6);
+    lseek(fd, 0, SEEK_SET);                /* try to go back to the start */
+    write(fd, "second\n", 7);              /* still goes to the end */
+    close(fd);
+    char buf[64];
+    fd = open("log.txt", O_RDONLY);
+    ssize_t n = read(fd, buf, sizeof buf);
+    fwrite(buf, 1, n, stdout);
+    return 0;
+}
+```
+
+```text
+first
+second
+```
+
+That atomic seek-and-write is why many processes can append to one log
+file without overwriting each other's lines, while an `lseek` to the end
+followed by a `write` can race: two processes both seek to byte 100, and
+the second write lands on top of the first.
+
+On the allocator side, the precise rules are alignment and ownership. A
+pointer from `malloc` is aligned for any object type, and the only valid
+argument to `free` is such a pointer, once. Everything the allocator
+knows about a block is in the header just before it, which is the cost
+model in one sentence: every allocation pays a header, rounded up to the
+alignment unit.
+
+The advanced mistake is to assume `write` returning success means the data
+is on disk. It means the kernel accepted it into its page cache. Only
+`fsync` asks the kernel to push it to the device, and only `close`
+reports some delayed errors, so durable code checks both.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Each of these is a single boundary, with what happens and why.
+
+**An empty file.** The first `read` returns 0. `countb` prints 0; the
+buffered `getchar` makes one call and returns `EOF`:
+
+```text
+$ ./mygetchar -b < empty.txt
+buffered: 0 chars, 1 read calls
+```
+
+**A file exactly one buffer long.** An 8,192-byte file with an 8,192-byte
+buffer costs two reads, one full and one that returns 0. Code that stops
+when a read returns less than the buffer size (instead of 0) would stop
+correctly here by luck and wrongly on a pipe that delivers a short block
+mid-stream.
+
+```text
+$ ./mygetchar -b < exact.txt
+buffered: 8192 chars, 2 read calls
+```
+
+**A zero-byte write.** `write(fd, buf, 0)` on a regular file returns 0 and
+does nothing. It is not end of file and not an error, and a write loop
+must not treat it as either.
+
+**A descriptor number at the limit.** When every descriptor is in use,
+`open` returns -1 with `EMFILE` ("Too many open files"). The program is
+not broken; it is leaking. The fix is to find the missing `close`.
+
+**A request of zero bytes to `malloc`.** The standard lets `malloc(0)`
+return `NULL` or a unique pointer. The book-style allocator returns a
+one-unit block, just a header, which must still be freed.
+
+**The largest request.** `kmalloc(SIZE_MAX)` makes the unit calculation
+overflow and wrap to a tiny number, so the allocator would hand out a
+small block for a huge request. Real allocators check for overflow first,
+and `calloc(n, size)` must check `n * size` too.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two boundaries, or a boundary with a side effect.
+
+**Source and target are the same file.** `mycp f f` truncates `f` when it
+creates the target, and then copies its now-empty contents: the data is
+gone and the exit status says success. Two harmless operations, opening
+and creating, combine into data loss. The fix is to `fstat` both
+descriptors and refuse when the device and inode numbers match.
+
+**Standard output closed and a file opened.** Started as `./prog >&-`,
+a program's first `open` returns 1, and every `printf` then writes into
+that file. A boundary (a missing standard descriptor) meets a side effect
+(reuse of the lowest number). Defensive programs open `/dev/null` on any
+of 0, 1, 2 that are closed at start-up.
+
+**`lseek` past the end, then read.** The seek succeeds and the read
+returns 0, as record 9 showed. Add a write and the file grows with a hole,
+so a later reader sees zeros it never wrote. A bug that seeks to a wrong,
+huge offset can make a 10-byte config file report a size of gigabytes.
+
+**A directory changing while it is walked.** If `fsize` deletes or creates
+files in the directory it is reading, `readdir` may or may not return the
+new or deleted entries; POSIX leaves it unspecified. Tools that modify a
+tree, like `rm -r`, collect names first or tolerate entries that vanish
+between `readdir` and `stat` (`ENOENT` at that point is normal, not a bug).
+
+**Freeing the block that `freep` points at, then allocating.** The search
+starts from `freep`, so after a free the next allocation starts near the
+block just freed. Combined with first fit, that spreads allocations round
+the list, which is the reason the book starts the search where the last
+one ended rather than at the beginning.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, the system interface fails in ways a test on a laptop
+never shows. Calls are interrupted by signals (`EINTR`), pipes and sockets
+accept partial writes, disks fill up, and files are replaced while being
+read. Code that survives wraps `read` and `write` in loops that retry
+`EINTR` and continue after short counts, and it treats `close` and
+`fsync` errors as real failures.
+
+The most important production pattern from this chapter is saving a file
+atomically:
+
+```c
+/* atomicsave.c: replace a file so readers never see half of it */
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static int save(const char *path, const char *data)
+{
+    char tmp[256];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) return -1;
+    size_t len = strlen(data);
+    if (write(fd, data, len) != (ssize_t)len || fsync(fd) == -1) {
+        close(fd); unlink(tmp); return -1;
+    }
+    if (close(fd) == -1) { unlink(tmp); return -1; }
+    return rename(tmp, path);            /* atomic on one file system */
+}
+```
+
+```text
+$ ./atomicsave && cat config.txt
+save: 0
+save to missing dir: -1
+port=8080
+```
+
+A crash at any point leaves either the old `config.txt` or the new one,
+never a half-written file, and no stray `.tmp` file after a clean failure.
+A fully durable version also `fsync`s the directory after the `rename`.
+
+Observability matters as much. `strace -f -e trace=file,read,write`
+shows exactly which files a program opens and how it reads them, and
+`/proc/PID/fd` lists its open descriptors. For memory, the allocator's
+choices show up as resident size that never shrinks after a peak, because
+freed blocks stay on the free list instead of returning to the system;
+`malloc_trim` or a different allocator is the usual remedy.
+
+The production mistake is a descriptor leak on an error path: a function
+opens a file, hits an error, and returns without closing it. Under load it
+fails only after hours, with `EMFILE`. The fix is a single exit path that
+closes everything (the `goto cleanup` idiom in C), plus `O_CLOEXEC` so
+descriptors do not leak into child processes.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to look one layer down. `printf`,
+`fopen` and `malloc` stop being black boxes once you have written small
+versions of them, and after that, performance and failures in the layer
+above become predictable. A slow program that writes one byte at a time,
+a log line that appears out of order, a memory peak that never shrinks:
+each is explained by the layer underneath.
+
+The second habit is to treat every return value as information. The
+system interface reports almost everything through a return value and
+`errno`, and none of it is optional: 0 from `read`, a short count from
+`write`, -1 from `close`. Reading the manual page's RETURN VALUE and ERRORS
+sections before using a call is the habit that prevents most of this
+chapter's bugs.
+
+The same habit transfers outside C. In Node, `fs.read` returns `bytesRead`
+for the same reason `read` does, and a stream's `'data'` events arrive in
+chunks of whatever size the kernel delivered; code that assumes one event
+is one message has the same bug as code that assumes `read` fills the
+buffer.
+
+```ts
+// Node: the same short-read lesson in TypeScript
+import { openSync, readSync, closeSync } from "node:fs";
+const fd = openSync("nums.txt", "r");
+const buf = Buffer.alloc(4096);
+let total = 0, n: number;
+while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) total += n;
+closeSync(fd);
+console.log(total); // 108894
+```
+
+The mindset mistake is to copy the book's code as if it were current
+practice. Its directory reading and its use of `sbrk` reflect its era; the
+ideas are timeless, the specific calls have changed, and checking the
+current manual is part of the work.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In a larger system, this chapter's decisions sit at the storage boundary.
+Take a small key-value store that keeps data in one file of fixed-size
+pages. Its design is this chapter assembled: `open` with `O_RDWR |
+O_CREAT`, page `n` at offset `n` times the page size via `pread` and
+`pwrite`, a cache of pages in memory (a buffer, as in 8.5, but for pages
+instead of bytes), a free list of unused pages (as in 8.7, but on disk),
+and an append-only log with `O_APPEND` and `fsync` for crash recovery.
+
+<Layers caption="A small page-based storage engine, layer by layer. Each layer is one section of the chapter grown up." layers={[
+  { name: "API: get, put, delete", note: "what the application calls" },
+  { name: "Page cache", note: "8.5's buffer, holding pages, written back when dirty" },
+  { name: "Free page list", note: "8.7's free list, kept on disk" },
+  { name: "Write-ahead log", note: "O_APPEND plus fsync, replayed after a crash" },
+  { name: "pread / pwrite at page offsets", note: "8.4's random access, thread-safe" },
+  { name: "Descriptors and the kernel", note: "8.1 to 8.3" },
+]} />
+
+The design choices are the chapter's trade-offs at scale. Bigger pages
+mean fewer calls but more wasted space and more data rewritten per change.
+Buffering in the program is fast but loses data on a crash unless a log
+records changes first. A free list is simple but fragments, so real
+engines compact or allocate by size class.
+
+The design mistake is to buffer in two places without knowing it: the
+program's own cache and the kernel's page cache both hold the same data,
+doubling memory. Databases either accept that, or bypass the kernel cache
+with `O_DIRECT` and manage everything themselves; the choice should be
+deliberate.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+I learn this chapter by building, in order: `countb`, `mycp`, `records`,
+the mini `stdio` with a write side added, `fsize`, and the allocator. Each
+program is small enough to finish in one sitting and each depends on the
+ones before it. I run each under `strace` once to see the system calls I
+think I am making, and the allocator under a test that allocates and frees
+in random order and checks the free list after every step.
+
+I check myself against the real thing. My `mtest` must agree with `wc`, my
+`mycp` with `cmp`, my `fsize` with `du -ab` (after sorting), and my
+allocator must end every random test with one free block covering the
+whole arena. Disagreements are the lessons.
+
+The strategy mistake is reading 8.7 without running it. The pointer
+arithmetic in `kfree` only becomes clear with a trace on paper, unit by
+unit, as above; I do one by hand before believing I understand it.
+
+Done when I can write `mycp` with full error handling, the buffered
+`m_getc` with its fill function, and the first-fit allocator with
+coalescing from a blank file, and each passes its comparison test and
+runs clean under AddressSanitizer.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Why learn system calls when `stdio` does the job?** Because `stdio` is
+built from them, and its behaviour (buffering, ordering, when errors
+appear) only makes sense once you know them. Some jobs, such as sockets,
+pipes between processes and random-access files, also need them directly.
+
+**Is `creat` still used?** Rarely. `open` with `O_CREAT | O_TRUNC` does
+the same and more, and is what modern code writes. `creat` remains in
+POSIX.
+
+**What is the difference between `read` and `fread`?** `read` is a system
+call on a descriptor with no buffering; `fread` is a library function on a
+`FILE *` that copies from the stream's buffer and calls `read` only when
+the buffer is empty.
+
+**Why does my output appear in the wrong order when piped?** `stdout` is
+fully buffered to a pipe and `stderr` is unbuffered, so error text appears
+immediately and normal text when the buffer is flushed. `setvbuf` or
+`fflush` changes that.
+
+**Does the directory code in the book still work?** The design does; the
+raw `read` of a directory does not on Linux. Use `opendir`, `readdir` and
+`closedir` from `<dirent.h>`, which are the interface the book's wrapper
+anticipated.
+
+**Should I use the book's allocator in real code?** No, the system's
+allocator is much faster and better tested. Write it to understand
+`malloc`, and to be able to write a special-purpose allocator (an arena or
+a pool) when profiling shows one would help.
+
+**What is `sbrk`, and why do allocators also use `mmap`?** `sbrk` moves
+the end of the process's data segment, giving one contiguous heap that
+can only shrink from the top. `mmap` gets independent regions that can be
+returned individually, which suits large blocks.
+
+## Key takeaways
+
+- A file descriptor is a small integer indexing the process's table of open files; 0, 1 and 2 are open at start.
+- `read` and `write` move bytes, return the count actually moved, and must be called in loops for pipes and sockets.
+- The cost of I/O is dominated by the number of system calls, which is why the library buffers.
+- `open` takes flags and, with `O_CREAT`, a mode that the umask trims; `creat` is `open` with write, create and truncate.
+- `unlink` removes a name; the data goes when no names or open descriptors remain.
+- `lseek` moves the position without moving data, seeking past the end is allowed, and writing there creates a hole.
+- A `FILE` is a structure with a descriptor, a buffer, a pointer, a count and flags; `getc` is a macro over it.
+- Directories hold names and inode numbers; `stat` reads the inode; walks skip `.` and `..` and should not follow links blindly.
+- `malloc` keeps a circular, address-ordered free list of headed blocks, allocates first fit from the tail, and `free` coalesces neighbours.
+- The header union with an alignment member guarantees every block is aligned for any type.
+
+## Glossary
+
+- **System call**: a request from a program to the kernel, such as `read` or `open`.
+- **File descriptor**: a small non-negative integer naming an open file in a process.
+- **Standard input, output, error**: descriptors 0, 1 and 2, opened by the shell before the program starts.
+- **Open file description**: the kernel record behind a descriptor, holding the position and mode.
+- **Redirection**: the shell connecting a standard descriptor to a file or pipe.
+- **Short read / short write**: a call that moves fewer bytes than requested, which is normal.
+- **`errno`**: a variable set by a failing call to a number naming the reason.
+- **Permissions**: nine bits of read, write and execute for owner, group and others, written in octal.
+- **umask**: a per-process set of permission bits removed from every newly created file.
+- **Unlink**: removing a directory entry, a file's name.
+- **File position (offset)**: where the next read or write on a description happens.
+- **Sparse file / hole**: a file region never written, which reads as zeros and uses no disk blocks.
+- **Buffer**: memory in the program that collects bytes so that many small operations become one system call.
+- **Fill function / flush function**: the routines that refill an input buffer or empty an output buffer.
+- **Directory entry**: a name paired with an inode number.
+- **Inode**: the kernel's record of a file: type, size, permissions, owner, times and data location.
+- **`stat` / `lstat`**: calls that read a file's inode information; `lstat` does not follow symbolic links.
+- **Free list**: the linked list of memory blocks not currently allocated.
+- **Header (block header)**: the bookkeeping unit before each block, holding its size and the next free block.
+- **First fit**: taking the first free block large enough for the request.
+- **Coalescing**: merging adjacent free blocks into one.
+- **Fragmentation**: free memory broken into pieces too small to use.
+- **Alignment**: the address multiple an object of a type must start at.
+- **`sbrk` / `mmap`**: system calls that give a process more memory, by growing the heap or mapping a new region.
+
+## Exercises and self-check
+
+These are my own exercises. The book has its own at the end of the
+chapter, including writing the output side of the mini `stdio`; do those
+too.
+
+**Warm-up (by hand)**
+
+1. A process with only 0, 1 and 2 open runs: open A, open B, close 0,
+   open C, close A's descriptor, open D. Write down each descriptor number.
+2. Compute the permissions of files created with `0666` and `0777` under
+   umasks `002`, `022` and `077`.
+3. With 16-byte headers, how many units do requests of 0, 15, 16, 17 and
+   1000 bytes take?
+4. Trace `kmalloc` and `kfree` by hand for: allocate 20, allocate 20,
+   allocate 20, free the second, free the first, free the third, drawing
+   the arena after each step.
+
+**Build (write and test)**
+
+5. Add `m_putc`, a flush function, `m_fflush` and `m_fclose` to the mini
+   `stdio`, and test that a file written through it matches one written
+   with `fputc`.
+6. Write `tail -n N` for regular files using `lseek` from the end and
+   reading backwards in blocks, falling back to reading everything for
+   pipes (detect them by `lseek` failing with `ESPIPE`).
+7. Extend `fsize` to print totals per directory, like `du`, and to skip
+   entries whose `lstat` fails with `ENOENT` because they vanished.
+8. Write `kcalloc` with an overflow check, and `krealloc` that grows in
+   place when the next block is free.
+
+**Stretch (change the problem)**
+
+9. Change the allocator to **best fit** (the smallest block that fits) and
+   compare fragmentation with first fit on a random allocation trace of
+   your own design: count free blocks and the largest free block at the
+   end.
+10. Make `mycp` safe against the same-file case and against crashes, by
+    comparing inodes and by writing to a temporary file and renaming.
+
+**Self-check**
+
+<details>
+<summary>What does read return at end of file, and what on error?</summary>
+
+0 at end of file, -1 on error with `errno` set. Any positive number is a
+count of bytes, possibly fewer than requested.
+
+</details>
+
+<details>
+<summary>Why does a program's first open usually return 3?</summary>
+
+Descriptors 0, 1 and 2 are already open, and the kernel hands out the
+lowest free number.
+
+</details>
+
+<details>
+<summary>What does creat do to an existing file?</summary>
+
+It truncates it to zero length and opens it for writing; the file keeps
+its permissions.
+
+</details>
+
+<details>
+<summary>What happens when you lseek past the end and write one byte?</summary>
+
+The file grows to that offset plus one. The gap is a hole: it reads as
+zeros and usually uses no disk space.
+
+</details>
+
+<details>
+<summary>In the getc macro, what triggers a call to the fill function?</summary>
+
+The count dropping below zero after the decrement, meaning the buffer is
+empty.
+
+</details>
+
+<details>
+<summary>Why must a directory walker skip . and ..?</summary>
+
+They are entries for the directory itself and its parent; recursing into
+them loops forever or climbs out of the tree.
+
+</details>
+
+<details>
+<summary>Why does free need the list in address order?</summary>
+
+So it can see whether the freed block is directly next to a free block
+before or after it, and merge them.
+
+</details>
+
+<details>
+<summary>Why is a freed block's header one unit before the pointer?</summary>
+
+Because `malloc` returned `p + 1`, the address just after the header, so
+`free` steps back one unit to find it.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to
+<a href={withBase('/plans/traditional-software-developer/#phase-6--operating-systems')}>phase 6</a>
+of <a href={withBase('/plans/traditional-software-developer/')}>the traditional
+core roadmap</a>, where it is read alongside the operating systems book,
+so every system call here meets its kernel side there. I give it three
+sessions.
+
+<Timeline caption="Three sessions for chapter 8, each ending with programs checked against a real Unix tool." items={[
+  { when: "Session 1", what: "8.1 to 8.4. Write fdinfo, rwcopy, both getchars, mycp, scratch and records. Run each under strace once and compare the calls with what I expected." },
+  { when: "Session 2", what: "8.5 and 8.6. Write the mini stdio, then add the write side (exercise 5). Write fsize and check it against du -ab. Try a symlink loop with stat, then with lstat." },
+  { when: "Session 3", what: "8.7. Trace the allocator on paper first, then type it in, then write a random alloc and free test that checks the free list after each step. Finish with the self-check." },
+]} />
+
+Everything goes into `kr-ch08/`, built with
+`-Wall -Wextra -fsanitize=address,undefined -g` (except the allocator's
+stress test, which I also build without sanitizers, since they replace
+`malloc`). I keep `readn`, `writen` and `save` in a small `sys/` folder
+because later projects need them.
+
+Done when I can write `mycp`, the buffered `getc` and the free-list
+allocator from a blank file, each agrees with its reference tool, and I
+can explain any descriptor number, permission or free-list state from the
+calls that produced it.
