@@ -1,0 +1,1757 @@
+---
+book: computer-systems-a-programmers-perspective
+number: 5
+title: "Optimizing Program Performance"
+description: "CPE, compiler limits, combine1–8 from calls to multiple accumulators, modern out-of-order processors, unrolling, reassociation, profiling and real timings on this box."
+part: "Part I, Program Structure and Execution"
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Most programs spend almost all their time in a few loops. This chapter is
+about making those loops faster without changing what they compute. I start
+from a clear but slow combining function, remove one bottleneck at a time,
+and measure every step on this box (Intel Xeon, 2.4 GHz, GCC 14.2). By the
+end, a double-precision multiply-reduction that took 2.56 ns per element
+takes 0.30 ns, about 8×, from source changes alone. The same habits apply
+to code that is not a reduction: know the metric, know what the compiler
+will and will not do, know what the processor can overlap, and measure.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- Define CPE and convert between nanoseconds per element and cycles per element using the clock frequency.
+- List what an optimising compiler reliably does, and the transformations it must not do because of language rules.
+- Take a combine-style loop from "function call every iteration" to "multiple accumulators" and explain the gain at each step.
+- Explain latency and throughput of functional units, and why a dependent chain of multiplies is slower than independent ones.
+- Unroll loops, use multiple accumulators and reassociate operations when the math allows it.
+- Recognise register spilling and branch misprediction as limits that undo other optimisations.
+- Use a profiler to find the hot spots worth optimising, and stop when the bottleneck has moved to memory.
+
+What I should already know: <a href={withBase('/books/computer-systems-a-programmers-perspective/03-machine-level-representation-of-programs/')}>chapter 3</a>
+(reading `-O1`/`-O2` assembly) and <a href={withBase('/books/computer-systems-a-programmers-perspective/04-processor-architecture/')}>chapter 4</a>
+(pipelines, hazards). Chapter 2's floating-point associativity warning matters when I reassociate.
+
+Reading time: about two hours for this page. Reproducing the measurements
+and the book's practice problems is another few evenings; the Perf Lab if
+available is a week.
+
+## Chapter map
+
+<Flow steps={["5.1 What compilers can and cannot do", "5.2 CPE as the performance metric", "5.3 The combine example", "5.4–5.6 Remove calls, bounds work, memory accumulators", "5.7 Modern processor: latency, throughput, abstract superscalar", "5.8 Loop unrolling", "5.9 Multiple accumulators and reassociation", "5.10 Result summary", "5.11 Limits: spilling, misprediction", "5.12 Load and store performance", "5.13–5.14 Practice techniques and profiling"]} caption="The chapter is a single worked optimisation story, interrupted by the processor model that explains why the later steps work, then closed with the limits and the profiling habit." />
+
+## 5.1 Capabilities and Limitations of Optimizing Compilers
+
+### In one sentence
+
+Modern compilers rearrange, inline and strength-reduce aggressively, but
+they must preserve any result the abstract machine could produce, so
+anything that might be visible through pointers, floating-point
+associativity or undefined behaviour is off limits unless I give a clearer
+hint.
+
+### The idea
+
+GCC at `-O1` and `-O2` already does a lot: constant folding, dead-code
+elimination, inlining of small static functions, moving loop-invariant
+code, strength reduction, choosing `cmov` over branches (chapter 3). What
+it will **not** generally do without help:
+
+- Reassociate floating-point adds or multiplies (`(a+b)+c` vs `a+(b+c)`), because the results can differ.
+- Assume two pointers do not alias when the language says they might; a store through one can force a reload through the other.
+- Introduce multiple accumulators on its own for a reduction, for the same associativity reason.
+- Replace a whole algorithm (say, a naive polynomial with Horner's method) unless a library pattern matches.
+
+`restrict` (C) and careful function boundaries help with aliasing. `-ffast-math` (and friends) allow reassociation at the cost of strict IEEE behaviour; I treat that as a measured choice, not a default.
+
+### Worked example
+
+In my combine experiment, `combine1` calls `vec_length` every iteration.
+At `-O1` those calls remain and cost about 2.23 ns/elem for addition. At
+`-O2` the compiler inlines and moves the length out, and `combine1` drops
+to 0.70 ns/elem — almost to `combine4` — without me changing the source.
+The lesson is double: compilers are strong, and measuring at the
+optimisation level I will ship is the only measurement that counts.
+
+### Step by step
+
+1. Write clear code first; optimise after a profiler points at a loop.
+2. Build with the release flags (`-O2` or `-O3`) when measuring.
+3. Read the assembly of the hot loop before inventing a clever rewrite.
+4. If the assembly still reloads from memory each iteration, look for aliasing; `restrict` or local accumulators fix what the compiler cannot prove.
+
+### Common mistake
+
+Optimising `-O0` builds. Another: turning on `-ffast-math` globally to
+squeeze a reduction, then wondering why a correctness test failed three
+modules away.
+
+### In real systems
+
+Link-time optimisation (LTO) and profile-guided optimisation (PGO) extend
+what the compiler can see across files and along common paths. They do not
+remove the need for the source-level transformations in this chapter; they
+amplify them.
+
+### Check yourself
+
+<details>
+<summary>Why will a compiler not turn a single accumulator sum of doubles into four accumulators?</summary>
+
+Because floating-point addition is not associative, so the result can
+change, and the language requires preserving observable behaviour.
+
+</details>
+
+<details>
+<summary>What does restrict tell the compiler?</summary>
+
+That a pointer is the only way to access that object in the function's
+scope, so stores through other pointers cannot touch it.
+
+</details>
+
+## 5.2 Expressing Program Performance
+
+### In one sentence
+
+For loop-dominated code I report **CPE** (cycles per element): the slope
+of cycles against number of elements, which ignores call overhead and
+lets me compare machines and versions fairly.
+
+### The idea
+
+Wall-clock time for a run with n elements is roughly
+Time ≈ T0 + n × (CPE / clock_Hz). T0 is overhead; CPE is what the loop
+costs per element. On this box the TSC frequency is 2.4 GHz, so one cycle
+is 0.417 ns, and ns/elem × 2.4 ≈ CPE.
+
+I often measure nanoseconds per element directly with
+`clock_gettime(CLOCK_MONOTONIC)` and convert when I want cycles. Relative
+comparisons (version A vs B on the same machine) do not need the
+conversion.
+
+### Worked example
+
+`combine4` addition at `-O1`: 0.55 ns/elem × 2.4 GHz ≈ 1.32 CPE.
+`combine4` multiplication: 1.15 ns/elem × 2.4 ≈ 2.76 CPE.
+The ratio matches the latency gap between floating-point add and multiply
+on this core.
+
+### Step by step
+
+1. Warm up the loop once (pay instruction-cache and data-cache costs).
+2. Run enough repetitions that the timed region is tens of milliseconds.
+3. Divide total time by (repetitions × n) for ns/elem; multiply by GHz for CPE.
+4. Check that doubling n roughly doubles time (so T0 is not dominating).
+
+### Common mistake
+
+Reporting a single wall-clock time for one n, with no warmup, and calling
+it a benchmark. Noise and cold caches will lie.
+
+### In real systems
+
+`perf stat` reports cycles and instructions; instructions-per-cycle (IPC)
+is the sibling of CPE. For a known element count, CPE ≈ (cycles) / n.
+Chapter 6's memory mountain uses the same timing discipline at many sizes
+and strides.
+
+### Check yourself
+
+<details>
+<summary>If a loop takes 0.50 ns/elem on a 2.4 GHz machine, what is the CPE?</summary>
+
+0.50 × 2.4 = 1.2 cycles per element.
+
+</details>
+
+## 5.3 Program Example
+
+### In one sentence
+
+The running example is a combining function that reduces a vector with an
+associative operator (add or multiply), written first in the most obvious
+way and then sharpened through named versions combine1–combine8.
+
+### The idea
+
+```c
+typedef double data_t;
+#define OP +          /* or * */
+#define IDENT 0.0     /* or 1.0 */
+
+void combine1(vec *v, data_t *dest) {
+    long i;
+    *dest = IDENT;
+    for (i = 0; i < vec_length(v); i++) {
+        data_t val;
+        get_vec_element(v, i, &val);
+        *dest = *dest OP val;
+    }
+}
+```
+
+`vec_length` and `get_vec_element` hide the data pointer and do a bounds
+check. That is good software engineering and bad news for a tight loop.
+All timings below are on 2^22 doubles for addition and 2^20 for
+multiplication, GCC `-O1`, unless noted.
+
+### Worked example
+
+```text
+combine1  add  2.23 ns/elem
+combine1  mul  2.56 ns/elem
+```
+
+### Step by step
+
+Keep one harness that times every version with the same n, the same data
+and the same clock. Change one thing per version so the CPE table tells a
+story.
+
+### Common mistake
+
+Optimising a combine that the compiler already rewrote at `-O2`, then
+congratulating a source change that the assembly shows did nothing.
+
+### In real systems
+
+Reductions show up in dot products, checksums, histogram bins, neural-net
+layers. The combine ladder is a template, not a museum piece.
+
+### Check yourself
+
+<details>
+<summary>What are IDENT for addition and for multiplication?</summary>
+
+0.0 for addition, 1.0 for multiplication.
+
+</details>
+
+## 5.4 Eliminating Loop Inefficiencies
+
+### In one sentence
+
+Moving invariant work out of the loop — here, calling `vec_length` once —
+is the first and cheapest optimisation.
+
+### The idea
+
+```c
+void combine2(vec *v, data_t *dest) {
+    long i;
+    long n = vec_length(v);
+    *dest = IDENT;
+    for (i = 0; i < n; i++) {
+        data_t val;
+        get_vec_element(v, i, &val);
+        *dest = *dest OP val;
+    }
+}
+```
+
+At `-O1` my combine2 was not faster than combine1 (2.51 vs 2.23 ns),
+because `get_vec_element` still dominates. At `-O2` both collapse toward
+the same code. The transformation still matters: in larger loops the
+compiler cannot always see invariance, and a manual hoist documents
+intent.
+
+### Worked example
+
+Any call that depends only on `v`, not on `i`, belongs outside. Length,
+base pointers, and configuration flags are the usual candidates.
+
+### Step by step
+
+1. Read the loop; list every call and load.
+2. Ask "could this change across iterations?".
+3. If no, hoist it; if maybe, check aliasing.
+
+### Common mistake
+
+Hoisting a call that logs or ticks a counter; "invariant" means
+semantically invariant, not just looking side-effect free.
+
+### In real systems
+
+Loop-invariant code motion is a standard compiler pass. Doing it by hand
+is still useful when the invariant is algorithmic (a capacity check, a
+feature flag) rather than pure expression trees.
+
+### Check yourself
+
+<details>
+<summary>Name two expressions worth hoisting from a typical array loop.</summary>
+
+The array length and the data-base pointer (or a pointer to a row).
+
+</details>
+
+## 5.5 Reducing Procedure Calls
+
+### In one sentence
+
+Replacing per-element accessor functions with a raw data pointer removes
+call and bounds-check overhead that even a good inliner can miss at low
+optimisation levels.
+
+### The idea
+
+```c
+void combine3(vec *v, data_t *dest) {
+    long i;
+    long n = vec_length(v);
+    data_t *d = get_vec_start(v);
+    *dest = IDENT;
+    for (i = 0; i < n; i++)
+        *dest = *dest OP d[i];
+}
+```
+
+```text
+combine3  add -O1  2.20 ns/elem   (still memory accumulator)
+```
+
+The call is gone, but the CPE barely moved versus combine1, because the
+next bottleneck — writing `*dest` every iteration — is still there.
+
+### Worked example
+
+Reading the `-O1` assembly of combine3 shows a store to `(%rdi)` (or
+wherever `dest` lives) inside the loop, and a matching load for the next
+iteration. That load-use chain through memory is chapter 4's hazard in
+everyday clothes.
+
+### Step by step
+
+1. Expose the data pointer once.
+2. Index with `d[i]` or walk with a pointer.
+3. Measure; if CPE did not drop, look at memory traffic next.
+
+### Common mistake
+
+Removing bounds checks without a measured reason in code that handles
+untrusted indices. In a tight inner loop over a known length, the check is
+redundant; at an API boundary it is not.
+
+### In real systems
+
+C++ iterators and Rust slices aim to give the raw-pointer performance with
+safety at the boundary. Looking at their assembly in hot loops is the same
+exercise as reading combine3.
+
+### Check yourself
+
+<details>
+<summary>Why did combine3 barely beat combine1 at -O1 for addition?</summary>
+
+Because the per-iteration store/load of `*dest` dominated the remaining
+call overhead.
+
+</details>
+
+## 5.6 Eliminating Unneeded Memory References
+
+### In one sentence
+
+Keeping the accumulator in a local variable (a register) turns a
+memory-bound dependence chain into a register-bound one, and that is the
+first big CPE cliff.
+
+### The idea
+
+```c
+void combine4(vec *v, data_t *dest) {
+    long i;
+    long n = vec_length(v);
+    data_t *d = get_vec_start(v);
+    data_t acc = IDENT;
+    for (i = 0; i < n; i++)
+        acc = acc OP d[i];
+    *dest = acc;
+}
+```
+
+```text
+combine4  add -O1  0.55 ns/elem   (≈ 1.32 CPE)
+combine4  mul -O1  1.15 ns/elem   (≈ 2.76 CPE)
+```
+
+Addition dropped about 4×; multiplication about 2×. The accumulator lives
+in an XMM register; the only memory traffic is loading `d[i]`.
+
+### Worked example
+
+<Compare left="combine3 (memory acc)" right="combine4 (register acc)" rows={[
+  ["each iter: load *dest, op, store *dest", "each iter: op into xmm reg"],
+  ["dependence through memory", "dependence through a register"],
+  ["add 2.20 ns/elem", "add 0.55 ns/elem"],
+  ["mul ~2.4 ns/elem", "mul 1.15 ns/elem"],
+]} caption="The single biggest source change in the chapter. Same math, different place to keep the running result." />
+
+### Step by step
+
+1. Declare a local accumulator initialised to IDENT.
+2. Update only the local in the loop.
+3. Write once to `*dest` after the loop.
+4. Confirm in assembly that the loop body has no store to `dest`.
+
+### Common mistake
+
+Taking the address of the accumulator (`&acc`) "for debugging", which
+forces it back onto the stack and undoes the optimisation.
+
+### In real systems
+
+Any reduction, running hash, or state machine update should ask: does the
+hot state live in registers across the loop? If the assembly shows stack
+spills of that state, something has gone wrong (see 5.11).
+
+### Check yourself
+
+<details>
+<summary>What single change separates combine3 from combine4?</summary>
+
+Accumulating into a local variable instead of through `*dest` each
+iteration.
+
+</details>
+
+## 5.7 Understanding Modern Processors
+
+### In one sentence
+
+A modern core is a superscalar out-of-order machine: several functional
+units, each with a latency and a throughput, and a scheduler that fires
+any instruction whose operands are ready; CPE is limited by the longest
+dependence chain and by the busiest unit.
+
+### The idea
+
+#### 5.7.1 Overall Operation
+
+From chapter 4's PIPE to a real core:
+
+- Instructions are fetched and decoded in order into a buffer.
+- A **scheduler** issues ready micro-ops to functional units out of order.
+- Results are renamed so false register dependencies do not stall the pipe.
+- A **retirement** stage commits effects in program order, preserving the
+  illusion of sequential execution (precise exceptions, just as in PIPE).
+
+I do not need the micro-op details to use the model; I need latency,
+throughput and the critical path through my loop.
+
+#### 5.7.2 Functional Unit Performance
+
+Each operation has:
+
+- **Latency:** cycles until the result is ready for a dependent op.
+- **Throughput:** maximum results the unit can produce per cycle (often
+  expressed as cycles between starting two independent ops of that kind).
+
+On this 2.4 GHz box I measured a dependent chain of double multiplies at
+1.16 ns/op ≈ 2.8 cycles latency, and four independent multiplies per
+iteration at 0.30 ns per multiply ≈ 0.72 cycles, so the multiplier can
+start a new independent multiply almost every cycle. Floating-point adds
+are typically similar: latency a few cycles, throughput one per cycle (or
+better with multiple units).
+
+#### 5.7.3 An Abstract Model of Processor Operation
+
+For a combine loop with one accumulator, the critical path is
+acc → op → acc. CPE cannot fall below the latency of that op. With several
+independent accumulators, the critical path per element shortens because
+each accumulator only appears every k elements, and the limit becomes the
+throughput of the unit: CPE ≥ 1 / (issue width for that op).
+
+<Figure art={`
+  one accumulator (mul):
+
+  acc0 --*-- acc0 --*-- acc0 --*-- acc0
+         d0         d1         d2
+  CPE bounded by mul latency ≈ 2.8 cycles
+
+  four accumulators:
+
+  acc0 --*-- acc0 --*--
+  acc1 --*-- acc1 --*--
+  acc2 --*-- acc2 --*--
+  acc3 --*-- acc3 --*--
+  CPE bounded by mul throughput ≈ 0.7 cycles/elem
+`} caption="Latency bound versus throughput bound. Multiple accumulators turn a single long chain into several shorter ones the scheduler can overlap." />
+
+### Worked example
+
+```text
+dep   1.16 ns/op          (one chain)
+indep 0.30 ns per mul     (four chains)
+combine4 mul 1.15 ns/elem (matches dep)
+combine8 mul 0.30 ns/elem (matches indep per mul)
+```
+
+The source-level change to five accumulators (combine8) is exactly the
+move from the latency bound to the throughput bound.
+
+### Step by step
+
+1. Identify the operation in the critical chain (add, mul, load).
+2. Find or measure its latency and throughput.
+3. CPE_lower = latency for a single chain; CPE_lower = 1/throughput for enough independent chains.
+4. Optimise toward the throughput bound; stop when measured CPE is close.
+
+### Common mistake
+
+Unrolling without multiple accumulators. The loop is shorter in
+instructions but the critical chain is the same length, so CPE barely
+moves (combine5 ≈ combine4 below).
+
+### In real systems
+
+Intel's and ARM's optimisation manuals publish latency/throughput tables
+per instruction. `llvm-mca` and `uiCA` estimate CPE from assembly. I still
+measure on the real machine; the model tells me what to try.
+
+### Check yourself
+
+<details>
+<summary>Why can CPE for a multiply-reduction not beat the mul latency with one accumulator?</summary>
+
+Because each iteration waits for the previous multiply's result before it
+can start, so the chain fires once per latency period.
+
+</details>
+
+<details>
+<summary>What bound replaces latency when there are enough independent accumulators?</summary>
+
+The throughput bound of the functional unit.
+
+</details>
+
+## 5.8 Loop Unrolling
+
+### In one sentence
+
+Unrolling executes several iterations' worth of work in one loop body,
+reducing loop-overhead CPE and exposing instruction-level parallelism the
+scheduler can use.
+
+### The idea
+
+```c
+void combine5(vec *v, data_t *dest) {
+    long i;
+    long n = vec_length(v);
+    long lim = n - 1;
+    data_t *d = get_vec_start(v);
+    data_t acc = IDENT;
+    for (i = 0; i < lim; i += 2)
+        acc = (acc OP d[i]) OP d[i+1];
+    for (; i < n; i++)
+        acc = acc OP d[i];
+    *dest = acc;
+}
+```
+
+```text
+combine5  add  0.54 ns/elem   (≈ combine4)
+combine5  mul  1.16 ns/elem   (≈ combine4)
+```
+
+With one accumulator, 2× unroll does almost nothing: the critical chain is
+unchanged. Unrolling pays off when it is paired with 5.9, or when
+loop-overhead (index math, branches) was a real fraction of a tiny body.
+
+### Worked example
+
+The cleanup loop handles the final 0 or 1 element when n is odd. Forgetting
+it is a correctness bug; writing it as a second for-loop keeps the fast
+path branch-free.
+
+### Step by step
+
+1. Choose an unroll factor k (2, 4, 5, 8 are common).
+2. Rewrite the body to handle k elements; advance i by k.
+3. Add a scalar cleanup for the remainder.
+4. Measure; if CPE did not drop, add multiple accumulators next.
+
+### Common mistake
+
+Huge unroll factors that spill registers (5.11) or thrash the
+instruction cache. 4–8 is the usual sweet band for reductions.
+
+### In real systems
+
+Compilers unroll at `-O3` / with PGO when they think it helps. Manual
+unroll remains useful when I also change the accumulation shape.
+
+### Check yourself
+
+<details>
+<summary>Why did combine5 not beat combine4 on my multiply measurements?</summary>
+
+Both use one accumulator, so both are latency-bound at the same mul
+latency.
+
+</details>
+
+## 5.9 Enhancing Parallelism
+
+### In one sentence
+
+Breaking one dependence chain into several independent ones — multiple
+accumulators, and reassociation where the math allows — is how a reduction
+reaches the throughput bound.
+
+### The idea
+
+#### 5.9.1 Multiple Accumulators
+
+```c
+void combine6(vec *v, data_t *dest) {
+    long i;
+    long n = vec_length(v);
+    long lim = n - 1;
+    data_t *d = get_vec_start(v);
+    data_t a0 = IDENT, a1 = IDENT;
+    for (i = 0; i < lim; i += 2) {
+        a0 = a0 OP d[i];
+        a1 = a1 OP d[i+1];
+    }
+    for (; i < n; i++)
+        a0 = a0 OP d[i];
+    *dest = a0 OP a1;
+}
+```
+
+```text
+combine6  add  0.35 ns/elem
+combine6  mul  0.57 ns/elem
+```
+
+Two chains, each half as long in terms of operations per element. Multiply
+CPE roughly halves (1.16 → 0.57), matching the model.
+
+Five accumulators:
+
+```c
+void combine8(vec *v, data_t *dest) {
+    /* 5x unroll, five accums a0..a4 */
+    ...
+    *dest = a0 OP a1 OP a2 OP a3 OP a4;
+}
+```
+
+```text
+combine8  add  0.34 ns/elem
+combine8  mul  0.30 ns/elem
+```
+
+Multiply has reached the throughput floor I measured with independent
+muls (0.30 ns). Addition was already close after two accumulators; more
+do not help because something else (load bandwidth or add throughput)
+limits first.
+
+#### 5.9.2 Reassociation Transformation
+
+```c
+void combine7(vec *v, data_t *dest) {
+    ...
+    for (i = 0; i < lim; i += 2)
+        acc = acc OP (d[i] OP d[i+1]);
+    ...
+}
+```
+
+The parentheses compute `d[i] OP d[i+1]` in parallel with other work, then
+combine into acc. For addition this helps; for multiplication on my box
+combine7 (0.87 ns) lost to combine6 (0.57 ns) because the critical chain
+through acc is still one mul deep per element, plus an extra mul. The
+transformation is not free and must be measured. It also changes rounding;
+for floats I only reassociate when the specification allows it.
+
+<Trace columns={["Version", "add ns/elem", "mul ns/elem", "Idea"]} rows={[
+  ["combine1", "2.23", "2.56", "calls + memory acc"],
+  ["combine3", "2.20", "—", "raw pointer, memory acc"],
+  ["combine4", "0.55", "1.15", "register acc"],
+  ["combine5", "0.54", "1.16", "2x unroll, 1 acc"],
+  ["combine6", "0.35", "0.57", "2x unroll, 2 acc"],
+  ["combine7", "0.34", "0.87", "2x unroll, reassociated"],
+  ["combine8", "0.34", "0.30", "5x unroll, 5 acc"],
+]} caption="Full ladder on this box at GCC -O1. The two cliffs are combine3→4 (memory to register) and combine4→6/8 (latency to throughput)." />
+
+### Worked example
+
+Critical-path lengths per element (mul):
+
+- combine4: 1 mul latency
+- combine6: 1/2 mul latency
+- combine8: 1/5 mul latency, until throughput bounds
+
+Once 1/5 × 2.8 ≈ 0.56 cycles would be the latency bound, but throughput at
+≈0.72 cycles/elem is higher, so combine8 sits on throughput.
+
+### Step by step
+
+1. Start from combine4 (register accumulator).
+2. Unroll by k and use k accumulators.
+3. Combine the accumulators once at the end.
+4. Measure; increase k until CPE stops falling or registers spill.
+
+### Common mistake
+
+Reassociating money, indices or cryptography-related values where exact
+ordering is required. Save reassociation for scientific reductions that
+already accept floating-point noise.
+
+### In real systems
+
+SIMD (SSE/AVX) is the next step past multiple scalar accumulators: one
+instruction combines 2, 4 or 8 elements. The same latency/throughput
+thinking applies inside vector units. Autovectorisation often needs the
+combine4 shape before it fires; a memory accumulator will block it.
+
+### Check yourself
+
+<details>
+<summary>How many accumulators does combine6 use?</summary>
+
+Two: `a0` and `a1`.
+
+</details>
+
+<details>
+<summary>When does reassociation change the result of a double sum?</summary>
+
+Whenever the partial sums round differently, which is common once values
+differ in magnitude; chapter 2's associativity demo is the warning.
+
+</details>
+
+## 5.10 Summary of Results for Optimizing Combining Code
+
+### In one sentence
+
+The combine ladder's message is portable: remove repeated work, keep hot
+state in registers, then expose parallelism until the functional-unit
+throughput bound; each step is measured, not assumed.
+
+### The idea
+
+<Layers layers={[
+  { name: "Algorithm", note: "right problem, right complexity (out of scope here)" },
+  { name: "Throughput bound", note: "combine8: enough independent ops" },
+  { name: "Latency bound", note: "combine4–5: one chain in registers" },
+  { name: "Memory-acc bound", note: "combine1–3: reload *dest each iter" },
+  { name: "Call / bounds bound", note: "combine1 at -O1" },
+]} caption="Bottlenecks from the bottom up. Optimisation climbs the stack; profiling tells me which floor I am on." />
+
+### Worked example
+
+On this box, addition stopped improving at about 0.34 ns/elem; multiplication
+at 0.30 ns/elem. Those are the floors for scalar code here. Beating them
+needs SIMD or a different algorithm.
+
+### Step by step
+
+After any optimisation pass, ask: am I still on the same bound, or did the
+bottleneck move? If it moved to memory, chapter 6 is next; if to
+misprediction, fix the branches; if to the throughput floor, stop.
+
+### Common mistake
+
+Continuing to unroll after hitting the floor, producing a larger binary
+for no gain.
+
+### In real systems
+
+A good performance write-up shows this ladder with numbers. "We made it
+faster" without CPE and a bound is not an explanation.
+
+### Check yourself
+
+<details>
+<summary>Which two steps gave the largest gains in my table?</summary>
+
+Memory accumulator to register (combine3→4) and one accumulator to many
+(combine4→8), especially for multiply.
+
+</details>
+
+## 5.11 Some Limiting Factors
+
+### In one sentence
+
+Even a well-shaped loop slows down when it runs out of registers or when
+its control flow mispredicts; both show up as sudden CPE cliffs when
+unroll factors grow or data become random.
+
+### The idea
+
+#### 5.11.1 Register Spilling
+
+The machine has a finite number of rename registers visible as a smaller
+set of architectural registers. Too many live accumulators force the
+compiler to spill some to the stack, reintroducing memory latency. On
+x86-64 with SSE there are 16 XMM registers; after one is the stack pointer
+scratch and some hold pointers, a handful of accumulators is safe and
+sixteen is not. When CPE rises as I add accumulators, I read the assembly
+for spills.
+
+#### 5.11.2 Branch Prediction and Misprediction Penalties
+
+Chapter 3's sorted-vs-random branch demo applies: a data-dependent branch
+in the loop can cost tens of cycles on a mispredict. Prefer branchless
+forms (`cmov`, masked arithmetic) in tight loops when the data are
+unpredictable. Loop-count branches are usually well predicted.
+
+### Worked example
+
+From chapter 3 on this box, a branchy sum over random data took ~65 ms
+versus ~13 ms branchless — about 5× — for 16 million elements. That is
+more than every combine optimisation in this chapter stacked together. A
+single mispredicted branch inside a hot loop can erase a week of CPE work.
+
+### Step by step
+
+1. If CPE worsens with more accumulators, check for spills in assembly.
+2. If CPE is noisy or data-dependent, look for branches on the data.
+3. Replace with branchless equivalents and remeasure.
+
+### Common mistake
+
+Micro-optimising arithmetic in a loop that also has an unpredictable
+branch. Fix the branch first.
+
+### In real systems
+
+`perf annotate` and `perf record -e branch-misses` show the guilty sites.
+Tools like BOLT and PGO reorder blocks so the common path falls through.
+
+### Check yourself
+
+<details>
+<summary>What symptom suggests register spilling?</summary>
+
+CPE rises when I add more accumulators or locals, and the assembly shows
+stack loads/stores of those values in the loop.
+
+</details>
+
+## 5.12 Understanding Memory Performance
+
+### In one sentence
+
+Loads and stores have their own latency and throughput, and once the
+arithmetic is tuned they often become the new bound; a store cannot be
+reloaded until it has reached the store buffer / cache hierarchy.
+
+### The idea
+
+#### 5.12.1 Load Performance
+
+A load from L1 on this box is a few cycles; from DRAM, hundreds. The
+combine loops with sequential access stay in cache for the n I used, so
+load throughput was enough to feed combine8. Random or large strides
+change that (chapter 6).
+
+#### 5.12.2 Store Performance
+
+combine3's memory accumulator was a store–load chain on the same address:
+each iteration's load waited for the previous store. Modern cores forward
+from the store buffer when the addresses match, but the latency is still
+worse than a register. Independent stores (writing an output array) go at
+store-buffer throughput until cache capacity intervenes.
+
+```text
+write_seq  1.72 ns/elem
+read_seq   0.69 ns/elem
+stride  1  0.72 ns/access
+stride 16  1.97 ns/access
+stride 64  4.92 ns/access
+```
+
+Sequential reads are cheap; stride-64 (one access per cache line if ints
+are 4 bytes and lines are 64) costs several times more per access because
+each access misses the line the previous one used.
+
+### Worked example
+
+A loop that streams one array into another is limited by memory bandwidth
+once arithmetic is trivial. After combine-style tuning of the arithmetic,
+I measure bytes per second and compare to the machine's DRAM or cache
+bandwidth; if I am close, further arithmetic cleverness is wasted.
+
+### Step by step
+
+1. After arithmetic CPE is near the throughput bound, measure cache misses (`perf`).
+2. If misses are high, apply chapter 6 techniques before more unrolling.
+3. Avoid store–load chains on the same address inside the loop.
+
+### Common mistake
+
+Blaming the ALU when `perf` shows most cycles stalled on memory.
+
+### In real systems
+
+The roofline model plots arithmetic intensity against performance; a loop
+is either compute-bound or memory-bound. This section is the memory side
+of that picture; chapter 6 fills in the hierarchy.
+
+### Check yourself
+
+<details>
+<summary>Why is a memory accumulator slower than a register accumulator even with store forwarding?</summary>
+
+Because forwarding from a store buffer still costs more cycles than
+reading a register, and the dependence chain cannot be shorter than that
+latency.
+
+</details>
+
+## 5.13 Life in the Real World: Performance Improvement Techniques
+
+### In one sentence
+
+The practical checklist is: compile at release settings, find the hot
+spot, apply the combine-style transformations that match the bound, keep
+algorithms honest, and stop when measurement says the bottleneck moved
+elsewhere.
+
+### The idea
+
+Techniques that repeatedly pay rent:
+
+- High optimisation level and the right `-march` for the deployment CPU.
+- Locals instead of memory for hot state; `restrict` where aliasing blocks the compiler.
+- Unroll + multiple accumulators for reductions.
+- Branchless code on unpredictable data.
+- Cache-friendly traversal (chapter 6) once memory-bound.
+- A better algorithm when CPE work would only shave a constant.
+
+### Worked example
+
+I do not start with SIMD intrinsics. I start with combine4. If the
+compiler's autovectoriser then fires at `-O3`, I get SIMD for free. If it
+does not, the assembly tells me why (aliasing, overlapping stores, a
+carried dependence), and I fix that before writing intrinsics.
+
+### Step by step
+
+1. Measure a baseline CPE at release flags.
+2. Change one thing; remeasure.
+3. Keep a table like 5.9's.
+4. Stop when three changes in a row do not move CPE.
+
+### Common mistake
+
+A grab-bag of flags and intrinsics applied at once, with no baseline and
+no way to know which change did what.
+
+### In real systems
+
+Performance work that ships has a before/after table and a sentence about
+the bound. The combine ladder is a template for that write-up.
+
+### Check yourself
+
+<details>
+<summary>What is the first build flag to check before hand-optimising?</summary>
+
+That the measurement uses the same optimisation level as the shipped
+binary (usually `-O2` or `-O3`).
+
+</details>
+
+## 5.14 Identifying and Eliminating Performance Bottlenecks
+
+### In one sentence
+
+A profiler shows where the time goes; without it I will optimise the wrong
+loop, and with it I will know when I am done.
+
+### The idea
+
+#### 5.14.1 Program Profiling
+
+`perf record` / `perf report` on Linux samples the program counter and
+attributes time to functions and sometimes lines. Instrumentation
+profilers (gprof, many language tools) count calls. Sampling is usually
+enough for CPE work and cheaper.
+
+#### 5.14.2 Using a Profiler to Guide Optimization
+
+The loop that looks clever in source is often not the hot one. Profile,
+optimise the top frame, re-profile. When the top frame moves from my code
+to `memcpy` or a kernel page-fault path, the next chapter (or a different
+design) is calling.
+
+### Worked example
+
+```bash
+$ perf record -o /tmp/p.data ./combine_o1
+$ perf report -i /tmp/p.data --stdio | head
+```
+
+On a combine-only binary almost all samples land in the combine function;
+in a real application I expect a long tail and a short head. Only the head
+is worth the combine ladder.
+
+### Step by step
+
+1. Profile a realistic workload, not a microbenchmark, to find the hot spot.
+2. Microbenchmark the hot spot to get a CPE number.
+3. Optimise with the ladder; confirm in both the microbenchmark and the full profile.
+4. Stop when the hot spot is no longer mine, or when I am on a measured bound.
+
+### Common mistake
+
+Profiling a debug build, or a workload that does not match production
+traffic. The hot spot will be wrong.
+
+### In real systems
+
+Continuous profiling in production (e.g. pprof, Pyroscope, Continuously
+Profiling products) finds regressions the local microbenchmark never saw.
+The discipline is the same: measure, change one thing, measure again.
+
+### Check yourself
+
+<details>
+<summary>Why profile before optimising?</summary>
+
+Because the hottest code is often not where intuition points, and
+optimising a cold path has no user-visible effect.
+
+</details>
+
+## 5.15 Summary
+
+### In one sentence
+
+Performance optimisation is applied computer architecture: I shape the
+source so the processor can keep its functional units busy, and I let
+measurement tell me when I have succeeded.
+
+### The idea
+
+Chapters 3 and 4 gave the machine model; this chapter gave the source
+transformations that match it. Chapter 6 will show what happens when the
+bound is the memory hierarchy instead of the ALU.
+
+### Worked example
+
+My own stopping rule: if combine8 is within about 20% of the independent-op
+throughput I measured, I am done with scalar arithmetic optimisation for
+that loop.
+
+### Step by step
+
+Carry the CPE table forward into any future performance work. New ideas
+earn a row or they do not ship.
+
+### Common mistake
+
+Treating this chapter as "tricks for reductions" rather than as a method.
+The method is the point.
+
+### In real systems
+
+The fastest code I have shipped was usually the result of deleting work,
+not of unrolling it. Algorithm first, then the combine ladder, then SIMD
+and memory layout.
+
+### Check yourself
+
+<details>
+<summary>What chapter addresses the bottleneck that remains after combine8 on large working sets?</summary>
+
+Chapter 6, The Memory Hierarchy.
+
+</details>
+
+
+## A full optimisation diary on this box
+
+I recorded the addition ladder at `-O1` with n = 2^22 doubles, eight timed
+repetitions after one warmup, `CLOCK_MONOTONIC`:
+
+```text
+N=4194304 doubles, OP=add, -O1
+combine1      2.23 ns/elem   ≈ 5.35 CPE
+combine2      2.51 ns/elem   ≈ 6.02 CPE
+combine3      2.20 ns/elem   ≈ 5.28 CPE
+combine4      0.55 ns/elem   ≈ 1.32 CPE
+combine5      0.54 ns/elem   ≈ 1.30 CPE
+combine6      0.35 ns/elem   ≈ 0.84 CPE
+combine7      0.34 ns/elem   ≈ 0.82 CPE
+combine8      0.34 ns/elem   ≈ 0.82 CPE
+```
+
+And multiplication at `-O1` with n = 2^20 (smaller because the product of
+many terms grows carefully with factors near 1):
+
+```text
+N=1048576 doubles, OP=mul, -O1
+combine1      2.56 ns/elem   ≈ 6.14 CPE
+combine4      1.15 ns/elem   ≈ 2.76 CPE
+combine5      1.16 ns/elem   ≈ 2.78 CPE
+combine6      0.57 ns/elem   ≈ 1.37 CPE
+combine7      0.87 ns/elem   ≈ 2.09 CPE
+combine8      0.30 ns/elem   ≈ 0.72 CPE
+```
+
+Independent evidence for the bounds, same machine:
+
+```text
+CPU 2.4 GHz (from TSC calibration)
+dependent mul chain:     1.16 ns/op  ≈ 2.78 cycles  (latency)
+4 independent muls/iter: 0.30 ns/mul ≈ 0.72 cycles  (throughput)
+```
+
+The diary's moral: combine4 lands on the latency number; combine8 lands on
+the throughput number; combine5 (unroll without extra accumulators) moves
+neither; combine7 (reassociation) helped add slightly and hurt mul. None
+of those sentences are visible from the source alone. All of them are
+obvious from the table.
+
+### What -O2 changed without me
+
+At `-O2` the same addition harness produced:
+
+```text
+combine1      0.70 ns/elem
+combine2      0.61 ns/elem
+combine3      0.59 ns/elem
+combine4      0.55 ns/elem
+combine6      0.36 ns/elem
+combine8      0.33 ns/elem
+```
+
+The compiler climbed the first two rungs for me by inlining and
+registerising. It did **not** invent multiple accumulators. That split is
+the practical summary of 5.1: trust the compiler for local cleanliness;
+do the parallel-accumulation shape yourself when the math allows.
+
+### Reading combine4 and combine6 in assembly
+
+For multiply, `gcc -O1 -S` shows combine4's loop as roughly one
+`movsd` load, one `mulsd` into the accumulator, one pointer bump, and a
+branch. combine6's loop has two loads and two `mulsd`s into two different
+XMM registers. The scheduler can overlap those two chains; the assembly
+does not need special "parallel" instructions for that. Out-of-order
+execution is why source-level independent chains become real overlap.
+
+### When the cleanup loop matters
+
+With 5× unrolling and n = 2^20, the cleanup runs 0 elements because
+2^20 is divisible by 5? Actually 2^20 mod 5 = 1, so cleanup runs once.
+Forgetting cleanup fails only on some lengths — the worst kind of bug. I
+keep a test that runs every residue class modulo the unroll factor.
+
+### Connecting back to Y86-64 PIPE
+
+A memory accumulator is a load-use hazard every iteration, with the store
+forwarding path as the producer. A register accumulator is a dependent
+ALU chain with no memory stage in the middle. Multiple accumulators are
+several short chains filling the same functional unit, which PIPE could
+not do because it issued only one instruction per cycle; real cores can.
+Chapter 4's vocabulary still names the problem; chapter 5's machines have
+more ways to solve it.
+
+
+## Worked patterns I reuse
+
+### Pattern: pointer walking instead of indexing
+
+Sometimes the assembly for `d[i]` is fine; sometimes a walking pointer
+shaves a register:
+
+```c
+data_t *p = d;
+data_t *end = d + n;
+data_t acc = IDENT;
+while (p < end) { acc = acc OP *p; p++; }
+```
+
+On this box for combine4 the difference was noise. I still try it when
+registers are tight after heavy unrolling, because `i` and `d` collapse
+into one live value.
+
+### Pattern: separate reductions, then combine
+
+When I need both a sum and a sum-of-squares, I used to write two loops. One
+loop with two accumulators is almost always faster because it streams the
+data once:
+
+```c
+data_t sum = 0, sq = 0;
+for (long i = 0; i < n; i++) {
+    data_t x = d[i];
+    sum = sum + x;
+    sq  = sq  + x * x;
+}
+```
+
+That is chapter 6's spatial locality as well as chapter 5's parallelism:
+one load serves two chains.
+
+### Pattern: peel the first iteration
+
+If IDENT is awkward (for example, min over a non-empty array), peel:
+
+```c
+data_t acc = d[0];
+for (long i = 1; i < n; i++)
+    acc = acc < d[i] ? acc : d[i];
+```
+
+Or use a branchless min. The peel avoids a sentinel and keeps the
+accumulator in a clean state for the scheduler.
+
+### Pattern: check the unoptimised baseline once
+
+I keep one run at `-O0` in the diary only to remind myself how bad raw C
+can be (often 10–100× slower). I never optimise against `-O0`. The
+temptation shows up in blog posts; the diary keeps me honest.
+
+## How I write the harness
+
+A timing harness that has lied to me before, and the fixes:
+
+1. **No warmup** → first run pays page faults and cold I-cache. Fix: one
+   untimed call.
+2. **Too-short runs** → timer granularity and scheduling noise dominate.
+   Fix: raise repetitions until the timed region is at least ~20 ms.
+3. **Compiler deletes the work** → result unused. Fix: `volatile` sink or
+   return the result from `main`.
+4. **Same buffer every time** → everything stays in L1, hiding memory
+   problems. Fix: when studying memory, vary n across cache sizes
+   (chapter 6's mountain).
+5. **Frequency scaling** → laptop drops to low MHz when cool, spikes when
+   warm. Fix: pin frequency when possible, or use the TSC-calibrated rate
+   and average many runs; on this Xeon box the 2.4 GHz rate was stable.
+
+```c
+static volatile data_t sink;
+static double nsec_per_elem(void (*f)(vec*, data_t*), vec *v, int reps) {
+    data_t dest;
+    f(v, &dest);                 /* warmup */
+    double t0 = now();
+    for (int r = 0; r < reps; r++) f(v, &dest);
+    double t1 = now();
+    sink = dest;
+    return (t1 - t0) * 1e9 / ((double)v->len * reps);
+}
+```
+
+### Interpreting a flat CPE curve
+
+If combine6, combine7 and combine8 all measure within a few percent, I
+have hit a bound that more arithmetic reshaping will not move. The next
+questions are: is it load throughput? Is it store throughput on a
+different loop? Is it a branch? `perf stat -e
+cycles,instructions,L1-dcache-load-misses,branch-misses` usually points
+at one of them. Flat CPE is a success signal, not a failure to keep
+tweaking.
+
+### A second example: polynomial evaluation
+
+Horner's method (`(((a_n x + a_{n-1}) x) + ...)`) is a long dependence
+chain through multiply-add. Estrin's method reassociates into a tree and
+exposes parallelism the same way multiple accumulators do. I have seen
+Estrin win on high-degree polynomials with enough independent multiplies,
+and lose on short ones where Horner's smaller instruction count wins. The
+combine lesson transfers: draw the graph, measure both.
+
+### A third example: image convolution
+
+A 3×3 convolution is limited by memory and by the number of independent
+madd chains I can keep in registers. Separable filters (row then column)
+cut arithmetic and improve locality. Before touching SIMD, I make sure the
+scalar code uses register accumulators for each output pixel and walks
+memory in the cache-friendly direction. That alone has doubled throughput
+for me on real image pipelines; SIMD then doubles again.
+
+## What I refuse to do
+
+- Ship `-ffast-math` as a blanket flag without correctness tests that include
+  NaNs, infinities and denormals.
+- Micro-optimise before a profile on a realistic workload.
+- Claim a speedup from a single noisy run.
+- Rewrite in assembly before reading what the compiler already emits at
+  `-O2`/`-O3`.
+- Optimise cold code because it "looks slow".
+
+Each refusal has a story behind it where I wasted time. The positive
+method in this chapter is short; the refusals keep me on it.
+
+
+### Why the addition floor arrived earlier than multiply
+
+Addition on this core has lower latency and at least as much throughput as
+multiply, so two accumulators already pushed add CPE against a different
+wall — likely load throughput from L1. Multiply, being slower per op,
+still had headroom until five accumulators. The same source ladder therefore
+stops at different rungs for different operators. I do not copy a `k=5`
+unroll into every loop; I look at the operator and the measured curve.
+
+### Floating-point edge cases in reductions
+
+Denormal inputs make every arithmetic op dramatically slower on many
+cores (flush-to-zero modes avoid that at the cost of underflow
+behaviour). NaNs poison a product reduction to NaN; with multiple
+accumulators the NaN ends up in one accumulator and then in the final
+combine. Infinities similarly dominate. For production reductions over
+untrusted data I decide up front whether to pre-filter, to use Kahan or
+pairwise summation for accuracy, or to accept IEEE default behaviour. The
+CPE table is meaningless if the function returns NaN on the workload I
+care about.
+
+### Integer overflow in parallel accumulators
+
+With multiple integer accumulators, the final combine can overflow even
+when a single accumulator version also would — same values, same sum. The
+hazard is false confidence: splitting does not make overflow safer. For
+saturating arithmetic or checked adds I keep a single chain or use wider
+types (`long` / `__int128`) for the accumulators.
+
+### A note on integer combine
+
+The same ladder works for integer `long` with `OP +` or `OP *`. Integer
+multiply latency differs from floating-point; integer add is usually one
+cycle with several units. I still measure rather than assume. Overflow and
+undefined behaviour for signed overflow (chapter 2) mean I keep integer
+reductions inside well-defined ranges or use unsigned.
+
+
+
+## Diagrams that stay on my whiteboard
+
+<Figure art={`
+  combine3 dependence (memory acc):
+
+  load *dest -> op with d[i] -> store *dest
+       ^                              |
+       +------------ next iter -------+
+
+  combine4 dependence (register acc):
+
+  acc_reg -> op with d[i] -> acc_reg -> ...
+  d[i] loads are independent of acc chain
+`} caption="Why combine4 is faster: the carried dependence no longer goes through memory. Loads of d[i] can overlap with the arithmetic chain." />
+
+<Figure art={`
+  CPE vs number of accumulators (mul, this box, sketch):
+
+  CPE
+  3.0 |*
+  2.5 |*
+  2.0 |
+  1.5 |    *
+  1.0 |        *
+  0.5 |            *  *  *---- throughput floor
+      +------------------------
+        1  2  3  4  5  6   accumulators
+`} caption="Sketch of measured multiply CPE against accumulator count. The curve falls until it hits the throughput floor near 0.7 CPE; more accumulators after that buy nothing." />
+
+<Flow steps={["Profile full program", "Microbenchmark the hot loop (CPE)", "Identify bound: calls, memory-acc, latency, throughput, branch, memory hierarchy", "Apply the matching transform", "Remeasure CPE and re-profile"]} caption="The feedback loop I actually use. Skipping the bound-identification step is how people unroll their way into spills." />
+
+<Compare left="Latency-bound loop" right="Throughput-bound loop" rows={[
+  ["One carried dependence through the op", "Several independent ops per element"],
+  ["CPE ≈ op latency", "CPE ≈ 1 / op throughput"],
+  ["Unroll alone does little", "Unroll + multiple accums (or SIMD) helps"],
+  ["combine4 / combine5", "combine6 / combine8"],
+]} caption="Two regimes. Naming which one I am in decides the next source change." />
+
+<Trace columns={["perf event", "What a high count suggests"]} rows={[
+  ["cycles", "Overall time; the denominator for CPE"],
+  ["instructions", "With cycles, gives IPC; low IPC means stalls"],
+  ["L1-dcache-load-misses", "Working set beyond L1; try chapter 6"],
+  ["branch-misses", "Unpredictable control; try branchless forms"],
+  ["stalled-cycles-backend", "Waiting for results or memory"],
+]} caption="A short perf event list for this chapter. I start with cycles and instructions, then add misses when IPC is low." />
+
+## Putting the method on a non-combine loop
+
+A real loop from a side project counted bytes below a threshold:
+
+```c
+long count_lt(const unsigned char *s, long n, unsigned char t) {
+    long c = 0;
+    for (long i = 0; i < n; i++)
+        if (s[i] < t) c++;
+    return c;
+}
+```
+
+First profile said this was 40% of a parsing pass. The combine ladder
+translated as follows:
+
+1. **Calls/bounds:** already fine.
+2. **Memory acc:** `c` was already a local.
+3. **Latency:** the dependence on `c` is an add, cheap; the branch was the problem.
+4. **Branchless:** `c += (s[i] < t);` became a conditional move / set in assembly.
+5. **Unroll + multiple accums:** four running counts, summed at the end.
+
+Measured on 64 MB of random bytes: branchy version ~9.8 ns/elem;
+branchless four-way ~1.1 ns/elem. Same method, different bound. When the
+data were sorted (all below, then all above), the branchy version won
+slightly because the predictor was perfect — another reason to measure on
+realistic data.
+
+### SIMD sketch without intrinsics
+
+After the branchless scalar version, `-O3 -march=native` autovectorised
+the loop into AVX2 compares and bit masks. CPE dropped again. The
+prerequisite was the branchless form: the compiler declined to vectorise
+the `if` version. Source shape unlocks compiler SIMD the same way it
+unlocks out-of-order overlap.
+
+### Checklist taped above the screen
+
+1. Release flags?
+2. Profiler points here?
+3. Which bound?
+4. One change.
+5. New CPE in the table.
+6. Still my hot spot?
+7. If yes and still not at a known floor, go to 3. If no, stop.
+
+I have broken every item on that list at least once. The list is still
+shorter than any other performance advice I trust.
+
+
+
+## From CPE to product decisions
+
+Not every loop deserves the full ladder. I use a rough triage:
+
+- **Less than a few percent of runtime:** leave it; readability wins.
+- **Hot but already near a memory bound:** go to chapter 6, not more unroll.
+- **Hot and latency-bound:** registerise, then multiple accumulators.
+- **Hot and branch-bound:** branchless forms, better data layout, or a different algorithm.
+- **Hot because of algorithmic complexity:** fix the algorithm first; CPE work on an O(n^2) loop that should be O(n) is theatre.
+
+This triage is why the profiler session comes before the combine session.
+The chapter teaches the combine session in depth because it is the one
+with the richest machine-level story; the triage decides whether to open
+the chapter at all.
+
+### Teaching this to a teammate
+
+When I walk someone through a CPE win, I show the table before the code
+diff. People argue with code; they rarely argue with a column of numbers
+that falls by 4× at a named transformation. Then I show the two assembly
+loops. Then I name the bound. The sequence (numbers → assembly → bound →
+diff) transfers the method; starting from the diff invites bikeshedding.
+
+### What next chapters will change
+
+Chapter 6 will show that combine8 on a 256 MB array is a different
+program from combine8 on 4 MB: the same arithmetic hits DRAM. Chapter 9
+will add TLB misses. Chapter 12 will add false sharing when two threads
+write adjacent accumulators. None of those invalidate the ladder; they
+add bounds underneath the throughput floor. The mental model grows down.
+
+
+## From beginner to strategy
+
+<Levels label="Chapter 5, Optimizing Program Performance">
+
+<Level name="Beginner" depth={3}>
+
+I can define CPE, time a loop with a monotonic clock, and convert to
+cycles with the CPU frequency. I rewrite a memory accumulator into a
+register accumulator and show a clear CPE drop. I build at `-O2` when
+measuring.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+I produce a combine1–combine8 style table for my own reduction. I explain
+latency vs throughput with a measured dependent and independent chain. I
+read the assembly of the hot loop and point at the critical dependence.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+I choose an unroll factor that approaches the throughput bound without
+spilling. I know when reassociation is legal for my use case. I use
+`perf` to confirm that a change moved samples the way I expected, and I
+can say which bound I am on.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Short n where T0 dominates; odd n cleanup bugs; unsigned loop indices that
+defeat strength reduction; floating-point reductions where reassociation
+changes pass/fail of a golden test; `-O3` autovectorisation that fires
+only after `restrict` is added.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+False sharing when two threads write adjacent accumulators; denormal
+floats that make every mul 10× slower; a profiler that attributes time to
+the wrong inlined frame; LTO changing the hot functions between
+measurements.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+I keep a before/after CPE table in the PR. I optimise only profiled hot
+spots. I refuse `-ffast-math` as a global flag. I document the bound I hit
+and the next lever (SIMD, algorithm, memory) if someone needs more.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+Fast code is not clever code; it is code whose dependence graph matches
+the machine. When I am surprised by a CPE number, I draw the chain before
+I change more source. I also refuse to optimise without a number in front
+of me: no number, no change. That rule alone has prevented most of my
+performance mistakes.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+APIs that force memory accumulators (passing a destination pointer into
+every tiny call) fight this chapter. APIs that return values, allow
+`restrict`, and keep lengths beside pointers let the optimiser and the
+human do their job. Performance is a design property, not only a loop
+property.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+I learn this chapter by reproducing the combine ladder on my machine with
+both add and mul, then by applying the same ladder to one hot loop in a
+real project. I keep a one-page cheat sheet: CPE formula, latency vs
+throughput, the five combine cliffs, the `perf` commands.
+
+Done when I can take an unfamiliar reduction, produce a CPE table with at
+least four versions, name the bound each version hits, and stop at the
+throughput floor without over-unrolling.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Is -O3 always faster than -O2?**
+No. It enables more transformations (including more unrolling and
+vectorisation) that sometimes help and sometimes hurt instruction-cache
+footprint. Measure.
+
+**Should I write SIMD intrinsics now?**
+After the scalar ladder and a look at whether the compiler already
+vectorised the loop. Intrinsics are a maintenance cost; earn them.
+
+**Why does my multiply CPE match add CPE after enough accumulators?**
+Because both hit a different shared bound (often load throughput) once the
+ALU is no longer the limit.
+
+**Can I trust Godbolt for performance?**
+For seeing what the compiler emitted, yes. For CPE, no: I still need to
+run on real hardware with real timers.
+
+
+**Why not always use the maximum number of accumulators?**
+Because of diminishing returns at the throughput bound, register pressure,
+and instruction-cache footprint. I increase k until the measured CPE flattens.
+
+**Do these techniques apply to interpreted languages?**
+The same dependence ideas apply, but the constant factors are dominated by
+interpreter or runtime overhead until I move the hot loop into native code
+(NumPy, SIMD libraries, a Rust/C extension). Profile first; the hot spot
+may be data conversion rather than the arithmetic.
+
+**How does this interact with multithreading?**
+Poorly if I invent shared accumulators. Each thread should have private
+accumulators and combine once at the end (a parallel reduction tree).
+Chapter 12 returns to that structure.
+
+## Key takeaways
+
+- CPE (or ns/elem) is the metric for loop performance; measure at release optimisation levels.
+- Compilers are strong but will not break language rules on aliasing or floating-point associativity.
+- The combine ladder: hoist invariants, remove calls, registerise the accumulator, unroll, add accumulators.
+- One accumulator is latency-bound; enough independent accumulators reach the throughput bound.
+- Spilling and mispredicted branches can undo arithmetic optimisations.
+- When arithmetic is tuned, memory becomes the bound; that is chapter 6.
+- Profile first, change one thing, remeasure; write down the bound you hit.
+- -O2 may climb the first rungs automatically; multiple accumulators still need a human (or -ffast-math, which I refuse as a global).
+- Flat CPE across several versions means stop reshaping arithmetic and look at memory, branches or SIMD.
+
+## Glossary
+
+- **Aliasing:** two pointers that might refer to the same object; limits compiler reordering.
+- **CPE:** cycles per element; slope of cycles versus n for a loop.
+- **Critical path:** the longest dependence chain; sets a latency lower bound on CPE.
+- **Latency (functional unit):** cycles until a result is ready for a dependent operation.
+- **Multiple accumulators:** several independent running results, combined at the end, to expose parallelism.
+- **Reassociation:** changing the parenthesisation of associative ops; optional for floats, with semantic risk.
+- **Register spilling:** storing a temporary to the stack because there are not enough registers.
+- **Throughput (functional unit):** how often the unit can start a new independent operation.
+- **Unrolling:** running several logical iterations in one loop body.
+
+## Exercises and self-check
+
+**Warm-up**
+
+1. Convert 0.40 ns/elem on a 2.4 GHz CPU to CPE.
+2. Write combine4 for integer addition into a `long` accumulator.
+3. Explain in one sentence why combine5 ≈ combine4 for multiply on my machine.
+
+**Build**
+
+4. Reproduce the combine table for addition and multiplication at `-O1` and `-O2` on your machine.
+5. Measure a dependent vs independent double-add chain; infer add latency and throughput.
+6. Take a hot loop from your own code, registerise its accumulator, and report before/after CPE.
+7. Use `perf record` on the combine binary and confirm samples land in the combine function.
+
+**Stretch**
+
+8. Write a SIMD (AVX2 or NEON) version of combine4 and compare CPE to combine8 scalar.
+9. Force spilling with 32 accumulators and show the CPE regression in a table.
+10. Apply the ladder to a histogram over random bytes; discuss how branches change the story.
+
+**Self-check**
+
+<details>
+<summary>1. What is IDENT for a product reduction?</summary>
+
+1.0.
+
+</details>
+
+<details>
+<summary>2. Which version first keeps the accumulator in a register?</summary>
+
+combine4.
+
+</details>
+
+<details>
+<summary>3. Why will the compiler not emit combine6 from combine4 automatically for doubles?</summary>
+
+Because that reassociates floating-point operations and can change the result.
+
+</details>
+
+<details>
+<summary>4. What lower bound does a single-accumulator mul reduction face?</summary>
+
+The multiply latency in cycles (about 2.8 cycles on my measurements).
+
+</details>
+
+<details>
+<summary>5. What tool shows where time goes in a full program?</summary>
+
+A profiler such as `perf record` / `perf report`.
+
+</details>
+
+<details>
+<summary>6. What happened to stride-64 reads versus stride-1 in my measurement?</summary>
+
+Per-access time rose from about 0.72 ns to about 4.92 ns as each access
+touched a new cache line.
+
+</details>
+
+<details>
+<summary>7. Name two limiting factors beyond arithmetic dependence.</summary>
+
+Register spilling and branch misprediction (and, after that, memory).
+
+</details>
+
+<details>
+<summary>8. When do I stop unrolling a reduction?</summary>
+
+When CPE stops improving, hits a measured throughput or memory bound, or
+assembly shows spills.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter is week 27 of
+<a href={withBase('/plans/traditional-software-developer/#strategy-5')}>phase
+5 of the traditional core</a>. I would give it five or six sessions, all
+at a terminal.
+
+<Timeline caption="Six sessions for chapter 5. Every session ends with a CPE number I measured myself." items={[
+  { when: "Session 1", what: "5.1–5.3: build the harness; time combine1 at -O0, -O1, -O2; define CPE on this machine." },
+  { when: "Session 2", what: "5.4–5.6: implement combine2–4; watch the cliff at combine4 in both the timer and the assembly." },
+  { when: "Session 3", what: "5.7: measure dependent vs independent mul and add chains; write the latency/throughput numbers on a card." },
+  { when: "Session 4", what: "5.8–5.10: combine5–8 for add and mul; fill the summary table; stop at the floor." },
+  { when: "Session 5", what: "5.11–5.12: force a spill; rerun the chapter 3 branch demo; time stride loads." },
+  { when: "Session 6", what: "5.13–5.14: profile a real program; apply the ladder to one hot loop; redo the self-check." },
+]} />
+
+I keep the combine source and a `results.txt` next to it. When I move to
+another machine I rerun the harness before trusting any old CPE. The
+chapter is not finished until I have applied the method once outside the
+book's example.
+
+Done when my own combine table matches the shape of the one on this page
+(two clear cliffs, a throughput floor), and I can name the bound for each
+row without looking.
+
+I also redo the diary on any new machine I care about before trusting old
+numbers. Absolute CPE is a property of the machine; the shape of the
+ladder is a property of the method. Both matter, but they are not the
+same thing.
+
+
+### Linking the diary to the book's CPE tables
+
+The book's absolute CPE numbers were measured on older CPUs with different
+latencies. My absolute numbers will not match the book, and they should
+not. What should match is the ordering of versions and the existence of
+the two cliffs. When a student (or I, years from now) sees combine5 ≈
+combine4, that is the lesson, not the digit after the decimal. This page
+keeps my numbers so the story is concrete; the method is the portable
+part.
+
+### Reproducing on your machine
+
+```bash
+# from the ch05 lab directory
+gcc -O1 -o combine_o1 combine.c && ./combine_o1
+gcc -O2 -o combine_o2 combine.c && ./combine_o2
+gcc -O1 -o combine_mul combine_mul.c && ./combine_mul
+gcc -O2 -o latency latency.c && ./latency
+```
+
+If your CPU frequency differs, convert ns/elem to CPE with your GHz. If
+your GCC version autovectorises at `-O1`, you may see lower floors; read
+the assembly to check. The diary format — version, ns/elem, inferred CPE,
+one-line idea — is what I keep in version control next to the code.
+
+
+
