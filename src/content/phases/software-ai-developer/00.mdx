@@ -546,3 +546,542 @@ compose file does.
 </Level>
 
 </Levels>
+
+#### Phase 0: A deployment target
+
+<Flow
+  caption="From a commit on my machine to a URL a stranger can open. Each arrow is a place a deploy can fail."
+  steps={["git push", "CI builds and tests", "Image or bundle built", "Platform starts the new version", "Health check passes", "Traffic moves to it", "Old version stopped"]}
+/>
+
+<Levels label="Phase 0, a deployment target">
+
+<Level name="Beginner">
+
+A deployment target is wherever the app runs for someone who is not me: a small VPS, a platform that
+runs my code from a Git push, or a container host. For Phase 0 I want the simplest one that gives me a
+public HTTPS URL, a managed Postgres or a way to attach one, environment variables and logs. The
+smallest thing that works is the baseline app answering `GET /health` with `200 ok` on a public URL.
+
+```ts
+app.get('/health', (_req, res) => res.status(200).send('ok'));
+```
+
+```sh
+$ curl -i https://baseline.example.dev/health
+HTTP/2 200
+content-type: text/html; charset=utf-8
+
+ok
+```
+
+The common mistake is binding the server to `localhost`. Inside a container that means only the
+container itself can reach it, and the platform reports the app as unhealthy. Listen on `0.0.0.0` and
+on the port the platform gives in `PORT`.
+
+</Level>
+
+<Level name="Intermediate">
+
+A real deploy has three moving parts: the build (install, type-check, compile), the release (the build
+plus this environment's configuration) and the run (the process started with that release). The
+Twelve-Factor App names this split, and keeping it clean is what makes a rollback possible: rolling
+back means running an older release, not rebuilding old code.
+
+```sh
+npm ci && npm run typecheck && npm run build   # build
+# platform attaches DATABASE_URL, SESSION_SECRET  # release
+node --enable-source-maps dist/server.js          # run
+```
+
+Migrations run as a separate release step before the new version takes traffic, not inside the
+server's start-up, so two instances starting at once do not race to migrate.
+
+</Level>
+
+<Level name="Advanced">
+
+Underneath, the platform does what Phase 5 will make me do by hand: it builds an image, starts a
+container, waits for a health check, points a load balancer at it, and stops the old container by
+sending `SIGTERM` and, after a grace period, `SIGKILL`. TLS is terminated at the platform's proxy, so my
+app sees plain HTTP plus an `X-Forwarded-Proto` header. Knowing this explains odd behaviour: a redirect
+to `http://` happens because the app thinks the request was not secure, and the fix is to trust the
+proxy.
+
+```ts
+app.set('trust proxy', 1); // one proxy hop in front of the app
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+The free tier sleeps after idle time, so the first request after a quiet hour takes many seconds and a
+health check from a monitor reports an outage. The build succeeds locally and fails on the platform
+because a dependency is in `devDependencies` but needed at run time. The app reads `PORT` as a string
+and `app.listen('3000')` still works, but `Number(process.env.PORT)` of an unset variable is `NaN` and
+the server listens on a random port.
+
+```text
+Error: listen EADDRINUSE: address already in use :::3000
+```
+
+That one appears locally when an old dev server is still running; `lsof -i :3000` finds it.
+
+</Level>
+
+<Level name="Corner cases">
+
+A new release that needs a migration, plus an old instance still serving traffic during the rollout:
+for a minute both versions run against the new schema. If the migration renamed a column, the old
+version breaks. This is why Phase 4 teaches expand-and-contract migrations. Another one: a secret
+rotated in the platform plus a running instance that read it at start-up. The new value is not used
+until the process restarts, so the rotation looks done and is not.
+
+</Level>
+
+<Level name="Production level">
+
+For real users I need three things from day one: a rollback I have tested, logs I can search, and an
+alert if `/health` fails. I also need the health check to mean something. A health route that returns
+200 without touching the database will say "healthy" while every real request fails. I split it: a
+liveness check (the process is up) and a readiness check (it can reach Postgres).
+
+```ts
+app.get('/ready', async (_req, res) => {
+  try { await pool.query('select 1'); res.send('ready'); }
+  catch { res.status(503).send('db unreachable'); }
+});
+```
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "a feature is not done until it is running somewhere I do not control." Deploying in week
+one, when the app is tiny, is how I learn the deploy while mistakes are cheap. Every later phase
+deploys continuously, so the pipeline has to be boring before the code becomes interesting.
+
+</Level>
+
+<Level name="System design">
+
+The choice of target shapes the system: a platform gives speed and hides the network; a VPS gives
+control and makes me own patching; a container host sits between. I choose the one that lets me move
+later: the app is a container image that reads its configuration from the environment, so the same
+image runs on any of the three.
+
+</Level>
+
+<Level name="Strategy">
+
+I deploy the hello-world server on day one, then redeploy after every meaningful change that week. I
+deliberately ship a broken build and watch the platform keep the old version, then roll back a working
+but wrong release. Done when I can deploy, see the logs, and roll back from the command line or
+dashboard without looking anything up, and the steps are in the README.
+
+</Level>
+
+</Levels>
+
+#### Phase 0: An observability account: logs, metrics, traces and error tracking
+
+<Layers
+  caption="The four signals, from cheapest to richest. Phase 0 needs the first two working and the last two wired."
+  layers={[
+    { name: "Error tracking", note: "one event per exception, with stack and context" },
+    { name: "Traces", note: "one request across every hop, with timings" },
+    { name: "Metrics", note: "numbers over time: rate, errors, duration" },
+    { name: "Logs", note: "one structured line per event" },
+  ]}
+/>
+
+<Levels label="Phase 0, an observability account">
+
+<Level name="Beginner">
+
+Observability is being able to answer "what is the app doing right now, and what did it do when the
+user complained" without adding code first. Logs are lines of text about events. Metrics are numbers
+over time. Traces follow one request through every service. Error tracking groups exceptions so I see
+each bug once with a count. In Phase 0 I sign up for one service that does at least logs and errors,
+and I send it one structured log line per request.
+
+```ts
+console.log(JSON.stringify({ level: 'info', msg: 'request', method: req.method, path: req.path, status: res.statusCode, ms }));
+```
+
+```text
+{"level":"info","msg":"request","method":"GET","path":"/health","status":200,"ms":2}
+```
+
+The common mistake is logging free text like "user logged in!!" which is impossible to search or
+count. JSON with fixed field names is searchable.
+
+</Level>
+
+<Level name="Intermediate">
+
+A real setup uses a logger library (`pino` is fast and writes JSON by default), a request ID added to
+every log line so one request's lines can be grouped, and an error handler that sends unexpected errors
+to the tracking service with that ID.
+
+```ts
+import pino from 'pino';
+import { randomUUID } from 'node:crypto';
+const log = pino();
+app.use((req, res, next) => {
+  req.id = req.headers['x-request-id']?.toString() ?? randomUUID();
+  req.log = log.child({ reqId: req.id });
+  res.setHeader('x-request-id', req.id);
+  next();
+});
+```
+
+The returned header means a user can send me the ID from their browser and I can find their request.
+
+</Level>
+
+<Level name="Advanced">
+
+The standard underneath is OpenTelemetry: a vendor-neutral API and protocol (OTLP) for traces, metrics
+and logs. A trace is a tree of spans; each span has a name, a start, a duration, attributes and a parent.
+Auto-instrumentation wraps HTTP, `pg` and `redis` clients so the spans appear without hand-written code.
+Using it from the start means changing vendors is a configuration change, not a rewrite.
+
+```text
+GET /notes            120 ms
+ ├─ auth.session       4 ms
+ ├─ pg.query select   95 ms   <- the slow part
+ └─ render            18 ms
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A log line that includes the request body leaks passwords into the log store. A process that crashes
+before the logger flushes loses the last lines, which are the ones I need; `pino` writes synchronously
+to stdout by default for this reason. A free tier drops events past a monthly quota, so the dashboard
+shows a quiet day that was actually busy. Logging an `Error` object with `JSON.stringify` gives `{}`
+because its fields are not enumerable.
+
+```ts
+JSON.stringify(new Error('boom'))        // '{}'
+log.error({ err: new Error('boom') })    // pino serialises message and stack
+```
+
+</Level>
+
+<Level name="Corner cases">
+
+High-cardinality labels plus metrics: adding `userId` as a metric label creates one time series per
+user and either explodes the bill or gets dropped. User IDs belong in logs and traces, not metric
+labels. Sampling plus a rare bug: keeping 10% of traces means the one failing request is likely not
+kept. The fix is tail sampling that always keeps errors and slow requests.
+
+</Level>
+
+<Level name="Production level">
+
+In production observability exists to shorten incidents. That means three dashboards I will look at
+(request rate, error rate, latency percentiles), one alert that fires when users are affected, and a
+retention period long enough to compare with last week. It also means a privacy rule: no secrets,
+tokens, passwords or full prompts in logs, enforced with a redaction list in the logger.
+
+```ts
+const log = pino({ redact: ['req.headers.authorization', 'req.headers.cookie', '*.password'] });
+```
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "instrument before I need it." The question during an incident is always one I did not
+think to ask in advance, so the data must already be there. If I cannot see it, I cannot fix it, and
+I certainly cannot prove I fixed it.
+
+</Level>
+
+<Level name="System design">
+
+Telemetry is a pipeline of its own: app, collector, storage, query, alert. Putting an OpenTelemetry
+collector between the app and the vendor lets me redact, sample and route in one place. In later phases
+the same pipeline carries AI-specific signals: tokens, cost, model version and eval scores per request.
+
+</Level>
+
+<Level name="Strategy">
+
+I wire logs and error tracking on day ten, then throw a deliberate error from a route and find it in
+the dashboard by its request ID. Done when, given only a request ID from a response header, I can find
+that request's log lines and, if it failed, its stack trace, in under two minutes.
+
+</Level>
+
+</Levels>
+
+#### Phase 0: A repository with a README, a study log and a project board
+
+<Figure art={`
+  baseline/
+  |-- README.md          what it is, how to run, how to deploy, decisions
+  |-- STUDY_LOG.md       date, hours, what I did, what I looked up, next
+  |-- compose.yaml       local Postgres and Redis
+  |-- .env.example       every variable, no real values
+  |-- migrations/        plain SQL, numbered
+  |-- src/               server, routes, db, views
+  |-- test/              one integration test to start
+  '-- .github/workflows/ ci.yml: typecheck, test, build
+`} caption="The shape of the baseline repository. Every file in it is one I can explain at the gate." />
+
+<Levels label="Phase 0, a repository with a README, a study log and a project board">
+
+<Level name="Beginner">
+
+The repository is the evidence. A README tells a stranger what the app is and how to run it. The study
+log records each session: the date, the hours, what I built, what I had to look up, and what is next.
+The project board lists the work as small cards. The smallest README that works has four headings.
+
+```md
+# Baseline
+A small full-stack app: one table, one form, one signed-in page.
+## Run it
+cp .env.example .env && docker compose up -d && npm ci && npm run migrate && npm run dev
+## Test it
+npm test
+## Deploy it
+Push to main; CI deploys. Roll back from the platform dashboard.
+```
+
+The common mistake is a README written once and never run. I test it by following it on a clean clone.
+
+</Level>
+
+<Level name="Intermediate">
+
+The log and the board work together. Each board card is a change small enough for one sitting and one
+commit. Each log entry names the card it moved. Over two weeks the log becomes the honest record of
+where time went, and the "looked up" column shows exactly what I have been avoiding.
+
+```md
+## 2026-10-23 (2.5 h)
+- Did: session cookie on /account; integration test passes.
+- Looked up: how to set SameSite on the cookie; what `trust proxy` does.
+- Stuck: test leaked a DB connection; fixed by closing the pool in afterAll.
+- Next: deploy, then error tracking.
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The README is also where decisions go until there are enough for ADRs: "Postgres, not SQLite, because
+the capstone needs concurrent writers." `.env.example` is the contract for configuration: every
+variable the app reads appears there with a fake value and a comment, and a start-up check fails fast
+when one is missing.
+
+```ts
+const required = ['DATABASE_URL', 'REDIS_URL', 'SESSION_SECRET'];
+const missing = required.filter((k) => !process.env[k]);
+if (missing.length) { console.error(`missing env: ${missing.join(', ')}`); process.exit(1); }
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+`.env` committed by accident puts a real secret in history; deleting the file in a later commit does
+not remove it. The fix is a `.gitignore` entry from the first commit and, if it happens, rotating the
+secret (Phase 6 makes this a drill). A study log with a gap of a week is still honest; a log back-filled
+from memory is not, and I do not do that. A board with fifty cards is a wish list, not a plan.
+
+</Level>
+
+<Level name="Corner cases">
+
+A README that works on my machine because a tool is installed globally, on a clean machine where it is
+not: the instructions pass for me and fail for everyone else. The fix is to put every tool in
+`devDependencies` and call it through `npx` or a script. A public repository plus a study log that
+mentions a real user's email in a bug note: the log is public evidence, so it must contain no personal
+data.
+
+</Level>
+
+<Level name="Production level">
+
+For a production repository the README grows sections a responder needs: how to see logs, how to roll
+back, where the runbook is, who owns what. CI badges show whether main is green. A `CHANGELOG.md` records
+user-visible changes. The test I apply is the one in the gate: someone who has never seen the project can
+run it, test it and deploy it from the README alone.
+
+</Level>
+
+<Level name="Mindset">
+
+The habit is "evidence over memory." I will not remember in month nine why I chose a session cookie in
+week one. The log and the README remember for me, and writing them forces me to notice when I do not
+actually know why something works.
+
+</Level>
+
+<Level name="System design">
+
+Documentation is part of the system's interface. A README is the onboarding path, `.env.example` is the
+configuration schema, the migrations folder is the data model's history and CI is the definition of
+"works." Treating them as code means they are reviewed and kept true with the code.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the study log entry at the end of every session, before closing the editor, and I review the
+week's entries every Sunday to pick next week's cards. Done when a clean clone on another machine
+follows the README to a running, tested app, and the log has an entry for every session of the phase.
+
+</Level>
+
+</Levels>
+
+#### Phase 0: the build, a baseline full-stack app
+
+<Flow
+  caption="The baseline's one critical path. Every box is a place I write a test or a log line."
+  steps={["Sign-up form", "Validate input", "Hash password, insert user", "Set session cookie", "Redirect to /account", "Protected route reads the session", "Render the user's own rows"]}
+/>
+
+<Levels label="Phase 0, the baseline build">
+
+<Level name="Beginner">
+
+The baseline is one small app: a database table, a form, one authenticated route, one test and a
+deploy. No AI. I keep the feature trivial so the work is in the plumbing: a "notes" app where a signed-in
+user adds a short note and sees only their own notes. The smallest version is a server-rendered page with
+a form that posts to the server and a table with a foreign key.
+
+```sql
+create table users (id bigserial primary key, email text unique not null, password_hash text not null);
+create table notes (id bigserial primary key, user_id bigint not null references users(id), body text not null,
+                    created_at timestamptz not null default now());
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+The pieces combine as a request path. The form posts to `/notes`; the server checks the session,
+validates the body, inserts with the session's user ID (never one from the form), and redirects. The
+account page selects `where user_id = $1`. One integration test proves the critical rule: a user cannot
+see someone else's notes.
+
+```ts
+test('a user sees only their own notes', async () => {
+  const a = await signUp('a@example.com'); const b = await signUp('b@example.com');
+  await a.post('/notes', { body: 'from a' });
+  const page = await b.get('/account');
+  expect(page.text).not.toContain('from a');
+});
+```
+
+```text
+ ✓ test/notes.test.ts (1)
+   ✓ a user sees only their own notes 84ms
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The exact rules underneath: passwords are hashed with a slow, salted function (`argon2id` or `bcrypt`),
+never stored or logged. The session is a random ID in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie,
+mapped to a user on the server (in Postgres or Redis). Queries use parameters (`$1`), never string
+concatenation. The form's POST is protected against cross-site requests by `SameSite` plus an origin
+check. Each of these is a Phase 3 or Phase 6 topic; the baseline uses the safe default and the log notes
+that I do not yet understand it fully.
+
+</Level>
+
+<Level name="Edge cases">
+
+An empty note body; a body of a megabyte; an email with uppercase letters that duplicates an existing
+lowercase one; a sign-up with an email already taken, which must give a useful error and not a 500.
+
+```text
+error: duplicate key value violates unique constraint "users_email_key"
+```
+
+The fix for the uppercase case is a lowercase normalisation before insert (or a `citext` column); for the
+duplicate, catching the unique violation (`code === '23505'`) and returning a form error.
+
+</Level>
+
+<Level name="Corner cases">
+
+A user double-clicks submit on a slow network: two identical notes. A session cookie set on
+`localhost` in development and then the production domain: cookies are per host, so the test passes
+locally with a cookie the deploy never sees if `Secure` is set and local is HTTP. A user deleted while
+their session is alive: the protected route must treat a missing user as signed out, not crash.
+
+</Level>
+
+<Level name="Production level">
+
+For real use the baseline needs the boring list: a 404 page, a 500 page that shows a request ID and no
+stack trace, request logging, a readiness check, and migrations that run on deploy. I also measure: time
+to first byte of `/account`, and how long the deploy takes. Those numbers are the baseline the plan's
+name promises.
+
+</Level>
+
+<Level name="Mindset">
+
+The baseline is a mirror. What took longest, what I copied without understanding, what I skipped
+because it was boring: those are the real syllabus, and the study log is where I write them down
+honestly.
+
+</Level>
+
+<Level name="System design">
+
+Small as it is, the baseline already has the capstone's shape: a browser, a stateless app, a relational
+store, a session store, a deploy pipeline and telemetry. Each later phase replaces one box with a
+deeper version, so the capstone grows from this repository rather than starting over.
+
+</Level>
+
+<Level name="Strategy">
+
+I build it in four sittings: schema and migration; form and validation; sessions and the protected
+route; test, deploy and telemetry. I commit after each sitting. Done when the deployed app passes the
+isolation test in CI, and I can explain every file in the repository, including the generated ones.
+
+</Level>
+
+</Levels>
+
+#### Phase 0: exercises
+
+- Run the three day-one scripts (count lines, fetch a URL, serve the time) with `tsx`, then built.
+- Plant one bug for each tool: a failing request, a lost commit, a non-zero exit code, an undefined
+  variable. Find each one with the tool and write down how.
+- Bring the compose stack up and down with and without `-v`; kill Postgres mid-request and read the
+  error the app gives.
+- Deploy a broken build and watch the platform keep the old one; roll back a working but wrong release.
+- Throw a deliberate error and find it by request ID in the observability dashboard.
+- Follow the README on a clean clone and fix every step that fails.
+- Read *The Pragmatic Programmer* chapters 1 to 3 and write one log entry each on what changes in how I
+  work.
+
+#### Phase 0: the gate
+
+The plan's gate: a deployed app with a README, a database, a test and a study log, and I can explain
+every file in the repository.
+
+- **Deployed:** a public HTTPS URL, `/health` and `/ready` both return 200, and a rollback has been done
+  once.
+- **README:** a clean clone runs, tests and deploys from it with no extra knowledge.
+- **Database:** a migration creates the schema, the isolation test proves ownership, and the volume
+  survives a restart.
+- **Test:** the integration test runs in CI against a real Postgres and blocks a merge when it fails.
+- **Study log:** one entry per session, nothing back-filled, with the list of things I looked up.
+- **Explain every file:** I walk an imagined reviewer through the repository top to bottom, out loud,
+  with nothing open but the code. Any file I cannot explain becomes the first card of Phase 1.
