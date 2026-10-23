@@ -1,0 +1,856 @@
+---
+plan: traditional-software-developer
+phase: 7
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+
+This is how I would work through every bullet of the networks phase. The
+primary book is
+[Computer Networking: A Top-Down Approach](/sanjay/books/computer-networking-a-top-down-approach/);
+when I need to see exactly what a packet does, I open
+[TCP/IP Illustrated, Volume 1](/sanjay/books/tcp-ip-illustrated-volume-1/).
+
+<Layers
+  caption="One HTTP request, wrapped layer by layer on the way down and unwrapped on the way up."
+  layers={[
+    { name: 'Application', note: 'HTTP request: GET /sanjay/ HTTP/1.1' },
+    { name: 'Transport', note: 'TCP segment: ports 51514 → 443, sequence numbers' },
+    { name: 'Network', note: 'IP datagram: source and destination addresses, TTL' },
+    { name: 'Link', note: 'Ethernet or Wi-Fi frame: MAC addresses, checksum' },
+    { name: 'Physical', note: 'bits on copper, glass or radio' },
+  ]}
+/>
+
+#### Layering and encapsulation: application, transport, network, link
+
+<Levels label="Phase 7, layering">
+<Level name="Beginner" depth={5}>
+
+Networking is split into layers so each one solves one problem: the link layer
+moves a frame to the next machine, IP moves a packet across networks, TCP or UDP
+moves data between two programs, and the application layer is the protocol the
+programs speak.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Each layer wraps the layer above in its own header: encapsulation. A router only
+opens up to the IP header; a switch only to the Ethernet header; my code only
+ever sees the application bytes.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+The end-to-end argument says to put functions like reliability at the ends,
+not in the network, unless doing it in the middle is a performance win. That is
+why IP is best-effort and TCP lives only in hosts.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Headers cost bytes: a 1-byte payload in TCP over IPv4 over Ethernet carries 54
+or more bytes of headers. Tunnels (VPNs, VXLAN) add a whole stack inside
+another and shrink the usable MTU.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Middleboxes break layering: NATs rewrite transport ports, firewalls read
+application data, and so new transport protocols ship inside UDP (QUIC) to get
+through.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+"Is it the network?" is answered layer by layer: can I resolve the name, reach
+the IP, open the port, complete TLS, get a valid HTTP response. Each has its
+own tool.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+When something fails, name the layer first. It halves the search space every
+time.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Layers are an interface contract; service meshes and API gateways are new
+layers with the same trade: easier reasoning, extra latency, new failure
+modes.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Capture one page load in Wireshark and label every header. Done when I can
+point at each layer's bytes in a packet.
+
+</Level>
+</Levels>
+
+#### IP addressing, subnets, routing, NAT, and ARP
+
+<Levels label="Phase 7, IP addressing and routing">
+<Level name="Beginner" depth={5}>
+
+An IPv4 address is 32 bits, written as four numbers. A subnet like
+`192.168.1.0/24` means the first 24 bits name the network and the last 8 name
+the host.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+To send a packet, a host checks whether the destination is on its own subnet.
+If yes, it uses ARP to find the destination's MAC address; if no, it sends the
+frame to its default gateway's MAC. Routers forward by longest-prefix match in
+their tables.
+
+```ts
+const toInt = (ip: string) => ip.split('.').reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+const inSubnet = (ip: string, net: string, bits: number) =>
+  bits === 0 || ((toInt(ip) ^ toInt(net)) >>> (32 - bits)) === 0;
+inSubnet('192.168.1.42', '192.168.1.0', 24); // true
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+NAT lets many private addresses share one public address by rewriting the
+source address and port and keeping a table to reverse it. Between networks,
+BGP exchanges routes as policy, not shortest path; inside one network, OSPF
+computes shortest paths.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+`/31` and `/32` subnets have no broadcast address to lose; `127.0.0.0/8` is all
+loopback; `169.254.0.0/16` means DHCP failed. IPv6 has no ARP; it uses Neighbor
+Discovery over ICMPv6.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Two hosts behind NAT cannot accept connections from each other without help:
+STUN, hole punching or a relay. Hairpin NAT (reaching your own public IP from
+inside) works on some routers and not others.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Overlapping private ranges between a VPC and an office VPN cause traffic to
+vanish silently. A NAT gateway's port table can run out under many outbound
+connections, which looks like random timeouts.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+An address is a location claim, and every claim is resolved by a table
+somewhere. Find the table.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Cloud networks are subnets, route tables and NAT gateways as configuration.
+Anycast puts the same address in many places and lets routing pick the
+nearest, which is how DNS roots and CDNs scale.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write the subnet calculator and a longest-prefix-match lookup in TypeScript,
+then read my own machine's routing table (`ip route`, `netstat -rn`). Done when
+I can predict the next hop for any address.
+
+</Level>
+</Levels>
+
+#### TCP: handshake, sequence numbers, acknowledgements, retransmission, flow control, and congestion control
+
+<Levels label="Phase 7, TCP">
+<Level name="Beginner" depth={5}>
+
+TCP gives two programs a reliable, ordered byte stream over an unreliable
+network. It starts with a three-way handshake: SYN, SYN-ACK, ACK.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Every byte has a sequence number; the receiver acknowledges the next byte it
+expects. Missing data is retransmitted after a timeout or after three duplicate
+ACKs (fast retransmit). The receive window tells the sender how much buffer is
+left: flow control.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Congestion control protects the network, not the receiver: slow start doubles
+the congestion window each round trip, then additive increase, multiplicative
+decrease on loss. Newer algorithms such as CUBIC and BBR change the shape.
+Throughput is bounded by window / RTT, so a long-distance link needs a large
+window.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Closing takes four segments and leaves the side that closed first in TIME_WAIT
+for a while. A receiver with a full buffer advertises a zero window and the
+sender probes until it opens. Nagle's algorithm plus delayed ACKs can add 40 ms
+or more to small request-response exchanges.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+A half-open connection: one side crashed and rebooted, the other still thinks
+the connection is alive until it sends and gets a RST, or a keepalive fires. A
+SYN flood fills the half-open queue; SYN cookies remove that state.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Connection reuse matters more than anything else in latency: each new
+connection costs a round trip plus TLS. Connection pools, keep-alive and
+`ss -ti` to read the congestion window and retransmits are daily tools.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+TCP is a stream, not a list of messages. Any protocol on top needs its own
+framing, and every bug of the form "I got half a message" is this lesson.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Head-of-line blocking at the TCP layer is why HTTP/2 over one connection can
+be worse than HTTP/1.1 on a lossy network, and why HTTP/3 moved to QUIC over
+UDP with per-stream ordering.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Implement a toy reliable protocol over UDP (stop-and-wait, then go-back-N), and
+watch real TCP retransmissions in Wireshark on a link with `tc netem` loss.
+Done when I can sketch the state diagram from memory.
+
+</Level>
+</Levels>
+
+<Figure
+  caption="The handshake and the close. Each arrow is one segment."
+  art={`
+  client                         server
+    │ ── SYN seq=x ─────────────▶ │   LISTEN → SYN_RCVD
+    │ ◀── SYN+ACK seq=y ack=x+1 ─ │
+    │ ── ACK ack=y+1 ───────────▶ │   ESTABLISHED
+    │         ... data ...        │
+    │ ── FIN ───────────────────▶ │   CLOSE_WAIT
+    │ ◀── ACK ─────────────────── │
+    │ ◀── FIN ─────────────────── │   LAST_ACK
+    │ ── ACK ───────────────────▶ │   CLOSED
+  TIME_WAIT (2 × MSL), then CLOSED
+`}
+/>
+
+#### UDP: when reliability is the wrong default
+
+<Levels label="Phase 7, UDP">
+<Level name="Beginner" depth={5}>
+
+UDP sends independent datagrams with ports and a checksum, and nothing else: no
+connection, no ordering, no retransmission.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+That makes it right when old data is useless (voice, games, live video), when
+one request fits in one packet (DNS), or when the application wants its own
+reliability (QUIC).
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+UDP has no congestion control, so an application that sends blindly can flood
+a link; well-behaved UDP protocols add pacing. Datagrams larger than the path
+MTU are fragmented by IP, and losing any fragment loses the whole datagram.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A UDP `send` to a closed port may surface later as `ECONNREFUSED` on a connected
+socket because of an ICMP error. Messages can arrive duplicated, reordered, or
+not at all.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Small requests with large replies make UDP services (DNS, NTP, memcached) usable
+for amplification attacks with spoofed sources.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+NATs and firewalls drop idle UDP mappings quickly, so long-lived UDP flows
+send keepalives. Some corporate networks block UDP entirely, so QUIC clients fall
+back to TCP.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Reliability is a feature with a cost (latency on loss). Choose it on purpose.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Metrics pipelines (StatsD), service discovery gossip and real-time media use
+UDP because a lost sample is cheaper than a late one.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build the DNS client over UDP (below). Then send datagrams through `netem` with
+loss and reordering and log what arrives. Done when I can name a use case for
+each of TCP and UDP and defend it.
+
+</Level>
+</Levels>
+
+#### DNS: resolution, caching, TTLs, and record types
+
+<Levels label="Phase 7, DNS">
+<Level name="Beginner" depth={5}>
+
+DNS turns names into addresses. An A record gives an IPv4 address, AAAA an IPv6
+one, CNAME an alias, MX a mail server, TXT free text.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+My machine asks a recursive resolver, which asks a root server, then the TLD
+server for `.io`, then the authoritative server for the domain, and caches each
+answer for its TTL.
+
+```sh
+dig +trace snjy-kumar.github.io A
+dig snjy-kumar.github.io AAAA +short
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+A DNS message is a 12-byte header, then questions and resource records, with
+names compressed by pointers back into the message. Queries go over UDP port
+53; large answers set the truncated bit and retry over TCP. DNSSEC signs
+records; DoH and DoT encrypt the transport.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A CNAME cannot sit at the zone apex with other records. Negative answers
+(NXDOMAIN) are cached too. Lowering a TTL only helps after the old, longer TTL
+has expired everywhere.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Applications and runtimes cache DNS on their own, sometimes forever (old JVM
+defaults), so a failover that changes an IP is invisible to them. `localhost`
+may resolve to `::1` first and miss a server bound only to `127.0.0.1`.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+"It's always DNS": expired domains, wrong records after a migration, resolver
+outages and search-domain lookups multiplying queries in Kubernetes are common
+incident causes.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+DNS is a globally distributed, eventually consistent cache. Every change is a
+cache invalidation problem with a TTL.
+
+</Level>
+<Level name="System design" depth={5}>
+
+DNS is also a load balancer (multiple A records, geo DNS) and a failover
+mechanism, both bounded by TTLs and client caching.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write the DNS client from the build list: encode the query by hand, send it
+over UDP, parse the answer including compressed names, and compare with `dig`.
+Done when it handles A, AAAA and a CNAME chain.
+
+</Level>
+</Levels>
+
+#### HTTP/1.1, HTTP/2, HTTP/3, headers, methods, status codes, and caching
+
+<Levels label="Phase 7, HTTP">
+<Level name="Beginner" depth={5}>
+
+HTTP is request and response: a method (GET, POST, PUT, DELETE), a path, headers,
+an optional body; back comes a status code, headers and a body. 2xx is success,
+3xx redirect, 4xx the client's fault, 5xx the server's.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+HTTP/1.1 is text with persistent connections; the body length comes from
+`Content-Length` or chunked encoding. Caching is driven by `Cache-Control`,
+`ETag` and `Last-Modified`, with `304 Not Modified` for revalidation.
+
+```http
+GET /sanjay/ HTTP/1.1
+Host: snjy-kumar.github.io
+If-None-Match: "abc123"
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+HTTP/2 is binary and multiplexes many streams over one TCP connection with
+compressed headers. HTTP/3 does the same over QUIC, so one lost packet only
+stalls its own stream. Methods have semantics: GET is safe, PUT and DELETE are
+idempotent, POST is neither.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A request with both `Content-Length` and `Transfer-Encoding` is ambiguous,
+and different parsers resolve it differently. `HEAD` responses have headers
+but no body. Redirects with 301 and 302 may turn a POST into a GET; 307 and 308
+keep the method.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+That ambiguity between a proxy and a server is request smuggling: one sees one
+request, the other sees two. `Vary` mistakes make caches serve one user's
+response to another.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Timeouts at every hop, keep-alive limits that differ between a load balancer
+and the app (giving random 502s), and cache headers on authenticated pages are
+the usual incidents.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+HTTP semantics are a contract with every cache and proxy on the path, not just
+with my client.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Idempotent methods make retries safe; caches and CDNs scale reads; status codes
+are how load balancers and clients decide to retry. Designing an API is
+choosing these semantics.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write the HTTP/1.1 server from the build list with keep-alive, routing,
+headers, chunked responses and proper errors, test it with `curl -v` and a
+fuzzer for malformed requests. Done when it survives the fuzzer.
+
+</Level>
+</Levels>
+
+#### TLS: certificates, the handshake, trust chains, and common failures
+
+<Levels label="Phase 7, TLS">
+<Level name="Beginner" depth={5}>
+
+TLS encrypts a connection and proves the server's identity with a
+certificate. The padlock means both: privacy and "this really is the host I
+asked for".
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+The certificate binds a public key to names and is signed by a certificate
+authority; the client checks the chain up to a root it trusts, the names
+(SAN), and the dates. In TLS 1.3 the handshake takes one round trip: key shares
+are exchanged, then everything after is encrypted.
+
+```sh
+openssl s_client -connect snjy-kumar.github.io:443 -servername snjy-kumar.github.io
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Ephemeral Diffie–Hellman gives forward secrecy: stealing the server's key later
+does not decrypt old sessions. SNI tells a shared server which certificate to
+present; ALPN negotiates HTTP/2 or HTTP/1.1 inside the handshake.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A server that sends only its leaf certificate works in browsers that cache
+intermediates and fails in `curl` and mobile apps. Clock skew makes valid
+certificates look expired.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+0-RTT resumption saves a round trip but its early data can be replayed, so it
+must only carry idempotent requests. A wildcard certificate covers one label
+only: `*.example.com` does not match `a.b.example.com`.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Expired certificates are still a leading cause of outages; automate renewal and
+alert weeks ahead. TLS termination at a load balancer means the hop behind it
+is plaintext unless re-encrypted.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Trust is a chain of signatures I did not verify myself. Know where each link
+comes from and when it expires.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Mutual TLS turns certificates into service identity inside a mesh; certificate
+rotation becomes a deployment problem.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Do the TLS experiment from the build list: make a CA and a self-signed server
+certificate, serve it, make `curl` trust it, then break it four ways (wrong
+name, expired, missing intermediate, untrusted root) and read each error. Done
+when I can explain each error message.
+
+</Level>
+</Levels>
+
+#### Sockets: blocking, non-blocking, and the connection lifecycle
+
+<Levels label="Phase 7, sockets">
+<Level name="Beginner" depth={5}>
+
+A socket is the program's end of a connection. A server calls `socket`, `bind`,
+`listen`, then `accept` in a loop; a client calls `socket` and `connect`.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+`accept` returns a new socket per client; the listening socket stays. In Node,
+`net.createServer` hides this but the lifecycle is the same.
+
+```ts
+import net from 'node:net';
+net.createServer((sock) => {
+  sock.on('data', (chunk) => sock.write(chunk));   // echo
+  sock.on('error', () => sock.destroy());
+}).listen(7000);
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+The kernel completes handshakes into an accept queue sized by the `listen`
+backlog; when it overflows, new connections stall or drop. Non-blocking sockets
+plus epoll let one thread serve thousands of connections.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+`read` returning 0 means the peer closed; writing to a closed peer raises
+SIGPIPE, which kills the process unless ignored. Restarting a server hits
+`EADDRINUSE` from TIME_WAIT unless `SO_REUSEADDR` is set.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+A message written in one `write` can arrive in several `read`s and two writes
+can arrive in one read; framing must handle both. A non-blocking `connect`
+returns `EINPROGRESS` and finishes later as writable.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+File descriptor limits (`ulimit -n`), ephemeral port exhaustion on busy
+clients, and missing timeouts on `connect` and `read` are frequent production
+bugs.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Every network call can hang forever unless I give it a deadline.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Connection pooling, keep-alive and load-balancer idle timeouts must agree, or
+clients reuse connections the far side already closed.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Write the TCP chat server from the build list with length-prefixed framing, then
+run a client that sends in one-byte writes. Done when no message is split or
+merged.
+
+</Level>
+</Levels>
+
+#### Proxies, reverse proxies, load balancers, and CDNs
+
+<Levels label="Phase 7, proxies and load balancers">
+<Level name="Beginner" depth={5}>
+
+A forward proxy acts for clients; a reverse proxy sits in front of servers and
+acts for them. A load balancer is a reverse proxy that spreads requests; a CDN
+is a worldwide set of caching reverse proxies.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+Layer 4 balancers forward TCP connections; layer 7 balancers parse HTTP and can
+route by path or header. Proxies add headers like `X-Forwarded-For` so the app
+knows the real client.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+Balancing algorithms (round robin, least connections, consistent hashing) trade
+evenness for stickiness. Health checks remove dead backends; connection
+draining lets deploys finish requests in flight.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Trusting `X-Forwarded-For` from anyone lets clients spoof their IP; only trust
+it from known proxies. WebSockets and long polls pin a connection to one
+backend.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Retrying a non-idempotent POST at the proxy after a backend timeout can run it
+twice. A CDN caching an error page spreads an outage.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Most "502 Bad Gateway" errors are timeout or keep-alive mismatches between the
+proxy and the app. Logs at the proxy are the first place to look.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Every hop is a place where a request can be changed, retried, cached or
+dropped. Draw the hops.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Put caching as close to the user as correctness allows, and put retries in
+exactly one layer.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Build the reverse proxy from the build list: forward requests, add a header,
+time out slow backends and stream bodies without buffering them whole. Done when
+it passes my HTTP server's tests through the proxy.
+
+</Level>
+</Levels>
+
+#### WebSockets and server-sent events
+
+<Levels label="Phase 7, WebSockets and SSE">
+<Level name="Beginner" depth={5}>
+
+Server-sent events keep an HTTP response open and stream text events from server
+to client. WebSockets upgrade an HTTP connection into a two-way message channel.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+SSE is plain HTTP with `Content-Type: text/event-stream` and the browser
+reconnects for you with `Last-Event-ID`. WebSockets start with an `Upgrade`
+request and a `101 Switching Protocols` response, then send framed messages.
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+WebSocket frames are masked from client to server so cache-poisoning proxies
+cannot be tricked; messages can be fragmented; ping and pong keep the
+connection alive.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+Proxies with short idle timeouts silently kill quiet connections; heartbeats
+fix it. SSE over HTTP/1.1 counts against the browser's six connections per
+host.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+After a reconnect, messages sent while the client was away are gone unless the
+server keeps a replay buffer keyed by event ID.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Long-lived connections make deploys and scaling harder: draining takes as long
+as the longest connection, and load stays on old instances.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Choose the simplest channel that matches the direction of data. Most live
+updates only flow one way.
+
+</Level>
+<Level name="System design" depth={5}>
+
+A pub/sub backbone (Redis, NATS) fans messages to whichever server holds each
+client's connection.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Add an SSE endpoint to my HTTP server and a WebSocket upgrade to the chat server,
+then kill the network mid-stream. Done when clients resume without losing
+events.
+
+</Level>
+</Levels>
+
+#### Debugging: curl, dig, tcpdump, Wireshark, and browser dev tools
+
+<Levels label="Phase 7, network debugging">
+<Level name="Beginner" depth={5}>
+
+`curl -v` shows the request and response headers; `dig` shows DNS answers; the
+browser's Network tab shows every request with its timing.
+
+</Level>
+<Level name="Intermediate" depth={5}>
+
+`curl -w` prints the timing breakdown: DNS, connect, TLS, first byte, total.
+
+```sh
+curl -o /dev/null -s -w 'dns %{time_namelookup}\nconnect %{time_connect}\ntls %{time_appconnect}\nttfb %{time_starttransfer}\ntotal %{time_total}\n' https://snjy-kumar.github.io/sanjay/
+```
+
+</Level>
+<Level name="Advanced" depth={5}>
+
+`tcpdump -i any -nn port 443` captures packets; Wireshark decodes them and can
+decrypt TLS with an `SSLKEYLOGFILE`. `ss -tanp` shows socket states and owning
+processes.
+
+</Level>
+<Level name="Edge cases" depth={5}>
+
+A connection timeout (SYN with no answer, usually a firewall drop) and a
+connection refused (an immediate RST, nothing listening) look alike in an app
+log and different in a capture.
+
+</Level>
+<Level name="Corner cases" depth={5}>
+
+Captures on the host miss what a container or a TLS-terminating proxy sees;
+capture where the problem is.
+
+</Level>
+<Level name="Production level" depth={5}>
+
+Keep a runbook: resolve, reach, connect, handshake, request, in that order,
+with the command for each.
+
+</Level>
+<Level name="Mindset" depth={5}>
+
+Measure the request before theorising about it.
+
+</Level>
+<Level name="System design" depth={5}>
+
+Distributed tracing is the same timing breakdown across services.
+
+</Level>
+<Level name="Strategy" depth={5}>
+
+Diagnose a deliberate timeout: block a port with a firewall rule, watch `curl`
+hang, then find the unanswered SYNs in `tcpdump`. That is the gate's diagnosis
+task.
+
+</Level>
+</Levels>
+
+<Timeline
+  caption="The request lifecycle the gate asks me to explain, from a name to the first byte."
+  items={[
+    { when: 'DNS', what: 'Resolve the name: cache, recursive resolver, root, TLD, authoritative.' },
+    { when: 'TCP', what: 'SYN, SYN-ACK, ACK: one round trip.' },
+    { when: 'TLS', what: 'ClientHello with key share, ServerHello, certificate, Finished: one round trip in TLS 1.3.' },
+    { when: 'HTTP', what: 'Send the request; the server routes, works, and starts the response.' },
+    { when: 'TTFB', what: 'The first byte arrives: roughly three round trips plus server time on a cold connection.' },
+  ]}
+/>
+
+#### The learning strategy for this phase
+
+<Timeline
+  caption="Four weeks: down the stack, then back up by building."
+  items={[
+    { when: 'Week 34', what: 'Layering, HTTP and DNS: Kurose & Ross chapters 1–2, the DNS client, Wireshark on a page load.' },
+    { when: 'Week 35', what: 'Transport: chapter 3, sockets, the chat server, a reliable protocol over UDP, netem loss.' },
+    { when: 'Week 36', what: 'Network and link: chapters 4–6, subnets, routing, NAT, ARP; the subnet calculator.' },
+    { when: 'Week 37', what: 'TLS, proxies, real-time and debugging: chapter 8, the TLS experiment, the reverse proxy, the gate.' },
+  ]}
+/>
+
+I learn networks top-down because that is where I already stand: I use HTTP
+every day. Each week I capture the traffic first and then read why it looks
+like that. TCP/IP Illustrated is the reference I open when a capture surprises
+me; I do not read it in order.
+
+#### How I would learn it
+
+I would keep Wireshark open the whole phase. Before every chapter, I capture
+something real (a page load, a DNS lookup, a failed connection) and write down
+what I cannot explain. Then I read, then I build the smallest client or server
+that produces the same packets. I write the HTTP server without a framework and
+without AI, then compare it with Node's `http` module and ask an AI to find
+parsing bugs. Every incident I have ever seen that was "the network" goes into
+my bug log, with the layer it was really at.
+
+#### Exercises
+
+- An HTTP/1.1 server with keep-alive, routing, chunked responses and proper 400,
+  404, 405 and 500 handling.
+- A DNS client over UDP for A and AAAA, with name compression and CNAME chains.
+- A TCP chat server with length-prefixed framing and a heartbeat.
+- A reverse proxy that adds `X-Request-Id`, times out slow backends and streams
+  bodies.
+- A TLS experiment with my own CA, broken four ways.
+- A subnet calculator and longest-prefix-match router table in TypeScript.
+- A timeout diagnosis with `curl -w` and `tcpdump`.
+
+#### The gate
+
+Closed book, no AI: the HTTP server passes its tests; I explain a request from
+DNS to TLS to the first byte; I diagnose a connection timeout with `curl` and
+`tcpdump`; I give a use case for TCP and one for UDP and defend both.
