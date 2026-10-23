@@ -7,6 +7,8 @@ import { series } from '../../data/series';
 import { roadmap } from '../../data/roadmap';
 import { planById, planGroups } from '../../data/plans';
 import { withBase } from '../../utils/base';
+import { booksForPlan } from '../../data/books';
+import { citeShort } from '../../utils/books';
 import { noteHref, publishedIn, seriesName, shortDate } from '../../utils/notes';
 
 export async function getStaticPaths() {
@@ -61,6 +63,37 @@ const covering = [...new Set(meta.phases.flatMap((phase) => phase.notes))]
 const relatedPlans = meta.related
   .map((id) => ({ meta: planById(id)!, entry: entries.find((entry) => entry.id === id)! }))
   .filter(({ entry }) => Boolean(entry));
+
+// The books this plan cites, by the first phase that needs each one. A book
+// links to its page once the page is written (src/content/books/).
+const bookPages = new Set((await getCollection('books')).map((page) => page.id));
+const cited = booksForPlan(plan.id)
+  .map((book) => {
+    const phases = book.cited.filter((cite) => cite.plan === plan.id && cite.phase !== undefined);
+    return {
+      book,
+      first: phases.length > 0 ? Math.min(...phases.map((cite) => cite.phase!)) : 99,
+      where: phases.map(citeShort).join(', ') || 'named in the plan',
+      href: bookPages.has(book.slug) ? withBase(`/books/${book.slug}/`) : undefined,
+    };
+  })
+  .sort((a, b) => a.first - b.first);
+
+// The learning strategy for each phase, climbing the nine levels. It sits
+// below the plan's own text and never replaces it: one MDX file per phase in
+// src/content/phases/<plan id>/, written separately from the plan.
+const strategies = (await getCollection('phases'))
+  .filter((entry) => entry.data.plan === plan.id)
+  .sort((a, b) => a.data.phase - b.data.phase);
+for (const entry of strategies) {
+  if (!meta.phases.some((phase) => phase.n === entry.data.phase)) {
+    throw new Error(`src/content/phases/${entry.id}: ${plan.id} has no phase ${entry.data.phase}.`);
+  }
+}
+const strategyBodies = await Promise.all(
+  strategies.map(async (entry) => ({ entry, Body: (await render(entry)).Content })),
+);
+const phaseFocus = (n: number) => meta.phases.find((phase) => phase.n === n)?.focus ?? '';
 
 const siteOrigin = Astro.site ?? new URL('https://snjy-kumar.github.io');
 const pageUrl = new URL(withBase(`/plans/${plan.id}/`), siteOrigin).href;
@@ -127,6 +160,45 @@ const jsonLd = {
     last column on the day it is published.
   </p>
   <PhaseTable plan={meta} posts={posts} />
+
+  {cited.length > 0 && (
+    <>
+      <h2 id="cited-books">Books this plan cites</h2>
+      <p class="series-note">
+        Each book, by the {meta.unit === 'Week' ? 'week' : meta.group === 'books' ? 'place in the sequence' : 'phase'} that first needs it. The
+        <a href={withBase('/books/')}> books page</a> has all of them, roadmap by roadmap.
+      </p>
+      <ol class="book-list">
+        {cited.map(({ book, where, href }) => (
+          <li>
+            <span class="book-when">{where}</span>
+            <span class="book-what">
+              {href ? <a href={href}>{book.title}</a> : <span>{book.title}</span>}
+              <span class="meta"> · {book.author}{!href && ' · page not written yet'}</span>
+            </span>
+          </li>
+        ))}
+      </ol>
+    </>
+  )}
+
+  {strategyBodies.length > 0 && (
+    <>
+      <h2 id="phase-strategy">Learning strategy, {meta.unit === 'Week' ? 'week' : 'phase'} by {meta.unit === 'Week' ? 'week' : 'phase'}</h2>
+      <p class="series-note">
+        How I would work through each {meta.unit === 'Week' ? 'week' : 'phase'}, from beginner to strategy. It
+        sits under the plan above and does not change it.
+      </p>
+      <div class="entry plan">
+        {strategyBodies.map(({ entry, Body }) => (
+          <section aria-labelledby={`strategy-${entry.data.phase}`}>
+            <h3 id={`strategy-${entry.data.phase}`}>{meta.unit === 'Week' ? 'Week' : 'Phase'} {entry.data.phase} · {entry.data.title ?? phaseFocus(entry.data.phase)}</h3>
+            <Body />
+          </section>
+        ))}
+      </div>
+    </>
+  )}
 
   {fed.length > 0 && (
     <>

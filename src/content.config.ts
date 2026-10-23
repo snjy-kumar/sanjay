@@ -75,4 +75,17 @@ const books = defineCollection({
   }),
 });
 
-export const collections = { blog, log, plans, books };
+// The learning strategy for one phase of a plan, climbing the nine levels.
+// It renders below the plan's own text on the plan page; the plan markdown
+// is never edited for it. File: src/content/phases/<plan id>/<nn>.mdx.
+const phases = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/phases' }),
+  schema: z.object({
+    plan: z.string(),
+    phase: z.number().int().min(0),
+    /** Defaults to the phase's focus in src/data/plans.ts. */
+    title: z.string().optional(),
+  }),
+});
+
+export const collections = { blog, log, plans, books, phases };
