@@ -1,0 +1,859 @@
+---
+title: "Error shapes, pagination and OpenAPI"
+series: "backend"
+seriesOrder: 5
+undated: true
+readTime: "about 25 min"
+description: "One error shape every endpoint shares, why offset pagination slows down and skips rows, how cursor pagination fixes both, and an OpenAPI contract that cannot drift."
+tags: ['http', 'architecture', 'databases']
+related: ['backend/02', 'backend/04']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+Three things decide whether an API is pleasant to build a client against,
+and none of them is the happy path. How it fails: does every endpoint fail
+in the same shape, or does each invent its own? How it lists: can a client
+walk ten thousand rows without the server slowing down or the list
+skipping items? And how it describes itself: is there a contract a client
+can trust, and does it match the code? This note takes those three in
+turn, with a real Postgres table of 200,000 rows for the pagination part.
+
+## Before you start
+
+After this note you will be able to:
+
+- design one error shape, based on the Problem Details standard, that every
+  endpoint returns, with field-level errors a form can display;
+- send every failure through one error-mapping function instead of
+  formatting errors in each handler;
+- explain, with measurements, why `offset` pagination gets slower on deep
+  pages and skips or repeats rows when data changes;
+- implement cursor (keyset) pagination with a composite sort key and an
+  opaque cursor;
+- write an OpenAPI description of an endpoint and check automatically that
+  the document and the router agree.
+
+What you should already know: status codes from
+[the second note](/sanjay/posts/backend/02/), schemas from
+[the fourth](/sanjay/posts/backend/04/), and basic SQL `order by` and
+`limit`.
+
+Reading time: about 25 minutes.
+
+## Note map
+
+<Layers layers={[
+  { name: "Error shape", note: "one JSON format for every failure" },
+  { name: "Error mapping", note: "one function turns any thrown error into that shape" },
+  { name: "Offset pagination", note: "the easy way, and its two failures" },
+  { name: "Cursor pagination", note: "the stable, fast way for feeds and big lists" },
+  { name: "OpenAPI", note: "the contract that documents all of the above, checked against the code" },
+]} caption="The five parts of the note. The first two are about failing well, the middle two about listing well, and the last one writes both down as a contract." />
+
+## One error shape for every failure
+
+### In one sentence
+
+Every error from an API should have the same JSON shape, so a client
+writes its error handling once instead of once per endpoint.
+
+### The idea
+
+Without a rule, each handler invents its own error body. One returns
+`{"error": "not found"}`, another `{"message": "Invalid", "fields": {...}}`,
+a third `{"errors": ["..."]}`, and the framework's default 500 returns an
+HTML page. Every client then needs special cases, and a generic "show the
+error" component is impossible.
+
+The fix is to choose one shape and use it everywhere. A good starting point
+is **Problem Details for HTTP APIs**, RFC 9457, which defines a JSON object
+served with the media type `application/problem+json`. Its standard fields
+are:
+
+- `type`: a URL that identifies the kind of problem, and can point at
+  documentation;
+- `title`: a short, human-readable summary of that kind of problem;
+- `status`: the HTTP status code, repeated in the body for convenience;
+- `detail`: a human-readable explanation of this occurrence;
+- `instance`: a URL identifying this occurrence, often the request path.
+
+The standard allows **extension members**: extra fields for things a
+client needs. Two are worth adding everywhere: a `requestId` that joins the
+error to the server's logs, and an `errors` array of field-level issues for
+validation failures, each with a `path`, a machine-readable `code` and a
+`message`.
+
+The machine-readable parts (`type`, `status`, each issue's `code`) are what
+a client branches on. The human-readable parts (`title`, `detail`,
+`message`) are for showing or logging, and may change wording without
+breaking anyone.
+
+### Worked example
+
+The simple case is a helper that builds a problem object, which I ran to
+print two examples:
+
+```ts
+type Problem = { type: string; title: string; status: number;
+  detail?: string; instance?: string; [ext: string]: unknown };
+const problem = (status: number, slug: string, title: string, extra: Partial<Problem> = {}): Problem =>
+  ({ type: `https://api.example.com/problems/${slug}`, title, status, ...extra });
+```
+
+The validation failure, as printed:
+
+```text
+{
+  "type": "https://api.example.com/problems/validation",
+  "title": "Your request has invalid fields",
+  "status": 422,
+  "instance": "/notes",
+  "requestId": "r-91c2",
+  "errors": [
+    { "path": "title", "code": "too_small", "message": "must be at least 1 character" },
+    { "path": "tags.2", "code": "invalid_enum", "message": "must be one of work, home" }
+  ]
+}
+```
+
+The `path` uses dots and indexes, so `tags.2` means the third tag. A form
+library can map that straight onto the field to highlight.
+
+The realistic case is a conflict that tells the client what to do next:
+
+```text
+{"type":"https://api.example.com/problems/conflict","title":"A note with this title already exists","status":409,"detail":"Pick another title or edit the existing note.","existingId":"42"}
+```
+
+The extension member `existingId` lets the client offer "open the existing
+note" as a button. That is the difference between an error and an error a
+product can be built on.
+
+### Step by step
+
+<Trace
+  columns={["field", "who reads it", "may it change wording?", "example"]}
+  rows={[
+    ["type", "client code, docs", "no: it is an identifier", "https://api.example.com/problems/validation"],
+    ["status", "client code, proxies", "no", "422"],
+    ["title", "people, logs", "yes", "Your request has invalid fields"],
+    ["detail", "people", "yes", "Pick another title or edit the existing note."],
+    ["errors[].path and code", "form code", "no", "tags.2, invalid_enum"],
+    ["errors[].message", "people", "yes", "must be one of work, home"],
+    ["requestId", "support, logs", "n/a", "r-91c2"],
+  ]}
+  caption="The shape field by field. The third column is the contract: anything a client branches on is stable, anything a person reads may be reworded."
+/>
+
+### Common mistake
+
+The common mistake is making the client parse the message:
+`if (err.message.includes('already exists'))`. The day someone fixes a typo
+in the message, the client breaks. The fix is a stable `type` or `code` and
+a rule that clients only branch on those.
+
+<Compare left="Ad hoc errors" right="One problem shape" caption="The same three failures, two ways. The right column lets one client function handle all of them." rows={[
+  ["{error: 'not found'}", "{type: .../not-found, status: 404, title}"],
+  ["{message: 'Invalid', fields: {title: 'short'}}", "{type: .../validation, status: 422, errors: [{path: 'title', code}]}"],
+  ["HTML 500 page from the framework", "{type: .../internal, status: 500, requestId}"],
+]} />
+
+### In real systems
+
+Several large API platforms and frameworks support Problem Details out of
+the box, and many public APIs use a shape close to it with their own field
+names. The exact names matter less than consistency. What matters is that
+every endpoint, including the framework's own 404 and 500, uses the same
+shape and media type.
+
+### Check yourself
+
+<details>
+<summary>1. Why include status in the body when it is already in the HTTP status line?</summary>
+
+Some layers lose the status: a log that stores only bodies, a client that
+passes the body around, a proxy that rewrites the status. Repeating it
+makes the body self-contained. The HTTP status line remains the
+authoritative one.
+
+</details>
+
+<details>
+<summary>2. Which field should a client use to decide to show the "open existing note" button?</summary>
+
+The `type` (or a stable code), here the conflict type, plus the
+`existingId` extension. Never the `title` or `detail` text.
+
+</details>
+
+## Mapping every failure to the shape
+
+### In one sentence
+
+Handlers throw meaningful errors and one central function turns each kind
+into a problem response, so formatting lives in one place and unknown
+errors become a safe 500.
+
+### The idea
+
+If every handler builds its own error responses, the shape drifts again
+within a month. The better pattern is to let handlers **throw** typed
+errors, such as `NotFound`, `Conflict` or `ValidationFailed`, and catch
+them in the error middleware from
+[the router note](/sanjay/posts/backend/03/). That middleware is the only
+code that knows the response format.
+
+The mapper has three kinds of input. **Known application errors** carry
+their own status and type. **Known library errors**, such as a Postgres
+unique violation or a schema library's parse failure, are translated into
+application errors. **Everything else** is a bug: log it with the stack and
+request id, and return a generic 500 problem that reveals nothing about the
+internals.
+
+### Worked example
+
+The simple case is a small error class hierarchy:
+
+```ts
+class HttpError extends Error {
+  constructor(public status: number, public slug: string, public title: string,
+              public extra: Record<string, unknown> = {}) { super(title); }
+}
+const notFound = (what: string) => new HttpError(404, 'not-found', `${what} not found`);
+const conflict = (title: string, extra = {}) => new HttpError(409, 'conflict', title, extra);
+```
+
+The realistic case is the mapper itself:
+
+```ts
+function toProblem(e: unknown, ctx: Ctx): Problem {
+  const base = { instance: ctx.path, requestId: ctx.id };
+  if (e instanceof HttpError) return problem(e.status, e.slug, e.title, { ...base, ...e.extra });
+  if (e instanceof z.ZodError) return problem(422, 'validation', 'Your request has invalid fields',
+    { ...base, errors: e.issues.map((i) => ({ path: i.path.join('.'), code: i.code, message: i.message })) });
+  if (isPgError(e) && e.code === '23505') return problem(409, 'conflict', 'That value is already taken',
+    { ...base, constraint: e.constraint });
+  log.error({ err: e, requestId: ctx.id }, 'unhandled');
+  return problem(500, 'internal', 'Something went wrong on our side', base);
+}
+```
+
+The order of checks is from most specific to least, and the last branch is
+the only one that logs at error level, because it is the only one that
+means "our bug".
+
+### Step by step
+
+<Flow steps={[
+  "Handler throws: notFound('Note'), a ZodError, or a pg error with code 23505",
+  "Error middleware catches it and calls toProblem",
+  "HttpError: use its status, slug and title",
+  "ZodError: 422 with an errors array built from issues",
+  "pg 23505: 409 conflict with the constraint name",
+  "Anything else: log with stack and request id, return a bare 500",
+  "Send with content-type application/problem+json",
+]} caption="One path for every failure. Handlers never format errors; they only decide which error to throw." />
+
+### Common mistake
+
+The common mistake is a `catch` in every handler that formats its own
+response, often swallowing the error: `catch (e) { res.status(400).json({
+error: 'failed' }) }`. A bug now looks like a client error, nothing is
+logged, and the request id is lost. The fix is to let errors propagate to
+the one mapper, and catch locally only when the handler can genuinely
+recover.
+
+### In real systems
+
+Frameworks provide a hook for this: a global error handler. Production
+services keep the mapper small and well tested, with one test per error
+kind, and alert on the rate of the "anything else" branch, since each one
+is an unhandled bug.
+
+### Check yourself
+
+<details>
+<summary>1. Why does only the last branch of the mapper log at error level?</summary>
+
+The earlier branches are expected outcomes: a missing note, bad input, a
+taken value. Logging them as errors floods the logs and hides real bugs.
+The last branch is the only one that means the server failed.
+
+</details>
+
+## Offset pagination and its two failures
+
+### In one sentence
+
+`limit` with `offset` is the easiest way to page through rows, and it gets
+slower the deeper you go and skips or repeats rows when the list changes
+between pages.
+
+### The idea
+
+**Pagination** splits a long list into pages. The simplest form asks for
+"20 rows, skipping the first N": `order by ... limit 20 offset 40` for page
+three. The client sends `?page=3`, the server multiplies.
+
+The first failure is **cost**. The database cannot jump to row 180,000; it
+has to produce the first 180,020 rows in order and throw 180,000 of them
+away. Even with an index on the sort column, it walks the index entry by
+entry. Deep pages cost in proportion to their depth.
+
+The second failure is **drift**. Pages are computed against the list as it
+is when each page is requested. If a new row is inserted at the top
+between page one and page two, every row shifts down by one, and the first
+row of page two is the last row of page one again. A deletion shifts rows
+up and one is never shown. For a feed that is constantly changing, the
+client sees duplicates and gaps.
+
+The third, smaller issue is **unstable order**. If the sort column has
+ties, such as many rows with the same `created_at`, the database may return
+tied rows in a different order on each query, so they can move across page
+boundaries. Always add a unique column, usually `id`, as the last sort key.
+
+### Worked example
+
+I loaded 200,000 rows into an `events` table with an index on
+`(created_at desc, id desc)` and measured with `explain analyze`:
+
+```sql
+select id, title from events
+order by created_at desc, id desc
+limit 20 offset 180000;
+```
+
+The real timings and the number of rows the plan produced before the limit
+threw them away:
+
+```text
+offset page 1     : 0.06 ms, rows scanned by top node input: 20
+offset page 9000  : 31.68 ms, rows scanned by top node input: 180020
+```
+
+Page 9,000 was about 500 times slower than page 1 and read 180,020 index
+entries to return 20 rows. On a laptop that is still fast; with wider rows,
+a cold cache and many clients, deep pages become the slowest queries in the
+system, and they are exactly what crawlers and "export all" scripts hit.
+
+The realistic case is drift. I took a tiny feed of ids 1 to 6, newest
+first, read page one with three rows, inserted id 7 at the top, then read
+page two:
+
+```text
+offset: page1 = 6,5,4 | new row arrives | page2 = 4,3,2
+```
+
+Row 4 appears on both pages, and the new row 7 is never shown, because it
+landed on page one after the client had already read it.
+
+### Step by step
+
+<Trace
+  columns={["moment", "list, newest first", "request", "returned"]}
+  rows={[
+    ["1", "6 5 4 3 2 1", "offset 0, limit 3", "6 5 4"],
+    ["2", "7 6 5 4 3 2 1", "row 7 inserted", ""],
+    ["3", "7 6 5 4 3 2 1", "offset 3, limit 3", "4 3 2: row 4 again"],
+  ]}
+  caption="Drift under offset pagination. The offset counts positions, and positions moved between the two requests."
+/>
+
+### Common mistake
+
+The common mistake is showing a total page count, "page 3 of 9,412", on a
+large table. Computing it needs `count(*)` over the whole filtered set on
+every request, which can cost more than the page itself. The fix is to drop
+the total, show "next" and "previous", or show an estimate.
+
+### In real systems
+
+Offset pagination is fine for small, slow-changing lists: an admin table of
+a few hundred users, search results where users rarely go past page five.
+Systems with large or fast-changing lists, such as feeds, logs, message
+histories and public APIs, move to cursors, which is the next part.
+
+### Check yourself
+
+<details>
+<summary>1. Why does an index not make offset 180000 fast?</summary>
+
+The index gives the rows in order, but offset still has to count past
+180,000 entries one by one; there is no way to jump to the 180,000th entry
+of a B-tree directly. The work grows with the offset.
+
+</details>
+
+<details>
+<summary>2. Why add id as the last sort key?</summary>
+
+To make the order total. With ties in `created_at`, rows with the same
+timestamp could come back in a different order on each query and cross
+page boundaries. A unique last key breaks every tie the same way each time.
+
+</details>
+
+## Cursor pagination
+
+### In one sentence
+
+Cursor pagination says "give me 20 rows after this one", using the last
+row's sort key as a bookmark, so each page is found by an index seek and
+insertions elsewhere cannot shift it.
+
+### The idea
+
+Instead of a count of rows to skip, the client sends a **cursor**: a value
+that identifies where the previous page ended. The server turns it into a
+`where` clause on the sort key, so the database can seek straight to that
+point in the index and read the next 20 entries. This is also called
+**keyset pagination**.
+
+With a composite sort key `(created_at, id)` in descending order, "after
+this row" means "strictly earlier in the order". Postgres supports **row
+value comparison**, so `(created_at, id) < ($1, $2)` compares the pair
+lexicographically: first by `created_at`, then by `id` for ties. That
+matches the index order exactly, which is what lets the index be used.
+
+The cursor sent to the client should be **opaque**: an encoded string, not
+raw column values. That way the client cannot build cursors by hand, and
+the server can change what is inside without breaking clients. Base64url of
+a small JSON object is enough; sign it if tampering matters.
+
+The trade-off is that cursors cannot jump to "page 400". They support next
+and previous, which is what infinite scroll, feeds and API clients need.
+
+### Worked example
+
+The simple case is the query for the page after a known row:
+
+```sql
+select id, title from events
+where (created_at, id) < ($1, $2)
+order by created_at desc, id desc
+limit 20;
+```
+
+At the same depth as the slow offset query, after row 180,000:
+
+```text
+cursor after row 180000: 0.06 ms, rows scanned by top node input: 20
+```
+
+The same 0.06 ms as page one, because the index seek lands directly on the
+right entry. And the drift test, re-run with cursors on the same tiny feed:
+
+```text
+cursor: page1 = 6,5,4 | new row arrives | page2 = 3,2,1
+```
+
+Page two continues from 4, so nothing repeats. Row 7 is not shown on this
+walk, but it is not "lost": it is newer than where the walk started, and a
+refresh shows it, which is what users expect from a feed.
+
+The realistic case is the API response, which carries the opaque cursor:
+
+```ts
+const enc = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+const nextCursor = rows.length === limit
+  ? enc({ c: last.created_at, i: last.id })
+  : null;
+send(res, 200, { data: rows, nextCursor });
+```
+
+```text
+opaque cursor: eyJjIjoiMjAyNi0wMS0xNFQyMToyMTowMC4wMDBaIiwiaSI6IjIwMDAxIn0
+```
+
+The client sends it back as `?cursor=...` and never needs to know it holds
+a timestamp and an id. A cleaner way to detect the last page is to fetch
+`limit + 1` rows and return a cursor only if the extra row exists, which
+avoids one empty final request.
+
+### Step by step
+
+<Figure art={`
+  index on (created_at desc, id desc)
+
+  [ 2026-05-20 08:00, 200000 ]  <- page 1 starts here
+  [ 2026-05-20 07:59, 199999 ]
+  ...
+  [ 2026-01-14 21:21,  20001 ]  <- cursor points here (end of row 180000)
+  [ 2026-01-14 21:20,  20000 ]  <- page 9001 starts here: one seek
+  [ 2026-01-14 21:19,  19999 ]
+  ...
+  offset 180000: walk 180000 entries, then read 20
+  cursor       : seek to the cursor, then read 20
+`} caption="Offset versus cursor on the same index. The cursor turns 'skip N' into 'start here', which costs the same at any depth." />
+
+<Compare left="Offset" right="Cursor" caption="When to use which. The right column wins for anything large, public or changing; the left wins for small admin tables where jumping to a page matters." rows={[
+  ["cost grows with page depth", "same cost at any depth"],
+  ["repeats or skips rows on insert or delete", "stable under inserts and deletes"],
+  ["can jump to page N", "next and previous only"],
+  ["simple ?page=3", "opaque ?cursor=..."],
+  ["needs count(*) for page totals", "no total needed"],
+]} />
+
+### Common mistake
+
+The common mistake is a cursor on a non-unique column alone:
+`where created_at < $1`. Rows that share the boundary timestamp are
+skipped. The fix is the composite key with the unique `id`, compared as a
+row value. A second mistake is a cursor whose sort order does not match an
+index, which turns the seek into a full scan; create the index to match the
+`order by` exactly, including direction.
+
+A third: changing the sort or filters between pages while keeping the
+cursor. A cursor is only meaningful for the query that produced it. Encode
+the sort and filter in the cursor, and reject a cursor used with a
+different query.
+
+### In real systems
+
+Most large public APIs paginate with opaque cursors, often called "next
+page tokens" or "starting after" ids. Database tooling uses keyset
+pagination for batch jobs: a backfill that walks a large table in chunks of
+1,000 by primary key is cursor pagination without the HTTP. The migrations
+note later in this series uses exactly that.
+
+### Check yourself
+
+<details>
+<summary>1. Why compare (created_at, id) as a row value instead of writing created_at < $1 or (created_at = $1 and id < $2)?</summary>
+
+Both are correct in meaning, but the row-value form matches the composite
+index directly and lets Postgres seek in one step. The expanded `or` form is
+often planned less efficiently. The single-column form is wrong, because it
+skips ties.
+
+</details>
+
+<details>
+<summary>2. Why make the cursor opaque?</summary>
+
+So clients cannot construct or depend on its contents, and the server can
+change the sort key or add a signature later without breaking clients.
+
+</details>
+
+## OpenAPI: the contract, checked against the code
+
+### In one sentence
+
+An OpenAPI document describes every endpoint, parameter, body and response
+of an API in a standard format, and it is only useful if something checks
+it against the real router.
+
+### The idea
+
+**OpenAPI** (formerly Swagger) is a standard way to describe an HTTP API in
+YAML or JSON. For each path and method it lists parameters, the request
+body schema, and each possible response with its schema. Tools turn the
+document into reference documentation, typed clients and mock servers, and
+some validate real requests against it.
+
+The document includes the parts of this note: a shared `Problem` schema
+used for every error response, and list endpoints with `limit` and
+`cursor` query parameters and a `nextCursor` field in the response. Writing
+those down once, as reusable **components**, is how the document enforces
+consistency on itself.
+
+The danger is **drift**: the document says one thing, the code does
+another. A hand-written document drifts the first time someone adds a
+route in a hurry. Two cures exist. Generate the document from the code's
+schemas (code first), or generate code types from the document (spec
+first). Either way, add a test that compares the two.
+
+### Worked example
+
+The simple case is the description of the list endpoint, in YAML:
+
+```yaml
+paths:
+  /notes:
+    get:
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Note' } }
+                  nextCursor: { type: [string, 'null'] }
+        '422':
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+```
+
+`type: [string, 'null']` is OpenAPI 3.1's way to say nullable, since 3.1
+aligned its schemas with JSON Schema.
+
+The realistic case is a drift check. I compared a small spec's paths and
+methods with a router's route table, converting `:id` to `{id}`:
+
+```ts
+const norm = (p: string) => p.replace(/:(\w+)/g, '{$1}');
+const inSpec = new Set(Object.entries(spec.paths)
+  .flatMap(([p, ops]) => Object.keys(ops).map((m) => `${m.toUpperCase()} ${p}`)));
+const inCode = new Set(routes.map(([m, p]) => `${m} ${norm(p)}`));
+```
+
+```text
+documented, not routed: [ 'PUT /notes/{id}', 'POST /notes/{id}/share' ]
+routed, not documented: [ 'PATCH /notes/{id}', 'GET /health' ]
+```
+
+Four real kinds of drift in one run: a documented `PUT` that the code
+implements as `PATCH`, a documented share endpoint nobody built, and a
+health check nobody documented (which may be fine to exclude on purpose).
+In CI, this check fails the build until each line is fixed or explicitly
+allowed.
+
+### Step by step
+
+<Flow steps={[
+  "Define schemas once: Note, NoteInput, Problem, Page",
+  "Attach them to routes: body, query, responses",
+  "Generate openapi.json from the routes (code first)",
+  "CI: compare spec paths with the router; fail on drift",
+  "CI: validate example responses against their schemas",
+  "Publish docs and generate typed clients from the same file",
+]} caption="A contract that stays true. The two CI steps are what make the document trustworthy; without them it is a wiki page with braces." />
+
+### Common mistake
+
+The common mistake is documenting only the 200 response. Clients then
+discover the error shapes by trial. The fix is to give every operation its
+4xx and 5xx responses, all pointing at the one `Problem` component, so the
+consistency of the first part is visible in the contract.
+
+### In real systems
+
+Teams generate TypeScript clients from OpenAPI so frontend code gets typed
+responses, run contract tests that call each endpoint and validate the
+response against its schema, and lint the document for rules like "every
+list endpoint has `limit` and `cursor`". The document becomes the review
+surface for API changes: a pull request that changes it gets an API review.
+
+### Check yourself
+
+<details>
+<summary>1. The drift check reports 'routed, not documented: GET /health'. Is that always a bug?</summary>
+
+No. Internal endpoints such as health checks are often excluded from the
+public contract on purpose. The fix is an explicit allow-list in the check,
+so the exclusion is a decision and not an accident.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Error shapes, pagination and OpenAPI">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, pick one error shape and use it everywhere, add
+`limit` to every list endpoint, and write down what each endpoint accepts
+and returns.
+
+A worked example: every error is `{ type, title, status, detail }`, every
+list takes `?limit=` with a maximum of 100 and returns `{ data }`, and a
+README lists the endpoints with an example request and response each.
+
+The mistake at this level is a list endpoint with no limit, which returns
+every row and gets slower every day. The fix is a default and a maximum
+limit on every list, from the first commit.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, centralise error mapping, add field-level
+errors, and move to cursor pagination for anything that grows. Generate the
+OpenAPI document from the route schemas.
+
+A worked example: a `/notes` list with `limit` and `cursor`, sorted by
+`(updated_at desc, id desc)` with a matching index, returning `nextCursor`.
+The 422 response lists issues with `path` and `code`. The OpenAPI document
+shows both.
+
+The mistake is a cursor on `updated_at` alone. The fix is the composite key
+and row-value comparison.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, handle filters, sorting options and backward paging
+with cursors. Encode sort and filters in the cursor, support `prev`, and
+make cursors tamper-evident.
+
+A worked example: a cursor holds `{ sort: 'updated', dir: 'desc', last:
+[ts, id], filter: 'tag=work' }`, signed with an HMAC. A request that changes
+the filter but reuses the cursor gets 422 "cursor does not match query".
+Backward paging flips the comparison and the order, then reverses the
+result.
+
+The mistake is backward paging that forgets to reverse the rows, showing a
+page upside down. The fix is a test that walks forward then back and
+compares.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: `limit=0`, `limit` over the maximum, an empty table, a
+cursor pointing at a deleted row, the very last page.
+
+A worked example: the row the cursor points at is deleted between pages.
+Keyset pagination still works, because the comparison uses values, not the
+row's existence. Offset pagination shifts by one. A test deletes the
+boundary row and checks the next page is still correct.
+
+The mistake is looking up the cursor's row by id to find its position,
+which fails when it is deleted. The fix is comparing values carried in the
+cursor.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a row is updated so its sort key moves from page
+three to page one while the client is on page two. It may be skipped in this
+walk, which is inherent to any live list. Another: a cursor from an old API
+version is sent after a deploy that changed the cursor format.
+
+A worked example of the second: the cursor includes a version number. The
+server decodes versions 1 and 2, and answers 422 with type
+`cursor-expired` for anything older, which the client handles by starting
+from the top.
+
+The mistake is crashing with a 500 on a cursor that fails to decode. The
+fix is treating cursors as untrusted input, parsed with a schema like any
+other.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, watch for the patterns in this note: slow deep-offset
+queries in the slow-query log, 500s from the "anything else" branch of the
+mapper, and drift failures in CI.
+
+A worked example: the slow-query log shows `offset 250000` from a crawler
+walking the public list. Switching the public endpoint to cursors and
+capping offset on the admin endpoint at 10,000 removes the slowest queries
+from the database.
+
+The mistake is fixing it with a bigger database. The fix is the query
+shape.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that an API's failures and edges are part of its design, not
+leftovers. Ask "what does the client do with this?" for every error, every
+page boundary and every undocumented field.
+
+A worked example: a 409 that includes the conflicting resource's id turns a
+dead end into a "go to existing" button. Five extra minutes on the error
+shape saved a support ticket per week.
+
+The mistake is treating error bodies as debugging output. The fix is
+treating them as a product surface.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, these conventions are shared across services: one
+Problem schema package, one pagination convention, one OpenAPI style guide,
+and a gateway that serves a merged document.
+
+A worked example: an organisation-wide lint on OpenAPI files requires every
+list operation to use the shared `Page` component and every error to use
+`Problem`. A new service that invents its own shape fails review
+automatically.
+
+The mistake is each team inventing its own conventions, so a client that
+talks to five services has five error parsers. The fix is shared components
+and a linter.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is to make the contract the centre: schemas define it, the
+router implements it, CI proves they agree, and clients are generated from
+it. Errors and pagination are chosen once and reused.
+
+A worked example: a new endpoint is designed as an OpenAPI diff in a pull
+request, reviewed, then implemented; the drift check stays red until the
+route exists, and the generated client is published with the release.
+
+Done when: every endpoint returns the same error shape, every growing list
+uses cursors with a matching index, and a CI check fails if the OpenAPI
+document and the router disagree.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should a 404 for an unknown route also use the problem shape?** Yes. The
+framework's default not-found handler is an endpoint too; override it so
+clients never see HTML.
+
+**Can I return a total count with cursor pagination?** You can, but it
+costs a `count(*)` per request. Return it only where the product needs it,
+cache it, or use the planner's estimate for very large tables.
+
+**Is GraphQL different?** The same problems exist. GraphQL has its own
+error array format and its connections specification uses cursors, which is
+the same keyset idea.
+
+**Code first or spec first for OpenAPI?** Code first is easier to keep true
+for a small team; spec first suits public APIs where the contract is
+reviewed before code exists. The drift check matters in both.
+
+## Key takeaways
+
+- Use one error shape everywhere; Problem Details is a good base.
+- Clients branch on `type`, `status` and `code`, never on messages.
+- Handlers throw; one mapper formats; only unknown errors log as errors.
+- Offset pagination costs grow with depth and it drifts when data changes.
+- Always end the sort with a unique key.
+- Cursor pagination seeks with a row-value comparison on an index that
+  matches the sort.
+- Make cursors opaque, versioned and treated as untrusted input.
+- An OpenAPI document needs an automated drift check to stay true.
+
+## Glossary
+
+- **Problem Details**: the RFC 9457 JSON format for HTTP API errors.
+- **Extension member**: an extra field added to a problem object.
+- **Error mapper**: one function that turns thrown errors into responses.
+- **Pagination**: splitting a long list into pages.
+- **Offset pagination**: skipping a count of rows.
+- **Drift (pagination)**: repeats and gaps caused by changes between pages.
+- **Cursor / keyset pagination**: continuing after the last row's sort key.
+- **Row value comparison**: comparing tuples like `(a, b) < (x, y)`.
+- **Opaque cursor**: an encoded cursor the client cannot interpret.
+- **OpenAPI**: a standard format describing an HTTP API.
+- **Component**: a reusable schema or response in an OpenAPI document.
+- **Drift (contract)**: the document and the code disagreeing.
+
+## Practice
+
+**Warm-up.** Collect five error responses from an API you use and compare
+their shapes. Write the one shape you would want instead.
+
+**Build.** Add a central error mapper and the Problem shape to your server,
+then switch your biggest list to cursor pagination with a composite index,
+and measure page 1 and a deep page with `explain analyze`.
+
+**Stretch.** Generate an OpenAPI document from your route schemas, add the
+drift check to CI, and generate a typed client that the frontend uses.
