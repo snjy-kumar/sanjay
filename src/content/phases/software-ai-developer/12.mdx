@@ -1,0 +1,980 @@
+---
+plan: software-ai-developer
+phase: 12
+title: "Capstone: build and operate one AI-native product end to end"
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Six weeks, weeks 63 to 68. One small product with real constraints: not a tutorial, not a demo with
+no users. The capstone pulls every earlier phase into one system I can operate without guessing. No
+new primary book: the short list is my reference, the official docs of every dependency are my
+manuals, and *The Staff Engineer's Path* is optional reading on owning something larger than a
+feature. The twelve parts below follow the plan's list; each climbs the nine levels, in my own words.
+
+#### Phase 12: how I would learn it
+
+I treat the capstone as a product with an operator (me) and users (the ten from phase 11). The design
+doc from phase 10 is the plan. Every week ends with a deploy, a number and a log entry. AI writes
+first drafts of tests and boilerplate, never the auth, payments, permissions, migrations or the eval
+criteria, and every accepted suggestion is read, run and logged in the delegation log.
+
+<Timeline
+  caption="Phase 12's six weeks"
+  items={[
+    { when: 'week 63', what: 'Auth, authorization, tenant isolation; schema, migrations, indexes; backup and restore drill.' },
+    { when: 'week 64', what: 'Frontend core flows: accessible, fast, tested. Backend validation, rate limits, jobs, errors.' },
+    { when: 'week 65', what: 'The AI feature: retrieval, citations, evals, guardrails, cost budget. Eval dashboard.' },
+    { when: 'week 66', what: 'Observability end to end; security: threat model, secrets scan, dependency audit.' },
+    { when: 'week 67', what: 'DevOps: CI/CD, rollback, runbook, incident game day. Billing or metering in test mode.' },
+    { when: 'week 68', what: 'Docs: README, architecture, ADRs, user guide. Postmortem. Public case study. Then the gate.' },
+  ]}
+/>
+
+<Layers
+  caption="The capstone, and the phase each layer comes from"
+  layers={[
+    { name: 'case study + postmortem', note: 'phases 11 and 12' },
+    { name: 'docs, runbooks, ADRs', note: 'phases 5 and 10' },
+    { name: 'billing / metering', note: 'phases 8 and 11' },
+    { name: 'AI feature + evals', note: 'phases 7 and 8' },
+    { name: 'observability, DevOps, security', note: 'phases 5 and 6' },
+    { name: 'frontend + backend', note: 'phases 2 and 3' },
+    { name: 'data + auth + tenancy', note: 'phases 3, 4 and 10' },
+  ]}
+/>
+
+#### Phase 12: Authentication, authorization and tenant isolation
+
+<Flow
+  caption="Every request, in order"
+  steps={['session cookie', 'load session: user + tenant + role', 'route policy: is this role allowed?', 'ownership check on the resource', 'database with RLS tenant setting', 'response']}
+/>
+
+<Levels label="Phase 12, authentication, authorization and tenant isolation">
+
+<Level name="Beginner">
+
+Authentication proves who the user is (sign up, sign in, sign out, password reset, session expiry).
+Authorization decides what they may do (roles, ownership). Tenant isolation makes sure no user ever
+touches another customer's data. In the capstone all three are in place before the first feature.
+
+Mistake: checking the role but not ownership: an editor in tenant A edits a document in tenant B by
+changing an id in the URL. Fix: every resource load includes the tenant and owner check.
+
+</Level>
+
+<Level name="Intermediate">
+
+Sessions are server-side rows with an expiry, referenced by an HttpOnly, Secure, SameSite cookie.
+Passwords use a slow hash (argon2id or bcrypt). Reset tokens are single-use, hashed at rest and
+short-lived.
+
+```ts
+export async function requireDoc(ctx: Ctx, docId: string, need: 'read' | 'write') {
+  const doc = await db.documents.find({ id: docId, tenantId: ctx.tenantId }); // tenant in the query
+  if (!doc) throw httpError(404);                 // 404, not 403: do not reveal existence
+  if (need === 'write' && !can(ctx.role, 'documents:write')) throw httpError(403);
+  return doc;
+}
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Defence in depth: the application check and Postgres RLS both enforce tenancy; vector retrieval
+filters by tenant; cache keys include tenant; queue messages carry tenant from the session, never
+from user input. Admin access is a separate role with audit logging of every action.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Expired session mid-form:** the form keeps its data and asks to sign in again.
+- **Password reset for an unknown email:** the same response as for a known one.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **User removed from a tenant while their session is live:** sessions are revoked on membership
+  change.
+- **A user in two tenants:** the active tenant is explicit in the session; switching re-checks
+  membership.
+
+</Level>
+
+<Level name="Production level">
+
+Tests: cross-tenant access for every route, an IDOR test per resource, session expiry, reset token
+reuse. Login is rate-limited.
+
+</Level>
+
+<Level name="Mindset">
+
+Auth is the code I do not delegate and do not improvise.
+
+</Level>
+
+<Level name="System design">
+
+One authorization module, used by HTTP routes, AI tools and workers alike.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the cross-tenant test suite first, then the auth code until it passes. Done when every route
+is covered and a deliberately removed check fails a test.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: A database with migrations, indexes and a backup/restore drill
+
+<Figure art={`
+  backup drill
+  1. take backup (nightly + WAL)        5. run smoke queries + row counts
+  2. spin up empty Postgres             6. compare to production counts
+  3. restore to a point in time         7. record: duration, data loss window
+  4. point a staging app at it          8. destroy the restored copy
+`} caption="A backup I have never restored is a hope. The drill turns it into a measured recovery time." />
+
+<Levels label="Phase 12, database, migrations, indexes, backup and restore">
+
+<Level name="Beginner">
+
+The schema has constraints (not null, unique, foreign keys, checks) so bad data cannot get in.
+Migrations change the schema in versioned, reviewed files. Indexes make the important queries fast.
+Backups are taken automatically and restored on purpose to prove they work.
+
+Mistake: editing the production schema by hand. Fix: every change is a migration in the repo.
+
+</Level>
+
+<Level name="Intermediate">
+
+Indexes come from the queries: I list the top queries from the slow log and `EXPLAIN ANALYZE` each.
+
+```sql
+EXPLAIN ANALYZE SELECT id, title FROM documents
+WHERE tenant_id = 42 ORDER BY updated_at DESC LIMIT 20;
+-- before: Seq Scan on documents ... then Sort
+-- after CREATE INDEX ON documents (tenant_id, updated_at DESC): Index Scan, no sort
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Migrations are backward-compatible with the previous app version (expand, migrate data, contract), so
+deploys and rollbacks never break. Large index builds use `CREATE INDEX CONCURRENTLY` to avoid locking
+writes.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A migration on an empty test database passes, on production data fails** (a not-null column on
+  existing rows): test migrations against a copy of realistic data.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Restore plus vectors:** the vector index is derived; the drill includes rebuilding or verifying it.
+
+</Level>
+
+<Level name="Production level">
+
+Restore time and data-loss window are measured numbers in the runbook.
+
+</Level>
+
+<Level name="Mindset">
+
+Data outlives code. I treat schema changes with more care than code changes.
+
+</Level>
+
+<Level name="System design">
+
+Postgres is the source of truth for rows, full-text, vectors and the job queue; one thing to back up.
+
+</Level>
+
+<Level name="Strategy">
+
+I run the restore drill twice and record both. Done when the runbook has the measured restore time.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: A frontend with accessible, fast, tested core flows
+
+<Compare
+  caption="Core flow budgets"
+  left="Flow"
+  right="Budget and test"
+  rows={[
+    ['Sign up to first answer', 'Under 3 minutes; Playwright test'],
+    ['Upload a document', 'Keyboard-only path; progress + error states'],
+    ['Ask and read an answer', 'LCP and INP within budget; screen reader announces completion'],
+    ['Manage billing', 'Works at 320 px width; test-mode checkout test'],
+  ]}
+/>
+
+<Levels label="Phase 12, frontend core flows">
+
+<Level name="Beginner">
+
+Core flows are the few paths every user takes. Each has loading, error, empty and success states,
+works with the keyboard alone, and has an end-to-end test.
+
+Mistake: testing components but not the flow. Fix: one Playwright test per core flow.
+
+</Level>
+
+<Level name="Intermediate">
+
+```ts
+test('ask a question and open a citation', async ({ page }) => {
+  await page.goto('/app');
+  await page.getByRole('textbox', { name: 'Ask about your documents' }).fill('termination notice?');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('status')).toHaveText(/answer ready/i);
+  await page.getByRole('link', { name: /\[1\]/ }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('Contract');
+});
+```
+
+Role-based selectors double as accessibility checks.
+
+</Level>
+
+<Level name="Advanced">
+
+Performance budgets in CI (Lighthouse CI) for LCP, CLS, bundle size; INP checked on the answer
+interaction in the field with real-user monitoring.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Slow 3G:** the streamed answer still shows progress; the upload shows real progress.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Reduced motion plus a streaming animation:** respect `prefers-reduced-motion`.
+
+</Level>
+
+<Level name="Production level">
+
+Front-end errors go to error tracking with the release version.
+
+</Level>
+
+<Level name="Mindset">
+
+A flow is done when someone using only a keyboard or a screen reader can finish it.
+
+</Level>
+
+<Level name="System design">
+
+Flows are the contract between product and code; their tests run on every deploy.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the four flow tests first. Done when they pass in CI and an axe scan shows no serious issues.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: A backend with validation, rate limits, jobs and useful errors
+
+<Figure art={`
+  HTTP 422
+  {
+    "error": "validation_failed",
+    "message": "Some fields are invalid.",
+    "fields": { "title": "Must be 1-200 characters." },
+    "requestId": "req_7f3c"
+  }
+`} caption="One error shape everywhere: a machine code, a human message, details, and the request id that finds the trace." />
+
+<Levels label="Phase 12, backend validation, rate limits, jobs, errors">
+
+<Level name="Beginner">
+
+Every input is validated at the boundary with a schema. Every AI and auth endpoint is rate-limited.
+Slow work (ingest, emails) runs in background jobs. Errors have one consistent shape with a request id.
+
+Mistake: returning stack traces to users. Fix: log the stack, return the shape.
+
+</Level>
+
+<Level name="Intermediate">
+
+Jobs are idempotent, retried with backoff, and dead-lettered after N attempts; their status is
+visible to the user ("indexing 3 of 10").
+
+</Level>
+
+<Level name="Advanced">
+
+Idempotency keys on mutating endpoints that clients may retry (uploads, payments) prevent duplicates.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Payload too large:** a 413 with the limit stated.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Job retried after the document was deleted:** the job checks existence first and exits cleanly.
+
+</Level>
+
+<Level name="Production level">
+
+Error rates per route and job failure rates are alerting metrics.
+
+</Level>
+
+<Level name="Mindset">
+
+A useful error saves a support request.
+
+</Level>
+
+<Level name="System design">
+
+Validation, limits and errors are middleware; handlers stay small.
+
+</Level>
+
+<Level name="Strategy">
+
+I fuzz every endpoint with invalid input. Done when all return the error shape and none returns 500.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: An AI feature with retrieval, citations, evals, guardrails and a cost budget
+
+<Flow
+  caption="The phase 7 and 8 work, inside the product"
+  steps={['retrieve (tenant-filtered, hybrid, reranked)', 'answer with citations or refuse', 'guardrails', 'cost check against the budget', 'trace + feedback', 'eval suite in CI']}
+/>
+
+<Levels label="Phase 12, the AI feature">
+
+<Level name="Beginner">
+
+The capstone's AI feature is the phase 8 Q&A, now inside a product with real users. It answers with
+citations, refuses when sources are missing, and stays within a cost budget.
+
+Mistake: re-tuning by feel in the last week. Fix: every change goes through the eval suite.
+
+</Level>
+
+<Level name="Intermediate">
+
+The eval suite grows from user feedback: every thumbs-down is triaged and many become cases. The suite
+runs in CI with a results table on the PR.
+
+</Level>
+
+<Level name="Advanced">
+
+I report quality with the failure taxonomy: what share of bad answers were retrieval, context or
+generation failures, and what I did about the biggest class.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A tenant with one document:** retrieval works, but the refusal path is common; check the UX.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Budget exhausted mid-month for one tenant:** non-AI mode, clear message, and an alert to me.
+
+</Level>
+
+<Level name="Production level">
+
+Prompt and model versions in the registry; rollback rehearsed; provider outage degrades to search.
+
+</Level>
+
+<Level name="Mindset">
+
+The AI feature is one component with numbers, like the database.
+
+</Level>
+
+<Level name="System design">
+
+It uses the same auth, tenancy, jobs and observability as every other feature.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when the eval dashboard shows the trend over the capstone weeks and one improvement made with
+evidence.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: Observability: logs, metrics, traces, error tracking, an eval dashboard
+
+<Layers
+  caption="What I look at, from the top"
+  layers={[
+    { name: 'SLO dashboard', note: 'availability, p95, answer success' },
+    { name: 'metrics', note: 'rates, errors, durations, cost, queue depth' },
+    { name: 'traces', note: 'one per request, AI stages as spans' },
+    { name: 'logs', note: 'structured JSON with request id' },
+    { name: 'error tracking', note: 'grouped exceptions with release version' },
+  ]}
+/>
+
+<Levels label="Phase 12, observability">
+
+<Level name="Beginner">
+
+Logs say what happened, metrics say how much and how fast, traces say where time went in one request,
+error tracking groups exceptions, the eval dashboard says how good the AI is. Together they let me
+operate without guessing.
+
+</Level>
+
+<Level name="Intermediate">
+
+I define two or three SLOs (for example, 99.5% of page loads succeed; 95% of answers within 5 s) and
+alert on burning the error budget, not on every blip.
+
+</Level>
+
+<Level name="Advanced">
+
+Every alert links to a runbook step and a dashboard. An alert with no action is deleted.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Zero traffic at night looks like an outage:** use synthetic checks.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Observability vendor down during an incident:** keep minimal local logs.
+
+</Level>
+
+<Level name="Production level">
+
+A weekly look at dashboards, written in the log.
+
+</Level>
+
+<Level name="Mindset">
+
+If I have to add logging to understand an incident, observability failed before the incident did.
+
+</Level>
+
+<Level name="System design">
+
+One request id ties browser, server, worker and provider call together.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when I can answer "why was this slow?" and "why was this wrong?" for any request from tools
+alone.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: Security: a threat model, a secrets scan, a dependency audit
+
+<Figure art={`
+  STRIDE on the Q&A flow
+  Spoofing        stolen session       -> HttpOnly cookies, rotation
+  Tampering       doc id swap (IDOR)   -> tenant + owner check, RLS
+  Repudiation     "I never deleted"    -> audit log
+  Info disclosure cross-tenant chunks  -> retrieval filter, tests
+  DoS             token flood          -> rate limit, cost cap
+  Elevation       injected tool use    -> no write tools, approvals
+`} caption="A threat model as a table: one threat per row, one control per threat." />
+
+<Levels label="Phase 12, security">
+
+<Level name="Beginner">
+
+A threat model lists what an attacker could do and what stops them. A secrets scan finds keys committed
+by mistake. A dependency audit finds known vulnerabilities in packages.
+
+Mistake: a threat model written once and never revisited. Fix: update it with each new feature.
+
+</Level>
+
+<Level name="Intermediate">
+
+```bash
+gitleaks detect --source . --redact      # secrets in history
+npm audit --omit=dev                     # known vulnerable packages
+```
+
+Both run in CI and block on findings above a severity I set.
+
+</Level>
+
+<Level name="Advanced">
+
+The AI section covers prompt injection via documents, data sent to providers, and tool permissions,
+with tests for each.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **A vulnerable package with no fix:** document the exposure and mitigation; do not ignore silently.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **A secret found in an old commit:** rotate it first, then clean history; rotation is the fix.
+
+</Level>
+
+<Level name="Production level">
+
+Security findings are tracked like bugs with owners and dates.
+
+</Level>
+
+<Level name="Mindset">
+
+Security is a property of the system I keep, not a review I pass.
+
+</Level>
+
+<Level name="System design">
+
+The threat model follows the architecture diagram's trust boundaries.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when the threat model has a tested control per row and CI blocks secrets and serious vulnerabilities.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: DevOps: CI/CD, a rollback, a runbook, an incident game day
+
+<Flow
+  caption="From commit to production"
+  steps={['push', 'CI: lint, types, unit, evals, e2e, scans', 'build image', 'deploy to staging', 'smoke tests', 'deploy to production', 'watch; rollback if needed']}
+/>
+
+<Levels label="Phase 12, DevOps">
+
+<Level name="Beginner">
+
+Every change goes through CI (checks) and CD (deploy). A rollback returns to the previous release
+quickly. A runbook says what to do in known situations. A game day practises an incident on purpose.
+
+</Level>
+
+<Level name="Intermediate">
+
+Rollback is tested: deploy a broken release to staging and roll back, timing it. Migrations are
+compatible with rollback.
+
+</Level>
+
+<Level name="Advanced">
+
+The game day scenario for the capstone: the model provider fails during peak use while a deploy is in
+progress. I play incident commander, follow the runbook, and write the timeline.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **CI flaky test:** quarantine with an owner and a date, never retry until green silently.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Rollback while a long job runs on the new code:** jobs are versioned or drained before rollback.
+
+</Level>
+
+<Level name="Production level">
+
+Deploy frequency, change failure rate and time to restore are recorded.
+
+</Level>
+
+<Level name="Mindset">
+
+Deploys should be boring; incidents should be rehearsed.
+
+</Level>
+
+<Level name="System design">
+
+The pipeline is code in the repo, reviewed like any other change.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when one game day has a written timeline and an action item that was completed.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: Billing or metering, even in test mode
+
+<Compare
+  caption="Test mode still teaches the hard parts"
+  left="Skipped in test mode"
+  right="Still learned"
+  rows={[
+    ['Real money', 'Webhooks, signatures, idempotency'],
+    ['Tax and payouts', 'Trials, failed payments, grace, downgrade'],
+    ['Disputes', 'Usage metering tied to the cost model'],
+  ]}
+/>
+
+<Levels label="Phase 12, billing or metering">
+
+<Level name="Beginner">
+
+The capstone meters AI usage per tenant and integrates a payment provider in test mode with a pricing
+page, checkout and webhooks.
+
+</Level>
+
+<Level name="Intermediate">
+
+Entitlements come from the billing module: plan, allowance, status. Features ask it, never the
+provider directly.
+
+</Level>
+
+<Level name="Advanced">
+
+Usage allowances are derived from the phase 10 cost model so a plan cannot lose money at its limit.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Webhook arrives before the user record exists:** retry later; idempotent handler.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Plan change mid-cycle with usage already consumed:** define proration or a simple rule, and test it.
+
+</Level>
+
+<Level name="Production level">
+
+Daily reconciliation of usage and subscriptions.
+
+</Level>
+
+<Level name="Mindset">
+
+Money paths get the most tests per line in the codebase.
+
+</Level>
+
+<Level name="System design">
+
+Billing is a module with its own tables and events.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when trial, payment, failure, grace and downgrade all pass in tests with test-mode webhooks.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: Documentation: README, architecture, ADRs, user guide
+
+<Layers
+  caption="Docs by reader"
+  layers={[
+    { name: 'README', note: 'a stranger: run it locally in minutes' },
+    { name: 'architecture', note: 'a new engineer: the diagram and why' },
+    { name: 'ADRs', note: 'a reviewer: each expensive decision' },
+    { name: 'runbook', note: 'the operator: what to do when' },
+    { name: 'user guide + changelog', note: 'users: how to use it, what changed' },
+  ]}
+/>
+
+<Levels label="Phase 12, documentation">
+
+<Level name="Beginner">
+
+Documentation is written for a reader with a goal. The README gets a stranger running the app; the
+architecture doc explains the shape; ADRs record decisions; the user guide helps users.
+
+Mistake: a README that assumes my laptop.
+
+</Level>
+
+<Level name="Intermediate">
+
+The README is tested: a fresh container or a friend follows it exactly, and every stumble is fixed in
+the README.
+
+```md
+## Run locally
+1. Node 22, Docker. 2. cp .env.example .env  3. docker compose up -d db
+4. npm ci && npm run db:migrate && npm run seed  5. npm run dev -> http://localhost:4321
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Docs live next to code and change in the same PRs; a PR that changes behaviour without docs is
+incomplete.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Windows users:** note differences or provide a container path.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Secrets needed to run:** `.env.example` with safe placeholders and a mock provider mode.
+
+</Level>
+
+<Level name="Production level">
+
+A changelog per release, user-facing.
+
+</Level>
+
+<Level name="Mindset">
+
+If a stranger cannot run it, I do not fully understand my own setup.
+
+</Level>
+
+<Level name="System design">
+
+Docs mirror the architecture: one page per module boundary.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when someone else ran it from the README without asking me anything.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: A postmortem: what broke, what I changed, what I would do differently
+
+<Figure art={`
+  POSTMORTEM: answers cited deleted documents (blameless)
+  impact:    6 answers over 2 days showed dead source links
+  detection: user report, not an alert   <- gap
+  cause:     ingest deleted rows but not vector entries
+  fix:       delete-by-doc in one transaction; citation check at render
+  actions:   alert on 404 source clicks; eval case added
+`} caption="A blameless postmortem: impact, detection, cause, fix, and actions that make it less likely or faster to see." />
+
+<Levels label="Phase 12, postmortem">
+
+<Level name="Beginner">
+
+A postmortem is a written account of something that went wrong: what happened, the impact, how it was
+detected, the cause, the fix and the follow-up actions. It is blameless: it looks at the system, not
+at who to blame.
+
+</Level>
+
+<Level name="Intermediate">
+
+The timeline comes from logs and traces, not memory. The causes go deeper than the trigger: why could
+the trigger cause harm, and why was it not caught earlier?
+
+</Level>
+
+<Level name="Advanced">
+
+Actions are few, owned and dated, and at least one improves detection.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **No real incident happened:** use the game day.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Two causes interacting:** describe both and the interaction; do not pick one for neatness.
+
+</Level>
+
+<Level name="Production level">
+
+Postmortems are published internally and their actions tracked to done.
+
+</Level>
+
+<Level name="Mindset">
+
+What would I do differently is the most valuable section.
+
+</Level>
+
+<Level name="System design">
+
+Each postmortem updates the failure matrix and adds an eval case or test.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when the postmortem is written and its actions are completed.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: A public case study: problem, design, numbers, lessons
+
+<Flow
+  caption="The case study's structure"
+  steps={['the problem and who has it', 'the design and the three decisions that mattered', 'the numbers: quality, latency, cost, reliability, usage', 'what broke and what I changed', 'what I would do next and what I would not']}
+/>
+
+<Levels label="Phase 12, public case study">
+
+<Level name="Beginner">
+
+The case study explains the capstone to someone who has never seen it: the problem, the design, the
+numbers and the lessons. It is the artefact that shows what I can be trusted with.
+
+</Level>
+
+<Level name="Intermediate">
+
+Numbers are real and dated: eval scores, p95, cost per successful answer, uptime, users. Each comes
+from a dashboard or log I can show.
+
+</Level>
+
+<Level name="Advanced">
+
+The strongest section is the honest one: what failed and what it taught me.
+
+</Level>
+
+<Level name="Edge cases">
+
+- **Users' data in screenshots:** use the sample tenant.
+
+</Level>
+
+<Level name="Corner cases">
+
+- **Numbers that look bad:** publish them with context; they show judgment.
+
+</Level>
+
+<Level name="Production level">
+
+The case study is published on this site as a note, once the capstone is real.
+
+</Level>
+
+<Level name="Mindset">
+
+Show the work, the numbers and the mistakes.
+
+</Level>
+
+<Level name="System design">
+
+It links to the README, architecture doc and ADRs.
+
+</Level>
+
+<Level name="Strategy">
+
+Done when a stranger can explain from it what I built and why.
+
+</Level>
+
+</Levels>
+
+#### Phase 12: the gate
+
+- A stranger can use it from the README.
+- I can operate it without guessing: dashboards, alerts and runbooks answer the questions.
+- I have numbers for quality, latency, cost and reliability.
+- I can explain every layer and every dependency.
+- The code is mine: every line I accepted from a model was read, run, tested and logged.
+
+Done when all five are shown to someone else, and they agree.
