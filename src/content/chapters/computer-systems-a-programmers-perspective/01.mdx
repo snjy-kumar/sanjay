@@ -1,0 +1,1524 @@
+---
+book: computer-systems-a-programmers-perspective
+number: 1
+title: "A Tour of Computer Systems"
+description: "One hello-world program followed from source bytes to a write system call: compilation, hardware, caches, the OS's illusions, networks, Amdahl's law."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+This chapter takes the smallest program anyone writes, one that prints
+`hello, world`, and follows it through the whole machine: from the bytes of
+the source file, through the compiler, onto the processor, out through the
+operating system to the terminal. Every later chapter of the book is one
+stop on this tour, opened up and explained in full. If I understand the tour,
+I know where every later idea fits.
+
+## Before you start
+
+After this chapter I will be able to:
+
+- Explain why the same bytes can be text, a number or an instruction, and what decides which.
+- Name the four stages that turn `hello.c` into an executable, and open the output of each one.
+- Draw the hardware of a computer (CPU, buses, memory, I/O devices) and trace where the program's bytes travel when it runs.
+- Explain why caches exist and why the storage hierarchy is a pyramid.
+- Describe the three illusions the operating system gives every program: processes, virtual memory and files.
+- Use Amdahl's law to predict the most a speed-up can buy before I spend time on it.
+
+What I should already know: how to write and compile a small C program
+(Kernighan and Ritchie's *The C Programming Language* covers it), and that a computer stores numbers in binary. Nothing else.
+
+Reading time: about an hour for this page, plus an hour at a terminal
+running the commands. I ran every command here on an x86-64 Linux box with
+GCC 14.2; your addresses and timings will differ, the shapes will not.
+
+## Chapter map
+
+<Layers caption="The chapter as one journey. Read top to bottom: each layer is a stop the hello program passes through, and each maps to later chapters of the book." layers={[
+  { name: "1.1 Information is bits plus context", note: "the source file is just bytes; chapter 2 opens this up" },
+  { name: "1.2 and 1.3 Compilation", note: "preprocess, compile, assemble, link; chapters 3, 5 and 7" },
+  { name: "1.4 Processors run stored instructions", note: "the hardware and the run of hello; chapters 4 and 5" },
+  { name: "1.5 and 1.6 Caches and the storage hierarchy", note: "why copying is the real cost; chapter 6" },
+  { name: "1.7 The operating system", note: "processes, threads, virtual memory, files; chapters 8, 9, 10, 12" },
+  { name: "1.8 Networks", note: "another machine is just another I/O device; chapter 11" },
+  { name: "1.9 Important themes", note: "Amdahl's law, concurrency and parallelism, abstractions" },
+]} />
+
+## 1.1 Information Is Bits + Context
+
+### In one sentence
+
+Everything inside a computer is a sequence of bits, and only the context,
+meaning which program reads the bits and how, decides what they mean.
+
+### The idea
+
+A **bit** is a single 0 or 1. Hardware groups bits into **bytes** of eight,
+because eight bits are enough to hold one character of English text and a
+convenient unit for memory addresses. A file on disk, a program in memory,
+a packet on the network: each is nothing but a row of bytes.
+
+The source file `hello.c` is a **text file**: every byte holds the code of
+one character, using the **ASCII** standard (a table that maps 128
+characters to the numbers 0 to 127). The letter `#` is byte 35, which is
+`0x23` in hexadecimal. A newline is byte 10, `0x0a`. Files that are not text
+(images, executables, compressed data) are called **binary files**; the
+bytes mean something only to the program that knows their format.
+
+The same bytes can be read many ways. The four bytes `0x23 0x69 0x6e 0x63`
+are the text `#inc`. Read as one little-endian 32-bit integer they are
+1,668,180,259. Read as x86-64 machine code they are a pair of instructions.
+Nothing in the bytes says which. The program reading them decides.
+
+This is the most important idea in the whole book, and it explains bugs I
+have seen in JavaScript work: a file read with the wrong encoding shows
+garbage characters, a number read from a binary buffer with the wrong byte
+order is huge, a float's bytes read as an integer look random. Each is the
+right bits in the wrong context.
+
+### Worked example
+
+Here is my `hello.c`, the program the whole page follows:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("hello, world\n");
+    return 0;
+}
+```
+
+Dumping its first bytes with `od` shows the hexadecimal value of each byte
+over the character it stands for:
+
+```text
+$ od -A d -t x1 -c hello.c | head -4
+0000000  23  69  6e  63  6c  75  64  65  20  3c  73  74  64  69  6f  2e
+          #   i   n   c   l   u   d   e       <   s   t   d   i   o   .
+0000016  68  3e  0a  0a  69  6e  74  20  6d  61  69  6e  28  76  6f  69
+          h   >  \n  \n   i   n   t       m   a   i   n   (   v   o   i
+```
+
+The left column is the offset in decimal. Each pair of hex digits is one
+byte, and there is no magic: the file is 74 numbers in a row. The two `0a`
+bytes at offsets 18 and 19 are the newline that ends the `#include` line
+and the empty line after it.
+
+A realistic version of the same lesson: in Node, `Buffer.from("hé")` gives
+three bytes, `68 c3 a9`, because UTF-8 spends two bytes on `é`. Read those
+three bytes as Latin-1 instead and the screen shows `hÃ©`. Same bits,
+different context.
+
+### Step by step
+
+Reading the first byte of the file by hand:
+
+<Trace
+  columns={["Step", "What I look at", "Result"]}
+  rows={[
+    ["1", "byte at offset 0", "0x23"],
+    ["2", "split into two hex digits", "2 and 3"],
+    ["3", "each hex digit is four bits", "0010 0011"],
+    ["4", "as an unsigned number", "2 times 16 plus 3 = 35"],
+    ["5", "look 35 up in the ASCII table", "the character #"],
+    ["6", "the C preprocessor reads # at line start", "a directive follows"],
+  ]}
+  caption="One byte, read in three contexts. Rows 3 and 4 are the bits and the number; rows 5 and 6 are what two different readers make of the same value."
+/>
+
+### Common mistake
+
+The mistake is believing a value "is" a type. A JavaScript developer often
+assumes a string is characters, so `"é".length` must be 1. In fact
+JavaScript strings are UTF-16 code units, emoji take two, and the byte
+length on the wire is different again. The fix is to always ask which
+reader, which encoding, which byte order. When a value looks wrong, dump its
+bytes first, then decide which context was wrong.
+
+### In real systems
+
+Every serialisation format (JSON, Protocol Buffers, a PNG header, a
+Postgres row on disk) is a contract about context. Bugs at system
+boundaries, like a Python service writing big-endian integers and a Go
+service reading them little-endian, are context bugs. Binary formats start
+with **magic numbers** (fixed bytes such as `7f 45 4c 46` for an ELF
+executable) precisely so a reader can check the context before trusting the
+rest.
+
+### Check yourself
+
+1. What are the bytes of the text `Hi` followed by a newline, in hex?
+2. Why can't a program look at four bytes and know if they are an integer or a float?
+
+<details>
+<summary>Answer</summary>
+
+1. `48 69 0a`: `H` is 72, `i` is 105, newline is 10.
+2. Because both are just 32 bits. Every pattern is a valid integer and (almost) every pattern is a valid float; the type lives in the program, not in the bytes.
+
+</details>
+
+## 1.2 Programs Are Translated by Other Programs into Different Forms
+
+### In one sentence
+
+A C source file becomes a runnable program by passing through four
+programs in a row, the preprocessor, the compiler, the assembler and the
+linker, each turning one file format into the next.
+
+### The idea
+
+The processor cannot read C. It reads **machine code**: binary instructions
+in a format fixed by its **instruction set architecture** (the ISA, the
+contract between software and the chip; x86-64 here). Getting from C to
+machine code is a pipeline of translations, and the program `gcc` is a
+**compiler driver** that runs each stage for me.
+
+The **preprocessor** (`cpp`) handles every line starting with `#`. It
+pastes the whole of `stdio.h` in place of the `#include` line, expands
+macros, and drops comments. The output, `hello.i`, is still C, just much
+longer.
+
+The **compiler proper** (`cc1`) translates the C into **assembly language**:
+a text form of machine instructions, one per line, with human-readable
+names. The output is `hello.s`. Assembly is the first form that is specific
+to one ISA, and it is where chapter 3 lives.
+
+The **assembler** (`as`) turns each assembly line into its binary encoding
+and packs the result into a **relocatable object file**, `hello.o`. It is
+machine code, but addresses of things defined elsewhere, like `printf`, are
+left blank, as zeros, with a note saying "fill this in later".
+
+The **linker** (`ld`) combines `hello.o` with the pieces of the C library
+it needs, fills in every blank address, and writes an **executable object
+file**, `hello`, that the operating system can load and run. Chapter 7 is
+the whole story of this step.
+
+<Flow steps={["hello.c: C text", "cpp: hello.i, C text with headers pasted in", "cc1: hello.s, x86-64 assembly text", "as: hello.o, relocatable machine code", "ld plus libc: hello, executable"]} caption="The compilation system. Read left to right; every arrow is a separate program that gcc runs for me, and every box is a file I can open." />
+
+### Worked example
+
+`gcc -save-temps` keeps every intermediate file instead of deleting it:
+
+```text
+$ gcc -Og -save-temps hello.c -o hello
+$ ls -la hello.i hello.s hello.o hello
+-rwxr-xr-x 1 box box 15952 Oct 23 13:59 hello
+-rw-r--r-- 1 box box 23824 Oct 23 13:59 hello.i
+-rw-r--r-- 1 box box  1360 Oct 23 13:59 hello.o
+-rw-r--r-- 1 box box   427 Oct 23 13:59 hello.s
+$ wc -l hello.i
+912 hello.i
+```
+
+My six-line file became 912 lines after the preprocessor, almost all of it
+declarations from `stdio.h`. The assembly, with the directives trimmed, is
+short enough to read:
+
+```text
+main:
+    subq    $8, %rsp
+    leaq    .LC0(%rip), %rdi
+    call    puts@PLT
+    movl    $0, %eax
+    addq    $8, %rsp
+    ret
+```
+
+Two surprises sit in it. First, the compiler replaced `printf` with `puts`,
+because printing a constant string that ends in a newline is exactly what
+`puts` does, and it is cheaper. Second, `subq $8, %rsp` moves the stack
+pointer down eight bytes before the call; that keeps the stack aligned to 16
+bytes, which the calling convention requires at every `call` (chapter 3).
+
+The object file holds the same instructions as bytes. `objdump -d`
+disassembles them back:
+
+```text
+$ objdump -d hello.o
+0000000000000000 <main>:
+   0:   48 83 ec 08             sub    $0x8,%rsp
+   4:   48 8d 3d 00 00 00 00    lea    0x0(%rip),%rdi
+   b:   e8 00 00 00 00          call   10 <main+0x10>
+  10:   b8 00 00 00 00          mov    $0x0,%eax
+  15:   48 83 c4 08             add    $0x8,%rsp
+  19:   c3                      ret
+```
+
+Look at the `00 00 00 00` in the `lea` and `call` lines. Those are the
+blanks: the assembler does not know where the string or `puts` will live.
+After linking, the same instructions in `hello` read:
+
+```text
+    113d:   48 8d 3d c0 0e 00 00    lea    0xec0(%rip),%rdi
+    1144:   e8 e7 fe ff ff          call   1030 <puts@plt>
+```
+
+The linker filled them in. `c0 0e 00 00` is the little-endian number
+`0x0ec0`, the distance from the next instruction to the string. That
+filling-in is called **relocation**.
+
+### Step by step
+
+<Trace
+  columns={["Stage", "Program", "Input", "Output", "What changed"]}
+  rows={[
+    ["1", "cpp", "hello.c (6 lines)", "hello.i (912 lines)", "#include replaced by the header's text"],
+    ["2", "cc1", "hello.i", "hello.s", "C turned into x86-64 assembly; printf became puts"],
+    ["3", "as", "hello.s", "hello.o (1,360 bytes)", "text instructions encoded as bytes; addresses left as zeros"],
+    ["4", "ld", "hello.o plus libc", "hello (15,952 bytes)", "blanks filled in, startup code added, ELF headers written"],
+  ]}
+  caption="The four stages on my machine. The sizes are from my run; watch the 'what changed' column, which is the work each tool does."
+/>
+
+### Common mistake
+
+The common mistake is treating "compile" as one step, so that every error
+looks the same. In fact the stage tells you the cause. "Fatal error:
+stdio.h: no such file" is the preprocessor. "Expected ';'" is the compiler.
+"Undefined reference to `foo`" is the linker: the code compiled fine, but no
+object file defined `foo`. The fix is to read which program printed the
+error, and look in that stage.
+
+### In real systems
+
+TypeScript projects have the same shape with different names: `tsc` or
+`esbuild` is the compiler, a bundler like Rollup is the linker (it resolves
+`import` names across files and drops unused code), and the output bundle is
+the executable. Native Node add-ons go through exactly this C pipeline,
+which is why a missing `.so` breaks `npm install` with a linker error.
+
+### Check yourself
+
+1. Which stage first produces something specific to x86-64?
+2. Why does `hello.o` contain zeros where `printf`'s address should be?
+
+<details>
+<summary>Answer</summary>
+
+1. The compiler proper, which writes `hello.s` in x86-64 assembly. The `.i` file is still portable C.
+2. Because `puts` is defined in the C library, not in `hello.c`. The assembler cannot know its address; the linker fills it in.
+
+</details>
+
+## 1.3 It Pays to Understand How Compilation Systems Work
+
+### In one sentence
+
+Knowing what the compiler and linker actually do lets me write faster code,
+understand link-time errors, and avoid a whole class of security holes.
+
+### The idea
+
+The book names three reasons, and each one is a later chapter.
+
+**Optimising performance.** A modern compiler is good, but it can only do
+what it can prove is safe. Knowing the machine code it produces tells me
+whether a `switch` is faster than a chain of `if`s, whether a function call
+costs anything, whether a `while` loop is better than a `for`. Chapters 3
+and 5 answer these with real assembly and cycle counts.
+
+**Understanding link-time errors.** Some of the most confusing bugs are
+linker bugs: two files defining the same global name, libraries listed in
+the wrong order on the command line, a static and a shared library
+disagreeing. Chapter 7 explains the rules that make these predictable.
+
+**Avoiding security holes.** Buffer overflows, where a program writes past
+the end of an array on the stack, were for decades the most common way to
+break into machines. Understanding how data and control information sit
+together on the stack (chapter 3) is the only way to see why they are
+dangerous and what the defences do.
+
+### Worked example
+
+A simple example of the first reason. These two functions look like they
+should cost the same:
+
+```c
+long sum1(long *a, long n) { long s = 0; for (long i = 0; i < n; i++) s += a[i]; return s; }
+long sum2(long *a, long n, long *out) { *out = 0; for (long i = 0; i < n; i++) *out += a[i]; return *out; }
+```
+
+At `-O2`, `sum1` keeps `s` in a register. `sum2` has to store to `*out` on
+every iteration, because the compiler cannot prove `out` does not point
+into `a` (that possibility is called **aliasing**). Chapter 5 measures the
+difference; it is several times slower on long arrays.
+
+A realistic example of the second reason: on Linux, `gcc -lm main.c` can
+fail with "undefined reference to `sqrt`" while `gcc main.c -lm` works. The
+linker reads files left to right and only pulls from a library what is
+already missing, so a library listed before the code that needs it is
+ignored.
+
+### Step by step
+
+How I decide which of the three reasons a problem belongs to:
+
+<Flow steps={["Symptom appears", "Slow? read the assembly and measure (chapters 3, 5)", "Fails to build or crashes on start? read the linker's message (chapter 7)", "Crashes on unusual input? suspect memory safety (chapters 3, 9)"]} caption="A triage path. Each branch points to the chapter whose model explains that kind of symptom." />
+
+### Common mistake
+
+The mistake is "the compiler is smarter than me, so I do not need to know".
+It is smarter at register allocation and instruction choice. It is not
+allowed to change what my program means, so aliasing, function calls with
+side effects, and memory order limit it. The fix is to look: `gcc -O2 -S`
+or Compiler Explorer, then measure.
+
+### In real systems
+
+V8 is an optimising compiler with the same limits. A JavaScript function
+that sees objects of many shapes cannot be specialised, just as a C loop
+with possible aliasing cannot be vectorised. Production profiling at large
+companies routinely finds hot loops where the fix was making the compiler's
+proof easy.
+
+### Check yourself
+
+1. Why can't the compiler keep `*out` in a register in `sum2`?
+
+<details>
+<summary>Answer</summary>
+
+1. Because `out` might point to an element of `a`. If it did, each store would change a value the loop reads later, so the compiler must write and reread memory to keep the program's meaning.
+
+</details>
+
+## 1.4 Processors Read and Interpret Instructions Stored in Memory
+
+### In one sentence
+
+Running a program means the processor fetching one instruction at a time
+from memory, doing what it says, and moving on, while data moves between
+the disk, memory, the processor and the display over buses.
+
+### The idea
+
+When I type `./hello` into a shell, the shell (itself a program) reads my
+command, asks the operating system to load the `hello` file, and waits for
+it to finish. To see what happens next, I need the parts of the machine.
+
+### 1.4.1 Hardware Organization of a System
+
+Four kinds of hardware matter.
+
+**Buses** are the wires that carry bytes between components. They move a
+fixed-size chunk at a time called a **word**; on x86-64 a word for this
+purpose is 8 bytes (64 bits). The word size is a basic parameter of a
+machine.
+
+**I/O devices** connect the system to the outside world: keyboard, mouse,
+display, disk, network. Each is attached to the I/O bus through a
+**controller** (a chipset on the motherboard) or an **adapter** (a card in a
+slot). Their job is to move bytes between the device and the bus.
+
+**Main memory** is a temporary store that holds the program and its data
+while it runs. Physically it is DRAM chips (dynamic random access memory,
+chapter 6). Logically it is one long array of bytes, each with its own
+**address**, starting at zero.
+
+The **processor** (CPU, central processing unit) is the engine. At its core
+is a word-sized register called the **program counter** (PC), which holds
+the address of the next instruction. From power-on until power-off the
+processor repeats one loop: read the instruction at the PC, interpret its
+bits, do the simple operation it names, and set the PC to the next
+instruction. The operations are few and simple: **load** a word from memory
+into a register, **store** a register to memory, **operate** (add, compare,
+shift) using the **ALU** (arithmetic/logic unit) on registers, and
+**jump** by writing a new value into the PC. The registers live in a small
+**register file**, a few dozen word-sized storage slots inside the CPU.
+
+<Figure art={`
+ +----------------------- CPU -----------------------+
+ |  +----------------+   +-----+   +----------------+ |
+ |  | register file  |<->| ALU |   | PC  0x1139     | |
+ |  +----------------+   +-----+   +----------------+ |
+ |            ^                                        |
+ |            | bus interface                          |
+ +------------+---------------------------------------+
+              | system bus
+       +------+-------+  memory bus  +--------------+
+       | I/O bridge   |<------------>| main memory  |
+       +------+-------+              | (DRAM)       |
+              | I/O bus              +--------------+
+   +----------+-----------+-----------------+
+   |          |           |                 |
+ +-----+  +--------+  +---------+    +-------------+
+ | USB |  |graphics|  |  disk   |    | expansion   |
+ | kbd |  |display |  | ctrl    |    | slots (NIC) |
+ +-----+  +--------+  +---------+    +-------------+
+`} caption="The hardware of a typical system. Follow the bus lines: every byte the program touches moves along one of them, and the I/O bridge is the junction between the fast and slow sides." />
+
+The real processor is far more complex inside (chapter 4 builds one,
+chapter 5 shows the out-of-order engine in modern chips). But the
+**instruction set architecture** promises that each instruction behaves as
+if it ran alone and in order. That promise is what lets the same program run
+on a cheap laptop and a server, and it is the first great abstraction of the
+book: the **microarchitecture** (how the chip is built) is hidden behind the
+ISA (what the chip promises).
+
+### 1.4.2 Running the hello Program
+
+The run happens in three movements of bytes.
+
+First, as I type `./hello`, the shell reads each character from the
+keyboard into a register and then stores it in memory. Second, when I press
+Enter, the shell asks the OS to load the executable: the bytes of code and
+the string `hello, world\n` are copied from disk into main memory. Using a
+technique called **direct memory access** (DMA), the disk controller copies
+the data straight into memory without passing through the processor.
+Third, the processor starts executing `main`'s instructions. Those
+instructions copy the 13 bytes of the string from memory into registers and
+out to the display device, where they become pixels.
+
+### Worked example
+
+I can watch the third movement's last step with `strace`, which prints every
+request a program makes to the operating system:
+
+```text
+$ strace ./hello 2>&1 | tail -4
+brk(0x55de5758b000)                     = 0x55de5758b000
+write(1, "hello, world\n", 13hello, world
+)          = 13
+exit_group(0)                           = ?
+```
+
+The whole program, after the library's startup work, comes down to one
+`write` of 13 bytes to file descriptor 1 (the terminal) and an exit. Counting
+every request with `strace -c` shows 34 system calls in total; most are the
+dynamic loader mapping the C library into memory (`mmap`, `openat`,
+`mprotect`). The program I wrote is the last two.
+
+A second, realistic view: `gdb` can stop the processor at `main` and show
+the program counter:
+
+```text
+$ gdb -q -batch -ex 'break main' -ex run -ex 'print $pc' -ex 'x/3i $pc' \
+      -ex stepi -ex 'print $pc' ./hello
+Breakpoint 1, 0x0000555555555139 in main ()
+$1 = (void (*)()) 0x555555555139 <main>
+=> 0x555555555139 <main>:     sub    $0x8,%rsp
+   0x55555555513d <main+4>:   lea    0xec0(%rip),%rdi   # 0x555555556004
+   0x555555555144 <main+11>:  call   0x555555555030 <puts@plt>
+0x000055555555513d in main ()
+$2 = (void (*)()) 0x55555555513d <main+4>
+```
+
+The PC holds the address of the `sub` instruction. Each `stepi` advances it
+by the length of the instruction just run: 4 bytes, then 7, then 5.
+
+### Step by step
+
+<Trace
+  columns={["Step", "PC before", "Instruction", "Effect", "PC after"]}
+  rows={[
+    ["1", "0x1139", "sub $0x8,%rsp", "stack pointer drops 8 bytes", "0x113d (+4)"],
+    ["2", "0x113d", "lea 0xec0(%rip),%rdi", "rdi = address of the string", "0x1144 (+7)"],
+    ["3", "0x1144", "call puts@plt", "push return address, jump", "0x1030"],
+    ["4", "(inside puts)", "...", "write(1, ..., 13) system call", "back to 0x1149"],
+    ["5", "0x1149", "mov $0x0,%eax", "return value 0", "0x114e (+5)"],
+    ["6", "0x114e", "add $0x8,%rsp", "stack pointer restored", "0x1152 (+4)"],
+    ["7", "0x1152", "ret", "pop return address into PC", "caller in libc"],
+  ]}
+  caption="The fetch-execute loop on main. Watch the last column: the PC normally grows by the instruction's length, and only call and ret write it directly."
+/>
+
+### Common mistake
+
+The mistake is picturing the program as "running on the CPU" while it sits
+on disk. It does not. The executable is copied into memory first, and the
+CPU only ever fetches from memory (through caches). The fix is to keep
+three locations in mind for every byte: disk, memory, register. Most
+performance questions are questions about which of those a byte is in.
+
+### In real systems
+
+Cold start time in serverless functions is this second movement of bytes:
+loading code from storage into memory. That is why smaller bundles start
+faster and why platforms keep warm instances around. DMA is why a server can
+stream a file to a network card while the CPU does other work.
+
+### Check yourself
+
+1. Which register always says where the next instruction is?
+2. In which step of running hello does the disk controller write directly to memory?
+
+<details>
+<summary>Answer</summary>
+
+1. The program counter, called `%rip` on x86-64.
+2. When the executable is loaded, before any of its instructions run. DMA copies the file's code and data into memory without the processor.
+
+</details>
+
+## 1.5 Caches Matter
+
+### In one sentence
+
+Because the processor is much faster than main memory, small fast memories
+called caches keep recently used data close, and code that reuses nearby
+data runs many times faster.
+
+### The idea
+
+The tour shows a lot of copying: disk to memory, memory to registers,
+registers to the display. Every copy costs time, so system designers work
+to make copying fast. They meet a physical rule: larger storage is slower,
+and faster storage costs more per byte. A register file holds a few hundred
+bytes and is read in under a cycle. Main memory holds gigabytes and takes
+on the order of a hundred cycles. A disk is larger again and slower by
+orders of magnitude.
+
+The gap between processor and memory grows every year, so designers put
+**cache memories** between them: L1, a few tens of kilobytes, almost as
+fast as a register; L2, hundreds of kilobytes to a few megabytes; L3,
+megabytes, shared by the cores. They are built from **SRAM** (static RAM),
+faster and costlier than DRAM.
+
+Caches work because of **locality**: programs tend to reuse data they used
+recently (**temporal locality**) and to use data near what they just used
+(**spatial locality**). The hardware moves memory in blocks of 64 bytes
+called **cache lines**, so touching one byte brings its 63 neighbours along
+for free. A program that walks memory in order uses every byte of every
+line it pays for.
+
+### Worked example
+
+My box reports a 64-byte line and per-core L1 and L2 caches:
+
+```text
+$ getconf -a | grep LEVEL1_DCACHE_LINESIZE
+LEVEL1_DCACHE_LINESIZE             64
+```
+
+The simplest demonstration sums the same 4096 by 4096 array of `int`s
+twice, once along rows and once down columns:
+
+```c
+for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) s += a[i][j];  /* row order    */
+for (int j = 0; j < N; j++) for (int i = 0; i < N; i++) s += a[i][j];  /* column order */
+```
+
+```text
+$ gcc -O1 rowcol.c -o rowcol && ./rowcol
+sum=33554432 row-major 0.012 s, column-major 0.144 s
+```
+
+Same additions, same array, about twelve times slower. C stores
+`a[i][j]` and `a[i][j+1]` next to each other, so row order uses all 16
+`int`s of each 64-byte line. Column order jumps 16 KB between accesses,
+touches one `int` per line, and the line has usually been evicted before
+the loop comes back for its neighbour.
+
+### Step by step
+
+<Trace
+  columns={["Access", "Row order address", "Line", "Column order address", "Line"]}
+  rows={[
+    ["1", "a[0][0] = base+0", "0 (miss)", "a[0][0] = base+0", "0 (miss)"],
+    ["2", "a[0][1] = base+4", "0 (hit)", "a[1][0] = base+16384", "256 (miss)"],
+    ["3", "a[0][2] = base+8", "0 (hit)", "a[2][0] = base+32768", "512 (miss)"],
+    ["16", "a[0][15] = base+60", "0 (hit)", "a[15][0] = base+245760", "3840 (miss)"],
+    ["17", "a[0][16] = base+64", "1 (miss)", "a[16][0] = base+262144", "4096 (miss)"],
+  ]}
+  caption="The first accesses of each loop. Line is the address divided by 64. Row order misses once per 16 accesses; column order misses on every one."
+/>
+
+### Common mistake
+
+The mistake is counting operations and ignoring memory. Both loops do
+16,777,216 additions, so a big-O count calls them equal. The fix is to count
+cache lines touched as well as operations, which chapter 6 turns into a
+precise model.
+
+### In real systems
+
+Typed arrays in JavaScript, columnar databases like DuckDB and ClickHouse,
+and the "struct of arrays" layout in game engines all exist because walking
+memory in order is so much faster. An array of small objects in V8 is an
+array of pointers to scattered heap objects, which is why a `Float64Array`
+can beat it by a wide margin on numeric loops.
+
+### Check yourself
+
+1. Why does touching `a[0][0]` make `a[0][1]` cheap?
+
+<details>
+<summary>Answer</summary>
+
+1. Because the cache loads the whole 64-byte line containing `a[0][0]`, and `a[0][1]` sits 4 bytes later in the same line.
+
+</details>
+
+## 1.6 Storage Devices Form a Hierarchy
+
+### In one sentence
+
+Storage is arranged as a pyramid from small, fast and expensive at the top
+to large, slow and cheap at the bottom, and each level acts as a cache for
+the level below.
+
+### The idea
+
+Put the pieces together and they form the **memory hierarchy**. Registers
+sit on top. Then L1, L2 and L3 caches. Then main memory. Then local disks
+(SSDs and spinning drives). At the bottom, remote storage: other machines'
+disks reached over a network, cloud object stores.
+
+The organising idea is that **each level caches the one below**. Registers
+cache words from L1. L1 caches lines from L2. Main memory caches blocks from
+disk (that is virtual memory, chapter 9). A local disk caches files from a
+network server. A web browser's disk cache caches pages from a server
+across the world.
+
+<Layers caption="The memory hierarchy. Going down, each level is bigger, slower and cheaper per byte, and each level holds copies of data from the level below it." layers={[
+  { name: "L0: registers", note: "hundreds of bytes, under one cycle" },
+  { name: "L1 cache (SRAM)", note: "tens of KB per core, a few cycles" },
+  { name: "L2 cache (SRAM)", note: "up to a few MB per core, around ten cycles" },
+  { name: "L3 cache (SRAM)", note: "tens to hundreds of MB shared, tens of cycles" },
+  { name: "Main memory (DRAM)", note: "GB, around a hundred cycles" },
+  { name: "Local secondary storage (SSD, disk)", note: "TB, microseconds to milliseconds" },
+  { name: "Remote storage (network, object stores)", note: "unbounded, milliseconds and up" },
+]} />
+
+The cycle figures are orders of magnitude, not measurements; chapter 6
+gives the measured shape on a real machine (the memory mountain on the
+book's cover).
+
+### Worked example
+
+A simple example: `lscpu` on my box shows the cache levels it has.
+
+```text
+L1d cache:   384 KiB (8 instances)
+L2 cache:    16 MiB (8 instances)
+L3 cache:    320 MiB (1 instance)
+```
+
+Eight cores, each with 48 KB of L1 data cache and 2 MB of L2, and one shared
+L3. A realistic example of a lower level caching a higher one: when I run a
+build twice, the second is faster because the operating system kept the
+source files in its **page cache**, main memory acting as a cache for the
+disk.
+
+### Step by step
+
+What happens when the program reads a value that is only on disk:
+
+<Flow steps={["Register needs value", "L1 miss", "L2 miss", "L3 miss", "DRAM: page not present", "OS reads block from disk into DRAM", "line copied up into L3, L2, L1", "value lands in a register"]} caption="One read that misses at every level. Each miss asks the level below; on the way back, each level keeps a copy so the next read stops higher up." />
+
+### Common mistake
+
+The mistake is to treat the hierarchy as a hardware detail with no bearing
+on design. In fact the same idea, a small fast copy in front of a big slow
+store, is every cache I build: Redis in front of Postgres, a CDN in front of
+an origin. The fix is to recognise the pattern and ask the same questions
+at every level: what is the block size, what gets evicted, what happens on a
+write.
+
+### In real systems
+
+Latency numbers like "a main memory reference is around 100 ns, a datacentre
+round trip is around 500 µs" are the hierarchy at system scale. A service
+that makes one database call per item in a loop is the column-order loop of
+section 1.5 at a bigger level.
+
+### Check yourself
+
+1. Which level acts as a cache for local disk?
+
+<details>
+<summary>Answer</summary>
+
+1. Main memory: the operating system keeps recently used disk blocks in DRAM, as the page cache and as virtual memory pages.
+
+</details>
+
+## 1.7 The Operating System Manages the Hardware
+
+### In one sentence
+
+The operating system sits between every program and the hardware, and
+gives each program three illusions: that it has the processor to itself
+(a process), all of memory to itself (virtual memory), and that every
+device is a file.
+
+### The idea
+
+Neither the shell nor `hello` touched the keyboard, disk or display
+directly. They asked the **operating system** (OS) to do it. The OS has two
+jobs: protect the hardware from runaway programs, and give programs simple,
+uniform ways to use complicated, varied hardware. It does both through
+three abstractions, and the book's later chapters each open one up.
+
+<Layers caption="The three abstractions of the OS, each covering more of the machine. Files cover I/O devices; virtual memory covers memory plus devices; a process covers the processor, memory and devices together." layers={[
+  { name: "Process", note: "covers the processor, main memory and I/O devices: chapter 8" },
+  { name: "Virtual memory", note: "covers main memory and disk: chapter 9" },
+  { name: "Files", note: "cover I/O devices: chapter 10" },
+  { name: "Hardware", note: "processor, main memory, I/O devices" },
+]} />
+
+### 1.7.1 Processes
+
+A **process** is the OS's abstraction of a running program. Many processes
+run at the same time on one machine, and each believes it is alone: it has
+the processor, memory and devices to itself. In fact a single core runs one
+process at a time and switches between them many times a second; that
+interleaving is called **concurrent** execution.
+
+The switch is a **context switch**. The **context** is everything the
+process needs to continue: the PC, the register file, the contents of
+memory. To switch, the OS saves the current process's context, restores the
+next one's, and hands it the processor. The piece of the OS that does this,
+and everything else on programs' behalf, is the **kernel**: not a separate
+process, but code that is always resident in memory and runs whenever a
+program makes a **system call** (a deliberate request to the OS, like
+`write`) or the hardware raises an interrupt.
+
+#### Worked example: two processes, one variable
+
+`fork` (chapter 8) creates a copy of the running process. Each copy has
+its own memory, even at the same address:
+
+```c
+int counter = 0;   /* each process gets its own copy */
+
+int main(void) {
+    pid_t pid = fork();
+    if (pid == 0) {                 /* child */
+        counter += 10;
+        printf("child  pid=%d counter=%d &counter=%p\n", getpid(), counter, (void *)&counter);
+        return 0;
+    }
+    waitpid(pid, NULL, 0);          /* parent waits for the child */
+    counter += 1;
+    printf("parent pid=%d counter=%d &counter=%p\n", getpid(), counter, (void *)&counter);
+    return 0;
+}
+```
+
+```text
+$ gcc -no-pie -Og procs.c -o procs && ./procs
+child  pid=228078 counter=10 &counter=0x404034
+parent pid=228077 counter=1 &counter=0x404034
+```
+
+Both print the same address, `0x404034`, yet hold different values. That is
+only possible if the address is not a physical location in RAM. It is a
+**virtual address**, private to each process, which is section 1.7.3.
+
+<Trace
+  columns={["Time", "Running", "Kernel action", "Saved context"]}
+  rows={[
+    ["t0", "shell", "shell calls execve-style loading for hello", "none"],
+    ["t1", "shell", "shell calls waitpid and blocks", "shell's PC and registers saved"],
+    ["t2", "hello", "context of hello restored; runs main", "shell"],
+    ["t3", "hello", "write system call: kernel runs on hello's behalf", "shell"],
+    ["t4", "hello", "exit: kernel frees hello's memory", "shell"],
+    ["t5", "shell", "shell's context restored; waitpid returns", "none"],
+  ]}
+  caption="Context switches while the shell runs hello. Watch the Running column: only one program has the core at a time, and the kernel is the hand that passes it over."
+/>
+
+### 1.7.2 Threads
+
+A process can contain several **threads**, flows of control that share the
+process's code and global data but each have their own stack and registers.
+Threads are cheaper to create and switch than processes, and sharing memory
+makes it easy to share data. That ease is also the danger:
+
+```c
+int counter = 0;   /* one copy, shared by every thread */
+
+static void *work(void *arg) {
+    for (int i = 0; i < 1000000; i++) counter++;   /* not atomic */
+    return arg;
+}
+/* main starts two threads running work, then joins both */
+```
+
+```text
+$ gcc -O0 -pthread threads.c -o threads && ./threads; ./threads; ./threads
+expected 2000000, got 1060525
+expected 2000000, got 1009641
+expected 2000000, got 1007999
+```
+
+`counter++` is three steps for the machine: load, add one, store. Two
+threads interleave those steps, and one thread's store overwrites the
+other's. This is a **data race**, and chapter 12 is how to prevent it.
+
+<Trace
+  columns={["Step", "Thread A", "Thread B", "counter in memory"]}
+  rows={[
+    ["1", "load counter (5) into register", "", "5"],
+    ["2", "", "load counter (5) into register", "5"],
+    ["3", "add 1: register is 6", "", "5"],
+    ["4", "", "add 1: register is 6", "5"],
+    ["5", "store 6", "", "6"],
+    ["6", "", "store 6", "6"],
+  ]}
+  caption="One lost update. Two increments ran, but the counter grew by one, because both threads read 5 before either stored. Repeat that a million times and you get the numbers above."
+/>
+
+### 1.7.3 Virtual Memory
+
+**Virtual memory** gives each process the illusion that it has the whole
+memory to itself, laid out the same way every time. Each process sees a
+**virtual address space**. On Linux it runs, from low addresses to high:
+the program's code and read-only data, its read/write data (globals like
+`counter`), the **heap** that `malloc` grows upward, a region for **shared
+libraries** like the C library, the **user stack** that grows downward with
+each function call, and at the very top the kernel's own memory, which user
+code cannot touch.
+
+<Figure art={`
+ high  +------------------------------+
+       | kernel virtual memory        |  invisible to user code
+       +------------------------------+
+       | user stack (grows down)      |  locals, return addresses
+       |              |               |
+       |              v               |
+       |                              |
+       | memory-mapped region         |  libc.so, other shared libs
+       |                              |
+       |              ^               |
+       |              |               |
+       | run-time heap (malloc)       |  grows up
+       +------------------------------+
+       | read/write data (.data,.bss) |  globals: counter at 0x404034
+       +------------------------------+
+       | read-only code and data      |  main, the hello string
+ low   +------------------------------+  0x400000 (non-PIE build)
+`} caption="A Linux process's virtual address space. Read from the bottom: code first, then globals, then the heap growing up toward the stack growing down." />
+
+I can see a real map for any process in `/proc/self/maps`. For `cat`
+reading its own map, the first lines were:
+
+```text
+5560ce5ca000-5560ce5cc000 r--p 00000000 fe:10 9216    /usr/bin/cat
+5560ce5cc000-5560ce5d2000 r-xp 00002000 fe:10 9216    /usr/bin/cat
+5560f85e0000-5560f8601000 rw-p 00000000 00:00 0       [heap]
+7f01cb51f000-7f01cb682000 r-xp 00028000 fe:10 22957   /usr/lib/x86_64-linux-gnu/libc.so.6
+```
+
+Each line is a region: its address range, its permissions (`r-xp` is read
+and execute, the code), and the file it came from. The hardware translates
+every virtual address to a physical one, using tables the OS maintains;
+chapter 9 shows how.
+
+### 1.7.4 Files
+
+A **file** is just a sequence of bytes. Every I/O device, including disks,
+keyboards, displays and even network connections, is presented as a file,
+and every input and output is reading and writing files through a small set
+of system calls (**Unix I/O**, chapter 10). This is why `hello` printing to
+the terminal was a `write` to descriptor 1, and why the same program can
+print into a file with `./hello > out.txt` without any change.
+
+### Worked example
+
+A realistic look at all three illusions at once: `strace -c ./hello` showed
+`execve` (create the process image), eight `mmap` calls (build the virtual
+memory map, including the C library), and one `write` (use a file). The OS's
+three abstractions are visible in one program's system calls.
+
+### Step by step
+
+<Flow steps={["Program calls write(1, buf, 13)", "CPU switches to kernel mode", "Kernel looks up descriptor 1: the terminal", "Terminal driver copies the 13 bytes", "Kernel returns 13 to the program", "CPU back in user mode"]} caption="One system call from start to end. The switch into the kernel and back is a controlled crossing; chapter 8 shows the exception mechanism behind it." />
+
+### Common mistake
+
+Mistake one: thinking threads are "lighter processes" that are always
+better. Sharing memory means sharing bugs, as the race above shows.
+Mistake two: thinking an address printed by a program is a location in
+RAM. It is virtual; two processes can print the same address for different
+data. The fix for both is the same model: a process owns an address space,
+threads share one.
+
+### In real systems
+
+Node runs JavaScript on one thread, but libuv uses a pool of threads for
+file I/O and DNS, and `worker_threads` adds more. Chrome runs each site in
+its own process so one tab's memory bug cannot read another's data. Docker
+containers are processes with their own view of files and network, built on
+these same OS abstractions.
+
+### Check yourself
+
+1. Two processes print the same address for a variable with different values. How?
+2. Why did the thread counter come out near one million, not two?
+
+<details>
+<summary>Answer</summary>
+
+1. The address is virtual. Each process has its own address space, and the hardware maps the same virtual address to different physical memory for each.
+2. Because `counter++` is a load, an add and a store, and the two threads' steps interleave so that many increments overwrite each other.
+
+</details>
+
+## 1.8 Systems Communicate with Other Systems Using Networks
+
+### In one sentence
+
+From one machine's point of view, the network is just another I/O device:
+data copied to the network adapter leaves for another machine, and data
+from it arrives as bytes to read.
+
+### The idea
+
+The network adapter sits on the I/O bus like a disk controller. When a
+program sends bytes, the OS copies them from memory to the adapter, which
+puts them on the wire. When bytes arrive, the adapter copies them into
+memory (by DMA, again) and the OS hands them to the program as a file it
+can read. Because the OS presents a connection as a file descriptor, the
+same `read` and `write` calls work.
+
+The book's example is `telnet` to a remote machine: the local client sends
+the keystrokes of `hello`, the remote server runs it, and sends the 13
+bytes of output back to be shown locally. Chapter 11 builds a small web
+server that works the same way.
+
+### Worked example
+
+The simplest demonstration on my box is a pair of shell commands, a
+listener and a sender, over the local machine's network stack:
+
+```text
+$ nc -l 9000 > got.txt &                            # listener first
+$ printf 'hello, world\n' | nc -N 127.0.0.1 9000    # sender
+$ cat got.txt
+hello, world
+```
+
+The 13 bytes went from one process's memory, into the kernel, through the
+TCP/IP stack, and back out to another process. A realistic case is any HTTP
+request my code makes: `fetch()` in Node becomes a `connect` and a `write`
+on a socket descriptor, just like `hello`'s `write` to descriptor 1.
+
+### Step by step
+
+<Flow steps={["user types hello on the local client", "client sends the string to the remote server", "server passes it to a shell that runs hello", "hello writes 13 bytes to its output", "server sends the output back over the network", "client writes it to the local display"]} caption="Running hello on a remote machine. The local side never runs hello; it only copies bytes between the keyboard, the network adapter and the display." />
+
+### Common mistake
+
+The mistake is to forget that a network "file" behaves differently from a
+disk file: a `read` can return fewer bytes than asked for, because the rest
+has not arrived yet. Chapter 10 calls these **short counts**. The fix is to
+loop until you have what you need, which is what the book's Rio package
+does.
+
+### In real systems
+
+Every microservice call is this section: bytes copied to an adapter and
+back. A network round trip within a datacentre is many thousands of times
+slower than a memory access, which is why batching and caching across the
+network matter far more than micro-optimising code.
+
+### Check yourself
+
+1. Why can a program use `write` both to print and to send over the network?
+
+<details>
+<summary>Answer</summary>
+
+1. Because the OS presents both the terminal and a network connection as file descriptors, so the same Unix I/O calls work on both.
+
+</details>
+
+## 1.9 Important Themes
+
+The tour ends with three ideas that thread through the whole book.
+
+### In one sentence
+
+Speeding up one part of a system is bounded by how much of the time that
+part takes (Amdahl's law), real speed-ups come from doing things at the
+same time at several levels, and abstractions are what make a system this
+complicated usable at all.
+
+### The idea
+
+#### 1.9.1 Amdahl's Law
+
+Gene Amdahl's observation is simple: if I speed up part of a system, the
+overall gain depends on how big that part was. Say a task takes time T, a
+fraction α (alpha) of it is the part I improve, and I make that part k times
+faster. The new time is the untouched part, (1 − α)T, plus the improved
+part, αT/k. The speed-up S is the old time divided by the new:
+
+```text
+S = T / ((1 − α)T + αT/k) = 1 / ((1 − α) + α/k)
+```
+
+The striking case is k going to infinity, a part made free. Then S becomes
+1 / (1 − α). If the part was 90% of the time, the best possible speed-up is
+ten times, no matter how much effort goes in. To speed the whole thing up a
+lot, I must speed up a very large fraction of it.
+
+#### 1.9.2 Concurrency and Parallelism
+
+**Concurrency** is the general idea of a system with several activities in
+progress at once. **Parallelism** is using concurrency to make a system run
+faster, by actually doing things at the same instant. The book names three
+levels.
+
+**Thread-level concurrency.** Several processes or threads in progress at
+once. On one core this is interleaving by context switch. With **multi-core**
+processors (several CPUs on one chip, each with its own L1 and L2 caches,
+sharing L3) and **hyperthreading** (one core keeping the state of two
+threads and switching between them each cycle), threads genuinely run in
+parallel.
+
+**Instruction-level parallelism.** Inside one core, modern processors run
+many instructions at once: a **pipeline** overlaps the steps of successive
+instructions (chapter 4), and a **superscalar** processor issues more than
+one instruction per cycle (chapter 5).
+
+**Single instruction, multiple data (SIMD).** One instruction operates on
+several values at once, such as adding eight pairs of floats in one go.
+Compilers use SIMD when they can vectorise a loop.
+
+<Layers caption="Three levels of parallelism, from the coarsest at the top to the finest at the bottom. Each is a separate chapter's tool for speed." layers={[
+  { name: "Thread-level: multiple cores, hyperthreading", note: "many flows of control; chapter 12" },
+  { name: "Instruction-level: pipelining, superscalar", note: "many instructions in flight per core; chapters 4 and 5" },
+  { name: "Data-level: SIMD", note: "one instruction, many values; vector registers in chapter 3" },
+]} />
+
+#### 1.9.3 The Importance of Abstractions in Computer Systems
+
+An **abstraction** is a simple interface that hides a complicated
+implementation. A function's signature hides its body. The instruction set
+hides the microarchitecture. Files hide I/O devices, virtual memory hides
+main memory and disks, processes hide the whole running program. The book
+adds one more: the **virtual machine**, which hides an entire computer,
+operating system and all, so several can run on one physical machine.
+
+Abstractions are why I can write a web app without thinking about DRAM
+refresh. They also leak, and the book's purpose is that I can look one
+layer down when they do.
+
+### Worked example
+
+A simple Amdahl calculation, computed by a small C program:
+
+```c
+static double amdahl(double a, double k) { return 1.0 / ((1.0 - a) + a / k); }
+```
+
+```text
+$ ./amdahl
+   a |   k=2    k=4    k=10   k=inf
+0.50 |   1.33   1.60   1.82   2.00
+0.80 |   1.67   2.50   3.57   5.00
+0.90 |   1.82   3.08   5.26  10.00
+0.95 |   1.90   3.48   6.90  20.00
+```
+
+Read the 0.80 row. Making 80% of the program four times faster gives 2.5
+times overall. Making it infinitely fast gives only 5.
+
+A realistic case: an API endpoint takes 200 ms, of which 120 ms is a
+database query and 80 ms is JSON serialisation and network. A new index
+makes the query three times faster. α is 0.6, k is 3, so S is
+1 / (0.4 + 0.2) ≈ 1.67: the endpoint drops to 120 ms, not to 40.
+
+### Step by step
+
+<Trace
+  columns={["Step", "Quantity", "Value"]}
+  rows={[
+    ["1", "old time T", "200 ms"],
+    ["2", "fraction improved α", "120 / 200 = 0.6"],
+    ["3", "untouched time (1 − α)T", "80 ms"],
+    ["4", "improved part αT / k with k = 3", "40 ms"],
+    ["5", "new time", "80 + 40 = 120 ms"],
+    ["6", "speed-up S", "200 / 120 ≈ 1.67"],
+    ["7", "limit as k grows without bound", "200 / 80 = 2.5"],
+  ]}
+  caption="Amdahl's law on the endpoint example, one quantity per row. Row 7 is the ceiling: even a free query leaves the 80 ms that was never touched."
+/>
+
+### Common mistake
+
+The common mistake with Amdahl is optimising what is easy to optimise, not
+what is big. A developer spends a week making a function ten times faster,
+and it was 3% of the time: the program gets 2.8% faster. The fix is to
+profile first and compute α before writing any code. The common mistake with
+concurrency is to say "parallel" when the work is only interleaved on one
+core, and expect a speed-up that cannot come.
+
+### In real systems
+
+Amdahl's law is why adding servers to a system with a shared database stops
+helping, why a build with one serial step cannot be parallelised past that
+step, and why a CDN that removes 90% of origin load still leaves the 10%
+that defines the tail. It applies to people too: adding engineers to the
+parallel part of a project does nothing for the part only one person can do.
+
+### Check yourself
+
+1. Half of a program's time is in a function. What is the best speed-up from optimising only that function?
+2. What is the difference between concurrency and parallelism?
+
+<details>
+<summary>Answer</summary>
+
+1. Two times. With α = 0.5 and k infinite, S = 1 / 0.5.
+2. Concurrency is several activities in progress at once, possibly interleaved on one core. Parallelism is concurrency that actually runs at the same instant to finish sooner.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 1, A Tour of Computer Systems">
+
+<Level name="Beginner" depth={3}>
+
+At the smallest scale, the chapter's main idea is that a program is a file
+of bytes that other programs turn into more bytes, and that running it
+means copying those bytes into memory and letting the processor fetch them
+one instruction at a time. Nothing in the computer is anything but bits;
+everything else is context.
+
+My first worked example is to follow `hello.c` myself. I run
+`gcc -save-temps hello.c`, open `hello.i` and scroll to the bottom to find
+my code after 900 lines of header, open `hello.s` and find `main`, run
+`objdump -d hello.o` and see the same instructions as bytes. The beginner
+lesson is that every stage is a real file I can open, not a black box.
+
+The beginner mistake is to think the CPU understands C. It does not. The
+fix is to say out loud, for each file, which program reads it: the
+compiler reads `.i`, the assembler reads `.s`, the linker reads `.o`, the
+OS loader reads the executable, and only the CPU reads machine code.
+
+</Level>
+
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level the pieces combine into one run. I can predict
+the system calls a program will make from its source, then check with
+`strace`. For `hello` the prediction is one `write` of 13 bytes and an
+`exit_group`; the 32 other calls belong to the dynamic loader and the C
+library's startup, which I can confirm by building a static version:
+
+```text
+$ gcc -static -Og hello.c -o hello-static && strace -c ./hello-static
+...
+  7.69    0.000006           6         1           write
+  0.00    0.000000           0         1           execve
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000078           4        16           total
+```
+
+On my box the static binary makes 16 system calls instead of 34, and none
+of them is an `mmap` or an `openat`: there is no shared library to find and
+map. Seeing that difference is seeing chapter
+7's subject (linking) change chapter 8's behaviour (system calls).
+
+The intermediate mistake is to blame my code for time that belongs to the
+layers around it. A command-line tool that runs for 2 ms may spend most of
+it starting up. The fix is to measure the empty program first, so I know
+the floor.
+
+</Level>
+
+<Level name="Advanced" depth={3}>
+
+Underneath, the exact rules are: the ISA promises sequential semantics, the
+OS promises isolation between processes through virtual memory and kernel
+mode, and the compiler promises to preserve the program's observable
+behaviour, not its structure. The `printf` to `puts` swap is legal because
+the output is identical; a store to `*out` cannot be removed because the
+output could differ if pointers alias.
+
+The cost model the chapter sets up is the memory hierarchy: a register in
+under a cycle, L1 in a few, DRAM in around a hundred, disk in tens of
+thousands to millions. The row-versus-column experiment measured a twelve
+times gap from layout alone, which is a direct reading of that model.
+Amdahl's law is the other cost model: S = 1 / ((1 − α) + α/k), with the
+ceiling 1 / (1 − α).
+
+The advanced mistake is to apply Amdahl's law with α measured on a
+different workload than the real one. α is a property of the workload, not
+of the code. The fix is to profile production-like input.
+
+</Level>
+
+<Level name="Edge cases" depth={3}>
+
+Single boundaries the tour touches:
+
+- **An empty `main`.** `int main(void) { return 0; }` still runs dozens of system calls and has a full address space. Its exit status, 0, is all it produces. Startup cost is never zero.
+- **No trailing newline.** `printf("hello, world")` without `\n` does not become `puts`, because `puts` adds a newline. The compiler checks the exact string. Also, on a terminal, standard output is line-buffered, so the text appears only when the buffer is flushed at exit.
+- **Output to a file.** `./hello > out.txt` changes nothing in the program. Descriptor 1 is now a file. If the disk is full, `write` fails, and since `hello` ignores the return value, the error is silent.
+- **α equal to 1.** Amdahl's law with the whole program improved gives S = k, the only case where the speed-up of the part is the speed-up of the whole.
+- **α equal to 0.** Improving a part that takes no time gives S = 1 for any k.
+
+</Level>
+
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **No newline and a crash.** If a program prints without a newline and then crashes with a segmentation fault, the buffered text is never flushed, so it seems the print never ran. Debugging by `printf` misleads here; use `fprintf(stderr, ...)`, which is unbuffered, or `setvbuf`.
+- **Threads and fork together.** If a program with several threads calls `fork`, only the calling thread exists in the child. A lock held by another thread at that moment stays locked forever in the child. This is why the safe pattern is to call `exec` straight after `fork` in threaded programs.
+- **Amdahl with overhead.** Parallelising a part across p cores is k = p only if splitting costs nothing. With a fixed coordination cost added for each worker, the speed-up rises, peaks and then falls as p grows. Real scaling curves have this hump.
+
+</Level>
+
+<Level name="Production level" depth={3}>
+
+In production, this chapter's map is the map of where time goes. When a
+Node service is slow, the time is in one of the layers: my JavaScript,
+V8's compiled code, the C library, system calls into the kernel, the
+network. Tools map onto layers: the Chrome profiler for JavaScript, `perf`
+for native code, `strace` and `bpftrace` for system calls, `tcpdump` for
+the wire.
+
+Memory works the same way. A container killed for "out of memory" reached
+the limit on its resident physical pages, not its virtual size, which is
+usually much larger. Reading `/proc/<pid>/status` for `VmRSS` versus
+`VmSize` is the first check.
+
+The production mistake is to tune the layer I know best rather than the one
+the profile points at. The fix is to collect a profile across all layers
+first (a flame graph from `perf` with JavaScript symbols, for example) and
+let α choose.
+
+</Level>
+
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to ask, for every abstraction, "what is
+the layer below, and what does it cost?" A function call is a few
+instructions and a stack frame. A file read is a system call. A `fetch` is
+a network round trip. An array of objects is pointers to scattered memory.
+
+The second habit is to measure before believing. Every claim in the tour
+can be checked in a terminal in seconds. I would rather run `strace` than
+guess what a program does.
+
+The mindset mistake is to treat lower layers as somebody else's problem.
+They are, until they leak, and then they are the only problem. The fix is
+not to master every layer, but to know enough of each to ask the right
+question.
+
+</Level>
+
+<Level name="System design" depth={3}>
+
+At system scale, the tour's patterns repeat. The memory hierarchy becomes
+caching tiers: in-process memory, Redis, a database, object storage, each a
+cache for the next. Processes and virtual memory become containers and
+virtual machines. Files and descriptors become streams and sockets between
+services. Amdahl's law decides how far horizontal scaling can go.
+
+A concrete system: a photo-sharing service. Thumbnails live in a CDN (the
+top of the hierarchy, close to users), originals in object storage (the
+bottom). The resize step is the part that scales with cores. The metadata
+database is the serial fraction. Amdahl says that if the database is 20% of
+request time, no number of resize workers takes the service past five
+times its single-worker throughput; sharding the database is the move that
+raises the ceiling.
+
+The design mistake is to scale the parallel part and forget the serial
+part. The fix is to identify the shared resource first.
+
+</Level>
+
+<Level name="Strategy" depth={3}>
+
+To learn this chapter I run every command on this page on my own machine,
+and I write down for each the layer it reveals. Then I pick one program I
+use every day, `node --version` for instance, and trace it the same way:
+`strace -c` for the system calls, `ldd` for the libraries, `/proc/<pid>/maps`
+for the address space.
+
+I treat the chapter as a map to come back to. When I finish each later
+chapter, I come back to its section here and check that the one-paragraph
+summary now feels obvious.
+
+Done when I can, without notes, follow `hello.c` from source to a `write`
+system call naming every stage and file, draw the hardware diagram and the
+address space from memory, explain the thread race with a trace table, and
+compute Amdahl's ceiling for a profile of my own code.
+
+</Level>
+
+</Levels>
+
+## Questions people ask
+
+**Why does the book start with a whole tour instead of chapter 2's bits?**
+Because each later chapter makes sense only once I know where it sits. The
+tour is the map; the chapters are the territory.
+
+**Is x86-64 still worth learning when ARM is everywhere?**
+Yes. The ideas (an ISA, registers, a stack, calling conventions, caches,
+virtual memory) are the same on ARM and RISC-V. Only the instruction names
+change.
+
+**Do I need to know assembly to be a good JavaScript developer?**
+I need to be able to read a little, so that performance and memory stop
+being mysteries. I do not need to write it.
+
+**Why did `printf` become `puts`?**
+Because the compiler knows what the standard library functions do, and
+`printf` of a constant string ending in a newline is exactly `puts`. It is
+allowed to swap them because the output is the same.
+
+**Is the kernel a process?**
+No. It is code and data that every process's address space maps at the top,
+and it runs when a process makes a system call or the hardware interrupts.
+
+**What is the difference between a virtual machine and a process?**
+A process virtualises one running program; a virtual machine virtualises a
+whole computer, including the operating system.
+
+## Key takeaways
+
+- Every piece of information is bits; the reader supplies the meaning.
+- `gcc` runs four programs: preprocessor, compiler, assembler, linker, and each output is a file I can open.
+- The processor runs a fetch, decode, execute loop driven by the program counter.
+- Most of a computer's time is spent copying bytes, and the memory hierarchy exists to make copying cheap.
+- Code that touches memory in order is many times faster than code that jumps around, because caches move 64-byte lines.
+- The OS gives each program three illusions: processes, virtual memory and files.
+- Threads share memory, which is both their advantage and the source of data races.
+- Amdahl's law: the speed-up of the whole is capped at 1 / (1 − α).
+- Abstractions make systems usable, and the point of this book is to see underneath them when they leak.
+
+## Glossary
+
+- **Bit, byte:** a single 0 or 1; a group of eight bits, the smallest addressable unit.
+- **ASCII:** a table mapping 128 characters to the numbers 0 to 127.
+- **Compiler driver:** a program, like `gcc`, that runs the preprocessor, compiler, assembler and linker in order.
+- **Assembly language:** a text form of machine instructions, one per line.
+- **Relocatable object file:** machine code with addresses of outside symbols left blank, for the linker.
+- **Executable object file:** a fully linked program the OS can load.
+- **Relocation:** the linker's filling-in of addresses.
+- **ISA:** instruction set architecture, the contract between software and a processor.
+- **Microarchitecture:** how a particular processor implements the ISA.
+- **Program counter (PC):** the register holding the next instruction's address.
+- **Register file:** the small set of word-sized registers inside the CPU.
+- **ALU:** the arithmetic/logic unit that computes on registers.
+- **Bus:** wires that carry words between components.
+- **DMA:** direct memory access; a device copies data into memory without the CPU.
+- **Cache, cache line:** a small fast memory holding copies of a larger one; its 64-byte unit of transfer.
+- **Temporal, spatial locality:** reuse of the same data soon; use of nearby data.
+- **Memory hierarchy:** the pyramid of storage in which each level caches the one below.
+- **Operating system, kernel:** the software that manages hardware for programs; its always-resident core.
+- **Process:** the OS's abstraction of a running program.
+- **Context switch:** saving one process's state and restoring another's.
+- **System call:** a program's deliberate request to the kernel.
+- **Thread:** a flow of control inside a process, sharing its memory.
+- **Data race:** two threads accessing the same memory, at least one writing, without synchronisation.
+- **Virtual memory, virtual address:** the private address space each process sees, and an address in it.
+- **File:** a sequence of bytes; every I/O device is presented as one.
+- **Amdahl's law:** S = 1 / ((1 − α) + α/k).
+- **Concurrency, parallelism:** activities in progress at once; activities running at the same instant to finish sooner.
+- **Multi-core, hyperthreading, superscalar, SIMD:** several cores on a chip; one core holding two threads; several instructions per cycle; one instruction on several values.
+- **Abstraction, virtual machine:** a simple interface over a complex implementation; an abstraction of a whole computer.
+
+## Exercises and self-check
+
+**Warm-up**
+
+1. Write out in hex the bytes of the line `int x = 1;` followed by a newline. Check with `od`.
+2. Compute Amdahl's speed-up for α = 0.3 and k = 10, and the ceiling for α = 0.3.
+3. Draw the hardware diagram from memory and mark the path the string `hello, world` takes when the program is loaded, and again when it is printed.
+
+**Build**
+
+4. Write a C program that prints its own `/proc/self/maps` and marks which region holds `main`, a global, a local and a `malloc`ed block, by printing their addresses next to the map.
+5. Rewrite the thread counter so it gives 2,000,000 every time, once with a mutex and once with `__atomic_fetch_add`, and time both.
+6. Repeat the row and column experiment for array sizes from 64 by 64 to 8192 by 8192 and plot the ratio. Find the size where the ratio jumps.
+
+**Stretch**
+
+7. A build takes 10 minutes: 2 minutes of dependency install that cannot be parallelised, and 8 minutes of compiling that can. Predict the build time on 2, 4, 8 and 64 cores, then add a 5-second cost per core for coordination and find the best core count.
+8. Strip `hello` with `strip` and compare `objdump -d` before and after. What did you lose, and what still works?
+
+**Self-check**
+
+<details>
+<summary>1. Which program turns hello.s into hello.o?</summary>
+
+The assembler, `as`.
+
+</details>
+
+<details>
+<summary>2. What does the linker fill into the zeros in hello.o?</summary>
+
+The addresses (as PC-relative offsets) of the string and of `puts`, once it knows where each will live in the executable.
+
+</details>
+
+<details>
+<summary>3. Name the three abstractions the OS provides and what each covers.</summary>
+
+Files cover I/O devices; virtual memory covers main memory and disk; processes cover the processor, memory and devices.
+
+</details>
+
+<details>
+<summary>4. Why is column-order summing slower even though it does the same additions?</summary>
+
+It touches one 4-byte `int` per 64-byte cache line before moving 16 KB away, so almost every access misses the cache.
+
+</details>
+
+<details>
+<summary>5. A fraction 0.95 of a program is made 20 times faster. What is the speed-up?</summary>
+
+1 / (0.05 + 0.95 / 20) = 1 / 0.0975 ≈ 10.3.
+
+</details>
+
+<details>
+<summary>6. Two processes print &counter as 0x404034. Do they share the variable?</summary>
+
+No. The address is virtual; each process's copy lives in different physical memory.
+
+</details>
+
+<details>
+<summary>7. What is the difference between thread-level and instruction-level parallelism?</summary>
+
+Thread-level runs several flows of control at once on several cores; instruction-level runs several instructions of one flow at once inside one core.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter is the first week of
+<a href={withBase('/plans/traditional-software-developer/#strategy-5')}>phase
+5 of the traditional core</a>, alongside chapter 2. It reads quickly, so the
+risk is reading it like a story and moving on. I would spend two sessions on
+it, both at a terminal.
+
+<Timeline caption="Two sessions for chapter 1. Each ends with a file of commands and outputs I produced myself." items={[
+  { when: "Session 1 (90 min)", what: "Read 1.1 to 1.6. Run od, gcc -save-temps, objdump on .o and the executable, gdb stepi, getconf and lscpu. Run the row and column experiment." },
+  { when: "Session 2 (90 min)", what: "Read 1.7 to 1.9. Run the fork and thread programs, read /proc/self/maps, run strace -c on hello and on a static build. Write the Amdahl table and apply it to a profile of my own code." },
+]} />
+
+I keep a single notes file, `ch01.md`, with each command, its output on my
+machine, and one sentence on which later chapter explains it. That file
+becomes the index for the rest of the book. I do the practice problems in
+the chapter as I reach them, because their answers are at the end and catch
+a misreading straight away.
+
+Done when I can redraw the chapter map and the address-space figure from
+memory, explain every line of `strace ./hello`, and predict, before
+measuring, roughly how much faster row order is than column order and why.
