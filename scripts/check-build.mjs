@@ -106,6 +106,34 @@ for (const file of htmlFiles) {
   }
 }
 
+// The level progression. Every chapter and every plan phase climbs the
+// same nine levels, in this order (src/data/levels.ts). A block that skips
+// one, repeats one or swaps two fails here. A book page has to have at
+// least one, and its in-page contents links have to land on a heading.
+const levelOrder = [
+  'beginner', 'intermediate', 'advanced', 'edge-cases', 'corner-cases',
+  'production', 'mindset', 'system-design', 'strategy',
+];
+for (const file of htmlFiles) {
+  const rel = path.relative(dist, file);
+  const html = await readFile(file, 'utf8');
+  const blocks = html.split('<div class="levels"').slice(1);
+  blocks.forEach((block, index) => {
+    const found = [...block.matchAll(/data-level="([^"]+)"/g)].map((m) => m[1]);
+    if (found.join(' ') !== levelOrder.join(' ')) {
+      note(`${rel}: level block ${index + 1} has [${found.join(', ')}], expected the nine levels in order`);
+    }
+  });
+  const isBookPage = /^books\/[^/]+\/index\.html$/.test(rel);
+  if (isBookPage) {
+    if (blocks.length === 0) note(`${rel}: a book page with no level progression`);
+    const ids = new Set([...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]));
+    for (const m of html.matchAll(/href="#([^"]+)"/g)) {
+      if (!ids.has(decodeURIComponent(m[1]))) note(`${rel}: link "#${m[1]}" has no heading on the page`);
+    }
+  }
+}
+
 // The pages that hold the learning path together. Each one is a hub, so a
 // missing one breaks the links into it.
 //
