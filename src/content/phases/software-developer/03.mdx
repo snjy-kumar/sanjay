@@ -1,0 +1,2867 @@
+---
+plan: software-developer
+phase: 3
+---
+
+import Levels from '../../../components/book/Levels.astro';
+import Level from '../../../components/book/Level.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Compare from '../../../components/book/Compare.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Figure from '../../../components/book/Figure.astro';
+
+Eight weeks to own the whole request path, from the click in the browser to the row in the database
+and back. Until now the data lived in `localStorage` or a public API someone else ran. In this phase I
+run the server, design the schema, decide who may read what, and keep it running for other people.
+
+The ship is a full-stack app with auth and a real database: a user can sign up, log in, create, edit
+and delete their own records, and upload an image, with the API and the database deployed. The proof
+is a schema diagram, API documentation, an auth flow I can draw from memory, integration tests, a seed
+script, and one test above all: a second user cannot read the first user's data. The gate is to design
+a multi-user schema with auth, authorization, migrations and a test that proves isolation.
+
+#### Phase 3: how I would learn it
+
+SQL before the ORM, the raw `http` module before the framework, the attack before the defence. Each
+topic starts with the primitive by hand, for an hour, so that when the framework or ORM hides it I
+know what is being hidden. I write every query twice in the first weeks: once in `psql`, once in code.
+The AI rule is the plan's: a model can generate CRUD faster than I type, so my value is the schema,
+the boundaries and the failure modes. I ask the model to attack my API, then write the test that
+proves the attack fails.
+
+<Timeline
+  caption="Phase 3's eight weeks"
+  items={[
+    { when: 'week 19', what: 'Node itself: the runtime, modules, the raw http server. Then Express or Fastify, routing and middleware.' },
+    { when: 'week 20', what: 'Validation at the boundary, REST and status codes, error handling, structured logging. API docs started.' },
+    { when: 'week 21', what: 'Postgres and SQL by hand in psql: tables, joins, aggregates, indexes, transactions.' },
+    { when: 'week 22', what: 'Schema design for the app, the schema diagram, Prisma, the first migrations, the seed script.' },
+    { when: 'week 23', what: 'Password hashing, sessions, cookies, the auth flow drawn from memory. Short-lived tokens compared.' },
+    { when: 'week 24', what: 'Authorization on every record, the isolation test, CORS.' },
+    { when: 'week 25', what: 'File upload and email: the two features that touch the outside world.' },
+    { when: 'week 26', what: 'Deploy the API and the database, run migrations in production, integration tests in CI. Take the gate.' },
+  ]}
+/>
+
+<Figure art={`
+  browser                    API server (Node)                         Postgres
+  -------                    -----------------                         --------
+  click "Save"
+  fetch POST /notes  ---->   TLS, HTTP parse
+  Cookie: sid=...            middleware: request id, logger
+  {"title":"Milk"}           middleware: CORS, body parser (size limit)
+                             middleware: session -> req.user
+                             route: POST /notes
+                               validate body (schema)        400 if bad
+                               authorize (logged in?)        401 if not
+                               INSERT ... owner_id=$1  ------------>   constraint checks
+                                                       <------------   row + id
+                             201 Created + JSON
+  render the new note <----  error handler (500, no stack)
+`} caption="The whole request path this phase makes mine. Every topic below is one box on this picture." />
+
+<Flow
+  caption="How each Phase 3 topic is learned"
+  steps={['The primitive by hand (raw http, psql)', 'The framework or ORM version', 'Break it with a hostile request', 'Integration test that proves the fix', 'Write the rule in the bug log']}
+/>
+
+#### Phase 3: Node, the runtime under the server
+
+<Layers
+  caption="What runs when I type node server.js"
+  layers={[
+    { name: 'My code', note: 'server.js, my modules, npm packages' },
+    { name: 'Node core modules', note: 'http, fs, crypto, stream, events (JavaScript)' },
+    { name: 'V8', note: 'compiles and runs the JavaScript, manages the heap' },
+    { name: 'libuv', note: 'event loop, thread pool for files, DNS and crypto' },
+    { name: 'Operating system', note: 'sockets, files, epoll or kqueue' },
+  ]}
+/>
+
+<Levels label="Phase 3, Node">
+
+<Level name="Beginner">
+
+Node is JavaScript outside the browser. It uses the same engine as Chrome (V8) but swaps the browser
+APIs (DOM, `window`) for server ones: files, network sockets, processes. The smallest web server needs
+only the built-in `http` module, and writing it once by hand shows what every framework is wrapping.
+
+```js
+// server.mjs
+import { createServer } from 'node:http';
+
+const server = createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  res.writeHead(404, { 'content-type': 'text/plain' });
+  res.end('not found');
+});
+
+server.listen(3000, () => console.log('listening on http://localhost:3000'));
+```
+
+```sh
+$ node server.mjs
+listening on http://localhost:3000
+$ curl -i localhost:3000/health
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"ok":true}
+```
+
+Mistake: forgetting `res.end()`. The request hangs until the client times out, because Node is waiting
+for me to finish the response. Every code path must end the response exactly once.
+
+</Level>
+
+<Level name="Intermediate">
+
+A request body arrives as a stream of chunks, not a ready object. Reading it by hand shows why body
+parsers exist and why they need a size limit.
+
+```js
+function readJson(req, limit = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(Object.assign(new Error('too large'), { status: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch { reject(Object.assign(new Error('bad json'), { status: 400 })); }
+    });
+    req.on('error', reject);
+  });
+}
+```
+
+Node's module system: modern code uses ES modules (`import`/`export`, `"type": "module"` in
+`package.json` or `.mjs` files). Older code uses CommonJS (`require`/`module.exports`). Configuration
+comes from `process.env`, and `process.exitCode` or `process.exit()` reports success or failure to
+whatever started the process.
+
+</Level>
+
+<Level name="Advanced">
+
+Node runs my JavaScript on one thread with an event loop. While a database query is in flight, the
+thread handles other requests; when the result arrives, its callback is queued. That is why Node serves
+many concurrent I/O-bound requests well, and why one CPU-heavy function blocks everyone.
+
+```js
+app.get('/slow', (req, res) => {
+  const end = Date.now() + 2000;
+  while (Date.now() < end) {}            // blocks the only JS thread for 2 s
+  res.send('done');
+});
+// meanwhile GET /health also waits 2 s
+```
+
+The event loop has phases (timers, pending callbacks, poll for I/O, check for `setImmediate`, close
+callbacks), and between each callback Node drains the microtask queue (resolved promises,
+`process.nextTick` first). File system calls, DNS lookups and some crypto run in libuv's thread pool
+(4 threads by default), so a burst of `bcrypt` hashes can queue behind each other. CPU-heavy work goes to
+`worker_threads` or a separate service.
+
+</Level>
+
+<Level name="Edge cases">
+
+An unhandled promise rejection crashes the process in current Node versions:
+
+```text
+node:internal/process/promises:289
+            triggerUncaughtException(err, true /* fromPromise */);
+Error: connect ECONNREFUSED 127.0.0.1:5432
+```
+
+That is the right default (fail loudly), but it means every `async` route needs its errors caught and
+passed to an error handler. `JSON.parse` of an empty body throws; `req.url` includes the query string
+(`/notes?page=2`), so compare paths with `new URL(req.url, 'http://x').pathname`, not raw strings.
+
+</Level>
+
+<Level name="Corner cases">
+
+A client disconnects mid-request while my handler is still awaiting the database: the handler finishes
+and writes to a closed socket. Mostly harmless, but for expensive work I listen for `req.on('close')` or
+pass an `AbortSignal` to stop early. Graceful shutdown meets in-flight requests: a deploy sends
+`SIGTERM`; if I exit immediately, requests in progress are cut off. The fix is to stop accepting new
+connections, let current ones finish with a timeout, close the database pool, then exit.
+
+```js
+process.on('SIGTERM', () => {
+  server.close(async () => { await pool.end(); process.exit(0); });
+  setTimeout(() => process.exit(1), 10_000).unref();
+});
+```
+
+</Level>
+
+<Level name="Production level">
+
+In production I pin the Node version (`.nvmrc` and `engines` in `package.json`, and the same version in
+CI and the host), run with `NODE_ENV=production`, and keep the process stateless so any instance can
+serve any request: sessions in the database or Redis, uploads in object storage, never on local disk. A
+process manager or the platform restarts crashed processes; a crash loop shows up in metrics, not silently.
+
+</Level>
+
+<Level name="Mindset">
+
+Know what the thread is doing. Every slow request in Node is either waiting on I/O (fine, others run) or
+burning CPU (everyone waits). Asking which one is the first debugging question.
+
+</Level>
+
+<Level name="System design">
+
+Node's model shapes architecture: it is excellent for API servers that mostly wait on databases and other
+services, and poor for heavy computation in the request path. Heavy jobs (image resizing, report
+generation, AI batch calls) move to background workers fed by a queue, which is where the backend series
+goes later.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the raw `http` server with three routes, a JSON body reader with a size limit, and graceful
+shutdown, before touching a framework. Then I block the loop on purpose and measure how `/health` suffers.
+
+Done when I can explain the event loop's effect on concurrent requests, my raw server handles a bad JSON
+body with a 400 and an oversized one with a 413, and it shuts down cleanly on `SIGTERM`.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Express or Fastify
+
+<Compare
+  left="Express"
+  right="Fastify"
+  caption="Either is fine for this phase. I pick one and learn it deeply; the concepts transfer."
+  rows={[
+    ['The long-standing default; huge ecosystem', 'Newer, fast, schema-first'],
+    ['Middleware chain: (req, res, next)', 'Plugins, hooks and encapsulated contexts'],
+    ['Validation is up to me (Zod, etc.)', 'JSON Schema validation and serialisation built in'],
+    ['Express 5 forwards rejected promises to the error handler', 'Async handlers are native'],
+    ['Simple mental model, easy to read', 'More structure, better performance under load'],
+  ]}
+/>
+
+<Levels label="Phase 3, Express or Fastify">
+
+<Level name="Beginner">
+
+A framework handles the repetitive parts of the raw server: matching a method and path to a handler,
+parsing JSON bodies, setting headers, sending responses. The same health route in Express:
+
+```ts
+import express from 'express';
+const app = express();
+app.use(express.json({ limit: '100kb' }));
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.listen(3000);
+```
+
+And in Fastify:
+
+```ts
+import Fastify from 'fastify';
+const app = Fastify({ logger: true });
+app.get('/health', async () => ({ ok: true }));
+await app.listen({ port: 3000 });
+```
+
+Mistake: choosing by benchmark charts. For an app with a database behind it, the framework's overhead is
+a tiny share of request time. Pick the one whose docs I enjoy reading and stick with it for the phase.
+
+</Level>
+
+<Level name="Intermediate">
+
+The real structure of an app is layers, whatever the framework: routes (HTTP in and out), services
+(business rules), and data access (queries). Keeping HTTP details out of services makes them testable
+without a server.
+
+```ts
+// routes/notes.ts
+router.post('/', requireUser, async (req, res) => {
+  const input = CreateNote.parse(req.body);
+  const note = await notes.create(req.user.id, input);  // service knows nothing about req/res
+  res.status(201).json(note);
+});
+```
+
+One app object, built by a function (`buildApp()`), and a separate file that calls `listen`. Tests import
+`buildApp()` and send requests in memory with Supertest or Fastify's `inject`, without opening a port.
+
+</Level>
+
+<Level name="Advanced">
+
+Async errors are where the frameworks differ. In Express 4, an `async` handler that rejects does not reach
+the error middleware; the request hangs or the process logs an unhandled rejection. Express 5 forwards the
+rejection automatically. In Express 4 I wrap handlers:
+
+```ts
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+router.get('/:id', ah(async (req, res) => { ... }));
+```
+
+Fastify compiles a JSON Schema per route to validate input and to serialise output, which both rejects bad
+requests and strips fields I did not declare from the response, so a `passwordHash` never leaks by accident.
+
+</Level>
+
+<Level name="Edge cases">
+
+Route order matters in Express: `GET /notes/:id` defined before `GET /notes/search` captures "search" as an
+id. Trailing slashes and case may or may not match depending on options. `express.json()` ignores bodies
+whose `Content-Type` is not JSON, so `req.body` is `undefined` and the handler crashes on `req.body.title`.
+
+</Level>
+
+<Level name="Corner cases">
+
+Sending two responses: a handler calls `res.json()` in an `if` and forgets `return`, so the code below also
+sends, and Express throws `ERR_HTTP_HEADERS_SENT: Cannot set headers after they are sent to the client`.
+The first response reached the client; the error appears in the log, often far from the cause. Always
+`return res...`.
+
+</Level>
+
+<Level name="Production level">
+
+`app.set('trust proxy', 1)` behind a load balancer so `req.ip` and `req.secure` are correct; `x-powered-by`
+disabled; `helmet` for headers; body size limits on every parser; a 404 handler and an error handler as the
+last middleware; graceful shutdown wired to the framework's close method.
+
+</Level>
+
+<Level name="Mindset">
+
+The framework is a convenience over HTTP, not a replacement for understanding it. When it surprises me, I
+drop down to what the raw request and response look like.
+
+</Level>
+
+<Level name="System design">
+
+Layered structure (routes, services, data) is what lets the same service code later serve a queue worker or
+a CLI, and what lets me replace the framework without rewriting business rules.
+
+</Level>
+
+<Level name="Strategy">
+
+I port my raw server to Express (or Fastify) route by route, with `buildApp()` and in-memory tests from the
+start, then deliberately trigger each edge case above and log the error message I saw.
+
+Done when every route is tested without opening a port, an async error reaches my error handler as a 500
+with a request ID, and I can explain what the framework does for me compared with my raw version.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Routing and middleware
+
+<Figure art={`
+  request
+    |
+    v
+  [request id] -> [logger] -> [helmet] -> [cors] -> [json body, 100kb]
+    -> [session: sets req.user or nothing] -> [rate limit (auth routes)]
+    -> router:  GET    /notes        -> requireUser -> list
+                POST   /notes        -> requireUser -> validate -> create
+                GET    /notes/:id    -> requireUser -> loadOwnNote -> show
+                PATCH  /notes/:id    -> requireUser -> loadOwnNote -> validate -> update
+                DELETE /notes/:id    -> requireUser -> loadOwnNote -> remove
+    -> [404 handler]  (no route matched)
+    -> [error handler] (anything called next(err) or threw)
+`} caption="Middleware is a pipeline. Each step can add to the request, end the response, or pass an error down to the error handler." />
+
+<Levels label="Phase 3, routing and middleware">
+
+<Level name="Beginner">
+
+Routing maps a method and a path to a handler: `GET /notes` lists, `POST /notes` creates. Path parameters
+(`/notes/:id`) capture parts of the URL into `req.params`; the query string (`?page=2`) lands in
+`req.query`. Middleware is a function that runs before the handler and either calls `next()` to continue
+or sends a response to stop.
+
+```ts
+function requestTimer(req, res, next) {
+  const start = performance.now();
+  res.on('finish', () => console.log(req.method, req.originalUrl, res.statusCode, Math.round(performance.now() - start), 'ms'));
+  next();
+}
+app.use(requestTimer);
+```
+
+```text
+GET /notes 200 14 ms
+POST /notes 400 3 ms
+```
+
+Mistake: middleware that forgets `next()` on one branch. The request hangs with no error anywhere.
+
+</Level>
+
+<Level name="Intermediate">
+
+Middleware composes cross-cutting concerns so handlers stay small. `requireUser` stops anonymous requests;
+`loadOwnNote` fetches the note scoped to the current user and attaches it, so every handler that uses it
+gets authorization for free.
+
+```ts
+export function requireUser(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'login required' });
+  next();
+}
+
+export async function loadOwnNote(req, res, next) {
+  const note = await db.note.findFirst({ where: { id: req.params.id, ownerId: req.user.id } });
+  if (!note) return res.status(404).json({ error: 'not found' });
+  req.note = note;
+  next();
+}
+```
+
+Routers group routes under a prefix (`app.use('/notes', notesRouter)`) and can carry their own middleware,
+so all note routes require a user in one line.
+
+</Level>
+
+<Level name="Advanced">
+
+Order is semantics. The body parser must run before validation, the session before `requireUser`, CORS
+before routes (and it must answer preflight `OPTIONS` requests), the 404 handler after every route, and
+the error handler last. Express recognises an error handler by its four parameters
+`(err, req, res, next)`; with three, it is treated as normal middleware and never receives errors.
+
+```ts
+app.use((err, req, res, _next) => {
+  req.log?.error({ err }, 'unhandled');
+  const status = err.status ?? 500;
+  res.status(status).json({ error: status === 500 ? 'internal error' : err.message, requestId: req.id });
+});
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+A path parameter is always a string: `req.params.id` is `"42"`, and comparing it to a numeric column without
+parsing finds nothing or throws, depending on the driver. Repeated query keys (`?tag=a&tag=b`) give an array,
+not a string, so `req.query.tag.toLowerCase()` crashes. Validate params and query like a body.
+
+</Level>
+
+<Level name="Corner cases">
+
+Middleware that reads the body for a webhook signature check plus a JSON parser that already consumed it:
+the raw bytes are gone, so the signature never verifies. Mount the raw-body parser only on the webhook route,
+before the global JSON parser. Async middleware plus a thrown error in Express 4: it escapes the chain and
+the error handler never sees it; wrap it like a handler.
+
+</Level>
+
+<Level name="Production level">
+
+Every route is documented and tested; a route inventory test lists all registered routes and asserts each
+has auth middleware unless it is in an explicit public allowlist (`/health`, `/auth/login`, `/auth/signup`).
+That catches the new route someone forgot to protect.
+
+</Level>
+
+<Level name="Mindset">
+
+Put each rule in exactly one place. If authorization is copied into every handler, one handler will forget
+it; if it lives in middleware attached to the router, forgetting is hard.
+
+</Level>
+
+<Level name="System design">
+
+The middleware pipeline is a small version of what API gateways and service meshes do at system scale:
+authentication, rate limiting, logging and routing as layers in front of business logic.
+
+</Level>
+
+<Level name="Strategy">
+
+I draw my pipeline (like the figure above) before writing it, then implement it in that order, then write the
+route inventory test.
+
+Done when I can explain why each middleware sits where it does, a new route without auth fails the inventory
+test, and a thrown error anywhere becomes a JSON 500 with a request ID and no stack trace.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Validation at the boundary
+
+<Compare
+  left="Client-side validation"
+  right="Server-side validation"
+  caption="The plan's trap is trusting client-side validation. Both exist, for different reasons."
+  rows={[
+    ['For the user: instant feedback', 'For the system: the only check that counts'],
+    ['Can be skipped with curl or DevTools', 'Every request passes through it'],
+    ['Shows friendly messages next to fields', 'Returns 400 with field errors'],
+    ['Nice to have', 'Mandatory, always'],
+  ]}
+/>
+
+<Levels label="Phase 3, validation">
+
+<Level name="Beginner">
+
+Validation checks that incoming data has the right shape and values before the code uses it: the title is a
+string, not empty, not longer than 200 characters; the email looks like an email; the id is a valid UUID. On
+the server it is mandatory, because the browser form's checks can be bypassed by anyone with `curl`.
+
+```ts
+import { z } from 'zod';
+export const CreateNote = z.object({
+  title: z.string().trim().min(1, 'title is required').max(200),
+  body: z.string().max(20_000).default(''),
+});
+
+router.post('/', requireUser, async (req, res) => {
+  const parsed = CreateNote.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'invalid input', fields: parsed.error.flatten().fieldErrors });
+  const note = await notes.create(req.user.id, parsed.data);
+  res.status(201).json(note);
+});
+```
+
+```text
+$ curl -s -X POST localhost:3000/notes -H 'content-type: application/json' -b cookies.txt -d '{"title":""}'
+{"error":"invalid input","fields":{"title":["title is required"]}}
+```
+
+Mistake: validating and then using `req.body` instead of `parsed.data`. The validated, trimmed, defaulted
+value is in `parsed.data`; `req.body` still has the raw input.
+
+</Level>
+
+<Level name="Intermediate">
+
+Validate at the boundary, once, and pass typed data inward. With Zod, `z.infer<typeof CreateNote>` gives the
+TypeScript type, so the service function's parameter type comes from the same schema that checks the input.
+No drift between the check and the type.
+
+Validate every source: body, params, query and headers. Params and query are strings and need coercion:
+
+```ts
+const ListQuery = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  q: z.string().max(100).optional(),
+});
+```
+
+Share the schema with the front end so the form shows the same rules, but the server never trusts that the
+front end ran them.
+
+</Level>
+
+<Level name="Advanced">
+
+Validation has layers. Shape and type checks happen in the schema. Business rules that need the database
+(is this email already taken? does this project belong to the user?) happen in the service. Integrity
+guarantees that must hold even if code is wrong (unique email, non-null owner, title length) also live in the
+database as constraints, because the database is the last line of defence and the only one shared by every
+code path, including scripts and future services.
+
+Parse, do not just validate: a function that returns typed, cleaned data (or an error) is better than one
+that returns `true`, because the rest of the code then cannot accidentally use the unchecked input.
+
+</Level>
+
+<Level name="Edge cases">
+
+Unicode: `"  "` trims to empty; a title of 200 emoji is more than 200 UTF-16 code units, so `.max(200)` counts
+differently than a user expects. Numbers: `z.coerce.number()` turns `""` into `0` and `"1e3"` into 1000. Dates:
+`"2026-02-30"` parses in some libraries as March 2. Each needs an explicit decision and a test.
+
+</Level>
+
+<Level name="Corner cases">
+
+Extra fields plus an ORM update: the schema allows `title` and `body`, but if I pass `req.body` instead of
+`parsed.data`, the attacker's extra `ownerId` reaches the update. With `parsed.data`, unknown keys are stripped
+by default in Zod; with `.strict()`, they are rejected with a 400, which is clearer to API clients. Deeply nested
+or huge arrays in a valid shape: a list of a million tags passes "is an array of strings" and exhausts memory;
+add `.max()` to arrays too.
+
+</Level>
+
+<Level name="Production level">
+
+Validation errors return a consistent shape (`{ error, fields }`) and status 400 (or 422 if the API distinguishes
+syntax from semantics), are logged at info level without the raw values (which may be personal data), and are
+counted, since a spike of 400s after a deploy usually means the front end and back end disagree.
+
+</Level>
+
+<Level name="Mindset">
+
+Everything that crosses a trust boundary is untrusted until parsed. The server boundary, the database boundary
+and later the model-output boundary are the same idea.
+
+</Level>
+
+<Level name="System design">
+
+Schemas at the boundary double as documentation: Zod or JSON Schema can generate OpenAPI, so the API docs, the
+types and the runtime checks come from one source.
+
+</Level>
+
+<Level name="Strategy">
+
+I write a schema for every route's input, use only parsed data in handlers, add matching database constraints,
+and write a test per route that sends a hostile body with `curl`-style requests.
+
+Done when every route rejects malformed input with a 400 and field errors, no handler reads `req.body` directly,
+and removing a schema check makes at least one test fail.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: REST and status codes
+
+<Compare
+  left="Request"
+  right="Good response"
+  caption="A small REST surface for notes. Resources are nouns in the path; the method says what to do; the status says what happened."
+  rows={[
+    ['GET /notes?page=2', '200 with a page of the user\'s notes and a next cursor'],
+    ['POST /notes with a body', '201 Created, Location: /notes/42, the new note'],
+    ['GET /notes/42 (not mine)', '404 Not Found (do not confirm it exists)'],
+    ['PATCH /notes/42 with a bad title', '400 with field errors'],
+    ['DELETE /notes/42', '204 No Content; a second DELETE also 204 or 404, never 500'],
+    ['any request, not logged in', '401 Unauthorized'],
+  ]}
+/>
+
+<Levels label="Phase 3, REST and status codes">
+
+<Level name="Beginner">
+
+REST is a style for HTTP APIs: things are resources with URLs (`/notes`, `/notes/42`), and the HTTP
+method says what to do with them. `GET` reads, `POST` creates, `PATCH` changes part, `PUT` replaces,
+`DELETE` removes. The status code is the first thing a client reads, and it has a meaning by its first
+digit: 2xx success, 3xx go elsewhere, 4xx the client did something wrong, 5xx the server failed.
+
+The codes I use every day: 200 OK, 201 Created, 204 No Content, 400 Bad Request (invalid input), 401
+Unauthorized (not logged in, despite the name), 403 Forbidden (logged in, not allowed), 404 Not Found,
+409 Conflict (duplicate email, edit conflict), 413 Payload Too Large, 429 Too Many Requests, 500 Internal
+Server Error.
+
+Mistake: returning `200 { "error": "not found" }`. Clients, caches, monitoring and retries all read the
+status, not the body; a 200 error is counted as success everywhere.
+
+</Level>
+
+<Level name="Intermediate">
+
+Two properties decide what is safe to retry. A safe method does not change state (`GET`, `HEAD`). An
+idempotent method has the same effect if sent once or ten times (`GET`, `PUT`, `DELETE`). `POST` is
+neither: retrying a timed-out `POST /notes` can create two notes. That is why clients and proxies may
+retry `GET` freely, and why creating things needs care.
+
+```text
+POST /notes   -> timeout (did it work?)  -> retry -> two notes
+PUT  /notes/42 {title:"Milk"} -> timeout -> retry -> same final state
+```
+
+An idempotency key fixes `POST`: the client sends `Idempotency-Key: 7c1e...`, the server stores the key
+with the result, and a repeat with the same key returns the stored result instead of creating again.
+
+Lists need pagination from day one. Offset pagination (`?page=3`) is simple; cursor pagination (`?after=2026-10-01T12:00:00Z_42`)
+stays correct when rows are inserted while someone pages.
+
+</Level>
+
+<Level name="Advanced">
+
+Consistency is what makes an API pleasant. One error shape everywhere (`{ error, fields?, requestId }`),
+one naming style (camelCase or snake_case, not both), one date format (ISO 8601 with a zone), one
+pagination style. Responses return resources, not database rows: no `passwordHash`, no internal flags.
+An explicit serialiser (a `toPublicNote()` function or a response schema) is the boundary.
+
+```ts
+const toPublicNote = (n: NoteRow) => ({ id: n.id, title: n.title, body: n.body, createdAt: n.created_at.toISOString() });
+```
+
+Versioning is for breaking changes only. Adding a field is not breaking; removing or renaming one is. A
+small app can avoid versions by only ever adding, and planning removals with a deprecation period.
+
+</Level>
+
+<Level name="Edge cases">
+
+401 versus 403 versus 404: for a record that exists but belongs to someone else, returning 403 confirms it
+exists, which leaks information (an attacker can enumerate IDs). Returning 404 for "not yours" is the safer
+default. An empty list is `200 []`, not 404. A `DELETE` of something already deleted should not produce a
+500.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two users edit the same note: both `GET` version 3, both `PATCH`, the second silently overwrites the first
+(a lost update). Optimistic concurrency fixes it: the response includes an `ETag` or a `version`, the client
+sends `If-Match: "3"`, and the server updates only `WHERE id = $1 AND version = 3`, returning 412
+Precondition Failed or 409 if zero rows changed.
+
+```sql
+UPDATE notes SET title = $2, version = version + 1 WHERE id = $1 AND owner_id = $3 AND version = $4 RETURNING *;
+```
+
+</Level>
+
+<Level name="Production level">
+
+APIs are documented (OpenAPI), tested for every status they can return, monitored by status class per route,
+and changed compatibly. 5xx responses never include stack traces or SQL; they include a request ID the user
+can report.
+
+</Level>
+
+<Level name="Mindset">
+
+An API is a user interface for programs. Predictability is its usability: the same shapes and codes
+everywhere, so clients never guess.
+
+</Level>
+
+<Level name="System design">
+
+Retries, idempotency and pagination look like details but are what make an API survive real networks,
+mobile clients, queues and later integrations with other services.
+
+</Level>
+
+<Level name="Strategy">
+
+I design the route table on paper first (method, path, request, every possible status, response), then
+implement and test each status.
+
+Done when every route has a test for each status it can return, `POST /notes` with a repeated idempotency key
+creates one note, and the lost-update case returns a conflict.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Postgres
+
+<Figure art={`
+  my app (Node)  --pool of 10 connections-->  Postgres server process
+                                                |
+                                 database "app" |
+                                   schema "public"
+                                     table users (id, email, password_hash, created_at)
+                                     table notes (id, owner_id -> users.id, title, body, ...)
+                                     indexes, constraints, sequences
+                                                |
+                                   WAL (write-ahead log) -> data files on disk
+`} caption="Postgres is a server my app connects to over the network; data is organised as databases, schemas and tables, and every change is logged before it is written." />
+
+<Levels label="Phase 3, Postgres">
+
+<Level name="Beginner">
+
+Postgres is a relational database: data lives in tables with typed columns, and I ask questions in SQL. It
+runs as a separate server, locally in Docker for development:
+
+```sh
+$ docker run --name pg -e POSTGRES_PASSWORD=dev -p 5432:5432 -d postgres:16
+$ psql postgres://postgres:dev@localhost:5432/postgres
+postgres=# CREATE TABLE notes (id bigserial PRIMARY KEY, title text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE
+postgres=# INSERT INTO notes (title) VALUES ('Milk') RETURNING *;
+ id | title |          created_at
+----+-------+-------------------------------
+  1 | Milk  | 2026-10-23 18:30:00.12+05:30
+```
+
+`psql` is the tool to live in for a week: `\dt` lists tables, `\d notes` describes one, `\x` toggles
+expanded output. Mistake: learning Postgres only through an ORM. When something goes wrong, the error comes
+from Postgres in SQL terms.
+
+</Level>
+
+<Level name="Intermediate">
+
+Types are part of correctness. `text` for strings (no arbitrary length limit needed; use a check constraint
+if a limit is a rule), `bigint` or `uuid` for IDs, `timestamptz` for moments in time (it stores UTC and converts
+for display), `numeric` for money (never floating point), `boolean`, `jsonb` for genuinely flexible data.
+Constraints encode rules the database enforces for every writer:
+
+```sql
+CREATE TABLE users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email text NOT NULL UNIQUE CHECK (email = lower(email)),
+  password_hash text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+From Node, the `pg` library with a connection pool, and always parameters:
+
+```ts
+import pg from 'pg';
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+const { rows } = await pool.query('SELECT id, title FROM notes WHERE owner_id = $1', [userId]);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Postgres uses MVCC (multi-version concurrency control): an update writes a new version of the row rather than
+overwriting it, so readers never block writers. Old versions are cleaned up by `VACUUM` (autovacuum runs it).
+Every change is first written to the write-ahead log, which is what makes commits durable after a crash and
+what replication and point-in-time recovery read from.
+
+Connections are expensive (each is a server process with its own memory), so the app uses a pool, and
+serverless or many-instance deployments put a pooler like PgBouncer in front. A pool of 10 with queries taking
+20 ms each serves roughly 500 queries per second; a slow query holding a connection for seconds starves the rest.
+
+</Level>
+
+<Level name="Edge cases">
+
+`timestamp` without a time zone stores wall-clock time with no zone, so the same value means different moments
+on servers in different zones; use `timestamptz`. `NULL` is not equal to anything, including `NULL`: `WHERE
+deleted_at = NULL` matches nothing; it must be `IS NULL`. `UNIQUE` allows multiple `NULL`s by default.
+
+</Level>
+
+<Level name="Corner cases">
+
+A unique email plus case: `Ana@x.com` and `ana@x.com` are different strings, so both sign up and one person has
+two accounts. Normalise on write and enforce with a check or a unique index on `lower(email)`. Pool exhaustion plus
+a transaction left open by an error path that never releases the client: after ten such errors, every request
+hangs waiting for a connection. Use `pool.query` for single statements and `try/finally` with `client.release()`
+for transactions.
+
+</Level>
+
+<Level name="Production level">
+
+A managed Postgres (Neon, Supabase, RDS) with automated backups, point-in-time recovery, TLS connections, a
+least-privilege app user, connection limits sized to the pool, and slow-query logging. Backups are only real
+once a restore has been tested.
+
+</Level>
+
+<Level name="Mindset">
+
+The database is the system's memory and its last line of defence. Rules that must always hold belong in it, not
+only in application code.
+
+</Level>
+
+<Level name="System design">
+
+Postgres covers far more than most apps need early: relational data, JSON, full-text search, queues (with `SKIP
+LOCKED`), even vectors with an extension. Using one well-understood store until it hurts is usually the right
+design.
+
+</Level>
+
+<Level name="Strategy">
+
+One week in `psql`: create my app's tables by hand, insert seed data, break each constraint on purpose and read
+the error, then connect from Node with a pool.
+
+Done when I can create a table with correct types and constraints from memory, explain `timestamptz` and `NULL`
+comparison, and every constraint violation in my app maps to a clear 400 or 409, not a 500.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: SQL, joins and aggregates
+
+<Figure art={`
+  users                    notes                          tags / note_tags
+  id | email               id | owner_id | title          note_id | tag
+  ---+------------         ---+----------+--------        --------+-------
+  u1 | ana@x.com           1  | u1       | Milk           1       | home
+  u2 | ben@x.com           2  | u1       | Rent           2       | home
+  u3 | cai@x.com           3  | u2       | Trip           2       | money
+
+  INNER JOIN users-notes on owner_id:  ana-Milk, ana-Rent, ben-Trip   (cai missing)
+  LEFT  JOIN users-notes:              ana-Milk, ana-Rent, ben-Trip, cai-NULL
+  GROUP BY user, count(notes.id):      ana 2, ben 1, cai 0
+`} caption="An inner join keeps only matching pairs; a left join keeps every row on the left, with NULLs where nothing matched." />
+
+<Levels label="Phase 3, SQL joins and aggregates">
+
+<Level name="Beginner">
+
+SQL describes the result I want, and the database decides how to get it. The core is `SELECT columns FROM
+table WHERE condition ORDER BY column LIMIT n`. A join combines rows from two tables where a condition holds,
+usually a foreign key matching a primary key.
+
+```sql
+SELECT u.email, n.title
+FROM notes n
+JOIN users u ON u.id = n.owner_id
+WHERE n.created_at > now() - interval '7 days'
+ORDER BY n.created_at DESC
+LIMIT 20;
+```
+
+The plan's trap is skipping SQL because an ORM hides it. The ORM writes SQL like this for me; when it writes
+bad SQL, I need to read it.
+
+</Level>
+
+<Level name="Intermediate">
+
+Aggregates collapse rows: `count`, `sum`, `avg`, `min`, `max` with `GROUP BY`. `HAVING` filters groups after
+aggregation, as `WHERE` filters rows before.
+
+```sql
+SELECT u.email, count(n.id) AS notes
+FROM users u
+LEFT JOIN notes n ON n.owner_id = u.id
+GROUP BY u.id, u.email
+HAVING count(n.id) < 3
+ORDER BY notes;
+```
+
+```text
+   email    | notes
+------------+-------
+ cai@x.com  |     0
+ ben@x.com  |     1
+ ana@x.com  |     2
+```
+
+`count(n.id)` counts non-null values, so users with no notes show 0; `count(*)` would show 1 for them,
+counting the NULL-filled row. That difference is a classic bug.
+
+</Level>
+
+<Level name="Advanced">
+
+Many-to-many relationships use a join table (`note_tags`). Common table expressions (`WITH`) name
+intermediate results for readability. Window functions compute across rows without collapsing them:
+
+```sql
+-- each user's latest note
+SELECT * FROM (
+  SELECT n.*, row_number() OVER (PARTITION BY owner_id ORDER BY created_at DESC) AS rn
+  FROM notes n
+) t WHERE rn = 1;
+```
+
+The logical order of evaluation explains many errors: `FROM` and joins, then `WHERE`, `GROUP BY`, `HAVING`,
+`SELECT`, `ORDER BY`, `LIMIT`. That is why a `SELECT` alias cannot be used in `WHERE` but can be used in
+`ORDER BY`.
+
+</Level>
+
+<Level name="Edge cases">
+
+A filter on the right table of a left join, placed in `WHERE`, turns it back into an inner join, because the
+NULL rows fail the condition: `LEFT JOIN notes n ON ... WHERE n.archived = false` drops users with no notes.
+Put the condition in the `ON` clause. `NOT IN (subquery)` returns no rows at all if the subquery contains a
+NULL; use `NOT EXISTS`.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two one-to-many joins at once multiply rows: joining users to notes (3 each) and to logins (5 each) gives 15
+rows per user, so `count(n.id)` reports 15 notes. Aggregate each relation in its own subquery or use
+`count(DISTINCT n.id)`. `LIMIT` without `ORDER BY` returns an arbitrary subset that can change between runs,
+so pagination shows duplicates and gaps.
+
+</Level>
+
+<Level name="Production level">
+
+Every list query has an `ORDER BY` with a unique tie-breaker (`created_at DESC, id DESC`), a `LIMIT`, and an
+index that supports it. Queries are reviewed in PRs as SQL, including what the ORM generates (logged in
+development).
+
+</Level>
+
+<Level name="Mindset">
+
+Think in sets, not loops. A loop in application code running one query per row is usually one SQL query
+waiting to be written.
+
+</Level>
+
+<Level name="System design">
+
+The questions the product asks (dashboards, reports, feeds) become queries; the shape of those queries drives
+schema and index design, and eventually whether a read model or a cache is needed.
+
+</Level>
+
+<Level name="Strategy">
+
+I write twenty queries for my app's real questions in `psql`, including every edge and corner case above,
+before using the ORM.
+
+Done when I can write a left join with an aggregate and a window function from memory, explain the logical
+evaluation order, and spot the row-multiplication bug in someone else's query.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Indexes
+
+<Flow
+  caption="The index loop for each query the app runs"
+  steps={['Find the query (log or pg_stat_statements)', 'EXPLAIN ANALYZE it', 'Seq Scan on a big table?', 'Add an index matching WHERE and ORDER BY', 'EXPLAIN ANALYZE again', 'Keep it only if it helps']}
+/>
+
+<Levels label="Phase 3, indexes">
+
+<Level name="Beginner">
+
+An index is a separate, sorted structure that lets Postgres find rows without reading the whole table, like a
+book's index. Primary keys and unique constraints create one automatically. Foreign keys do not, and the
+column I filter by most in a multi-user app is exactly a foreign key: `owner_id`.
+
+```sql
+CREATE INDEX notes_owner_created_idx ON notes (owner_id, created_at DESC);
+```
+
+Mistake: never looking. On a table with 50 rows everything is fast, so missing indexes only show up after
+launch. The seed script should create realistic volume.
+
+</Level>
+
+<Level name="Intermediate">
+
+`EXPLAIN ANALYZE` shows the plan and real timings. A `Seq Scan` with `Rows Removed by Filter: 999960` on a big
+table is the signal. After the composite index above, the dashboard query reads only that user's newest rows,
+already in order, and stops at the `LIMIT`.
+
+Phase 4 goes deep on index types, plans and production practice; here the rule is to add the index in the same
+migration as the feature that needs it.
+
+</Level>
+
+<Level name="Advanced">
+
+A B-tree index on `(a, b)` serves `WHERE a = ?`, `WHERE a = ? AND b = ?`, and `WHERE a = ? ORDER BY b`, but not
+`WHERE b = ?` alone. Unique indexes enforce rules (one membership per user per project). Partial indexes cover a
+subset, such as `WHERE deleted_at IS NULL`, and stay small.
+
+</Level>
+
+<Level name="Edge cases">
+
+An index on `email` does not help `WHERE lower(email) = $1`; index the expression. A leading-wildcard `LIKE
+'%milk%'` cannot use a B-tree; full-text search or a trigram index can.
+
+</Level>
+
+<Level name="Corner cases">
+
+Adding a unique index to a live table that already contains duplicates fails the migration in production, though
+it passed on the clean development database. Check for duplicates in a query first, fix them in a data migration,
+then add the index.
+
+</Level>
+
+<Level name="Production level">
+
+Indexes on large live tables are created `CONCURRENTLY` to avoid blocking writes, and unused ones are dropped
+because each index slows every write.
+
+</Level>
+
+<Level name="Mindset">
+
+Indexes follow queries. I add one when a real query needs it, with the plan to prove it.
+
+</Level>
+
+<Level name="System design">
+
+Each new access pattern in the product is a potential index; reviewing schema changes and query changes
+together keeps them aligned.
+
+</Level>
+
+<Level name="Strategy">
+
+Seed 100,000 notes across 1,000 users, `EXPLAIN ANALYZE` the five queries my app runs most, add indexes in
+migrations.
+
+Done when every frequent query shows an index scan and I have before-and-after timings in the PR.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Transactions
+
+<Timeline
+  caption="A transfer of a shared note to another user, with and without a transaction, if the server crashes between steps"
+  items={[
+    { when: 'step 1', what: 'UPDATE notes SET owner_id = new WHERE id = 42' },
+    { when: 'crash here', what: 'Without a transaction: note moved, audit row missing, old owner still listed as a member.' },
+    { when: 'step 2', what: 'INSERT INTO audit (note_id, from, to) ...' },
+    { when: 'step 3', what: 'DELETE FROM note_members WHERE note_id = 42 AND user_id = old' },
+    { when: 'COMMIT', what: 'With a transaction: either all three happened, or none did.' },
+  ]}
+/>
+
+<Levels label="Phase 3, transactions">
+
+<Level name="Beginner">
+
+A transaction groups statements so they succeed or fail together. `BEGIN` starts it, `COMMIT` makes every change
+permanent at once, `ROLLBACK` undoes them all. If the server crashes before `COMMIT`, nothing happened. This is
+the A (atomicity) in ACID; C is consistency (constraints hold), I is isolation (concurrent transactions do not see
+each other's partial work), D is durability (committed means it survives a crash).
+
+```sql
+BEGIN;
+UPDATE notes SET owner_id = 'u2' WHERE id = 42;
+INSERT INTO audit (note_id, from_user, to_user) VALUES (42, 'u1', 'u2');
+COMMIT;
+```
+
+Mistake: running related writes as separate statements from the app, so an error between them leaves half-done
+data that no code expects.
+
+</Level>
+
+<Level name="Intermediate">
+
+From Node with `pg`, a transaction must use one client for all statements, and must always release it:
+
+```ts
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  await client.query('UPDATE notes SET owner_id = $1 WHERE id = $2 AND owner_id = $3', [to, noteId, from]);
+  await client.query('INSERT INTO audit (note_id, from_user, to_user) VALUES ($1, $2, $3)', [noteId, from, to]);
+  await client.query('COMMIT');
+} catch (e) {
+  await client.query('ROLLBACK');
+  throw e;
+} finally {
+  client.release();
+}
+```
+
+With `pool.query` for each statement instead, each could run on a different connection, and `BEGIN` would apply to
+none of them. Prisma offers `prisma.$transaction(async (tx) => ...)` with the same rule: use `tx`, not the global
+client, inside.
+
+</Level>
+
+<Level name="Advanced">
+
+Isolation levels decide what concurrent transactions can see. Postgres defaults to Read Committed: each statement
+sees data committed before it began. That still allows a lost update: two transactions read a counter of 5, both
+write 6. Fixes: do the arithmetic in SQL (`SET count = count + 1`), lock the row (`SELECT ... FOR UPDATE`), or use
+Serializable isolation and retry on serialization failures.
+
+```text
+ERROR:  could not serialize access due to read/write dependencies among transactions
+HINT:  The transaction might succeed if retried.
+```
+
+Serializable is the simplest to reason about (it behaves as if transactions ran one at a time), at the cost of
+retries.
+
+</Level>
+
+<Level name="Edge cases">
+
+An error inside a transaction aborts it; every later statement fails with `current transaction is aborted,
+commands ignored until end of transaction block` until `ROLLBACK`. A transaction that calls an external service
+(sending an email) cannot roll that back; the email goes out even if the commit fails.
+
+</Level>
+
+<Level name="Corner cases">
+
+Two transactions that lock rows in opposite orders deadlock; Postgres detects it and kills one with `deadlock
+detected`. Lock in a consistent order (by id) and retry the victim. A long transaction holding locks while waiting on
+user input or a slow HTTP call blocks everyone else; keep transactions short and do slow work outside.
+
+</Level>
+
+<Level name="Production level">
+
+Side effects that must follow a commit use the outbox pattern: insert an "email to send" row in the same
+transaction, and a worker sends it after commit. Monitoring watches long-running transactions and lock waits.
+
+</Level>
+
+<Level name="Mindset">
+
+Ask what the data looks like if the process dies between any two lines. If the answer is "broken", those lines
+belong in one transaction.
+
+</Level>
+
+<Level name="System design">
+
+Transactions end at the database boundary. Once work spans services or external APIs, the tools change to
+idempotency, outboxes and compensating actions, which the backend and agent series build on.
+
+</Level>
+
+<Level name="Strategy">
+
+Find every multi-step write in my app, wrap each in a transaction, and write a test that injects a failure between
+steps and asserts nothing changed. Reproduce a lost update with two concurrent requests, then fix it.
+
+Done when every multi-step write is atomic under a forced failure, and I can demonstrate and fix a lost update.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Schema design and the schema diagram
+
+<Figure art={`
+  +------------------+        +---------------------+        +------------------+
+  | users            |        | notes               |        | uploads          |
+  +------------------+        +---------------------+        +------------------+
+  | id  uuid PK      |1      *| id  uuid PK         |1      *| id  uuid PK      |
+  | email text UQ    |--------| owner_id uuid FK NN |--------| note_id uuid FK  |
+  | password_hash    |        | title text NN       |        | owner_id uuid FK |
+  | created_at       |        | body text           |        | storage_key text |
+  +------------------+        | version int         |        | mime text        |
+           |1                 | created_at          |        | bytes int        |
+           |                  | updated_at          |        +------------------+
+           |*                 +---------------------+
+  +------------------+
+  | sessions         |   PK primary key  FK foreign key  UQ unique  NN not null
+  | id text PK       |   1 ----- * : one user has many notes
+  | user_id uuid FK  |
+  | expires_at       |
+  +------------------+
+`} caption="The schema diagram the plan asks for: every table, key, constraint and relationship, drawn before the first migration." />
+
+<Levels label="Phase 3, schema design">
+
+<Level name="Beginner">
+
+Schema design is deciding what tables exist, what columns they have and how they relate. Start from the nouns
+in the product (users, notes, uploads, sessions) and the sentences that connect them ("a user owns many notes",
+"a note has many uploads"). Each noun becomes a table, each "has many" becomes a foreign key on the "many" side.
+
+Every table gets a primary key, `NOT NULL` on every column that must exist, foreign keys for every
+relationship, and `created_at`. The plan asks for a schema diagram; I draw it before writing any migration,
+because changing a box on paper is free and changing a table with data is not.
+
+Mistake: one big table with comma-separated values in a column (`tags = 'home,money'`). It cannot be indexed,
+joined or constrained properly. A separate table (or a Postgres array with care) is the fix.
+
+</Level>
+
+<Level name="Intermediate">
+
+Normalisation means each fact is stored once. The owner's email lives in `users`, not copied into every note, so
+changing it is one update. Relationships: one-to-many with a foreign key, many-to-many with a join table (`note_members(note_id,
+user_id, role)` with a composite primary key so a user cannot be added twice).
+
+Foreign key actions decide what happens on delete: `ON DELETE CASCADE` deletes a user's notes with the user;
+`RESTRICT` refuses to delete a user who has notes; `SET NULL` orphans them. Choose deliberately per relationship
+and write it down.
+
+```sql
+CREATE TABLE notes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title text NOT NULL CHECK (char_length(title) BETWEEN 1 AND 200),
+  body text NOT NULL DEFAULT '',
+  version int NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Multi-user schemas need an ownership path from every row to a user (or a tenant), because authorization queries
+follow that path. If uploads belong to notes, every upload query must join to notes to check the owner, or the
+upload row carries `owner_id` too (deliberate denormalisation for a cheap, safe check), with a constraint or
+code that keeps them consistent.
+
+IDs: sequential integers are compact and fast but guessable and leak counts; UUIDs (v4, or time-ordered v7 for
+index locality) are safe to expose. Soft delete (`deleted_at`) keeps history but means every query must filter
+it, which is easy to forget; a partial index and a view help.
+
+</Level>
+
+<Level name="Edge cases">
+
+A column that is "always set" but `NULL`able will eventually be null in some row. A `text` email without a unique
+constraint will eventually have duplicates. A table without `created_at` makes every later "since when?" question
+unanswerable. Money as `float` makes 0.1 + 0.2 wrong; use `numeric` or integer minor units.
+
+</Level>
+
+<Level name="Corner cases">
+
+Cascading deletes plus a large account: deleting one user cascades to a million rows in one transaction and locks
+tables for minutes. Large deletions run in batches in a background job. Uniqueness plus soft delete: a user deletes
+their account (soft), signs up again with the same email, and the unique constraint rejects it; use a partial unique
+index `WHERE deleted_at IS NULL`.
+
+</Level>
+
+<Level name="Production level">
+
+The schema is versioned in migrations, documented by the diagram (regenerated or updated with each migration), and
+reviewed like code. Columns that hold personal data are marked, so retention and deletion requests can be handled.
+
+</Level>
+
+<Level name="Mindset">
+
+Data outlives code. A bad function can be rewritten in an afternoon; a bad schema with a year of data in it takes
+weeks of careful migration.
+
+</Level>
+
+<Level name="System design">
+
+The schema encodes the system's boundaries: which data belongs together, who owns it, what must be consistent. Later
+decisions (sharding by tenant, splitting a service) follow these lines.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the product's sentences, derive tables, draw the diagram, review it against every feature (can I answer each
+screen's query?), then write the first migration.
+
+Done when the diagram matches the database exactly, every relationship has a foreign key with a chosen delete action,
+every row has an ownership path, and this is the schema part of Gate 3.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Prisma
+
+<Flow
+  caption="The Prisma workflow: the schema file is the source of truth for the client types and the migrations"
+  steps={['Edit schema.prisma', 'prisma migrate dev --name add_uploads', 'SQL migration file generated', 'Applied to the dev database', 'Typed client regenerated', 'Code uses prisma.note.findMany']}
+/>
+
+<Levels label="Phase 3, Prisma">
+
+<Level name="Beginner">
+
+Prisma is an ORM for TypeScript. I describe models in `schema.prisma`, Prisma generates SQL migrations from changes
+to that file, and generates a typed client so queries are checked by the compiler.
+
+```prisma
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String
+  notes        Note[]
+  createdAt    DateTime @default(now())
+}
+
+model Note {
+  id        String   @id @default(uuid()) @db.Uuid
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId   String   @db.Uuid
+  title     String   @db.VarChar(200)
+  body      String   @default("")
+  createdAt DateTime @default(now())
+  @@index([ownerId, createdAt(sort: Desc)])
+}
+```
+
+```ts
+const notes = await prisma.note.findMany({
+  where: { ownerId: user.id },
+  orderBy: { createdAt: 'desc' },
+  take: 20,
+  select: { id: true, title: true, createdAt: true },
+});
+```
+
+Mistake: using Prisma before writing the same query in SQL. The plan's trap is exactly this; I keep SQL first.
+
+</Level>
+
+<Level name="Intermediate">
+
+Turning on query logging shows the SQL Prisma generates, which I read for every new query in development:
+
+```ts
+const prisma = new PrismaClient({ log: ['query'] });
+```
+
+```text
+prisma:query SELECT "public"."Note"."id", "public"."Note"."title", "public"."Note"."createdAt" FROM "public"."Note"
+  WHERE "public"."Note"."ownerId" = $1 ORDER BY "public"."Note"."createdAt" DESC LIMIT $2 OFFSET $3
+```
+
+`select` returns only the fields I list, which is also a security boundary: a `findUnique` on users without
+`select` returns `passwordHash`, and one careless `res.json(user)` leaks it. `include` loads relations in a separate
+query, not always a join.
+
+</Level>
+
+<Level name="Advanced">
+
+Relations and N+1: looping over notes and calling `prisma.upload.findMany` per note is 21 queries for 20 notes.
+`include: { uploads: true }` makes it two. For queries Prisma cannot express well (window functions, complex
+aggregates), `prisma.$queryRaw` with a tagged template keeps parameters safe:
+
+```ts
+const rows = await prisma.$queryRaw`SELECT owner_id, count(*)::int AS n FROM "Note" WHERE created_at > ${since} GROUP BY owner_id`;
+```
+
+`$queryRawUnsafe` with string concatenation reintroduces SQL injection. Prisma errors carry codes: `P2002` is a unique
+constraint violation (map it to 409), `P2025` is "record not found" for updates and deletes (map to 404).
+
+</Level>
+
+<Level name="Edge cases">
+
+`update({ where: { id } })` only accepts unique fields in `where`, so scoping by owner needs `updateMany({ where: { id,
+ownerId } })` and a check that `count` is 1, or a `findFirst` then update in a transaction. Forgetting this is how
+authorization gets skipped.
+
+</Level>
+
+<Level name="Corner cases">
+
+The generated client out of date with the schema (someone pulled a schema change without running `prisma generate`)
+gives type errors or runtime errors about unknown fields. Run generate in `postinstall` and in CI. Prisma plus a
+serverless deployment opens a connection pool per instance and exhausts the database's connection limit; use a pooler
+and set `connection_limit`.
+
+</Level>
+
+<Level name="Production level">
+
+Migrations run with `prisma migrate deploy` (never `migrate dev`) in the deploy pipeline before the new code starts.
+Query logging is off in production but slow queries are visible through database metrics and traces.
+
+</Level>
+
+<Level name="Mindset">
+
+An ORM is a productivity tool over SQL, not a replacement for knowing SQL. When the abstraction leaks, I go to the SQL.
+
+</Level>
+
+<Level name="System design">
+
+Keeping all Prisma calls in a data-access layer, behind functions like `notesRepo.listForOwner(userId)`, means
+authorization scoping is enforced in one place and the ORM could be swapped.
+
+</Level>
+
+<Level name="Strategy">
+
+I port my hand-written SQL to Prisma one query at a time, reading the generated SQL for each, and keep raw SQL where it
+is clearer.
+
+Done when every query is scoped by owner in a repository function, no response can include `passwordHash` (a test checks),
+and I can explain the SQL behind each Prisma call.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Migrations
+
+<Timeline
+  caption="Renaming notes.title to notes.heading safely, with expand and contract across three deploys"
+  items={[
+    { when: 'deploy 1, expand', what: 'Add column heading (nullable). Code writes both title and heading, reads title.' },
+    { when: 'backfill', what: 'UPDATE notes SET heading = title WHERE heading IS NULL, in batches.' },
+    { when: 'deploy 2', what: 'Code reads heading, still writes both. Add NOT NULL once the backfill is complete.' },
+    { when: 'deploy 3, contract', what: 'Code stops writing title. A later migration drops title.' },
+  ]}
+/>
+
+<Levels label="Phase 3, migrations">
+
+<Level name="Beginner">
+
+A migration is a versioned file that changes the database schema: create a table, add a column, add an index. The
+files live in the repository and run in order, and the database records which ones have run, so every environment
+(my laptop, CI, production) can be brought to the same schema with one command. The plan's trap is "no migrations":
+changing the production schema by hand in a console, where nobody can reproduce or review it.
+
+```sh
+$ npx prisma migrate dev --name add_note_version
+Applying migration `20261023130000_add_note_version`
+```
+
+```sql
+-- prisma/migrations/20261023130000_add_note_version/migration.sql
+ALTER TABLE "Note" ADD COLUMN "version" INTEGER NOT NULL DEFAULT 1;
+```
+
+Mistake: editing a migration that has already run somewhere. The database thinks it has applied it, and the change
+never happens there. Migrations are append-only; fix forward with a new one.
+
+</Level>
+
+<Level name="Intermediate">
+
+Migrations come in two kinds: schema (DDL) and data (backfills, fixes). Each migration is reviewed in a PR with the
+code that needs it. A seed script, separate from migrations, fills a development or test database with realistic
+data; it is idempotent (safe to run twice) and never runs in production.
+
+```ts
+// prisma/seed.ts
+for (let i = 0; i < 1000; i++) {
+  await prisma.user.upsert({ where: { email: `user${i}@example.com` }, update: {}, create: { email: `user${i}@example.com`, passwordHash: await hash('dev password') } });
+}
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Migrations run while the old code is still serving traffic (during a rolling deploy) and must not break it. That rules
+out dropping or renaming a column the old code uses in the same deploy. Expand and contract (the timeline above) makes
+every step compatible with the version before it, so each deploy can be rolled back.
+
+Some operations lock tables: adding a column with a volatile default on old Postgres versions, adding `NOT NULL` (it
+scans the table), creating an index without `CONCURRENTLY`. On a big table these become outages. Add constraints as
+`NOT VALID` then `VALIDATE CONSTRAINT` separately, which takes a weaker lock.
+
+</Level>
+
+<Level name="Edge cases">
+
+Adding a `NOT NULL` column without a default to a table that has rows fails:
+
+```text
+ERROR:  column "heading" of relation "Note" contains null values
+```
+
+It passed on an empty dev database and fails in production. Add it nullable, backfill, then set `NOT NULL`. Two
+developers creating migrations on branches at the same time produce two files with interleaved timestamps; the
+migration tool may refuse or apply them in a surprising order. Rebase and regenerate before merge.
+
+</Level>
+
+<Level name="Corner cases">
+
+A migration that partially fails: Postgres runs DDL in transactions, so most migrations roll back cleanly, but
+`CREATE INDEX CONCURRENTLY` cannot run in a transaction and can leave an invalid index behind that must be dropped
+before retrying. A backfill of ten million rows in one statement holds locks and bloats the WAL; batch it by id ranges
+with a pause between batches.
+
+</Level>
+
+<Level name="Production level">
+
+The deploy pipeline runs `migrate deploy` once, before new code starts, with a lock so two instances never migrate
+concurrently. A migration that takes longer than seconds on production-sized data is tested on a copy first. Backups
+are taken before risky migrations, and restores have been practised.
+
+</Level>
+
+<Level name="Mindset">
+
+Every schema change happens while the system is running and has to be undoable. Design migrations for the moment when
+old and new code both exist.
+
+</Level>
+
+<Level name="System design">
+
+Backward-compatible migrations are what make continuous deployment possible with a database. They are also the core
+skill behind larger migrations: moving to a new table, a new service or a new database, one compatible step at a time.
+
+</Level>
+
+<Level name="Strategy">
+
+Every schema change in this phase goes through a migration, including one deliberate rename done with expand and
+contract across three PRs, and one `NOT NULL` addition done safely.
+
+Done when a fresh database reaches the production schema with one command, the seed script creates realistic volume,
+and I have performed a column rename with zero failed requests, which is the migrations part of Gate 3.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Authentication with sessions or short-lived tokens
+
+<Figure art={`
+  SIGN UP / LOG IN (sessions)
+  browser                          API                               Postgres
+  POST /auth/login {email,pw} -->  find user by lower(email)  ---->  users
+                                   verify argon2(pw, hash)
+                                   create session id (random 32B) -> sessions(id_hash, user_id, expires)
+                    <-- 204  Set-Cookie: sid=...; HttpOnly; Secure; SameSite=Lax; Max-Age=28800
+
+  LATER REQUEST
+  GET /notes  Cookie: sid=... -->  hash(sid) -> lookup session ->  sessions
+                                   expired? -> 401   ok -> req.user = user
+  LOG OUT
+  POST /auth/logout  ---------->   DELETE session row; Set-Cookie: sid=; Max-Age=0
+`} caption="The auth flow I should be able to draw from memory: credentials once, then an opaque session id in an httpOnly cookie, checked on every request." />
+
+<Levels label="Phase 3, authentication">
+
+<Level name="Beginner">
+
+Authentication answers "who is this?". Authorization, a separate topic, answers "may they do this?". The usual web flow:
+the user sends email and password once; the server checks them and creates a session, a record saying "this random ID
+belongs to user u1 until 8pm"; the session ID goes back in a cookie; the browser sends the cookie with every later request;
+the server looks the session up and sets `req.user`.
+
+```ts
+router.post('/auth/login', loginLimiter, async (req, res) => {
+  const { email, password } = Login.parse(req.body);
+  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const ok = user && (await argon2.verify(user.passwordHash, password));
+  if (!ok) return res.status(401).json({ error: 'email or password is wrong' });
+  const sid = crypto.randomBytes(32).toString('base64url');
+  await prisma.session.create({ data: { idHash: sha256(sid), userId: user.id, expiresAt: addHours(new Date(), 8) } });
+  res.cookie('sid', sid, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 8 * 3600_000 });
+  res.status(204).end();
+});
+```
+
+Mistake: different messages for "no such user" and "wrong password". That tells an attacker which emails have accounts.
+One message for both.
+
+</Level>
+
+<Level name="Intermediate">
+
+Sessions versus tokens. A server-side session is an opaque random ID; all the data stays on the server, and logging out
+or banning a user is deleting a row. A token (like a JWT) carries signed claims (`sub: u1, exp: ...`) that the server
+can verify without a database lookup. The plan says "sessions or short-lived tokens": both are fine if done right. For a
+browser app talking to its own API, sessions in httpOnly cookies are simpler and easier to revoke.
+
+If I use JWTs: short lifetime (minutes), signed with a strong secret or a key pair, verified for signature, expiry, issuer
+and audience on every request, and paired with a refresh token stored server-side so it can be revoked.
+
+```ts
+const payload = jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256'], issuer: 'api.example.com', audience: 'app' });
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Session IDs are stored hashed in the database (like passwords, but a fast hash is fine because they are high-entropy
+random values), so a database leak does not hand out live sessions. On login, the session ID is always new: reusing a
+pre-login ID allows session fixation. Sessions have both an idle timeout and an absolute lifetime. Sensitive actions
+(changing email or password) require re-entering the password, and a password change revokes all other sessions.
+
+JWT pitfalls are well known: accepting `alg: none`, not pinning the algorithm (so an HMAC secret can be confused with
+a public key), long lifetimes with no revocation, and storing tokens in `localStorage`, where any XSS can read them.
+
+</Level>
+
+<Level name="Edge cases">
+
+A user logs in on two devices, then logs out on one: only that session is deleted. "Log out everywhere" deletes all of
+the user's sessions. An expired session must return 401, not a 500 from a null user. A deleted user's sessions must stop
+working immediately, which the foreign key cascade handles.
+
+</Level>
+
+<Level name="Corner cases">
+
+Password reset meets sessions: an attacker who stole a session keeps it after the victim resets the password, unless the
+reset revokes all sessions. Reset tokens themselves must be single-use, short-lived (an hour), stored hashed, and the
+reset request must answer the same way whether or not the email exists.
+
+</Level>
+
+<Level name="Production level">
+
+Login, signup and reset are rate-limited per IP and per account; failed logins are logged (without the password) and
+monitored; session cleanup runs on a schedule. Libraries are used for the hard primitives (hashing, cookie signing), and
+the flow is covered by integration tests including expiry and logout.
+
+</Level>
+
+<Level name="Mindset">
+
+Identity is established once and checked every time. Every request must earn `req.user` from a credential the server can
+verify, never from something the client claims in a body or header.
+
+</Level>
+
+<Level name="System design">
+
+As systems grow, authentication often moves to a dedicated provider or service (OAuth, OpenID Connect), but the flow
+stays the same: a verified identity, a short-lived credential, revocation, and authorization done by the app.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement signup, login, logout and "log out everywhere" with server-side sessions, then draw the flow from memory and
+compare. I implement a JWT version in a branch to compare the trade-offs, then keep sessions.
+
+Done when I can draw the full flow without notes, every protected route returns 401 with no or an expired cookie, and
+logout and password change revoke sessions as tested.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Password hashing
+
+<Compare
+  left="Wrong"
+  right="Right"
+  caption="Password storage: what a database leak exposes in each case."
+  rows={[
+    ['Plain text: every password readable', 'argon2id or bcrypt hash with a per-user salt'],
+    ['sha256(password): billions of guesses per second on a GPU', 'A slow, memory-hard hash: thousands per second at most'],
+    ['One global salt', 'A random salt per hash, stored inside the hash string'],
+    ['Max length 12, no spaces', 'Long passphrases allowed; minimum length, a breached-password check'],
+  ]}
+/>
+
+<Levels label="Phase 3, password hashing">
+
+<Level name="Beginner">
+
+Passwords are never stored, only a hash: a one-way function of the password. To check a login, I hash what the user typed
+and compare. The hash must be deliberately slow, because if the database leaks, attackers guess passwords offline, and a
+fast hash lets them try billions per second. The plan says argon2 or bcrypt; both are designed for this.
+
+```ts
+import argon2 from 'argon2';
+const hash = await argon2.hash('correct horse battery staple');   // argon2id by default
+// '$argon2id$v=19$m=65536,t=3,p=4$Wl0z...$Kf8x...'
+await argon2.verify(hash, 'correct horse battery staple');        // true
+await argon2.verify(hash, 'wrong');                               // false
+```
+
+The string contains the algorithm, its parameters, the random salt and the hash, so `verify` needs nothing else. Mistake:
+`crypto.createHash('sha256')` for passwords. It is a fine hash for files and a terrible one for passwords.
+
+</Level>
+
+<Level name="Intermediate">
+
+A salt is random data mixed into each hash so two users with the same password get different hashes, and precomputed
+tables are useless. Libraries generate it automatically. The cost parameters (memory, iterations for argon2; the cost
+factor for bcrypt) are tuned so one hash takes roughly a few hundred milliseconds on my server: slow for an attacker
+guessing, acceptable once per login.
+
+Password rules that help: a minimum length (the current guidance is length over complexity), allowing long passphrases and
+any characters, and rejecting passwords known from breaches (the Pwned Passwords range API checks without sending the
+password).
+
+</Level>
+
+<Level name="Advanced">
+
+Argon2id is memory-hard: each guess needs a chunk of memory, which makes GPU and custom-hardware attacks expensive. bcrypt is
+older, widely available, and still acceptable, with one sharp edge: it only uses the first 72 bytes of input. Rehashing on
+login upgrades old hashes when I raise the parameters: after a successful verify, if `argon2.needsRehash(hash)` is true,
+store a new hash.
+
+Timing: comparing hashes must not leak how many characters matched; library `verify` functions use constant-time comparison.
+For a user that does not exist, run a dummy verify anyway so the response time does not reveal whether the email exists.
+
+</Level>
+
+<Level name="Edge cases">
+
+A password with trailing spaces or Unicode that normalises differently on different devices (an accented letter composed
+or decomposed) fails to match. Normalise to NFC before hashing, and do not trim. An empty password must be rejected by
+validation before it reaches the hasher.
+
+</Level>
+
+<Level name="Corner cases">
+
+Hashing on the event loop's thread pool plus a login burst: each argon2 hash uses memory and a pool thread, so a hundred
+concurrent logins queue up and other file and DNS operations stall. Rate limiting plus a sensible cost, and sometimes a
+larger `UV_THREADPOOL_SIZE`, keep it healthy. A very long password (a megabyte) makes hashing expensive; cap input length
+(for example 1,024 characters).
+
+</Level>
+
+<Level name="Production level">
+
+Hashes never appear in logs, API responses or analytics. A test asserts no user row has a value that equals a known seed
+password. Cost parameters are reviewed yearly. A breach response plan exists: force resets, revoke sessions, notify.
+
+</Level>
+
+<Level name="Mindset">
+
+Design for the day the database leaks. Good hashing turns that day from a disaster into an incident.
+
+</Level>
+
+<Level name="System design">
+
+Many products avoid storing passwords at all by delegating to an identity provider or passkeys. Even then, the same
+principle applies to any secret I store: API keys and reset tokens are stored hashed.
+
+</Level>
+
+<Level name="Strategy">
+
+I implement hashing with argon2id, measure one hash's time on my deploy target and tune it, add rehash-on-login, a length
+cap, a breached-password check and the dummy verify.
+
+Done when no plain or fast-hashed password exists anywhere, login time is similar for existing and non-existing emails, and
+the tests prove all of it.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Cookies
+
+<Figure art={`
+  Set-Cookie: sid=Q2h...; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Lax
+
+    sid=Q2h...     name and value (opaque random id, nothing meaningful inside)
+    Path=/         sent for every path on this host
+    Max-Age=28800  expires in 8 hours (no Max-Age/Expires = session cookie)
+    HttpOnly       JavaScript cannot read it (document.cookie hides it)
+    Secure         only sent over HTTPS
+    SameSite=Lax   not sent on cross-site POSTs, sent on top-level links
+    (no Domain)    host-only: not shared with subdomains
+`} caption="Every attribute of the session cookie is a security decision." />
+
+<Levels label="Phase 3, cookies">
+
+<Level name="Beginner">
+
+A cookie is a small name-value pair the server asks the browser to store with `Set-Cookie`, and the browser sends back in
+a `Cookie` header on later requests to the same site. That is how a stateless protocol remembers that I logged in. In
+DevTools, Application, Cookies, I can see every cookie and its attributes.
+
+```text
+HTTP/1.1 204 No Content
+Set-Cookie: sid=Q2h...; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Lax
+
+GET /notes HTTP/1.1
+Cookie: sid=Q2h...
+```
+
+The plan's security checklist says prefer `httpOnly`, `secure` cookies. Mistake: storing the session token in
+`localStorage` "because cookies are old". Any script that runs on my page, including an XSS payload or a compromised
+npm package, can read `localStorage`; it cannot read an httpOnly cookie.
+
+</Level>
+
+<Level name="Intermediate">
+
+Attributes, one by one. `HttpOnly` hides the cookie from JavaScript. `Secure` sends it only over HTTPS. `SameSite`
+controls cross-site sending (`Lax` is the sane default; `Strict` is stricter; `None` requires `Secure` and is for genuine
+cross-site use). `Max-Age` or `Expires` sets lifetime; without them the cookie dies when the browser session ends (though
+browsers that restore sessions keep them). `Path` and `Domain` scope it; omitting `Domain` makes it host-only, which is
+safer.
+
+Signed cookies (`cookie-parser` with a secret) detect tampering for values I must trust; for sessions, an opaque random
+ID looked up on the server needs no signature, because guessing a valid one is infeasible.
+
+</Level>
+
+<Level name="Advanced">
+
+Cookie prefixes enforce attributes in the browser: a cookie named `__Host-sid` is only accepted if it is `Secure`, has
+`Path=/` and no `Domain`, which blocks a subdomain from planting or overwriting it. Size limits (about 4 KB per cookie)
+and every cookie being sent on every request mean cookies hold IDs, not data.
+
+When the front end and API are on different sites (app on `app.vercel.app`, API on `api.render.com`), cookies are
+third-party from the browser's view. Browsers increasingly block those, so the robust setup is same-site: serve the API
+under the same registrable domain (`api.example.com` and `app.example.com`) or proxy `/api` through the front-end host.
+
+</Level>
+
+<Level name="Edge cases">
+
+`Secure` cookies are not set over plain `http://localhost` in some setups; browsers treat localhost as a secure context,
+but a proxy or a custom hostname may not be. Make the flag depend on environment carefully, and test with HTTPS locally if
+needed. Clearing a cookie requires the same `Path` and `Domain` it was set with; otherwise logout "does nothing".
+
+</Level>
+
+<Level name="Corner cases">
+
+A cookie set by `app.example.com` with `Domain=example.com` is sent to every subdomain, including a user-content or
+marketing subdomain that might be compromised, which can then read or overwrite it. Host-only cookies plus the `__Host-`
+prefix close that. `SameSite=Lax` plus an OAuth callback that arrives as a cross-site POST: the cookie is not sent and
+login fails; such flows use GET redirects or a short-lived state cookie with `SameSite=None; Secure`.
+
+</Level>
+
+<Level name="Production level">
+
+An integration test asserts the exact `Set-Cookie` attributes on login and logout. HTTPS everywhere with HSTS so `Secure`
+cookies are always sent. Cookie-based auth is paired with CSRF defences (SameSite plus an origin check), covered in Phase 4.
+
+</Level>
+
+<Level name="Mindset">
+
+Cookies are sent automatically. That is their convenience and their danger, and every attribute exists to narrow when
+"automatically" applies.
+
+</Level>
+
+<Level name="System design">
+
+Where the front end and API live (same site, subdomains, different sites) decides whether cookie auth works cleanly, so
+domain layout is an early architectural decision, not a deploy detail.
+
+</Level>
+
+<Level name="Strategy">
+
+I set the session cookie with every attribute, inspect it in DevTools, try to read it from the console (and fail), try to
+use the app over HTTP (and fail), and write the attribute test.
+
+Done when the session cookie is `__Host-` prefixed (or host-only), `HttpOnly`, `Secure`, `SameSite=Lax`, has a lifetime, is
+cleared correctly on logout, and a test pins all of it.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: CORS
+
+<Figure art={`
+  page at https://app.example.com  wants  fetch('https://api.example.com/notes', {credentials:'include', method:'PATCH'})
+
+  1. preflight   OPTIONS /notes
+                 Origin: https://app.example.com
+                 Access-Control-Request-Method: PATCH
+                 Access-Control-Request-Headers: content-type
+  2. API answers 204
+                 Access-Control-Allow-Origin: https://app.example.com   (exact, not *)
+                 Access-Control-Allow-Credentials: true
+                 Access-Control-Allow-Methods: GET, POST, PATCH, DELETE
+                 Access-Control-Allow-Headers: content-type
+                 Access-Control-Max-Age: 600
+  3. browser sends the real PATCH with cookies; JS may read the response
+`} caption="CORS is the browser asking the API for permission to let another origin's JavaScript read responses. The server never relies on it for security." />
+
+<Levels label="Phase 3, CORS">
+
+<Level name="Beginner">
+
+Browsers enforce the same-origin policy: JavaScript on one origin (scheme, host and port) cannot read responses from
+another origin unless that origin allows it. CORS (cross-origin resource sharing) is how the API allows it, with
+`Access-Control-Allow-Origin` headers. When my React app on `localhost:5173` calls my API on `localhost:3000`, those are
+different origins, and I see this in the console:
+
+```text
+Access to fetch at 'http://localhost:3000/notes' from origin 'http://localhost:5173' has been blocked by CORS policy:
+No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+The fix is on the server, allowing exactly my front-end origin:
+
+```ts
+import cors from 'cors';
+app.use(cors({ origin: ['http://localhost:5173', 'https://app.example.com'], credentials: true }));
+```
+
+Mistake: `cors()` with no options (allow every origin) "to make the error go away", or a browser extension that disables
+CORS, which hides the real configuration problem until production.
+
+</Level>
+
+<Level name="Intermediate">
+
+Simple requests (GET, or POST with form-like content types and no custom headers) are sent directly, and the browser
+checks the response headers afterwards. Anything else, a JSON `Content-Type`, `PATCH` or `DELETE`, a custom header,
+triggers a preflight `OPTIONS` request first. The API must answer the preflight with the allowed methods and headers,
+before any auth middleware rejects it for having no cookie.
+
+With cookies (`credentials: 'include'` in fetch), the response must name the exact origin (a wildcard `*` is rejected by
+the browser) and send `Access-Control-Allow-Credentials: true`. A local dev proxy (Vite's `server.proxy`) avoids CORS
+in development by making the API same-origin.
+
+</Level>
+
+<Level name="Advanced">
+
+CORS is not a server-side security control. It only tells browsers whether page JavaScript may read a response. `curl`,
+servers and scripts ignore it entirely, and even in a browser a "simple" cross-origin POST still reaches my server and
+runs; the browser just hides the response. So CORS never replaces authentication, authorization or CSRF protection.
+
+Responses that vary by origin need `Vary: Origin`, or a cache may serve a response with one origin's allow header to
+another origin.
+
+</Level>
+
+<Level name="Edge cases">
+
+`http://localhost:5173` and `http://127.0.0.1:5173` are different origins. A trailing slash in the configured origin
+(`https://app.example.com/`) never matches, because the `Origin` header has no path. Error responses (a 500 from the
+error handler) without CORS headers show up in the browser as a CORS error, hiding the real error; apply CORS before
+everything, including errors.
+
+</Level>
+
+<Level name="Corner cases">
+
+Reflecting the request's `Origin` header back as `Access-Control-Allow-Origin` together with `Allow-Credentials: true`
+lets any website read any logged-in user's data through their browser: a full cross-site data leak. Origins must be checked
+against an allowlist, and a regex allowlist must be anchored (`/^https:\/\/([a-z]+\.)?example\.com$/`), or
+`example.com.evil.net` matches.
+
+</Level>
+
+<Level name="Production level">
+
+The allowlist comes from configuration per environment, includes only my own front ends, and is tested: a request with
+an unknown `Origin` gets no allow header. Preflight results are cached with `Access-Control-Max-Age` to save round trips.
+
+</Level>
+
+<Level name="Mindset">
+
+When the browser blocks something, find out what it is protecting before switching it off.
+
+</Level>
+
+<Level name="System design">
+
+Same-origin deployment (the API under the app's domain or behind a proxy path) removes CORS, third-party cookie problems
+and preflight latency at once, which is why it is often the simplest architecture for a single product.
+
+</Level>
+
+<Level name="Strategy">
+
+I reproduce the CORS error deliberately, fix it with an exact allowlist, then try the reflected-origin misconfiguration
+in a branch and exploit it from a page on another port.
+
+Done when only my origins are allowed with credentials, a test proves an unknown origin is not allowed, and I can explain
+why CORS is not a security boundary for the server.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: File upload
+
+<Flow
+  caption="A direct-to-storage image upload: the file never passes through my Node process"
+  steps={['Client asks POST /uploads/sign {type, size}', 'API checks auth, type, size; creates pending row', 'API returns a presigned PUT URL (5 min)', 'Browser PUTs the bytes to object storage', 'Client calls POST /uploads/:id/complete', 'API verifies object, marks ready']}
+/>
+
+<Levels label="Phase 3, file upload">
+
+<Level name="Beginner">
+
+The plan's build includes uploading an image. Files arrive as `multipart/form-data`, a body format that holds fields and
+file bytes. In Express, `multer` parses it. The first version stores to memory with strict limits, then writes to object
+storage (S3, R2, or a local folder only in development):
+
+```ts
+import multer from 'multer';
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
+
+router.post('/notes/:id/image', requireUser, loadOwnNote, upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'image required' });
+  const key = `u/${req.user.id}/${crypto.randomUUID()}`;
+  await storage.put(key, req.file.buffer, { contentType: req.file.mimetype });
+  const row = await prisma.upload.create({ data: { noteId: req.note.id, ownerId: req.user.id, storageKey: key, mime: req.file.mimetype, bytes: req.file.size } });
+  res.status(201).json({ id: row.id });
+});
+```
+
+Mistake: saving files to the server's local disk in production. The next deploy or a second instance loses them.
+
+</Level>
+
+<Level name="Intermediate">
+
+Never trust the client's file name or declared type. The name can be `../../etc/passwd` or contain HTML; generate my own
+storage key. The `Content-Type` the browser sends is a guess from the extension; check the file's real bytes (magic
+numbers) with a library like `file-type`, and allow a short list (`image/png`, `image/jpeg`, `image/webp`).
+
+```ts
+import { fileTypeFromBuffer } from 'file-type';
+const ft = await fileTypeFromBuffer(req.file.buffer);
+if (!ft || !['image/png', 'image/jpeg', 'image/webp'].includes(ft.mime)) return res.status(415).json({ error: 'unsupported image type' });
+```
+
+Serve uploads with the verified type, `Content-Disposition` as appropriate, and `X-Content-Type-Options: nosniff`, ideally
+from a separate domain, so an uploaded file can never run as script on my app's origin.
+
+</Level>
+
+<Level name="Advanced">
+
+At scale, files should not stream through the API at all. Presigned URLs (the flow above) let the browser upload straight
+to storage with a URL that only allows one PUT, of one key, for a few minutes, with conditions on size and type. The API
+handles only small JSON requests. A completion step (or a storage event) verifies the object exists and matches, then marks
+the row ready; a cleanup job removes pending uploads that never completed.
+
+Images are usually re-encoded (resized, metadata stripped) in a background job with `sharp`, which removes embedded GPS
+location data, normalises format, and defeats files that are valid images and also something else.
+
+</Level>
+
+<Level name="Edge cases">
+
+A zero-byte file, a file exactly at the limit and one byte over, a file with no extension, a filename with emoji, a
+`.png` that is really a PDF, a 10,000 by 10,000 pixel image that is small on disk but huge when decoded (a decompression
+bomb). Each needs a defined outcome and a test.
+
+</Level>
+
+<Level name="Corner cases">
+
+Upload succeeds, database insert fails: an orphan object in storage that costs money and is never cleaned up. Or the
+reverse: row created, upload failed: a broken image link. The pending-row-then-complete flow plus a cleanup job handles
+both. Authorization plus file URLs: a public bucket with predictable keys lets anyone read anyone's images; keep the
+bucket private and serve through signed GET URLs or an authorized route.
+
+</Level>
+
+<Level name="Production level">
+
+Limits at every layer (proxy body size, multer limits, presigned conditions), storage lifecycle rules, metrics on upload
+failures, virus scanning if files are shared between users, and the image served through a CDN with long cache headers
+on immutable keys.
+
+</Level>
+
+<Level name="Mindset">
+
+A file is the most hostile input an app accepts: large, binary, and interpreted by other software later. Treat every
+property of it as attacker-controlled.
+
+</Level>
+
+<Level name="System design">
+
+Separating bytes (object storage, CDN) from metadata (Postgres rows) and processing (background jobs) is the standard shape
+for any media feature, and it scales from one user to millions without changing.
+
+</Level>
+
+<Level name="Strategy">
+
+I build the simple multer version first with all the validation, then replace it with presigned direct uploads, a completion
+step, background re-encoding and a cleanup job.
+
+Done when every edge case above has a test, uploads survive a redeploy, another user cannot read my image URL, and EXIF
+location data is gone from served images.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Email
+
+<Flow
+  caption="Sending a password-reset email without blocking the request or losing the email"
+  steps={['POST /auth/reset {email}', 'Same 202 response whether or not the email exists', 'Transaction: token row + outbox row', 'Worker picks the outbox row', 'Provider API sends (with idempotency key)', 'Webhook: delivered or bounced']}
+/>
+
+<Levels label="Phase 3, email">
+
+<Level name="Beginner">
+
+Apps send email for verification, password resets and notifications. I do not run a mail server; I use a provider's API
+(Resend, Postmark, SES, SendGrid) and, in development, a local catcher (Mailpit) that shows emails in a web UI without sending
+anything real.
+
+```ts
+await mailer.send({
+  to: user.email,
+  from: 'Notes <no-reply@mail.example.com>',
+  subject: 'Reset your password',
+  text: `Reset your password: ${appUrl}/reset?token=${token}\nThis link expires in 1 hour.`,
+});
+```
+
+Mistake: sending the email inside the request and returning 500 if the provider is slow or down. The user's action
+fails because of a third party.
+
+</Level>
+
+<Level name="Intermediate">
+
+Send in the background. The request writes an outbox row in the same transaction as the business change, returns, and a
+worker sends. If the provider is down, the worker retries with backoff; the user never waits.
+
+Content: always a plain-text part, HTML optional; links built from a configured base URL, never from the request's `Host`
+header (an attacker could set it and make reset links point to their site). Templates escape user-provided values, since
+a user's display name with HTML in it would otherwise inject into the email.
+
+</Level>
+
+<Level name="Advanced">
+
+Deliverability is a system. The sending domain needs SPF (which servers may send for it), DKIM (a signature proving the
+message was not altered), and DMARC (the policy for failures) DNS records, or mail lands in spam or is rejected. Providers
+report bounces and complaints by webhook; hard-bounced addresses must stop receiving mail, or the provider suspends the
+account.
+
+```text
+example.com.        TXT  "v=spf1 include:amazonses.com ~all"
+s1._domainkey       CNAME s1.dkim.provider.net
+_dmarc              TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"
+```
+
+</Level>
+
+<Level name="Edge cases">
+
+Email addresses are messier than they look: plus addressing (`ana+notes@x.com`), case, international domains. Validate
+loosely, verify by sending a link. A reset request for an unknown email must return the same response, and take similar
+time, as a known one.
+
+</Level>
+
+<Level name="Corner cases">
+
+A worker that crashes after the provider accepted the email but before marking the outbox row sent will send it again on
+retry. Pass an idempotency key (the outbox row ID) to the provider if supported, and accept that "at least once" is the
+realistic guarantee. A reset email plus link scanners: corporate mail security fetches every link to scan it, consuming a
+single-use token before the user clicks. Make the link open a page with a button that performs the reset with a POST.
+
+</Level>
+
+<Level name="Production level">
+
+Rate limits on every endpoint that sends email (to stop my app being used to spam a victim), monitoring of send failures
+and bounce rates, unsubscribe links for anything not transactional, and no personal data beyond what the message needs.
+
+</Level>
+
+<Level name="Mindset">
+
+Anything that leaves my system cannot be taken back. Design so it happens once, after commit, and so failure is retried,
+not lost.
+
+</Level>
+
+<Level name="System design">
+
+The outbox-plus-worker pattern built for email is the general pattern for any side effect: webhooks, payments,
+notifications, AI jobs. It is the first queue in my system.
+
+</Level>
+
+<Level name="Strategy">
+
+I wire Mailpit locally, implement verification and reset through an outbox and a worker, configure SPF, DKIM and DMARC on
+a real domain, and send to a few providers' inboxes to check spam placement.
+
+Done when a provider outage does not fail any user request, reset emails arrive in the inbox (not spam), the reset flow is
+safe against enumeration and link scanners, and tests cover it with the mailer faked.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Structured logging
+
+<Compare
+  left="Unstructured"
+  right="Structured"
+  caption="The same event logged two ways. Only the right one can be searched, counted and alerted on."
+  rows={[
+    ['console.log("user " + id + " failed login")', 'log.warn({ event: "login_failed", userId, reqId }, "login failed")'],
+    ['Free text: grep and hope', 'JSON: filter event=login_failed, group by reqId'],
+    ['Leaks whatever was concatenated', 'Redaction list removes password, token, email'],
+    ['No request context', 'Every line carries reqId, route, userId'],
+  ]}
+/>
+
+<Levels label="Phase 3, structured logging">
+
+<Level name="Beginner">
+
+Logs are the app's diary. In production I cannot attach a debugger, so logs are how I learn what happened. Structured
+logging writes each event as a JSON object with consistent fields, using a logger like `pino`, with levels: `debug` for
+development detail, `info` for normal events, `warn` for something odd but handled, `error` for failures.
+
+```ts
+import pino from 'pino';
+export const log = pino({ level: process.env.LOG_LEVEL ?? 'info', redact: ['password', 'req.headers.cookie', 'req.headers.authorization'] });
+log.info({ event: 'note_created', noteId: note.id, userId: user.id }, 'note created');
+```
+
+```text
+{"level":30,"time":1761224400000,"event":"note_created","noteId":"8c2e...","userId":"u1","msg":"note created"}
+```
+
+Mistake: logging whole objects (`log.info(req.body)` on signup) and writing passwords to disk. The plan's checklist: log
+events without personal data.
+
+</Level>
+
+<Level name="Intermediate">
+
+Request context: `pino-http` logs every request with method, route, status and duration, and creates a child logger per
+request with a request ID, so every line during that request can be grouped.
+
+```ts
+import pinoHttp from 'pino-http';
+app.use(pinoHttp({ logger: log, genReqId: (req) => req.headers['x-request-id']?.toString() ?? crypto.randomUUID() }));
+// in a handler: req.log.info({ event: 'upload_rejected', reason: 'type' })
+```
+
+Event names (`login_failed`, `note_created`) are stable strings I can count and alert on, better than parsing messages.
+
+</Level>
+
+<Level name="Advanced">
+
+Logs go to standard output, and the platform collects them (twelve-factor). The app does not manage log files. Sampling
+reduces volume for high-frequency debug events. Errors are logged with the serialised error (message, stack, cause) and
+correlated with error tracking by request ID. Log levels are configurable at runtime through an environment variable, so
+debug can be turned on for an incident without a code change.
+
+</Level>
+
+<Level name="Edge cases">
+
+Logging inside a hot loop floods the output and slows requests. Circular objects crash naive serialisers (pino handles them).
+Logging `err` as a string loses the stack; log it as an object under the `err` key.
+
+</Level>
+
+<Level name="Corner cases">
+
+The redaction list covers `password` but the field is `newPassword` in the change-password route, so it leaks. Use wildcards
+(`*.password`, `*.newPassword`) and, better, never log request bodies at all on auth routes. Log injection: a user-supplied
+value with newlines forges fake log lines in a text log; JSON logs escape them, one more reason for structure.
+
+</Level>
+
+<Level name="Production level">
+
+Retention periods, access control on the log store, alerts on error-level event counts, and dashboards on key events (signups,
+failed logins, upload rejections). A quarterly check greps the log store for emails and tokens.
+
+</Level>
+
+<Level name="Mindset">
+
+Write the log line for the person debugging at 2am, with the context they will need and nothing they should not see.
+
+</Level>
+
+<Level name="System design">
+
+Logs, metrics and traces are three views of one system; request IDs that propagate across services and queues are what tie
+them together when the system grows past one process.
+
+</Level>
+
+<Level name="Strategy">
+
+I replace every `console.log` with the logger, add request logging and IDs, define event names for the ten events that matter,
+and write the redaction list with a test that logs a fake signup and asserts no password appears.
+
+Done when every log line is JSON with a request ID, I can trace one request's lines end to end, and the redaction test passes.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Error handling
+
+<Layers
+  caption="Where each kind of error is handled, from closest to the cause to the last resort"
+  layers={[
+    { name: 'Validation', note: 'bad input becomes a 400 with field errors' },
+    { name: 'Domain errors', note: 'NotFound, Conflict, Forbidden thrown by services, mapped to 404, 409, 403' },
+    { name: 'Database errors', note: 'unique violation to 409, FK violation to 400 or 409' },
+    { name: 'External calls', note: 'timeouts and retries, then a 502 or 503' },
+    { name: 'Error middleware', note: 'everything else: log with request id, 500 with no internals' },
+    { name: 'Process handlers', note: 'unhandledRejection or uncaughtException: log, exit, let the platform restart' },
+  ]}
+/>
+
+<Levels label="Phase 3, error handling">
+
+<Level name="Beginner">
+
+Errors are normal: bad input, missing records, a database restart, a provider timeout. Good error handling gives the client
+a useful status and message, gives me a log entry with context, and never shows internals (stack traces, SQL) to users.
+
+```ts
+class HttpError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+export const notFound = () => new HttpError(404, 'not found');
+
+app.use((err, req, res, _next) => {
+  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, requestId: req.id });
+  req.log.error({ err }, 'unhandled error');
+  res.status(500).json({ error: 'internal error', requestId: req.id });
+});
+```
+
+Mistake: `catch (e) {}`. Swallowed errors become mysteries: the feature silently does nothing and no log says why.
+
+</Level>
+
+<Level name="Intermediate">
+
+Map known failure types close to where they are understood. A Prisma unique violation (`P2002`) on signup means "email
+already registered", a 409. A foreign key violation means the referenced record does not exist. Translate them in the data
+layer or a small mapping function, not by matching error strings in handlers.
+
+```ts
+function mapDbError(e: unknown) {
+  if (e instanceof Prisma.PrismaClientKnownRequestError) {
+    if (e.code === 'P2002') return new HttpError(409, 'already exists');
+    if (e.code === 'P2025') return new HttpError(404, 'not found');
+  }
+  return e;
+}
+```
+
+Every external call gets a timeout (`AbortSignal.timeout(5000)` on fetch), because the default is to wait forever.
+
+</Level>
+
+<Level name="Advanced">
+
+Distinguish operational errors (expected failures of a correct program: timeouts, bad input) from programmer errors (bugs:
+undefined is not a function). Operational errors are handled and answered; programmer errors are logged loudly, return 500,
+and, if they leave the process in an unknown state, crash the process so the platform restarts a clean one. `Error` has a
+`cause` option to wrap low-level errors with context without losing them:
+
+```ts
+throw new Error('failed to create note', { cause: e });
+```
+
+Retries only for idempotent operations and transient errors, with exponential backoff and jitter, and a cap.
+
+</Level>
+
+<Level name="Edge cases">
+
+An error thrown after headers were sent cannot change the status; the error handler must check `res.headersSent` and delegate
+to Express's default (which closes the connection). An error object from a library may not be an `Error` instance at all (a
+string or a plain object); handle `unknown` carefully.
+
+</Level>
+
+<Level name="Corner cases">
+
+A retry plus a non-idempotent call creates duplicates (the email sent twice, the note created twice). A timeout plus a
+request that actually succeeded on the other side: my code reports failure while the provider did the work. Both are why
+idempotency keys exist. An error handler that itself throws (logging a circular object) loses the original error; keep the
+handler minimal and defensive.
+
+</Level>
+
+<Level name="Production level">
+
+Error responses are consistent and documented; 5xx rates are monitored per route; error tracking groups exceptions with the
+release SHA; user-facing messages are friendly and include the request ID so support can find the log.
+
+</Level>
+
+<Level name="Mindset">
+
+Ask for every line that can fail: what does the user see, what do I see, and what state is left behind?
+
+</Level>
+
+<Level name="System design">
+
+Timeouts, retries, circuit breakers and graceful degradation (show cached data when a dependency is down) are error handling
+at system scale; the Craft and architecture series develops them.
+
+</Level>
+
+<Level name="Strategy">
+
+I list every failure each route can hit, decide the response for each, implement the mapping and timeouts, and write a test per
+failure, including a database outage simulated by stopping the container.
+
+Done when no response ever contains a stack trace or SQL, every known failure has a specific status and test, and a stopped database
+gives clean 503s and recovers without a restart.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Authorization, and the isolation test
+
+<Figure art={`
+  user A (session a)                                    user B (session b)
+  creates note 42                                        knows or guesses id 42
+
+  B: GET    /notes/42          -> 404   (not 403: do not confirm it exists)
+  B: PATCH  /notes/42          -> 404   and A's note unchanged
+  B: DELETE /notes/42          -> 404   and A's note still there
+  B: GET    /notes             -> only B's notes, never 42
+  B: GET    /notes?ownerId=A   -> query param ignored; still only B's notes
+  B: POST   /notes {ownerId:A} -> ownerId stripped; note belongs to B
+  B: GET    /uploads/<A's id>  -> 404
+
+  every row of this table is one assertion in tests/integration/isolation.test.ts
+`} caption="The plan's key proof: a second user cannot read, change or delete the first user's data, shown by a test for every route." />
+
+<Levels label="Phase 3, authorization and the isolation test">
+
+<Level name="Beginner">
+
+Authentication says who the user is. Authorization says whether they may do this, to this record. The plan's trap is
+checking authentication but not authorization: the route requires login, then loads `notes WHERE id = $1`, so any
+logged-in user can read any note by changing the number in the URL. This is broken access control, the first item in the
+OWASP Top 10, and the most common serious bug in web apps.
+
+The fix is that every query for a user-owned record includes the owner:
+
+```ts
+// wrong
+const note = await prisma.note.findUnique({ where: { id } });
+// right
+const note = await prisma.note.findFirst({ where: { id, ownerId: req.user.id } });
+if (!note) throw notFound();
+```
+
+</Level>
+
+<Level name="Intermediate">
+
+The isolation test is the plan's proof. Two users, one record, every route:
+
+```ts
+describe('isolation', () => {
+  let a, b, noteId;
+  beforeEach(async () => {
+    a = await loginAs('a@example.com');
+    b = await loginAs('b@example.com');
+    noteId = (await a.post('/notes').send({ title: 'secret' })).body.id;
+  });
+
+  test('B cannot read A\'s note', async () => { expect((await b.get(`/notes/${noteId}`)).status).toBe(404); });
+  test('B cannot edit A\'s note', async () => {
+    expect((await b.patch(`/notes/${noteId}`).send({ title: 'pwned' })).status).toBe(404);
+    expect((await a.get(`/notes/${noteId}`)).body.title).toBe('secret');
+  });
+  test('B cannot delete A\'s note', async () => {
+    expect((await b.delete(`/notes/${noteId}`)).status).toBe(404);
+    expect((await a.get(`/notes/${noteId}`)).status).toBe(200);
+  });
+  test('B\'s list never includes A\'s note', async () => {
+    const ids = (await b.get('/notes')).body.items.map((n) => n.id);
+    expect(ids).not.toContain(noteId);
+  });
+});
+```
+
+Each test asserts both the status and that the data is unchanged; a 404 that still deleted the note would pass a
+status-only test.
+
+</Level>
+
+<Level name="Advanced">
+
+Centralise the rule so forgetting is hard: a repository whose every function takes the user (`notesRepo.get(user, id)`), or
+middleware like `loadOwnNote`, or Postgres row-level security, where the database itself filters rows by a session setting:
+
+```sql
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_owner ON notes USING (owner_id = current_setting('app.user_id')::uuid);
+-- per request, inside a transaction: SET LOCAL app.user_id = '...';
+```
+
+Roles and sharing extend the model: a `note_members` table with roles, and a single `can(user, action, note)` function that
+every route calls, tested as a table of cases.
+
+</Level>
+
+<Level name="Edge cases">
+
+Child resources: uploads, comments and tags must be checked through their parent's owner, not just by their own ID. Bulk
+endpoints (`DELETE /notes` with a list of IDs) must check every ID. Admin routes need an explicit role check and their own
+tests.
+
+</Level>
+
+<Level name="Corner cases">
+
+A record shared with B and then unshared: B's open tab still shows it, and B's cached responses or a long-lived token with
+embedded permissions still allow it. Check permissions on every request against current data, and do not embed
+permissions in long-lived tokens. Search and aggregate endpoints leak through counts ("3 results" for a query on A's
+private titles) even if they return no rows; scope those queries too.
+
+</Level>
+
+<Level name="Production level">
+
+A route inventory test fails if any route lacks an isolation test; authorization failures are logged as security events;
+new endpoints cannot merge without the isolation case in review.
+
+</Level>
+
+<Level name="Mindset">
+
+Every request asks two questions, who are you and may you touch this exact thing, and both are answered by the server from
+data it trusts.
+
+</Level>
+
+<Level name="System design">
+
+Tenant isolation in multi-tenant products is this same check one level up (every row has a tenant ID, every query filters by
+it), and it is the property that, if broken, ends companies. Getting the habit right here scales directly.
+
+</Level>
+
+<Level name="Strategy">
+
+I write the isolation test first for every route, watch the vulnerable versions fail, scope every query, then add the route
+inventory check.
+
+Done when the isolation suite covers every route and child resource, passes, and fails if I remove any owner filter, which is
+the isolation part of Gate 3.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: The build, seed script, API docs, integration tests and deploy
+
+<Timeline
+  caption="From a working local app to a deployed one, in the order that keeps each step verifiable"
+  items={[
+    { when: '1', what: 'Seed script: 1,000 users, 100,000 notes, idempotent. Local and CI use it.' },
+    { when: '2', what: 'OpenAPI document generated from the Zod schemas; served at /docs.' },
+    { when: '3', what: 'Integration tests against Postgres in CI: every route, every status, isolation.' },
+    { when: '4', what: 'Managed Postgres provisioned, TLS on, least-privilege app user, backups on.' },
+    { when: '5', what: 'API deployed; migrate deploy runs before start; /health reports the SHA.' },
+    { when: '6', what: 'Front end points at the API on the same site; smoke test passes in production.' },
+  ]}
+/>
+
+<Levels label="Phase 3, the build and the deploy">
+
+<Level name="Beginner">
+
+The plan's build: a user can sign up, log in, create, edit and delete their own records, and upload an image, with the
+API and database deployed. The proof adds a schema diagram, API documentation, the auth flow drawn from memory,
+integration tests and a seed script. I keep a checklist with a link to each artefact in the README.
+
+Deploying means three things run somewhere public: the database (a managed Postgres), the API (a Node host such as Render,
+Fly or Railway), and the front end (a static host). Configuration comes from environment variables on each host, never from
+committed files.
+
+Mistake: deploying everything at the end of week 26. Deploy a hello-world API and an empty database in week 19 and keep
+deploying; the deploy is a skill, not an event.
+
+</Level>
+
+<Level name="Intermediate">
+
+API docs from the same schemas that validate: `zod-to-openapi` (or Fastify's built-in schemas) generates an OpenAPI
+document, and a viewer serves it. Each route lists its request schema, responses per status, and auth requirement. Docs that
+come from code cannot drift from code.
+
+```ts
+registry.registerPath({
+  method: 'post', path: '/notes', security: [{ cookieAuth: [] }],
+  request: { body: { content: { 'application/json': { schema: CreateNote } } } },
+  responses: { 201: { description: 'created', content: { 'application/json': { schema: Note } } }, 400: { description: 'invalid input' }, 401: { description: 'not logged in' } },
+});
+```
+
+</Level>
+
+<Level name="Advanced">
+
+The production start sequence: build once in CI, deploy the artefact, run `prisma migrate deploy` as a release step (one
+instance, with a lock), then start the app, whose `/health` checks the database and reports the commit SHA. The platform's
+health check gates traffic to the new instance. Secrets (database URL, session secret, storage keys) are set per environment.
+
+</Level>
+
+<Level name="Edge cases">
+
+A cold managed database (serverless Postgres that scales to zero) makes the first request slow or time out; set connection
+timeouts and a warm-up, or a minimum compute size. The free tier's connection limit is low; size the pool to fit.
+
+</Level>
+
+<Level name="Corner cases">
+
+The seed script run against production by accident deletes or overwrites real data. Guard it: refuse to run unless
+`NODE_ENV` is development or test and the database URL host is local or a known test host. A migration that ran but the
+deploy that followed failed: the schema is new, the code is old; expand-and-contract makes that safe.
+
+</Level>
+
+<Level name="Production level">
+
+Backups with a tested restore, monitoring of the health endpoint, error tracking, logs collected, and a written list of every
+environment variable with its purpose. The README explains how to run locally in three commands.
+
+</Level>
+
+<Level name="Mindset">
+
+The app is not done when it works on my laptop; it is done when a stranger can use it and I can see what happens when they do.
+
+</Level>
+
+<Level name="System design">
+
+API, database, storage, email provider, front end: five components with explicit contracts between them. Drawing that diagram,
+with the data flows and trust boundaries, is the system-design artefact of this phase.
+
+</Level>
+
+<Level name="Strategy">
+
+I deploy a skeleton in week 19, then every week add the feature, its tests, its docs entry and its migration together, and
+redeploy.
+
+Done when the live app passes the smoke test, the docs list every route, a fresh clone runs locally with seed data in three
+commands, and a backup has been restored into a scratch database.
+
+</Level>
+
+</Levels>
+
+#### Phase 3: Gate 3, the traps and the AI-era note
+
+<Compare
+  left="The plan's trap"
+  right="The habit that replaces it"
+  caption="Phase 3's five traps, each paired with the evidence that I avoided it."
+  rows={[
+    ['Skipping SQL because an ORM hides it', 'Twenty queries in psql first; generated SQL read for every Prisma call'],
+    ['Trusting client-side validation', 'Zod at every route; curl tests with hostile bodies'],
+    ['Secrets in the repository', 'Env config validated at startup; secret scanning in CI'],
+    ['No migrations', 'Every schema change is a reviewed migration; one expand-and-contract rename'],
+    ['Authentication without authorization', 'The isolation suite on every route'],
+  ]}
+/>
+
+<Levels label="Phase 3, Gate 3, the traps and the AI-era note">
+
+<Level name="Beginner">
+
+Gate 3 is: design a multi-user schema; pass with auth, authorization, migrations and a test that proves isolation. I take it
+cold, on a new small domain (a shared shopping list with members), without notes: schema diagram, migrations, signup and
+login, membership-based authorization, and the isolation suite. If I cannot do it, the plan says the next phase will not fix
+it; go back.
+
+</Level>
+
+<Level name="Intermediate">
+
+The AI-era note: AI can generate CRUD faster than I can type it; my value is the schema, the boundaries and the failure modes.
+In practice: I let a model scaffold routes after I have designed the schema and the route table, then review every query for
+owner scoping, every input for validation, and every error path. Then I ask the model to attack my API and turn each attack
+into a test.
+
+```text
+Prompt: Here is my route table and schema. List concrete requests a malicious logged-in
+user could send to read or modify another user's data, or to break validation.
+For each, give the exact HTTP request.
+```
+
+</Level>
+
+<Level name="Advanced">
+
+Generated attacks are a starting list, not a complete one. I check each against my isolation suite, add what is missing, and
+also try the classes models often miss: mass assignment through nested objects, child resources, bulk endpoints, count leaks
+in search, and race conditions (two requests that together exceed a limit).
+
+</Level>
+
+<Level name="Edge cases">
+
+A generated route that "works" but uses `findUnique({ where: { id } })` passes a happy-path test and fails the isolation test;
+the gate exists to catch exactly this.
+
+</Level>
+
+<Level name="Corner cases">
+
+A model suggests disabling a failing check ("remove the owner filter so the test passes" or "set CORS to allow all") as the fix.
+Generated fixes that weaken a boundary are rejected on sight; the fix is always to make the boundary correct.
+
+</Level>
+
+<Level name="Production level">
+
+The gate's artefacts (diagram, migrations, isolation suite, docs) live in the repository and run in CI, so the proof keeps
+being true after the phase ends.
+
+</Level>
+
+<Level name="Mindset">
+
+Speed of generation is not the bottleneck. Judgment about data and trust is, and it is what this phase trains.
+
+</Level>
+
+<Level name="System design">
+
+The shape built here, a validated API over a constrained schema with per-record authorization, is the base every later phase
+adds to: craft hardens it, AI features read from it, agents call it as tools.
+
+</Level>
+
+<Level name="Strategy">
+
+Take the gate on the new domain with a timer and no notes, then compare against my main app and log every gap.
+
+Done when the gate's new app has a diagram, migrations, auth, membership authorization and a passing isolation suite written
+from scratch, and every trap in the table has evidence in my main app.
+
+</Level>
+
+</Levels>
