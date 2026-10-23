@@ -1,0 +1,1000 @@
+---
+title: "Indexes and reading a query plan"
+series: "backend"
+seriesOrder: 8
+undated: true
+readTime: "about 25 min"
+description: "How a B-tree index finds rows, how to read EXPLAIN ANALYZE, and which index fits which query, measured on a million-row Postgres table with real plans."
+tags: ['databases', 'performance', 'debugging']
+related: ['backend/07', 'backend/06']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+A query that took 39 milliseconds took 0.097 milliseconds after one
+`create index` statement. That is roughly four hundred times faster, and
+it is the most common performance fix in backend work. It is also the most
+commonly misapplied one: an index on the wrong column changed nothing, an
+index on a column wrapped in a function was ignored, and six indexes made
+inserts almost seven times slower. The difference between those outcomes
+is not guesswork. Postgres will tell you exactly what it did and why, in
+the query plan. This note teaches what an index is, how to read a plan, and
+how to choose the index a query needs.
+
+Every plan here is real output from Postgres 17 on a table of one million
+rows, run on the box. Timings depend on the machine and on what is cached,
+so the ratios matter more than the absolute numbers.
+
+Reading time: about 25 minutes.
+
+## Before you start
+
+You need the SQL from note 6 and the schema ideas from note 7. Run the
+setup below on a scratch database; it builds a 159 MB table called
+`events` with a million rows in about three seconds.
+
+```sql
+create table events (
+  id         bigint generated always as identity primary key,
+  user_id    int not null,
+  kind       text not null,          -- view, click, signup, purchase
+  status     text not null,          -- 'ok', or 'failed' for 1 row in 100
+  created_at timestamptz not null,   -- one row every 25 seconds from 1 January
+  email      text not null,          -- 'user<n>@Example.com'
+  payload    text
+);
+insert into events (user_id, kind, status, created_at, email, payload)
+select (random() * 49999)::int + 1,
+       (array['view', 'click', 'signup', 'purchase'])[1 + (g % 4)],
+       case when g % 100 = 0 then 'failed' else 'ok' end,
+       timestamptz '2026-01-01' + (g || ' seconds')::interval * 25,
+       'user' || g || '@Example.com',
+       repeat('x', 80)
+from generate_series(1, 1000000) g;
+analyze events;
+```
+
+`user_id` is random, so the exact row counts for a given user in your run
+will differ from mine; the plan shapes will not.
+
+## Note map
+
+<Flow steps={[
+  "What an index is: a sorted copy with pointers",
+  "Reading a plan: nodes, estimates, actuals, buffers",
+  "Selectivity: why the planner ignores some indexes",
+  "Index shapes: composite, expression, partial, pattern",
+  "Order, limit and pagination, and what indexes cost to keep",
+  "From beginner to strategy, questions, takeaways, glossary, practice",
+]} caption="The order of this note. Each part runs real plans on the same million-row table." />
+
+## What an index is
+
+### In one sentence
+
+An index is a separate, sorted structure that maps column values to the
+locations of rows, so the database can jump to matching rows instead of
+reading the whole table.
+
+### The idea
+
+A table in Postgres is a **heap**: rows stored in 8 KB pages in roughly
+insertion order, with no sorting. To find rows where `user_id = 4242`
+without help, the database must read every page and test every row. That
+is a **sequential scan**, and its cost grows with the table.
+
+A **B-tree index** on `user_id` is a balanced tree of pages. The leaf pages
+hold every `user_id` value in sorted order, each with a pointer (a **tuple
+id**, page number plus slot) to the row in the heap. The pages above the
+leaves hold separator values that route a search downwards. Finding one
+value means reading the root, a few inner pages and one leaf: for a
+million rows, about three or four page reads instead of twenty thousand.
+Then the database follows the pointers to fetch the actual rows from the
+heap.
+
+Because the leaves are sorted and linked, a B-tree also answers range
+queries (`between`, `<`, `>=`), prefix matches on sorted text, and `order
+by` on the indexed column without sorting. Postgres has other index types
+(GIN for arrays, JSON and full-text search; GiST for ranges and geometry,
+used by the exclusion constraint in note 7; BRIN for huge, naturally
+ordered tables), but B-tree is the default and covers most application
+queries.
+
+### Worked example
+
+The simple case is one user's events with no index:
+
+```sql
+explain (analyze, buffers) select id, kind, created_at from events where user_id = 4242;
+```
+
+```text
+ Gather  (cost=1000.00..26619.43 rows=21 width=22) (actual time=11.861..39.192 rows=14 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=14543 read=5866
+   ->  Parallel Seq Scan on events  (cost=0.00..25617.33 rows=9 width=22) (actual time=9.263..32.920 rows=5 loops=3)
+         Filter: (user_id = 4242)
+         Rows Removed by Filter: 333329
+ Execution Time: 39.264 ms
+```
+
+Three processes (the main one plus two workers) each scanned a third of the
+table, removed about 333,329 rows each, and kept 14 between them. The
+buffers line says 14,543 pages were found in memory and 5,866 were read
+from disk: about twenty thousand pages to return fourteen rows.
+
+Now the index:
+
+```sql
+create index events_user_id on events (user_id);
+explain (analyze, buffers) select id, kind, created_at from events where user_id = 4242;
+```
+
+```text
+ Bitmap Heap Scan on events  (cost=4.59..86.83 rows=21 width=22) (actual time=0.046..0.074 rows=14 loops=1)
+   Recheck Cond: (user_id = 4242)
+   Heap Blocks: exact=14
+   Buffers: shared hit=12 read=5
+   ->  Bitmap Index Scan on events_user_id  (cost=0.00..4.58 rows=21 width=0) (actual time=0.030..0.030 rows=14 loops=1)
+         Index Cond: (user_id = 4242)
+         Buffers: shared read=3
+ Execution Time: 0.097 ms
+```
+
+Three index pages, then fourteen heap pages (one per row, because random
+user ids scatter each user's rows across the table), seventeen pages in
+total. 39.264 ms became 0.097 ms.
+
+### Step by step
+
+<Figure art={`
+                      [ root: ..20000..40000.. ]
+                     /            |             \\
+         [ 1..9999 | 10000..19999 ] [ ... ]   [ ... ]
+           /      \\
+  leaf: 4241 -> (812,3)     4242 -> (77,14)
+        4242 -> (1203,9)    4242 -> (5010,2)   ...
+                     |
+                     v
+  heap page 1203, slot 9: the actual row for user 4242
+`} caption="A B-tree lookup: root, inner page, leaf. The leaf holds sorted values with pointers into the heap, where the full row lives." />
+
+<Trace
+  columns={["step", "without index", "with index"]}
+  rows={[
+    ["find candidates", "read all ~20,400 heap pages", "read 3 index pages"],
+    ["test rows", "test 1,000,000 rows", "14 pointers already match"],
+    ["fetch rows", "already in hand", "read 14 heap pages"],
+    ["pages touched", "about 20,400", "17"],
+    ["time", "39.264 ms", "0.097 ms"],
+  ]}
+  caption="The same query with and without an index on user_id. The work shrinks from proportional to the table to proportional to the result."
+/>
+
+### Common mistake
+
+The common mistake is expecting an index to help a query that needs most
+of the table anyway. Following a pointer to the heap for each matching row
+is random I/O. When a query matches a large share of rows, reading the
+whole table sequentially is cheaper, and the planner will rightly ignore
+the index. The selectivity part shows this with real plans.
+
+### In real systems
+
+Most application queries filter on a key (a user, a tenant, an order) and
+return a handful of rows. Those are exactly the queries B-tree indexes make
+cheap, which is why the first round of tuning on any slow backend is
+usually "the foreign key and lookup columns had no index".
+
+### Check yourself
+
+<details>
+<summary>1. Why did the indexed query still read 14 heap pages for 14 rows?</summary>
+
+The index only holds `user_id` and pointers. The query asked for `id`,
+`kind` and `created_at`, which live in the heap, and this user's rows sit
+on 14 different pages because user ids were assigned randomly.
+
+</details>
+
+## Reading a plan
+
+### In one sentence
+
+A query plan is a tree of operations, read from the innermost node
+outwards, and the most useful thing in it is the gap between the rows the
+planner expected and the rows that actually came out.
+
+### The idea
+
+`explain` shows the plan Postgres chose without running the query.
+`explain analyze` runs it and adds what actually happened. `buffers` adds
+how many pages each node touched. Use `explain analyze` on `select`s freely;
+on `insert`, `update` or `delete` it really modifies data, so wrap it in
+`begin` and `rollback`.
+
+Each line is a **node**: an operation such as a scan, a join, a sort or an
+aggregate. Indented nodes feed their parent. Read from the most indented
+node up: the leaves read data, and each parent consumes its children's
+rows.
+
+Every node shows two groups of numbers:
+
+- `(cost=4.59..86.83 rows=21 width=22)` is the **estimate**. Cost is in
+  arbitrary units (roughly "sequential page reads"): the first number is
+  the cost before the first row comes out, the second the cost for all
+  rows. `rows` is the expected row count, and `width` the average row size
+  in bytes.
+- `(actual time=0.046..0.074 rows=14 loops=1)` is what happened. Times
+  are in milliseconds, first row and last row. `rows` is per loop, so
+  multiply by `loops` for the total. In the parallel scan above, `rows=5
+  loops=3` means about 15 rows across three processes.
+
+The planner chooses between plans by estimated cost, and it estimates rows
+from **statistics** that `analyze` collects: how many distinct values a
+column has, its most common values, and a histogram of the rest. When the
+statistics are wrong, the row estimates are wrong, and a plan that is
+cheapest for 1 row can be terrible for 100,000.
+
+### Worked example
+
+The simple case is the bitmap plan above, read from the inside out. The
+`Bitmap Index Scan` reads the index and builds a bitmap of heap pages that
+contain matches. The `Bitmap Heap Scan` above it visits those pages in
+physical order and rechecks the condition. Estimated 21 rows, actually 14:
+close enough that the plan was right.
+
+The realistic case is stale statistics. I created a table of 100,000 rows
+with a distinct `user_id` each, indexed and analysed it, then inserted
+another 100,000 rows all for `user_id = 7`, without analysing again:
+
+```text
+ Aggregate  (cost=8.31..8.32 rows=1 width=8) (actual time=16.089..16.091 rows=1 loops=1)
+   ->  Index Only Scan using hot_user_id_idx on hot  (cost=0.29..8.31 rows=1 width=0) (actual time=0.013..12.026 rows=100001 loops=1)
+         Index Cond: (user_id = 7)
+         Heap Fetches: 100001
+ Execution Time: 16.111 ms
+```
+
+The planner expected 1 row and got 100,001. It chose the index because,
+by its statistics, user 7 was one row. After `analyze hot`:
+
+```text
+ Aggregate  (cost=3636.20..3636.21 rows=1 width=8) (actual time=12.931..12.932 rows=1 loops=1)
+   ->  Seq Scan on hot  (cost=0.00..3385.00 rows=100480 width=0) (actual time=0.010..9.212 rows=100001 loops=1)
+         Filter: (user_id = 7)
+         Rows Removed by Filter: 99999
+ Execution Time: 12.951 ms
+```
+
+Estimate 100,480, actual 100,001, and now it chooses a sequential scan,
+which is faster for half the table. Here the difference is small; in a
+join, where the estimate decides between a nested loop run once per row and
+a hash join, a 1-versus-100,000 mistake can be the difference between
+milliseconds and minutes. Autovacuum normally runs `analyze` for you after
+enough changes, but a bulk load followed immediately by queries can run
+ahead of it.
+
+`Heap Fetches: 100001` is worth a note too. An **index-only scan** can
+answer from the index alone, but only for pages the **visibility map**
+marks as all-visible; otherwise it checks the heap to see whether each row
+is visible to this transaction. Freshly written rows are not marked until
+`vacuum` runs. On the events table, the count of failed events took
+32.401 ms with `Heap Fetches: 10000`, and 1.330 ms with `Heap Fetches: 0`
+after `vacuum events`.
+
+### Step by step
+
+<Flow steps={[
+  "Run explain (analyze, buffers) on the slow query",
+  "Find the node where most of the actual time goes",
+  "Compare its estimated rows with its actual rows times loops",
+  "If they differ by 10x or more, fix statistics before indexes",
+  "If a scan reads far more rows than it returns, look for an index",
+  "Change one thing, rerun, and compare the same numbers",
+]} caption="A routine for reading any plan. Most fixes come from the slowest node or the worst estimate." />
+
+<Compare left="Plan line" right="What it tells you" caption="The lines to look for first." rows={[
+  ["Seq Scan ... Rows Removed by Filter: 999986", "read everything to keep a few: an index candidate"],
+  ["rows=1 ... actual rows=100001", "statistics are wrong; analyze, or rethink the condition"],
+  ["Sort Method: external merge  Disk", "the sort spilled to disk; more work_mem or an index in that order"],
+  ["Heap Fetches: 10000 on an index-only scan", "visibility map not set; vacuum"],
+  ["loops=5000 under a nested loop", "the inner side runs 5000 times; check its cost per loop"],
+]} />
+
+### Common mistake
+
+The common mistake is running plain `explain` and trusting the estimates,
+or running `explain analyze` once on a cold cache and once on a warm one
+and comparing them. Run it a few times, look at the buffers to see how much
+came from disk, and compare like with like.
+
+### In real systems
+
+Production teams turn on `auto_explain` or `pg_stat_statements` to find
+the queries worth reading. `pg_stat_statements` ranks queries by total
+time across all calls, which usually points at a fast query called a
+million times rather than one slow report.
+
+### Check yourself
+
+<details>
+<summary>1. A node shows rows=10 loops=200. How many rows did it produce?</summary>
+
+About 2,000: `rows` is the average per loop, so the total is rows times
+loops.
+
+</details>
+
+<details>
+<summary>2. Why is explain analyze on a delete dangerous, and how do you do it safely?</summary>
+
+It actually runs the delete. Wrap it: `begin; explain analyze delete ...;
+rollback;`.
+
+</details>
+
+## Selectivity: when an index is ignored
+
+### In one sentence
+
+An index pays off only when the query keeps a small fraction of the table,
+and the planner uses the statistics to decide, query by query, whether
+that is the case.
+
+### The idea
+
+**Selectivity** is the fraction of rows a condition keeps. `user_id =
+4242` keeps 14 rows out of a million, so it is highly selective. `status
+= 'ok'` keeps 99 rows in 100, so it is not selective at all.
+
+An index scan costs roughly one random page read per matching row (less
+when matching rows cluster together). A sequential scan costs one
+sequential read per page of the table, and sequential reads are cheaper.
+So for a condition that keeps most rows, the index scan would do more work
+than just reading the table, and the planner chooses the sequential scan
+even if an index exists.
+
+The same column can be selective for one value and not for another. In
+`events`, `status = 'failed'` keeps 1 in 100 rows, and `status = 'ok'`
+keeps the other 99. The planner knows this from the column's
+**most-common-values** statistics, and picks a different plan for each
+value.
+
+### Worked example
+
+The simple case is the unselective value. Counting `ok` events with no
+index:
+
+```text
+ Parallel Seq Scan on events  (cost=0.00..25617.33 rows=412139 width=0) (actual time=0.032..43.194 rows=330000 loops=3)
+   Filter: (status = 'ok'::text)
+   Rows Removed by Filter: 3333
+ Execution Time: 63.090 ms
+```
+
+After `create index events_status on events (status)` and `analyze`, the
+same query:
+
+```text
+ Parallel Seq Scan on events  (cost=0.00..25617.33 rows=412736 width=0) (actual time=0.089..40.774 rows=330000 loops=3)
+   Filter: (status = 'ok'::text)
+   Rows Removed by Filter: 3333
+ Execution Time: 59.311 ms
+```
+
+The plan did not change. The planner considered the index and rejected it,
+correctly: 990,000 pointer-follows would cost more than reading 20,000
+pages in order.
+
+The realistic case is the selective value on the same index:
+
+```text
+ Aggregate  (cost=1590.38..1590.39 rows=1 width=8) (actual time=32.377..32.377 rows=1 loops=1)
+   ->  Index Only Scan using events_status on events  (cost=0.42..1566.79 rows=9433 width=0) (actual time=0.150..31.801 rows=10000 loops=1)
+         Index Cond: (status = 'failed'::text)
+         Heap Fetches: 10000
+ Execution Time: 32.401 ms
+```
+
+And after `vacuum events` set the visibility map:
+
+```text
+ ->  Index Only Scan using events_status on events  (cost=0.42..201.50 rows=9433 width=0) (actual time=0.046..0.756 rows=10000 loops=1)
+       Heap Fetches: 0
+ Execution Time: 1.330 ms
+```
+
+One index, two values, two different plans, both correct. An index on
+`status` is useful only for the rare values; the partial index in the next
+part does that job with a fraction of the space.
+
+### Step by step
+
+<Trace
+  columns={["condition", "rows kept", "share", "plan chosen", "time"]}
+  rows={[
+    ["user_id = 4242", "14", "0.0014%", "bitmap index scan", "0.097 ms"],
+    ["status = 'failed'", "10,000", "1%", "index-only scan", "1.330 ms after vacuum"],
+    ["status = 'ok'", "990,000", "99%", "sequential scan, index ignored", "59.311 ms"],
+  ]}
+  caption="The planner's choice follows the share of rows kept, not whether an index exists."
+/>
+
+<Figure art={`
+  cost
+   ^
+   |                                  index scan
+   |                               ..
+   |                            ..
+   |-------------------------*-------------- seq scan
+   |                     ..  ^
+   |                  ..     crossover: a few % of rows,
+   |              ..         depends on table and caching
+   |      ....
+   +---------------------------------------------> share of rows kept
+   0%                                         100%
+`} caption="Sequential scan cost is flat; index scan cost grows with every matching row. Below the crossover the index wins." />
+
+### Common mistake
+
+The common mistake is "the query is slow and there is an index on that
+column, so Postgres is broken". Check the estimated rows. If the condition
+genuinely keeps a large share, the fix is not forcing the index; it is
+changing the query (aggregate less, add a selective condition), or
+precomputing the answer.
+
+### In real systems
+
+Boolean and status columns are the classic wasted indexes. A full index on
+`is_deleted` with 99% `false` costs write time and space and is used only
+for the rare `true`. A partial index on the rare value is the usual
+answer.
+
+### Check yourself
+
+<details>
+<summary>1. Why can't the planner use a single rule like "always use the index if one exists"?</summary>
+
+Because cost depends on how many rows match. For 1% of rows the index
+wins; for 99% it loses badly. The planner estimates the share from
+statistics and picks per query.
+
+</details>
+
+## Index shapes: composite, expression, partial, pattern
+
+### In one sentence
+
+The right index matches the query's exact shape: which columns it filters
+by equality, which by range, which it sorts by, and whether it wraps them
+in functions or patterns.
+
+### The idea
+
+**Composite indexes** cover several columns, sorted by the first column,
+then by the second within ties of the first, and so on, like a phone book
+sorted by surname then first name. That order matters. An index on
+`(kind, created_at)` can find "purchases in the first week of June" as one
+contiguous slice: go to `purchase`, then to 1 June, read until 8 June. An
+index on `(created_at, kind)` cannot: the first week of June is
+contiguous, but purchases are scattered through it. The rule of thumb is
+**equality columns first, then the range or sort column**.
+
+An index on `(a, b)` is efficient for conditions on `a`, or on `a` and
+`b`, but not on `b` alone, since `b` is only sorted within each `a`. This
+is the **leftmost prefix** rule.
+
+**Expression indexes** index the result of a function. An index on `email`
+cannot serve `where lower(email) = ...`, because the index is sorted by
+`email`, not by `lower(email)`. An index on `lower(email)` can.
+
+**Partial indexes** have a `where` clause and only contain matching rows.
+They are smaller and only help queries whose condition implies the
+index's condition.
+
+**Pattern matching.** A B-tree can serve `like 'user7777%'` as a range
+scan, but only if the index's sort order matches simple byte order. With
+most collations it does not, so Postgres needs an index built with the
+`text_pattern_ops` operator class. No B-tree helps `like '%7777@...'`,
+because a leading wildcard has no starting point in a sorted list; that
+needs a trigram index (`pg_trgm` with GIN).
+
+### Worked example
+
+The simple case is the composite. Purchases in one week, with only
+single-column indexes available:
+
+```text
+ Parallel Seq Scan on events  (cost=0.00..27700.67 rows=2562 width=0) (actual time=16.016..29.642 rows=2016 loops=3)
+   Filter: ((created_at >= '2026-06-01 ...') AND (created_at < '2026-06-08 ...') AND (kind = 'purchase'::text))
+   Rows Removed by Filter: 331317
+ Execution Time: 35.949 ms
+```
+
+With both `(created_at, kind)` and `(kind, created_at)` available, the
+planner picked the one with equality first:
+
+```text
+ Index Only Scan using events_kind_created on events  (cost=0.42..226.75 rows=5792 width=0) (actual time=0.029..0.701 rows=6048 loops=1)
+   Index Cond: ((kind = 'purchase'::text) AND (created_at >= '2026-06-01 ...') AND (created_at < '2026-06-08 ...'))
+   Heap Fetches: 0
+   Buffers: shared hit=1 read=33
+ Execution Time: 1.027 ms
+```
+
+34 pages, 1.027 ms. Then I dropped `(created_at, kind)` and asked for one
+day of events of any kind, a condition on the second column only:
+
+```text
+ Index Only Scan using events_kind_created on events  (cost=0.42..26553.31 rows=3289 width=0) (actual time=4.966..42.497 rows=3456 loops=1)
+   Index Cond: ((created_at >= '2026-06-01 ...') AND (created_at < '2026-06-02 ...'))
+ Execution Time: 42.655 ms
+```
+
+The plan says "Index Only Scan", which sounds good, but the cost and time
+say otherwise: without a leading `kind` condition, Postgres 17 had to read
+the entire index. An index with `created_at` first did the same query in
+0.606 ms. Reading the node name is not enough; read the numbers.
+
+The realistic case is case-insensitive email lookup. With an index on
+`email` only:
+
+```text
+ Parallel Seq Scan on events  (cost=0.00..26659.00 rows=2083 width=8) (actual time=65.132..98.502 rows=0 loops=3)
+   Filter: (lower(email) = 'user777@example.com'::text)
+   Rows Removed by Filter: 333333
+ Execution Time: 104.278 ms
+```
+
+With `create index events_email_lower on events (lower(email))`:
+
+```text
+ Index Scan using events_email_lower on events  (cost=0.42..8.44 rows=1 width=8) (actual time=0.023..0.024 rows=1 loops=1)
+   Index Cond: (lower(email) = 'user777@example.com'::text)
+ Execution Time: 0.035 ms
+```
+
+Prefix search, `email like 'user7777%'`, used neither email index on this
+database (its collation is `C.UTF-8`, not plain `C`) and took 35.534 ms.
+With `create index events_email_pattern on events (email
+text_pattern_ops)`:
+
+```text
+ Index Scan using events_email_pattern on events  (cost=0.42..8.45 rows=100 width=8) (actual time=0.057..0.098 rows=111 loops=1)
+   Index Cond: ((email ~>=~ 'user7777'::text) AND (email ~<~ 'user7778'::text))
+   Filter: (email ~~ 'user7777%'::text)
+ Execution Time: 0.120 ms
+```
+
+The index condition shows the trick: a prefix match is turned into a range,
+from `user7777` up to but not including `user7778`. The leading-wildcard
+version, `like '%7777@example.com'`, still did a sequential scan, 46.380
+ms, as expected.
+
+Last, the partial index. "Latest 20 failed events" scanned the table and
+sorted, 33.563 ms. With `create index events_failed_recent on events
+(created_at) where status = 'failed'`:
+
+```text
+ Limit  (cost=0.29..1.24 rows=20 width=16) (actual time=0.017..0.041 rows=20 loops=1)
+   ->  Index Scan Backward using events_failed_recent on events  (cost=0.29..471.78 rows=9833 width=16) (actual time=0.016..0.039 rows=20 loops=1)
+ Execution Time: 0.060 ms
+```
+
+That index is 240 kB, against 32 MB to 39 MB for the full indexes on this
+table, because it holds only the 1% of rows that are failed.
+
+### Step by step
+
+<Compare left="Query shape" right="Index that fits" caption="Match the index to the query, then confirm with a plan." rows={[
+  ["where kind = $1 and created_at between ...", "(kind, created_at): equality first, range last"],
+  ["where created_at between ... (any kind)", "(created_at) or (created_at, ...) with it first"],
+  ["where lower(email) = $1", "on (lower(email)), and query with the same expression"],
+  ["where email like 'abc%'", "(email text_pattern_ops), or a C-collated column"],
+  ["where email like '%abc%'", "GIN trigram index from pg_trgm"],
+  ["where status = 'failed' order by created_at desc", "(created_at) where status = 'failed'"],
+]} />
+
+<Figure art={`
+  index (kind, created_at), leaves in order:
+
+  click    2026-01-01 ... 2026-12-31
+  purchase 2026-01-01 ... [2026-06-01 .. 2026-06-08) ... 2026-12-31
+                          ^ one contiguous slice to read
+  signup   2026-01-01 ... 2026-12-31
+  view     2026-01-01 ... 2026-12-31
+
+  'all kinds on 1 June' = four separate slices, and
+  Postgres 17 reads the whole index to find them
+`} caption="Why column order matters in a composite index. Equality on the first column makes the range on the second one slice." />
+
+### Common mistake
+
+The common mistake is a function on the indexed column in the query:
+`where date(created_at) = '2026-06-01'`, `where lower(email) = ...`,
+`where id::text = $1`. Each one hides the column from a plain index.
+Either rewrite the condition as a range on the bare column (`created_at >=
+'2026-06-01' and created_at < '2026-06-02'`), or index the expression and
+use exactly that expression in the query.
+
+### In real systems
+
+Teams keep a short list of each table's hot queries and check that every
+one has an index whose leading columns match its equality conditions.
+Composite indexes often replace several single-column ones; a
+`(tenant_id, created_at)` index serves both "everything for this tenant"
+and "this tenant's recent items".
+
+### Check yourself
+
+<details>
+<summary>1. You have an index on (tenant_id, status). Which of these can use it efficiently: where tenant_id = 5; where status = 'open'; where tenant_id = 5 and status = 'open'?</summary>
+
+The first and third. The second filters only on the second column, which
+is sorted only within each tenant, so the index is no help to find it
+directly.
+
+</details>
+
+<details>
+<summary>2. Rewrite where date(created_at) = '2026-06-01' so a plain index on created_at can serve it.</summary>
+
+`where created_at >= '2026-06-01' and created_at < '2026-06-02'`, with
+the dates interpreted in the time zone you mean.
+
+</details>
+
+## Order, limit, pagination, and what indexes cost
+
+### In one sentence
+
+An index in the right order lets `order by ... limit` stop after a few
+rows, keyset pagination keeps deep pages fast, and every index you add
+makes every write slower and the database larger.
+
+### The idea
+
+Because B-tree leaves are sorted, a query that filters and sorts in index
+order can read the first N matching entries and stop. No sort, no reading
+of the rest. This is why "latest 20 for a user" wants an index on
+`(user_id, created_at)`, not just `(user_id)`. A B-tree can be read in
+either direction, so the same index serves `desc`.
+
+That also explains why `offset` pagination gets slower the deeper you go.
+`order by id limit 20 offset 900000` must walk 900,020 entries and throw
+away 900,000. **Keyset pagination** (from note 5) says `where id > $last
+order by id limit 20` instead, which jumps straight to the right place.
+
+Indexes are not free. Every insert writes the row to the heap and an entry
+to every index on the table. Every update that changes an indexed column
+does the same. Indexes take disk space and memory in the cache, which
+competes with the data itself.
+
+### Worked example
+
+The simple case is a filtered top-N in index order:
+
+```sql
+explain (analyze) select id, created_at from events
+where kind = 'purchase' order by created_at desc limit 20;
+```
+
+```text
+ Limit  (cost=0.42..7.45 rows=20 width=16) (actual time=0.055..0.068 rows=20 loops=1)
+   ->  Index Scan Backward using events_kind_created on events  (cost=0.42..88470.92 rows=251933 width=16) (actual time=0.054..0.065 rows=20 loops=1)
+         Index Cond: (kind = 'purchase'::text)
+ Execution Time: 0.096 ms
+```
+
+The scan node's total estimate is 88,470 for all 251,933 purchases, but
+the `Limit` above it stops after 20 rows, so the actual work was 0.065 ms.
+The startup cost of 0.42 is what made this plan attractive.
+
+Deep offset against keyset, on the primary key:
+
+```text
+-- order by id limit 20 offset 900000
+ Limit  (cost=41753.23..41754.15 rows=20 width=16) (actual time=230.707..230.712 rows=20 loops=1)
+   ->  Index Scan using events_pkey on events  (... actual time=0.030..203.840 rows=900020 loops=1)
+ Execution Time: 230.725 ms
+
+-- where id > 900000 order by id limit 20
+ Limit  (cost=0.42..1.40 rows=20 width=16) (actual time=0.047..0.051 rows=20 loops=1)
+   ->  Index Scan using events_pkey on events  (... actual time=0.046..0.048 rows=20 loops=1)
+         Index Cond: (id > 900000)
+ Execution Time: 0.063 ms
+```
+
+Same 20 rows. The offset version read 900,020 index entries.
+
+The realistic case is the write cost. By this point `events` had six
+indexes: the primary key, `user_id`, `(kind, created_at)`, `email`,
+`lower(email)` and `email text_pattern_ops`. I copied 200,000 rows into a
+table with the same columns and no indexes, then inserted the same 200,000
+rows into `events`:
+
+```text
+insert into events_bare (no indexes): 349.901 ms
+insert into events (six indexes):    2358.949 ms
+```
+
+About 6.7 times slower. The index sizes explain part of it:
+
+```text
+      indexname       | pg_size_pretty
+----------------------+----------------
+ events_email         | 39 MB
+ events_email_lower   | 39 MB
+ events_email_pattern | 39 MB
+ events_kind_created  | 32 MB
+ events_pkey          | 21 MB
+ events_user_id       | 7800 kB
+```
+
+About 178 MB of indexes on a 159 MB table, and three of them on the same
+column. In a real schema I would keep one of the email indexes, the one
+matching how the application actually searches.
+
+### Step by step
+
+<Timeline items={[
+  { when: "Query is slow", what: "explain (analyze, buffers) shows a seq scan removing most rows" },
+  { when: "Hypothesis", what: "an index on the equality columns, then the sort column" },
+  { when: "Build safely", what: "create index concurrently, so writes are not blocked" },
+  { when: "Verify", what: "rerun the plan; confirm the index is used and time dropped" },
+  { when: "A week later", what: "pg_stat_user_indexes shows idx_scan > 0; drop unused ones" },
+]} caption="The life of an index added for a reason. Each one is checked when added and checked again once real traffic has used it." />
+
+<Layers layers={[
+  { name: "Write path", note: "heap row + one entry per index; more indexes, slower writes" },
+  { name: "Storage", note: "each index is its own file; here 178 MB beside a 159 MB table" },
+  { name: "Cache", note: "hot index pages compete with table pages for memory" },
+  { name: "Read path", note: "the right index turns scans into jumps" },
+]} caption="What an index costs and what it buys. The read benefit has to outweigh the costs on every other layer." />
+
+### Common mistake
+
+The common mistake is `create index` on a large production table during
+the day. A plain `create index` blocks writes to the table until it
+finishes. `create index concurrently` builds without blocking writes, at
+the cost of taking longer and not being allowed inside a transaction
+block. Note 10 covers this with other migration hazards.
+
+### In real systems
+
+`pg_stat_user_indexes` records how often each index is scanned. Indexes
+that show zero scans over weeks of normal traffic (and are not enforcing
+uniqueness) are candidates for removal, which speeds up every write.
+
+### Check yourself
+
+<details>
+<summary>1. Why did the Limit plan show a total cost of 88,470 for the scan but finish in 0.096 ms?</summary>
+
+The scan's total cost is for reading all matching rows. The Limit node
+stops pulling rows after 20, so only the first few index entries were
+read. The low startup cost is why the planner chose it.
+
+</details>
+
+<details>
+<summary>2. Name two costs of an index that do not show up in the read query's plan.</summary>
+
+Slower inserts and updates (each index must be maintained) and disk and
+cache space. Here six indexes made a bulk insert about 6.7 times slower
+and took more space than the table.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Indexes and reading a query plan">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, index the columns you look rows up by: foreign keys
+and the identifiers in your `where` clauses. Learn to run `explain
+analyze` and spot `Seq Scan` with a large `Rows Removed by Filter`.
+
+A worked example: the "my events" page filters by `user_id`. The plan
+shows a sequential scan removing 999,986 rows; an index on `user_id`
+turns 39 ms into 0.1 ms.
+
+The mistake at this level is adding indexes by guessing. The fix is to
+read the plan before and after.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, design composite indexes from query shapes:
+equality columns first, then the range or sort column. Rewrite conditions
+so the bare column is compared.
+
+A worked example: "latest 20 purchases" uses `(kind, created_at)` read
+backwards and stops after 20 rows, 0.096 ms.
+
+The mistake is one single-column index per column, hoping the planner
+combines them. It sometimes can, with bitmap scans, but a composite in the
+right order is usually far better.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, use expression, partial and covering indexes, and
+read estimates against actuals to find statistics problems.
+
+A worked example: a partial index on `created_at where status =
+'failed'` serves the error dashboard at 240 kB instead of a 32 MB full
+index.
+
+The mistake is fixing a bad estimate with an index. The fix is correct
+statistics first: `analyze`, a higher statistics target for skewed
+columns, or extended statistics for correlated columns.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries: a table so small that a sequential scan is always
+cheaper, a value present in every row, a freshly loaded table with no
+statistics, an index-only scan on a table never vacuumed.
+
+A worked example: a test database with 50 rows shows sequential scans
+everywhere, and someone concludes the indexes are broken. With 50 rows,
+reading one page beats any index.
+
+The mistake is judging plans on tiny data. The fix is testing on data of
+realistic size and shape.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two conditions at once: a parameterised query whose best plan depends on
+the value. With prepared statements, Postgres may switch to a **generic
+plan** after a few executions, chosen without knowing the value.
+
+A worked example: `where status = $1` is fast for `'failed'` and slow for
+`'ok'`; a generic plan picks one shape for both. Checking with `explain
+(analyze) execute` for both values, and keeping rare-value queries
+separate, removes the surprise.
+
+The mistake is testing a prepared query with only one parameter value.
+The fix is testing the rare and the common value.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, find slow queries from `pg_stat_statements` by total time,
+build indexes with `create index concurrently`, and watch index usage and
+bloat.
+
+A worked example: the top query by total time is a 2 ms lookup called
+three million times a day. A covering index that makes it index-only
+saves more total time than fixing a 4-second monthly report.
+
+The mistake is tuning the slowest single query instead of the most
+expensive total. The fix is ranking by total time.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that the plan is evidence and the planner is usually right
+given what it knows. When it chooses badly, the question is what it does
+not know.
+
+A worked example: the planner chose an index for a value with 100,000
+rows because the statistics said 1. Running `analyze` fixed the plan
+without touching the query.
+
+The mistake is forcing plans with hints or disabling scan types. The fix
+is giving the planner better information.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, decide which queries the primary database serves with
+indexes, and which go to other systems: full-text and fuzzy search to a
+search index or `pg_trgm`, analytics to a replica or warehouse, hot keys
+to a cache.
+
+A worked example: an admin "search anything" box with leading wildcards
+moves to a trigram index, not a dozen B-tree indexes that cannot help it.
+
+The mistake is adding indexes for every possible filter in an admin
+screen. The fix is a search system designed for arbitrary filters.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is an index budget per table: every index exists for named
+queries, is verified by a plan, is reviewed for usage, and is removed when
+unused.
+
+A worked example: each migration that adds an index includes the query it
+serves and the before and after plan in the description.
+
+Done when: you can read any plan, find the slowest node and the worst
+estimate, propose the index that fits the query shape, and say what it
+will cost on writes.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I index every column?** No. Each index slows writes and takes
+space; here six indexes made inserts about 6.7 times slower. Index for
+the queries you run.
+
+**Does the primary key need a separate index?** No. Postgres creates one
+for every primary key and unique constraint. Foreign key columns, on the
+other hand, are not indexed automatically.
+
+**What does "covering index" mean?** An index that contains every column
+the query needs, so it can be answered with an index-only scan. Postgres
+lets you add non-key columns with `include (...)` for this.
+
+**Why does the same query have a different plan in production?** Different
+data sizes, different statistics, different settings, and different cache
+contents. Always read the plan from the environment that is slow.
+
+**Can I force Postgres to use my index?** Not directly; there are no
+query hints in core Postgres. Settings like `enable_seqscan = off` exist
+for experiments, to see what the alternative plan costs, not for
+production.
+
+## Key takeaways
+
+- An index is a sorted structure of values and row pointers; lookups go
+  from proportional-to-table to proportional-to-result.
+- Read plans from the inside out; compare estimated rows with actual rows
+  times loops.
+- Large estimate errors usually mean stale or insufficient statistics.
+- The planner ignores indexes for conditions that keep a large share of
+  rows, correctly.
+- Composite indexes: equality columns first, then range or sort columns.
+- A function on a column hides it from a plain index; index the
+  expression or rewrite the condition.
+- Partial indexes serve rare values cheaply.
+- Keyset pagination stays fast at any depth; deep `offset` does not.
+- Every index costs write time, disk and cache.
+
+## Glossary
+
+- **Heap**: the table's unordered storage of rows in pages.
+- **Sequential scan**: reading every page of a table.
+- **B-tree**: the default balanced, sorted index structure.
+- **Tuple id**: a pointer to a row's page and slot in the heap.
+- **Bitmap scan**: collecting matching pages from an index, then reading
+  them in page order.
+- **Index-only scan**: answering from the index without visiting the heap.
+- **Visibility map**: per-page flags that let index-only scans skip the
+  heap.
+- **Selectivity**: the share of rows a condition keeps.
+- **Statistics**: per-column summaries collected by `analyze`.
+- **Composite index**: an index on several columns, sorted in order.
+- **Partial index**: an index over rows matching a `where`.
+- **Expression index**: an index on the result of an expression.
+- **Keyset pagination**: paging with `where key > last` instead of
+  `offset`.
+
+## Practice
+
+**Warm-up.** Build the `events` table and run the `user_id = 4242` query
+(or any user id) before and after indexing. Record pages touched and time.
+
+**Build.** Write the three queries behind a user's activity page (latest
+20 events, counts per kind this month, failed events this week) and design
+the fewest indexes that serve all three. Prove each with a plan.
+
+**Stretch.** Load 100,000 rows of a single value into an analysed table,
+run a query on that value before and after `analyze`, and explain the plan
+change from the estimates. Then measure insert time with zero, two and six
+indexes on the same table.
