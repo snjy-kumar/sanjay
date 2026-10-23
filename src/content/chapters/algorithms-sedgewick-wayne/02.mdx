@@ -1,0 +1,1654 @@
+---
+book: algorithms-sedgewick-wayne
+number: 2
+title: "Sorting"
+description: "Selection, insertion and shellsort, mergesort, quicksort with three-way partitioning, binary heaps and heapsort, and how real systems sort, all in TypeScript."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+Sorting is putting items in order, and it is the most studied problem in
+computing because almost everything else gets easier once data is sorted:
+searching, finding duplicates, merging, ranking, computing medians. This
+chapter builds every important sorting algorithm from the simplest to the
+ones inside your language's standard library, measures each one, and ends
+with the priority queue, the data structure that sorting turns into when
+items keep arriving.
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Write selection sort, insertion sort and shellsort, and predict their compare counts on random, sorted and reversed input.
+- Write top-down and bottom-up mergesort, explain why mergesort is stable, and derive its `n lg n` cost.
+- Explain the lower bound that says no compare-based sort can beat about `n lg n` compares.
+- Write quicksort with a shuffle, explain why the shuffle matters, and use three-way partitioning for many duplicate keys.
+- Build a binary-heap priority queue with swim and sink, and turn it into heapsort and a top-k filter.
+- Choose a sort for a real job using stability, memory, worst case and the shape of the data.
+
+What you should already know: <a href={withBase('/books/algorithms-sedgewick-wayne/01-fundamentals/')}>chapter 1</a>
+(stacks, queues, the doubling test and tilde notation) and recursion.
+
+Reading time: about two hours to read; three or four evenings to build and
+run everything.
+
+## Chapter map
+
+<Flow caption="How the chapter's five sections lead into each other. Each algorithm answers a weakness of the one before; the priority queue turns sorting into a data structure." steps={[
+  "2.1 Elementary Sorts: selection, insertion, shellsort; the rules of the game",
+  "2.2 Mergesort: divide and conquer, guaranteed n lg n, the lower bound",
+  "2.3 Quicksort: in place, fast in practice, shuffle and three-way partitioning",
+  "2.4 Priority Queues: the binary heap, swim and sink, heapsort",
+  "2.5 Sorting Applications: comparators, stability, selection, choosing a sort",
+]} />
+
+Every algorithm here sorts with only two operations: **compare** two items
+and **exchange** two items. Counting those two operations is how the book,
+and this page, measures cost. All code is my own TypeScript, run on Node
+22; every output block is real output.
+
+## 2.1 Elementary Sorts
+
+### In one sentence
+
+Selection sort repeatedly picks the smallest remaining item, insertion sort
+slides each new item into place among the ones already sorted, and
+shellsort runs insertion sort on items far apart first so that the final
+pass has little left to do.
+
+### The idea
+
+#### The rules of the game
+
+A sort takes an array of items with **keys** and rearranges it so the keys
+are in ascending order. The book's sorts touch the data only through
+`less(a, b)` and `exch(a, i, j)`. That restriction does two things: it lets
+one implementation sort anything comparable (numbers, strings, dates,
+records under any rule), and it lets us count cost exactly.
+
+Four properties describe every sort. **Running time**, in compares and
+exchanges. **Extra memory**: an **in-place** sort uses only a constant or
+logarithmic amount beyond the array. **Stability**: a stable sort keeps
+items with equal keys in their original relative order. And **adaptivity**:
+whether the sort runs faster on input that is already nearly sorted.
+
+A comparison rule has to be a **total order**: for any two keys, exactly one
+of less, equal or greater holds (with equal reflexive and symmetric), and
+the rule is transitive. If a comparator breaks transitivity, every sort in
+this chapter can produce garbage, or in some libraries, throw.
+
+#### Selection sort
+
+Find the smallest item and exchange it with the first. Find the smallest
+of the rest and exchange it with the second. Continue until the array is
+sorted. It is the algorithm most people describe if asked how they would
+sort.
+
+Its cost is fixed by its loops, not by the data. Pass `i` scans the n − 1 −
+i items after it, so the total compares are `(n−1) + (n−2) + ... + 1 + 0`,
+which is `n(n−1)/2`, or `~n²/2`. It makes exactly n exchanges, one per pass.
+That is both its weakness and its one strength: it is slow even on sorted
+input, but it moves data less than any other sort, which matters only when
+moving an item is very expensive.
+
+#### Insertion sort
+
+Keep the left part of the array sorted. Take the next item and move it left,
+exchanging with each larger neighbour, until it sits after something no
+larger. This is how many people sort a hand of cards.
+
+Its cost depends on the data, which makes it **adaptive**. An **inversion**
+is a pair of items that are out of order. Each exchange in insertion sort
+fixes exactly one inversion, so the number of exchanges equals the number
+of inversions. On sorted input there are none: `n − 1` compares and zero
+exchanges. On reversed input every pair is inverted: `~n²/2` compares and
+exchanges. On random input about half the pairs are inverted: `~n²/4` of
+each. On **partially sorted** input, where the number of inversions is at
+most a constant times n, it runs in linear time, and that is why insertion
+sort survives inside fast sorts today.
+
+#### Shellsort
+
+Insertion sort is slow on random data because items move one position at a
+time; an item at the far end needs n exchanges to get home. Shellsort
+fixes this by first sorting items that are h apart, for a large h, so items
+take big jumps. An array where every h-th item forms a sorted sequence is
+called **h-sorted**. Shellsort h-sorts for a decreasing sequence of h
+values ending at 1. The last pass, with h = 1, is plain insertion sort, so
+the result is sorted; the earlier passes just make that last pass cheap.
+
+The book uses the increment sequence `1, 4, 13, 40, 121, ...`, each value
+three times the previous plus one. A key fact makes the passes cooperate:
+an array that is h-sorted and then k-sorted stays h-sorted. Nobody has a
+precise formula for shellsort's average cost with this sequence, which
+makes it a nice example of an algorithm that is understood by experiment.
+Measured, it does far fewer than `n^(3/2)` compares, and its worst case
+with this sequence is known to be bounded by about `n^(3/2)`.
+
+### Worked example
+
+Here are the three sorts in TypeScript, sharing a comparator type and
+counted `less` and `exch` helpers so I can measure them.
+
+```ts
+export type Cmp<T> = (a: T, b: T) => number;
+export let compares = 0, exchanges = 0;
+function less<T>(c: Cmp<T>, a: T, b: T) { compares++; return c(a, b) < 0; }
+function exch<T>(a: T[], i: number, j: number) {
+  exchanges++; const t = a[i]; a[i] = a[j]; a[j] = t;
+}
+export function selection<T>(a: T[], c: Cmp<T>) {
+  for (let i = 0; i < a.length; i++) {
+    let min = i;
+    for (let j = i + 1; j < a.length; j++) if (less(c, a[j], a[min])) min = j;
+    exch(a, i, min);
+  }
+}
+export function insertion<T>(a: T[], c: Cmp<T>) {
+  for (let i = 1; i < a.length; i++)
+    for (let j = i; j > 0 && less(c, a[j], a[j - 1]); j--) exch(a, j, j - 1);
+}
+```
+
+```ts
+export function shell<T>(a: T[], c: Cmp<T>) {
+  const n = a.length; let h = 1;
+  while (h < Math.floor(n / 3)) h = 3 * h + 1;          // 1, 4, 13, 40, ...
+  for (; h >= 1; h = Math.floor(h / 3))
+    for (let i = h; i < n; i++)                        // h-sort the array
+      for (let j = i; j >= h && less(c, a[j], a[j - h]); j -= h) exch(a, j, j - h);
+}
+```
+
+Shellsort's code is insertion sort with `1` replaced by `h` and one extra
+loop. That small change is the difference between quadratic and fast.
+
+The realistic example is the doubling test from chapter 1, run on random
+arrays of doubles, with the compare counter.
+
+```text
+selection | 2000: 19ms cmp=1999000 | 4000: 66ms cmp=7998000 | 8000: 266ms cmp=31996000 | 16000: 983ms cmp=127992000
+insertion | 2000: 12ms cmp=1003676 | 4000: 39ms cmp=3971900 | 8000: 167ms cmp=15820107 | 16000: 635ms cmp=63801992
+shell | 2000: 1ms cmp=33035 | 4000: 3ms cmp=77345 | 8000: 3ms cmp=172441 | 16000: 6ms cmp=403121
+```
+
+Selection sort's count is exactly `n(n−1)/2` every time (1,999,000 for n =
+2000). Insertion sort's is close to `n²/4` (about 1,000,000 for n = 2000),
+so it does half the work on random data. Shellsort does about 400,000
+compares at n = 16,000, where insertion sort does 64 million: 150 times
+fewer. And on the special inputs:
+
+```text
+sorted n=1000 compares 999 exchanges 0
+reversed n=1000 compares 499500 exchanges 499500
+```
+
+Exactly as the inversion argument predicts: zero inversions costs `n − 1`
+compares; the maximum, `n(n−1)/2` = 499,500, costs that many exchanges.
+
+### Step by step
+
+Selection sort on `38 27 43 3 9 82 10`. Each row is one pass: `i` is the
+position being filled and `min` is where the smallest remaining item was.
+
+<Trace
+  columns={["i", "min", "array after the exchange"]}
+  rows={[
+    ["0", "3", "3 27 43 38 9 82 10"],
+    ["1", "4", "3 9 43 38 27 82 10"],
+    ["2", "6", "3 9 10 38 27 82 43"],
+    ["3", "4", "3 9 10 27 38 82 43"],
+    ["4", "4", "3 9 10 27 38 82 43"],
+    ["5", "6", "3 9 10 27 38 43 82"],
+    ["6", "6", "3 9 10 27 38 43 82"],
+  ]}
+  caption="Selection sort: the sorted prefix grows by one each pass, and each pass scans everything to its right, whether or not the array is already in order."
+/>
+
+The invariant: at the start of pass `i`, `a[0..i-1]` holds the i smallest
+items in order, and no item to the right is smaller than any of them.
+Passes 4 and 6 found the minimum already in place and exchanged an item
+with itself, which still counts as an exchange in the book's model.
+
+Insertion sort on the same array. Each row shows where item `i` came to
+rest (`j`).
+
+<Trace
+  columns={["i", "j", "array after inserting a[i]"]}
+  rows={[
+    ["1", "0", "27 38 43 3 9 82 10"],
+    ["2", "2", "27 38 43 3 9 82 10"],
+    ["3", "0", "3 27 38 43 9 82 10"],
+    ["4", "1", "3 9 27 38 43 82 10"],
+    ["5", "5", "3 9 27 38 43 82 10"],
+    ["6", "2", "3 9 10 27 38 43 82"],
+  ]}
+  caption="Insertion sort: when j equals i (rows 2 and 5) the item was already in place and cost one compare. Item 3 at row 3 travelled three places, one exchange per place."
+/>
+
+Count the inversions in the input to check the exchange count: (38,27),
+(38,3), (38,9), (38,10), (27,3), (27,9), (27,10), (43,3), (43,9), (43,10),
+(82,10). That is 11 inversions, and the trace's travel distances are 1 + 0
+\+ 3 + 3 + 0 + 4 = 11 exchanges.
+
+Shellsort on sixteen numbers, one row per value of h.
+
+<Trace
+  columns={["h", "array after h-sorting"]}
+  rows={[
+    ["start", "62 83 18 53 7 17 95 86 47 69 25 28 4 33 71 12"],
+    ["13", "33 71 12 53 7 17 95 86 47 69 25 28 4 62 83 18"],
+    ["4", "4 17 12 18 7 62 25 28 33 69 83 53 47 71 95 86"],
+    ["1", "4 7 12 17 18 25 28 33 47 53 62 69 71 83 86 95"],
+  ]}
+  caption="Shellsort: h = 13 swaps only the three pairs 13 apart; h = 4 makes the array roughly ordered (small numbers drift left); h = 1 is insertion sort with little left to fix."
+/>
+
+### Common mistake
+
+The first mistake is writing insertion sort with the compare outside the
+loop condition, so the inner loop scans all the way to the left on every
+pass. It stays correct but loses adaptivity: sorted input becomes
+quadratic. The `less` call must be in the `for` condition so the loop stops
+at the first item that is not larger.
+
+The second is choosing a bad shellsort sequence. Powers of two (`1, 2, 4,
+8, ...`) never compare items in odd positions with items in even positions
+until the last pass, so the last pass can still be quadratic. Use `3h + 1`
+or a published better sequence.
+
+The third is a comparator that is not a total order, such as
+`(a, b) => a.score > b.score ? 1 : -1`, which never returns 0. Two equal
+items each claim to be less than the other. Insertion sort tolerates it by
+luck; other sorts misbehave.
+
+### In real systems
+
+Insertion sort is inside nearly every production sort: Timsort (Python,
+Java's object sort, older V8) and introsort-style hybrids (C++
+`std::sort`) switch to insertion sort for small slices, typically under a
+few dozen items, because its tiny constant beats everything else there.
+
+Shellsort turns up in embedded code and C libraries where code size matters
+and recursion is unwelcome; some small C libraries have implemented `qsort`
+as a shellsort for exactly that reason. Selection sort's one virtue, minimal writes, matters for flash
+memory with limited write cycles.
+
+### Check yourself
+
+<details>
+<summary>1. How many compares does selection sort make on an already sorted array of 1,000 items?</summary>
+
+Exactly 499,500, the same as on any input: `n(n−1)/2`. Selection sort is
+not adaptive.
+
+</details>
+
+<details>
+<summary>2. An array has 50 inversions. How many exchanges will insertion sort make?</summary>
+
+Exactly 50. Each exchange swaps one adjacent inverted pair, which removes
+exactly one inversion.
+
+</details>
+
+<details>
+<summary>3. Why does shellsort's last pass, plain insertion sort, run fast?</summary>
+
+The earlier passes leave the array h-sorted for several h, which leaves
+few inversions, and insertion sort's cost is proportional to the number of
+inversions plus n.
+
+</details>
+
+## 2.2 Mergesort
+
+### In one sentence
+
+Split the array in half, sort each half recursively, and merge the two
+sorted halves; it always takes about `n lg n` compares, it is stable, and
+it needs an extra array as big as the input.
+
+### The idea
+
+#### Merging
+
+**Merging** combines two sorted sequences into one. Look at the front item
+of each; take the smaller; repeat. When one side runs out, copy the rest of
+the other. Every step outputs one item after at most one compare, so
+merging n items costs at most n compares, and each item is copied a constant
+number of times.
+
+The standard implementation is the **abstract in-place merge**: copy the
+range `a[lo..hi]` into an auxiliary array `aux`, then merge from `aux`
+back into `a`. Doing it truly in place without `aux` is possible but
+complicated and slow; the extra array is the price of simplicity.
+
+The tie rule decides stability. When the two front items are equal, take
+the one from the **left** half. Then equal keys come out in the order they
+went in, and the sort is **stable**.
+
+#### Top-down mergesort
+
+Top-down mergesort is the recursive form of divide and conquer: to sort
+`a[lo..hi]`, sort `a[lo..mid]`, sort `a[mid+1..hi]`, and merge. The
+recursion stops at subarrays of size 0 or 1, which are sorted already.
+
+Cost: let `C(n)` be the compares to sort n items. Sorting two halves costs
+`2C(n/2)`, and merging costs at most n, so `C(n) ≤ 2C(n/2) + n` with `C(1) =
+0`. For n a power of two, that solves to `n lg n` (the derivation is below).
+The lower end is `½ n lg n`, when one half always runs out early. On random
+data the count sits between, close to the top.
+
+#### Bottom-up mergesort
+
+The same work can be organised without recursion. First merge pairs of
+single items into sorted runs of 2. Then merge pairs of runs of 2 into runs
+of 4. Then 8, and so on, until one run covers everything. The last run in a
+pass may be short when n is not a power of two; the `Math.min` in the code
+handles it. Bottom-up mergesort does the same compares in a different
+order, and it is the natural shape for sorting a **linked list**, where it
+needs no extra array at all.
+
+#### The lower bound for compare-based sorting
+
+Mergesort's `n lg n` is not just good; it is optimal among sorts that only
+compare. The argument is about information. A compare-based sort can be
+drawn as a **decision tree**: each internal node is one compare, each branch
+one outcome, and each leaf a final ordering. For the sort to be correct on
+every input of n distinct keys, the tree must have at least one leaf for
+each of the `n!` possible orderings. A binary tree of height h has at most
+`2^h` leaves, so `2^h ≥ n!`, so `h ≥ lg(n!)`. By Stirling's approximation,
+`lg(n!)` is `~n lg n`. So some input forces at least about `n lg n`
+compares, whatever the algorithm.
+
+<Figure art={`
+ decision tree for sorting three keys a, b, c
+
+                      a < b ?
+                   yes/     \\no
+                b < c ?       a < c ?
+              yes/  \\no     yes/   \\no
+          [a b c]  a < c ?  [b a c]  b < c ?
+                 yes/  \\no         yes/  \\no
+              [a c b] [c a b]   [b c a] [c b a]
+
+ 3! = 6 leaves; the tallest path has 3 compares; lg 6 is about 2.58
+`} caption="A compare-based sort of three keys as a decision tree. Six orderings need six leaves, so some path needs at least three compares. For n keys the same counting gives about n lg n." />
+
+### Worked example
+
+The simple example is my TypeScript mergesort, top-down and bottom-up,
+sharing one merge.
+
+```ts
+export function merge<T>(a: T[], aux: T[], lo: number, mid: number, hi: number, c: Cmp<T>) {
+  for (let k = lo; k <= hi; k++) aux[k] = a[k];
+  let i = lo, j = mid + 1;
+  for (let k = lo; k <= hi; k++) {
+    if (i > mid) a[k] = aux[j++];                  // left exhausted
+    else if (j > hi) a[k] = aux[i++];              // right exhausted
+    else if (c(aux[j], aux[i]) < 0) a[k] = aux[j++];   // right strictly less
+    else a[k] = aux[i++];                          // ties go left: stable
+  }
+}
+export function topDown<T>(a: T[], c: Cmp<T>) {
+  const aux = new Array<T>(a.length);
+  const sort = (lo: number, hi: number) => {
+    if (hi <= lo) return;
+    const mid = lo + Math.floor((hi - lo) / 2);
+    sort(lo, mid); sort(mid + 1, hi);
+    merge(a, aux, lo, mid, hi, c);
+  };
+  sort(0, a.length - 1);
+}
+```
+
+```ts
+export function bottomUp<T>(a: T[], c: Cmp<T>) {
+  const n = a.length, aux = new Array<T>(n);
+  for (let len = 1; len < n; len *= 2)
+    for (let lo = 0; lo < n - len; lo += 2 * len)
+      merge(a, aux, lo, lo + len - 1, Math.min(lo + 2 * len - 1, n - 1), c);
+}
+```
+
+The realistic example checks the theory at scale and checks stability. I
+counted compares on random arrays up to a million items, and sorted records
+with equal keys.
+
+```text
+1024 compares 8934 n lg n 10240 ratio 0.872
+4096 compares 43935 n lg n 49152 ratio 0.894
+16384 compares 208688 n lg n 229376 ratio 0.910
+65536 compares 965661 n lg n 1048576 ratio 0.921
+1048576 compares 19645606 n lg n 20971520 ratio 0.937
+sorted 1024 compares 5120
+1b 1d 2a 2c
+```
+
+On random data the count is a little under `n lg n` and the ratio creeps
+up towards 1, because the subtracted term grows more slowly than `n lg n`.
+On sorted input it is exactly `½ n lg n` (5,120 for n = 1024): every merge
+exhausts the left half after half the compares. The last line is four
+records `2a 1b 2c 1d` sorted by number: `1b` stays before `1d` and `2a`
+before `2c`. Stable.
+
+### Step by step
+
+Top-down mergesort on `38 27 43 3 9 82 10 55`. Indentation shows recursion
+depth; each line is a merge and the array right after it.
+
+<Trace
+  columns={["depth", "merge(lo, mid, hi)", "array after the merge"]}
+  rows={[
+    ["2", "(0, 0, 1)", "27 38 43 3 9 82 10 55"],
+    ["2", "(2, 2, 3)", "27 38 3 43 9 82 10 55"],
+    ["1", "(0, 1, 3)", "3 27 38 43 9 82 10 55"],
+    ["2", "(4, 4, 5)", "3 27 38 43 9 82 10 55"],
+    ["2", "(6, 6, 7)", "3 27 38 43 9 82 10 55"],
+    ["1", "(4, 5, 7)", "3 27 38 43 9 10 55 82"],
+    ["0", "(0, 3, 7)", "3 9 10 27 38 43 55 82"],
+  ]}
+  caption="Top-down mergesort: the left half is finished completely (rows 1 to 3) before the right half starts. The final merge at depth 0 touches all eight items."
+/>
+
+Bottom-up on the same array finishes in three passes, and on five items
+the short last run shows up.
+
+<Trace
+  columns={["run length", "eight items", "five items: 5 1 4 2 3"]}
+  rows={[
+    ["1", "27 38 3 43 9 82 10 55", "1 5 2 4 3"],
+    ["2", "3 27 38 43 9 10 55 82", "1 2 4 5 3"],
+    ["4", "3 9 10 27 38 43 55 82", "1 2 3 4 5"],
+  ]}
+  caption="Bottom-up mergesort: each pass doubles the run length. With five items, the 3 sits alone until the last pass merges a run of four with a run of one."
+/>
+
+#### Solving the recurrence, line by line
+
+1. The recurrence: `C(n) = 2C(n/2) + n`, `C(1) = 0`, for n a power of two.
+2. Divide both sides by n: `C(n)/n = C(n/2)/(n/2) + 1`.
+3. Apply the same step to `C(n/2)/(n/2)`: it equals `C(n/4)/(n/4) + 1`.
+4. So `C(n)/n = C(n/4)/(n/4) + 2`, and after k steps,
+   `C(n)/n = C(n/2^k)/(n/2^k) + k`.
+5. Stop when `n/2^k = 1`, which is `k = lg n`: `C(n)/n = C(1)/1 + lg n = lg n`.
+6. Multiply by n: `C(n) = n lg n`.
+
+<Figure art={`
+ level 0:            [ n ]                  merge cost n
+ level 1:       [ n/2 ]   [ n/2 ]           merge cost n
+ level 2:    [n/4] [n/4] [n/4] [n/4]        merge cost n
+   ...                 ...                    ...
+ level lg n: [1][1][1] ... [1][1][1]        no merging
+
+ lg n levels, each costing n  =>  n lg n compares in total
+`} caption="Mergesort's recursion tree: every level does n units of merging in total, and there are lg n levels." />
+
+### Common mistake
+
+The first mistake is allocating `aux` inside `merge`, or inside the
+recursive call. Correct, but it allocates on every one of the n − 1
+merges, which turns a fast sort into a garbage-collector benchmark. Allocate
+once and pass it down.
+
+The second is the tie rule. Writing `c(aux[j], aux[i]) <= 0` (take from the
+right on ties) still sorts correctly but breaks stability. The trace looks
+fine on distinct keys; only a test with equal keys catches it, like my
+`1b 1d 2a 2c` line.
+
+The third is the midpoint for large indices, the same overflow bug as
+binary search in Java; and in JavaScript, forgetting `Math.floor`, which
+makes `mid` fractional.
+
+### In real systems
+
+Mergesort is the backbone of **external sorting**: sorting data bigger than
+memory. Read chunks that fit in memory, sort each, write them out as sorted
+runs, then do a multi-way merge of the runs. Databases do exactly this for
+`ORDER BY` on large results, spilling sorted runs to disk; so do MapReduce's
+shuffle phase and `sort` on the Unix command line.
+
+**Timsort**, the sort in Python and in Java for objects, is a mergesort
+that finds existing sorted runs in the data, extends short ones with
+insertion sort, and merges runs with a careful policy. It is stable,
+adaptive (linear on already sorted data) and `n lg n` in the worst case.
+Stability is why: `list.sort()` in Python and `Arrays.sort` on objects in
+Java promise it, and JavaScript's `Array.prototype.sort` has been required
+to be stable since ES2019.
+
+### Check yourself
+
+<details>
+<summary>1. How many compares does mergesort make on 1,024 items that are already sorted?</summary>
+
+Exactly 5,120, which is `½ n lg n`. Each merge exhausts its left half after
+comparing each left item once, then copies the right half without compares.
+
+</details>
+
+<details>
+<summary>2. Why can no compare-based sort guarantee fewer than about n lg n compares?</summary>
+
+It must distinguish all `n!` orderings, each compare has two outcomes, so it
+needs at least `lg(n!)` compares in the worst case, and `lg(n!)` is `~n lg n`.
+
+</details>
+
+## 2.3 Quicksort
+
+### In one sentence
+
+Pick a pivot, partition the array so smaller items are left of it and
+larger items right, and sort the two sides recursively; shuffled first, it
+is the fastest general-purpose sort in practice and needs no extra array.
+
+### The idea
+
+#### Partitioning
+
+Quicksort is also divide and conquer, but it does the work before the
+recursion instead of after. **Partitioning** a subarray around a **pivot**
+`v` rearranges it so that for some index j: `a[j]` is v, nothing to its left
+is greater, and nothing to its right is less. Then `a[j]` is in its final
+sorted position, and the two sides can be sorted independently, with no
+merge needed.
+
+The book's partition takes `a[lo]` as the pivot. It scans `i` from the left
+while items are less than v, scans `j` from the right while items are
+greater than v, and then exchanges `a[i]` and `a[j]`, because each is on the
+wrong side. It repeats until the pointers cross, then exchanges the pivot
+into `a[j]`. Both scans **stop on keys equal to the pivot**, which sounds
+wasteful but is what keeps quicksort fast on arrays with many equal keys.
+
+#### Why the shuffle
+
+Quicksort's speed depends on the pivot splitting the array evenly. If the
+pivot is always the smallest item, one side is empty and the other has n −
+1 items, and the total work is `n + (n−1) + ... + 1`, or `~n²/2`. Taking
+`a[lo]` as the pivot hits exactly that case on input that is already
+sorted, which is common in practice. The book's fix is to **shuffle the
+array first**. Then every pivot is a random item, the bad case needs a
+fantastically unlikely shuffle, and the analysis gives `~2n ln n` compares
+on average, about `1.39 n lg n`.
+
+That is about 39 percent more compares than mergesort. Quicksort still wins
+in practice because its inner loop is tiny (a compare and an index
+increment), it moves fewer items, it needs no auxiliary array, and it scans
+memory sequentially, which caches love.
+
+#### Three-way partitioning
+
+When the array has many **duplicate keys**, two-way partitioning wastes
+time re-partitioning subarrays that are all equal. **Three-way
+partitioning**, Dijkstra's "Dutch national flag" scheme, splits the
+subarray into three parts: less than v, equal to v, and greater than v. Only
+the outer two parts recurse. If there are only a few distinct keys, three-way
+quicksort runs in linear time; the book shows its cost is proportional to
+the entropy of the key distribution, which is optimal.
+
+#### Improvements
+
+Three practical tweaks: **cut off to insertion sort** for small subarrays
+(somewhere from 5 to 15 items); choose the pivot as the **median of three**
+sampled items, which makes splits more even; and use three-way partitioning
+when duplicates are likely. Production quicksorts add one more:
+**introsort** watches the recursion depth and switches to heapsort if it
+grows past about `2 lg n`, which turns the worst case into a guaranteed `n lg
+n` even against adversarial input.
+
+### Worked example
+
+My quicksort with a Fisher–Yates shuffle and the book's partition scheme.
+
+```ts
+export function shuffle(a: number[], rand = Math.random) {
+  for (let i = a.length - 1; i > 0; i--) exch(a, i, Math.floor(rand() * (i + 1)));
+}
+export function partition(a: number[], lo: number, hi: number): number {
+  const v = a[lo]; let i = lo, j = hi + 1;
+  while (true) {
+    while (a[++i] < v) if (i === hi) break;     // scan right past smaller keys
+    while (v < a[--j]) if (j === lo) break;     // scan left past larger keys
+    if (i >= j) break;                          // pointers crossed
+    exch(a, i, j);
+  }
+  exch(a, lo, j);                               // pivot into place
+  return j;
+}
+export function quicksort(a: number[]) {
+  shuffle(a);
+  const sort = (lo: number, hi: number) => {
+    if (hi <= lo) return;
+    const j = partition(a, lo, hi);
+    sort(lo, j - 1); sort(j + 1, hi);
+  };
+  sort(0, a.length - 1);
+}
+```
+
+And three-way quicksort, which keeps three regions with pointers `lt`, `i`
+and `gt`.
+
+```ts
+export function quick3way(a: number[], lo = 0, hi = a.length - 1) {
+  if (hi <= lo) return;
+  let lt = lo, gt = hi, i = lo + 1; const v = a[lo];
+  while (i <= gt) {
+    if (a[i] < v) exch(a, lt++, i++);          // grow the less-than region
+    else if (a[i] > v) exch(a, i, gt--);       // grow the greater-than region
+    else i++;                                  // equal: leave it in the middle
+  }
+  quick3way(a, lo, lt - 1); quick3way(a, gt + 1, hi);
+}
+```
+
+The realistic example is a set of measurements, each the real output of
+my code.
+
+```text
+10000 compares 167272 2n ln n 184207 ratio 0.908
+100000 compares 2065019 2n ln n 2302585 ratio 0.897
+1000000 compares 26321413 2n ln n 27631021 ratio 0.953
+sorted, no shuffle, n=5000 compares 12507498 n^2/2 12500000 29ms
+sorted, shuffled, n=5000 compares 76211
+1e6 keys in {0,1,2}: 3-way compares 1999926 23ms
+1e6 keys in {0,1,2}: 2-way compares 19179956 85ms
+```
+
+Three lessons are in that table. On random data the count tracks `2n ln n`
+(the exact formula has a negative linear term, so the ratio sits a little
+under 1). On sorted data **without** the shuffle, quicksort does `n²/2`
+compares, 164 times the shuffled count. And on a million keys with only
+three distinct values, three-way partitioning does about `2n` compares,
+ten times fewer than two-way.
+
+### Step by step
+
+Partitioning `50 20 80 10 60 30 90 40 70` around the pivot 50. Each row is
+one exchange.
+
+<Trace
+  columns={["event", "i", "j", "array"]}
+  rows={[
+    ["start, v = 50", "0", "9", "50 20 80 10 60 30 90 40 70"],
+    ["i stops at 80, j stops at 40; exchange", "2", "7", "50 20 40 10 60 30 90 80 70"],
+    ["i stops at 60, j stops at 30; exchange", "4", "5", "50 20 40 10 30 60 90 80 70"],
+    ["i stops at 60 (5), j stops at 30 (4); crossed", "5", "4", "50 20 40 10 30 60 90 80 70"],
+    ["exchange pivot with a[j]", "-", "4", "30 20 40 10 50 60 90 80 70"],
+  ]}
+  caption="Two-way partitioning: i and j close in from both ends, swapping misplaced pairs. When they cross, j marks the pivot's final position, index 4."
+/>
+
+After the partition, 50 is at index 4 forever. Everything left of it (30
+20 40 10) is smaller, everything right (60 90 80 70) is larger, and the two
+sides are sorted independently.
+
+Three-way partitioning on `3 5 3 1 3 6 2 3` with v = 3. Each row is one
+step of the loop.
+
+<Trace
+  columns={["a[i] seen", "action", "lt", "i", "gt", "array"]}
+  rows={[
+    ["5", "greater: swap with a[gt], gt shrinks", "0", "1", "6", "3 3 3 1 3 6 2 5"],
+    ["3", "equal: i moves on", "0", "2", "6", "3 3 3 1 3 6 2 5"],
+    ["3", "equal: i moves on", "0", "3", "6", "3 3 3 1 3 6 2 5"],
+    ["1", "less: swap with a[lt], both move", "1", "4", "6", "1 3 3 3 3 6 2 5"],
+    ["3", "equal: i moves on", "1", "5", "6", "1 3 3 3 3 6 2 5"],
+    ["6", "greater: swap with a[gt], gt shrinks", "1", "5", "5", "1 3 3 3 3 2 6 5"],
+    ["2", "less: swap with a[lt], both move", "2", "6", "5", "1 2 3 3 3 3 6 5"],
+  ]}
+  caption="Three-way partitioning: a[lo..lt-1] is less than 3, a[lt..i-1] equals 3, a[gt+1..hi] is greater. When i passes gt, the four 3s are done and never touched again."
+/>
+
+<Figure art={`
+   three-way partition invariant during the scan
+
+   lo          lt          i           gt          hi
+   +-----------+-----------+-----------+-----------+
+   |   < v     |   = v     | unknown   |   > v     |
+   +-----------+-----------+-----------+-----------+
+
+   after the scan (i > gt):
+   +-----------+-----------------------+-----------+
+   |   < v     |         = v           |   > v     |
+   +-----------+-----------------------+-----------+
+     recurse        done, never touched     recurse
+`} caption="The four regions of three-way partitioning. The unknown region shrinks by one item every step, so the scan is linear; only the outer regions recurse." />
+
+#### Why the average is about 2n ln n, in plain words
+
+1. Number the items by their final sorted rank, 1 to n.
+2. Items of rank i and j (i less than j) are compared at most once, and
+   only if one of them is the first pivot chosen among ranks i to j.
+3. If any rank strictly between them is chosen first, they land on
+   opposite sides and are never compared.
+4. Because the shuffle makes every pivot equally likely, the chance that i
+   or j is chosen first among those `j − i + 1` items is `2/(j − i + 1)`.
+5. Summing that chance over all pairs gives the expected compares, and the
+   sum works out to about `2n ln n`, because for each distance d there are
+   about n pairs, each contributing `2/(d + 1)`, and the sum of `1/d` up to n
+   is about `ln n`.
+
+### Common mistake
+
+The first mistake is skipping the shuffle "because the data is random
+anyway". Real data is rarely random: it is sorted, reverse-sorted, or
+sorted with a few appended items. The trace above shows the cost: 12.5
+million compares instead of 76 thousand for just 5,000 items, and on larger
+inputs the recursion depth overflows the call stack.
+
+The second is the partition that does not stop on equal keys. If `i` scans
+past items equal to the pivot, an array of all-equal keys puts everything on
+one side and becomes quadratic. Stopping on equal keys on both sides
+balances the split even when everything is equal.
+
+The third is missing the bounds check `if (i === hi) break`. When the pivot
+is the largest item, `i` runs off the end of the subarray. In JavaScript it
+reads `undefined`, the compare is false, and the loop stops by accident, so
+the bug hides; in a language with bounds checks it crashes.
+
+### In real systems
+
+C's `qsort` is often a quicksort variant, C++'s `std::sort` is introsort
+(quicksort, heapsort fallback, insertion sort for small ranges), and Java
+sorts **primitive** arrays with a dual-pivot quicksort, because stability
+does not matter for numbers and quicksort is faster. Go's `sort` package and
+Rust's unstable sort use **pattern-defeating quicksort** (pdqsort), which
+adds detection of sorted and adversarial patterns.
+
+The adversarial case is a real security issue. A server that sorts
+attacker-controlled data with a deterministic pivot rule can be fed an
+input that makes it quadratic, a denial-of-service attack. Randomisation or
+an introsort fallback closes it.
+
+### Check yourself
+
+<details>
+<summary>1. Why is quicksort faster than mergesort in practice despite doing more compares?</summary>
+
+Its inner loop is shorter, it moves fewer items, it needs no auxiliary array
+and no copying back, and it scans memory sequentially, so it uses the cache
+well.
+
+</details>
+
+<details>
+<summary>2. What happens to two-way quicksort on an array of a million copies of the same key?</summary>
+
+With partitioning that stops on equal keys, each partition splits roughly in
+half, so it is still `n lg n`. Three-way partitioning is better still: one
+pass and it is done, because everything is equal to the pivot.
+
+</details>
+
+## 2.4 Priority Queues
+
+### In one sentence
+
+A priority queue lets you insert items and remove the largest (or
+smallest) at any time; the binary heap does both in `lg n` by keeping a
+nearly complete tree in an array where every parent is at least as large as
+its children.
+
+### The idea
+
+#### The API and why it matters
+
+Many programs do not need everything sorted; they need the most important
+item **next**, while new items keep arriving. A scheduler wants the job with
+the highest priority, a simulation the event with the earliest time, a
+network router the packet with the highest class. A **priority queue** is
+the data type for this: `insert(x)`, `delMax()` (remove and return the
+largest), `max()`, `size()` and `isEmpty()`. A min-oriented version has
+`delMin()` instead.
+
+The obvious implementations each make one operation slow. An unordered
+array has constant-time insert and linear delMax (scan for the largest). An
+ordered array has constant delMax and linear insert (shift to make room).
+The heap balances them: both logarithmic.
+
+#### The binary heap
+
+A **binary tree** is **heap-ordered** if every node's key is at least as
+large as its children's keys. Then the largest key is at the root. A
+**complete** binary tree is one that is perfectly balanced except possibly
+the bottom level, which is filled left to right. A complete tree with n
+nodes has height `⌊lg n⌋`.
+
+The trick is that a complete tree needs no pointers. Put the nodes in an
+array level by level, starting at index 1 (index 0 unused). Then the
+parent of node k is at `⌊k/2⌋`, and its children are at `2k` and `2k + 1`.
+Moving up or down the tree is arithmetic.
+
+<Figure art={`
+ heap-ordered complete tree        the same heap as an array (1-indexed)
+
+              90 (1)               index:  1   2   3   4   5   6
+            /        \\             key:   90  70  60  30  50  20
+        70 (2)      60 (3)
+        /    \\       /              parent of k is k/2 (rounded down)
+    30 (4) 50 (5) 20 (6)           children of k are 2k and 2k+1
+`} caption="A binary heap is a complete tree stored level by level in an array. No pointers: the parent and children of a node are found by halving and doubling its index." />
+
+#### Swim and sink
+
+Two repair operations keep heap order. **Swim** (bottom-up reheapify) fixes
+a node that has become **larger** than its parent: exchange it with its
+parent and repeat until it is not larger than its parent or reaches the
+root. **Sink** (top-down reheapify) fixes a node that has become **smaller**
+than a child: exchange it with its **larger** child and repeat until both
+children are no larger or it reaches the bottom.
+
+With those, the operations are short. `insert`: add the item at the end
+(index n + 1) and swim it up. `delMax`: take the root, move the last item
+to the root, shrink n, and sink the new root. Each walks at most one path
+from root to leaf, so each is at most `lg n` exchanges: insert needs at most
+`1 + lg n` compares, delMax at most `2 lg n` (two per level: which child is
+larger, and is it larger than the node).
+
+#### Heapsort
+
+A heap gives a sort almost for free, and an in-place one. **Phase 1, heap
+construction**: treat the array as a complete tree and sink every node
+from `n/2` down to 1. Leaves are already heaps, so starting at the last
+parent and working back builds a heap bottom-up. This takes fewer than `2n`
+compares, linear time, which is better than n inserts. **Phase 2,
+sortdown**: repeatedly exchange the root (the max) with the last item of the
+heap, shrink the heap by one, and sink the new root. The max items collect
+at the end of the array in order.
+
+Heapsort is the only sort in this chapter that is both in place and
+guaranteed `n lg n` (about `2n lg n` compares). It is rarely the fastest in
+practice: sink jumps around the array, so almost every compare is a cache
+miss on large arrays, and it is not stable.
+
+#### Index priority queues
+
+The book also builds an **index priority queue**: each item has an integer
+index, and clients can change the key of an item already in the queue
+(`changeKey`, `decreaseKey`) or delete it by index. It keeps two extra
+arrays, the heap of indices and the inverse that says where each index sits
+in the heap. Chapter 4's Dijkstra and Prim algorithms need exactly this,
+and it is also how to merge many sorted streams: keep the current head of
+each stream in an index min-PQ.
+
+### Worked example
+
+My max-heap, 1-indexed in the array with slot 0 unused.
+
+```ts
+export class MaxPQ<T> {
+  private pq: T[] = [undefined as T];          // pq[0] is unused
+  private n = 0;
+  private less: (a: T, b: T) => boolean;
+  constructor(less: (a: T, b: T) => boolean) { this.less = less; }
+  size() { return this.n; }
+  isEmpty() { return this.n === 0; }
+  insert(x: T) { this.pq[++this.n] = x; this.swim(this.n); }
+  delMax(): T {
+    if (!this.n) throw new Error('Priority queue underflow');
+    const top = this.pq[1];
+    this.exch(1, this.n--);
+    this.pq.length = this.n + 1;               // drop the old slot: no loitering
+    this.sink(1);
+    return top;
+  }
+  private swim(k: number) {
+    while (k > 1 && this.less(this.pq[k >> 1], this.pq[k])) { this.exch(k >> 1, k); k >>= 1; }
+  }
+  private sink(k: number) {
+    while (2 * k <= this.n) {
+      let j = 2 * k;
+      if (j < this.n && this.less(this.pq[j], this.pq[j + 1])) j++;   // larger child
+      if (!this.less(this.pq[k], this.pq[j])) break;
+      this.exch(k, j); k = j;
+    }
+  }
+  private exch(i: number, j: number) { const t = this.pq[i]; this.pq[i] = this.pq[j]; this.pq[j] = t; }
+}
+```
+
+The simple example inserts six numbers and removes the max twice. The
+lines show the heap array after each operation.
+
+```text
+insert 30: 30
+insert 70: 70 30
+insert 20: 70 30 20
+insert 90: 90 70 20 30
+insert 50: 90 70 20 30 50
+insert 60: 90 70 60 30 50 20
+delMax 90: 70 50 60 30 20
+delMax 70: 60 50 20 30
+```
+
+The realistic example is **top-k**: find the five fastest response times
+out of a million without sorting a million numbers. Keep a **max**-heap of
+at most five items; after each insert, if it holds six, remove the max (the
+slowest of the candidates). The heap never grows past six, so each step is
+constant time and memory is constant.
+
+```ts
+const k = 5; const keep = new MaxPQ<number>((a, b) => a < b);
+for (let i = 0; i < 1_000_000; i++) {
+  keep.insert(latency());                    // a random time in ms
+  if (keep.size() > k) keep.delMax();        // evict the slowest candidate
+}
+```
+
+```text
+5 fastest of 1e6: 0.0002 0.0015 0.0015 0.0040 0.0050
+```
+
+The cost is `n lg k` instead of `n lg n`, and memory is k instead of n, so
+it works on a stream that never ends.
+
+### Step by step
+
+The insert of 90 into the heap `70 30 20`, then the delMax of 90.
+
+<Trace
+  columns={["step", "heap array", "what happened"]}
+  rows={[
+    ["append 90 at k = 4", "70 30 20 90", "parent of 4 is 2 (30), 30 is less than 90"],
+    ["swim: exchange 4 and 2", "70 90 20 30", "parent of 2 is 1 (70), 70 is less than 90"],
+    ["swim: exchange 2 and 1", "90 70 20 30", "k = 1, at the root: stop"],
+    ["... insert 50 and 60 ...", "90 70 60 30 50 20", "60 swam above 20"],
+    ["delMax: exchange root with last", "20 70 60 30 50 | 90", "90 removed; 20 at the root"],
+    ["sink 1: children 70 and 60, larger is 70", "70 20 60 30 50", "exchange 1 and 2"],
+    ["sink 2: children 30 and 50, larger is 50", "70 50 60 30 20", "exchange 2 and 5; 5 has no children: stop"],
+  ]}
+  caption="Swim moves a large new item up one level per exchange; sink moves a small root down, always swapping with the larger child so heap order holds."
+/>
+
+Heapsort on `30 70 20 90 50 60 10`, real output of my code: first the
+array after heap construction, then after each sortdown step.
+
+<Trace
+  columns={["phase", "heap size n", "array (heap part | sorted part)"]}
+  rows={[
+    ["heap built", "7", "90 70 60 30 50 20 10"],
+    ["sortdown", "6", "70 50 60 30 10 20 | 90"],
+    ["sortdown", "5", "60 50 20 30 10 | 70 90"],
+    ["sortdown", "4", "50 30 20 10 | 60 70 90"],
+    ["sortdown", "3", "30 10 20 | 50 60 70 90"],
+    ["sortdown", "2", "20 10 | 30 50 60 70 90"],
+    ["sortdown", "1", "10 | 20 30 50 60 70 90"],
+  ]}
+  caption="Heapsort: the heap shrinks from the right while the sorted suffix grows. Every step moves the current maximum to the boundary and sinks its replacement."
+/>
+
+#### Why heap construction is linear
+
+1. Sinking a node at height h costs at most 2h compares (height counts
+   levels below it).
+2. In a complete tree of n nodes, about n/2 nodes are leaves (height 0), n/4
+   have height 1, n/8 height 2, and so on.
+3. Total cost is at most `2 · (n/4 · 1 + n/8 · 2 + n/16 · 3 + ...)`.
+4. That is `2n · (1/4 + 2/8 + 3/16 + ...)`, and the series in brackets sums
+   to 1.
+5. So construction takes at most about `2n` compares: linear, because most
+   nodes are near the bottom and sink only a little way.
+
+### Common mistake
+
+The first mistake is mixing 0-based and 1-based indexing. With the root at
+index 0, the children of k are `2k + 1` and `2k + 2` and the parent is
+`⌊(k − 1)/2⌋`. Use the 1-based formulas on a 0-based array and the tree
+silently loses nodes. Pick one convention and test with a heap of 1, 2 and 3
+items.
+
+The second is sinking towards the **first** child that is larger instead of
+the **larger** child. Swap a small root with the smaller of two larger
+children, and the bigger child is now below a smaller parent: heap order is
+broken.
+
+The third, top-k specific, is using a **min**-heap to keep the k
+**smallest**. The item you need to evict is the largest of the candidates,
+so the heap must be max-oriented. Keeping the k largest needs a min-heap.
+
+### In real systems
+
+Priority queues schedule work everywhere: the Linux kernel's timer
+handling, the event queue in discrete-event simulations, Kubernetes'
+scheduling queue, and the delayed-job queues in BullMQ and Sidekiq. Java's
+`PriorityQueue` and Python's `heapq` are binary heaps; JavaScript has none
+built in, so you write one or use a library.
+
+Top-k with a bounded heap is how monitoring systems keep the "slowest
+requests" panel and how search engines keep the best k results while
+scoring millions of documents. Multi-way merging with a heap of stream
+heads is how databases merge sorted runs and how log-structured storage
+engines compact files.
+
+### Check yourself
+
+<details>
+<summary>1. In a 1-indexed heap, where are the children of node 6, and where is its parent?</summary>
+
+Children at 12 and 13, parent at 3.
+
+</details>
+
+<details>
+<summary>2. Why is heap construction by sinking from n/2 down faster than n inserts?</summary>
+
+Inserting swims every item up from the bottom, up to `lg n` levels each:
+`n lg n`. Sinking from the bottom up does most of the work on nodes near the
+leaves, which have little height, and sums to about `2n`.
+
+</details>
+
+<details>
+<summary>3. Why is heapsort not stable?</summary>
+
+The sortdown exchanges the root with the last item, moving items long
+distances past equal keys, so equal keys can swap relative order.
+
+</details>
+
+## 2.5 Sorting Applications
+
+### In one sentence
+
+Sorting is a building block for other problems, and choosing the right sort
+means weighing stability, memory, guarantees and the shape of the data
+rather than just raw speed.
+
+### The idea
+
+#### Sorting with any order
+
+Real programs sort records, not numbers, and by rules chosen at run time:
+orders by city, then by total descending; files by modified date; people by
+last name, then first name. A **comparator** is a function that defines the
+order. The book uses Java's `Comparable` (a type's natural order) and
+`Comparator` (any order, chosen by the client); TypeScript's sort takes a
+comparator function that returns a negative number, zero or a positive
+number. Every sort in this chapter works with any comparator that is a total
+order.
+
+#### Stability, and why it matters
+
+Sorting by several keys can be done two ways. Compose the comparators:
+compare by city and, on a tie, by total. Or, with a **stable** sort, sort
+twice: first by the **secondary** key, then by the primary. The second sort
+keeps the first sort's order among items with the same primary key. This is
+how clicking table column headers in a spreadsheet builds up a multi-key
+order. It only works if the sort is stable.
+
+Of this chapter's sorts, insertion sort and mergesort are stable; selection
+sort, shellsort, quicksort and heapsort are not. Any sort can be made stable
+by adding the original index as a final tie-breaking key, at a memory cost.
+
+#### Which sort should I use?
+
+The book ends with a comparison table. My version:
+
+<Compare left="Sort" right="When it is the right choice" caption="Choosing a sort. No algorithm wins on every row; production sorts are hybrids that pick per situation." rows={[
+  ["insertion sort", "tiny arrays and nearly sorted data; stable; in place"],
+  ["selection sort", "only when writes are far more expensive than reads"],
+  ["shellsort", "small code, no recursion, decent speed; embedded"],
+  ["mergesort", "stability or a hard n lg n guarantee; linked lists; external data"],
+  ["quicksort (shuffled, 3-way)", "general-purpose fastest for primitives in memory"],
+  ["heapsort", "in place with a guaranteed n lg n; introsort's fallback"],
+]} />
+
+#### Reductions: sorting solves other problems
+
+A problem **reduces** to sorting if sorting the data makes it easy. Finding
+**duplicates**: sort, then equal items are adjacent; one pass finds them.
+The **median** or any order statistic: sort, then read the middle. Counting
+**distinct values**, finding the **closest pair** of numbers, **ranking**
+(how many items are smaller than this one), and scheduling to minimise
+average completion time (shortest job first) all fall out of a sort. Since
+sorting is `n lg n`, each of these is at most `n lg n` plus the post-pass.
+
+#### Selection without sorting
+
+Sometimes sorting is overkill. To find the k-th smallest item, the
+**quickselect** algorithm partitions as in quicksort but recurses into only
+the side that contains position k. Shuffled, its expected cost is linear,
+about `2n + 2k ln(n/k) + 2(n − k) ln(n/(n − k))` compares, which is at most
+about `3.4n` for the median.
+
+### Worked example
+
+The simple example: quickselect for the median of the numbers 1 to 101.
+
+```ts
+export function select(a: number[], k: number): number {
+  shuffle(a); let lo = 0, hi = a.length - 1;
+  while (hi > lo) {
+    const j = partition(a, lo, hi);
+    if (j < k) lo = j + 1;           // the k-th item is to the right
+    else if (j > k) hi = j - 1;      // ... or to the left
+    else return a[k];
+  }
+  return a[k];
+}
+console.log('median of 1..101 shuffled:', select(Array.from({ length: 101 }, (_, i) => 101 - i), 50));
+```
+
+```text
+median of 1..101 shuffled: 51
+```
+
+The realistic example: sorting orders by city, then by total descending,
+two ways, plus the two traps in JavaScript's built-in sort.
+
+```ts
+const byCity = (a: Order, b: Order) => a.city.localeCompare(b.city);
+const byTotalDesc = (a: Order, b: Order) => b.total - a.total;
+const thenBy = <T,>(...cs: ((a: T, b: T) => number)[]) => (a: T, b: T) => {
+  for (const c of cs) { const r = c(a, b); if (r) return r; }
+  return 0;
+};
+console.log([...orders].sort(thenBy(byCity, byTotalDesc)).map(o => o.id).join(' '));
+console.log([...orders].sort(byTotalDesc).sort(byCity).map(o => o.id).join(' '));
+console.log([10, 9, 1, 100].sort().join(' '), '|', [10, 9, 1, 100].sort((a, b) => a - b).join(' '));
+console.log([3, NaN, 1].sort((a, b) => a - b));
+```
+
+```text
+o4 o2 o1 o5 o3
+o4 o2 o1 o5 o3
+1 10 100 9 | 1 9 10 100
+[ 3, NaN, 1 ]
+```
+
+The orders were `o1` Pune 300, `o2` Delhi 300, `o3` Pune 120, `o4` Delhi
+950, `o5` Pune 300. Both approaches agree: Delhi first (950, then 300), then
+Pune (300, 300, 120), and within Pune's tie at 300, `o1` stays before `o5`
+because the sort is stable. The third line is the classic trap: with no
+comparator, JavaScript sorts numbers **as strings**. The fourth: one NaN
+makes every compare against it false, so the comparator is not a total order
+and the array comes back unsorted.
+
+### Step by step
+
+Quickselect for k = 4 (the fifth smallest) in `50 20 80 10 60 30 90 40 70`,
+using the partition from section 2.3 without the shuffle so the steps are
+easy to follow.
+
+<Trace
+  columns={["lo", "hi", "pivot lands at j", "decision", "subarray left to search"]}
+  rows={[
+    ["0", "8", "4 (pivot 50)", "j equals k: done", "answer is 50"],
+  ]}
+  caption="Quickselect on this array finishes in one partition, because the first pivot happens to be the median. In general each partition discards the side that cannot contain position k."
+/>
+
+A second run, k = 1 (the second smallest), shows the discarding.
+
+<Trace
+  columns={["lo", "hi", "array after partition", "j", "decision"]}
+  rows={[
+    ["0", "8", "30 20 40 10 50 60 90 80 70", "4", "k = 1 is less than 4: hi = 3"],
+    ["0", "3", "10 20 30 40 ...", "2", "k = 1 is less than 2: hi = 1"],
+    ["0", "1", "10 20 ...", "0", "k = 1 is more than 0: lo = 1"],
+    ["1", "1", "10 20 ...", "-", "lo equals hi: answer a[1] = 20"],
+  ]}
+  caption="Quickselect for the second smallest: each partition throws away the side that cannot hold rank k, so the work shrinks geometrically and the total is linear on average."
+/>
+
+<Flow caption="Choosing a sort in practice: a short decision path before writing any code." steps={[
+  "is the built-in sort good enough? usually yes",
+  "do equal keys need to keep their order? use a stable sort",
+  "does the data fit in memory? if not, external mergesort",
+  "many duplicate keys? three-way partitioning",
+  "need only the top k or the k-th? a heap or quickselect, not a sort",
+  "adversarial input? randomise or use a guaranteed n lg n sort",
+]} />
+
+### Common mistake
+
+The biggest mistake in practice is the JavaScript default sort shown above:
+`[10, 9, 1, 100].sort()` gives `1 10 100 9`. Always pass a comparator for
+numbers.
+
+The second is a comparator that subtracts large numbers or mixes types.
+`(a, b) => a - b` overflows in languages with fixed-width integers (Java's
+`int`), turning large positive differences negative. In Java use
+`Integer.compare`; in TypeScript, `a - b` on numbers is safe, but on
+timestamps as strings it is NaN.
+
+The third is sorting when a heap or selection would do. Sorting a million
+items to show the top ten costs `n lg n` and `n` memory; a bounded heap
+costs `n lg 10` and constant memory.
+
+### In real systems
+
+Database engines choose between sort-based and hash-based algorithms for
+`GROUP BY`, `DISTINCT` and joins; sort-merge joins win when inputs are
+already sorted by an index. Search engines sort posting lists. Version
+control sorts and merges. Deduplication pipelines sort or hash. Every one is
+a reduction to sorting, or a choice to avoid it.
+
+Language runtimes take stability seriously: JavaScript requires stable
+`Array.prototype.sort` since ES2019, Python's sort is stable, Java's object
+sort is stable while its primitive sort is not (primitives have no identity
+to preserve).
+
+### Check yourself
+
+<details>
+<summary>1. How can you sort by last name, then first name, using only a stable sort and a single-key comparator?</summary>
+
+Sort by first name, then sort the result by last name. The second, stable
+sort keeps first-name order among people with the same last name.
+
+</details>
+
+<details>
+<summary>2. Why does [10, 9, 1, 100].sort() return 1 10 100 9?</summary>
+
+Without a comparator, JavaScript converts items to strings and compares
+them in UTF-16 order, so "10" comes before "9".
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 2, Sorting">
+<Level name="Beginner" depth={3}>
+
+At the smallest scale, sorting is "put these in order", and this chapter
+gives you several ways to do it that differ in how much work they waste.
+Selection sort always scans everything. Insertion sort does less when the
+data is already close to sorted. Mergesort and quicksort split the problem
+in half and are fast on big inputs. A heap keeps the biggest item ready at
+the top.
+
+The smallest working example is sorting five exam scores by hand with
+insertion sort: `72 45 90 61 45`. Take 45, it is less than 72, slide it
+left: `45 72 90 61 45`. 90 stays. 61 slides past 90 and 72: `45 61 72 90
+45`. The last 45 slides past 90, 72 and 61 and stops after the first 45,
+because it is not less than it: `45 45 61 72 90`. Notice the two 45s kept
+their original order. That is stability, and you just saw why insertion
+sort has it.
+
+The beginner's mistake is thinking all sorts are equal because they give
+the same answer. They do, but on a million items one finishes in a
+fraction of a second and another takes an hour. The chapter is about that
+difference.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+In a real program I sort records with comparators, and I combine sorts
+with the structures around them. A leaderboard sorts players by score
+descending, then by time ascending for ties. An activity feed merges
+already-sorted streams from several sources. A dashboard shows the ten
+slowest endpoints. Each uses a different tool: a composed comparator, a
+k-way merge with a heap, and a bounded heap.
+
+Here is a k-way merge of sorted arrays with a min-heap of stream heads,
+the realistic shape of "merge the sorted results of three shards".
+
+```ts
+function kWayMerge(lists: number[][]): number[] {
+  const heap = new MaxPQ<[number, number, number]>((a, b) => a[0] > b[0]); // min by value
+  lists.forEach((l, s) => l.length && heap.insert([l[0], s, 0]));
+  const out: number[] = [];
+  while (!heap.isEmpty()) {
+    const [v, s, i] = heap.delMax();
+    out.push(v);
+    if (i + 1 < lists[s].length) heap.insert([lists[s][i + 1], s, i + 1]);
+  }
+  return out;
+}
+console.log(kWayMerge([[1, 7, 9], [2, 3, 10], [4, 5, 6, 8]]).join(' '));
+```
+
+```text
+1 2 3 4 5 6 7 8 9 10
+```
+
+Passing a reversed `less` turns my max-heap into a min-heap. The cost is
+`n lg k` for n items in k streams. The intermediate mistake is
+concatenating and sorting, `n lg n`, which also loses the ability to stream.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+The exact rules: compare-based sorting needs at least `lg(n!)`, about `n lg
+n − 1.44n`, compares in the worst case, by the decision-tree argument.
+Mergesort matches it to within a linear term, so it is **optimal** in
+compares, though not in memory. Quicksort's average is `~2n ln n`, about
+`1.39 n lg n`, and its worst case is `~n²/2`, made vanishingly unlikely by
+the shuffle. Heapsort's worst case is `~2n lg n` compares, in place.
+
+The lower bound has two escape hatches, and both are real. First, it counts
+compares on **distinct** keys; with few distinct values, three-way
+quicksort beats it, running in time proportional to n times the entropy of
+the key distribution. Second, it assumes you can only compare; if keys are
+small integers or strings, you can look at their digits, and chapter 5's
+radix sorts run in linear time.
+
+The advanced mistake is citing the lower bound as "sorting is n lg n". It is
+"compare-based sorting of distinct keys needs about n lg n compares in the
+worst case". Every word matters, and the exceptions are used in production
+every day.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Single boundaries, each with what happens in my code:
+
+- **Empty array.** Every sort returns immediately; mergesort's `hi` is −1
+  and the recursion's guard `hi <= lo` holds. Heap: `delMax` throws
+  "Priority queue underflow".
+- **One element.** Already sorted; no compares. A heap of one: `delMax`
+  exchanges index 1 with itself and sinks nothing.
+- **All keys equal.** Insertion sort: `n − 1` compares, zero exchanges.
+  Two-way quicksort that stops on equal keys: balanced splits, `n lg n`.
+  Three-way quicksort: one pass, `n − 1` compares, done.
+- **Already sorted.** Insertion sort is linear; mergesort is `½ n lg n`;
+  quicksort without a shuffle is quadratic, my run showed 12.5 million
+  compares for n = 5000.
+- **Reverse sorted.** Insertion sort's worst case: `n(n−1)/2` exchanges.
+- **Two elements.** Mergesort makes one compare; partition makes the pivot
+  and the other item cross immediately. Test it; off-by-one errors hide
+  here.
+- **NaN in a numeric array.** Every compare against NaN is false, so it
+  blocks movement; the sort returns unsorted output with no error.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Two boundaries at once:
+
+- **Many duplicates plus a partition that does not stop on equal keys.**
+  Either feature alone is fine; together, quadratic.
+- **Already sorted input plus deterministic pivot plus deep recursion.**
+  Quadratic time, and the recursion depth reaches n, which overflows the
+  call stack in Node around ten thousand frames by default. Shuffle, or
+  recurse on the smaller side and loop on the larger, which bounds the
+  depth at `lg n`.
+- **Stable two-pass sort plus an unstable algorithm.** Sorting by first
+  name then last name with heapsort scrambles first-name order within each
+  last name. The code looks right; only a test with shared last names
+  catches it.
+- **Heap of records plus mutating a record's key while it sits in the
+  heap.** The heap order is now silently wrong. Either remove and
+  re-insert, or use an index priority queue with `changeKey`.
+- **Top-k with k larger than n.** The heap never evicts; the output has n
+  items, not k. Decide whether that is an error or fine, and test it.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production I almost always use the platform's sort, so the questions are
+different. Is it stable (JavaScript, Python, Java objects: yes; C `qsort`,
+C++ `std::sort`, Java primitives: no)? What does it cost in memory (Timsort
+needs up to n/2 extra references)? Is the comparator consistent, and is it
+cheap? A comparator that calls `localeCompare` with a locale argument, or
+parses a date string, runs `n lg n` times; precompute the key once per
+item (the decorate-sort-undecorate pattern) when it is expensive.
+
+Large data changes the picture. Sorting a 50 GB log on a machine with 4 GB
+of memory is an external mergesort: sorted runs written to disk, then a
+k-way merge with a heap. Databases do this automatically and expose it as a
+setting such as Postgres's `work_mem`; when a sort spills to disk, the query
+plan says so. A slow `ORDER BY` in production is often a sort that spilled,
+fixed with an index that already delivers rows in order.
+
+The production mistake is sorting inside a request path on unbounded data:
+fine at a hundred rows, a timeout at a million. Paginate with an index, or
+keep a top-k heap.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit this chapter teaches is to ask what the data looks like before
+choosing an algorithm. Is it nearly sorted? Full of duplicates? Bigger
+than memory? Arriving as a stream? Each answer points to a different tool,
+and the fastest generic algorithm is often the wrong one.
+
+The second habit is that guarantees and averages are different promises.
+Quicksort is usually fastest; mergesort is never slow. Which you want
+depends on who controls the input and what happens when you are slow. A
+batch job can take the average; a public API facing attackers needs the
+guarantee.
+
+The mistake is choosing on one number, "quicksort is fastest". The fix is
+to name the property you need first: speed, stability, memory, worst case,
+streaming.
+
+</Level>
+<Level name="System design" depth={3}>
+
+Sorting decisions sit inside larger systems. In a search service, each
+shard scores documents and keeps its top k with a heap; the coordinator
+k-way merges the shard results with another heap and returns the global top
+k. No one sorts everything. In a data warehouse, a sort-merge join reads two
+tables already sorted by the join key (from their indexes or from a sort
+step) and merges them in one pass, while a hash join builds a hash table
+instead; the planner picks by estimated sizes and existing order.
+
+A concrete example: a leaderboard for a game with ten million players. A
+full sort per request is impossible. Keep scores in an ordered structure
+(chapter 3's balanced trees, or Redis sorted sets, which use a skip list)
+so rank and top-k are logarithmic, and keep a heap-based top-100 cache
+refreshed on writes.
+
+The system-design mistake is centralising a sort that could be distributed:
+gathering everything to one node to sort. The fix is local top-k plus a
+merge.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+I learn this chapter by implementing every sort with counters and running
+the same benchmark harness over all of them: random, sorted, reversed, few
+distinct keys, and nearly sorted (sorted with ten random swaps), at four
+sizes each. The table that comes out is the chapter in numbers, and I
+should be able to predict every cell before running it.
+
+Then I do the traces by hand, because they reveal what the code hides:
+one partition, one merge, one sink, one sortdown, on arrays of eight to ten
+items, checked against the code's log.
+
+Done when, from a blank file, I can write insertion sort, mergesort (both
+forms), quicksort with shuffle and three-way partitioning, and a binary
+heap with heapsort, all passing a property test against the built-in sort
+on ten thousand random arrays; I can prove the `n lg n` lower bound and the
+linear heap construction in my own words; and I can choose a sort for a
+described workload and defend the choice in one paragraph.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Which sort does JavaScript use?** V8 uses Timsort since 2018 (Chrome 70).
+It is stable and adaptive. Other engines may differ, but stability is
+required by the language specification.
+
+**Is quicksort really faster than mergesort?** For arrays of primitives in
+memory, usually yes, by a constant factor. For objects, where stability
+matters and compares are expensive, mergesort-style sorts like Timsort win
+because they make fewer compares.
+
+**Why does the book shuffle instead of picking a random pivot?** The two are
+equivalent in effect. Shuffling once keeps the partition code simple and
+makes the analysis clean.
+
+**Can I sort faster than n lg n?** Yes, if you do not rely only on
+compares. Counting sort and radix sort (chapter 5) run in linear time for
+integer or string keys of bounded length.
+
+**Why learn heapsort if nobody uses it directly?** Because the heap is
+everywhere: priority queues, schedulers, top-k, Dijkstra, k-way merge. And
+introsort uses heapsort as its safety net.
+
+**What is a "nearly sorted" array, precisely?** One with few inversions,
+say at most a constant times n. Insertion sort and Timsort are linear on
+it.
+
+**Is mergesort's extra memory a real problem?** For arrays of a billion
+items, yes; for typical in-memory data, rarely. For linked lists,
+bottom-up mergesort needs no extra memory at all.
+
+## Key takeaways
+
+- All the sorts here use only compare and exchange, so they work for any total order and their cost can be counted exactly.
+- Insertion sort's cost is n plus the number of inversions, which makes it the best choice for small or nearly sorted data.
+- Shellsort's h-sorting lets items jump far, turning insertion sort into a fast, tiny sort.
+- Mergesort guarantees `n lg n` compares and is stable, at the price of an auxiliary array.
+- No compare-based sort can guarantee fewer than about `n lg n` compares, by the decision-tree argument.
+- Quicksort is fastest in practice only with a shuffle (or random pivots); without one, sorted input is quadratic.
+- Three-way partitioning makes quicksort linear when there are few distinct keys.
+- A binary heap gives `lg n` insert and delete-max, linear construction, and in-place heapsort.
+- A bounded heap finds the top k of a stream in `n lg k` time and k memory.
+- Stability, memory, worst-case guarantees and data shape decide which sort to use, more than raw speed.
+
+## Glossary
+
+- **Adaptive sort:** a sort that runs faster on input that is already partially sorted.
+- **Auxiliary array:** the extra array mergesort copies into while merging.
+- **Binary heap:** a heap-ordered complete binary tree stored in an array.
+- **Complete binary tree:** a binary tree with every level full except possibly the last, filled left to right.
+- **Comparator:** a function that defines an order by returning negative, zero or positive.
+- **Decision tree:** a tree of compares whose leaves are the possible outputs of a sort.
+- **External sort:** a sort for data too large for memory, built from sorted runs and merging.
+- **Heap-ordered:** every node's key is at least as large as its children's keys.
+- **h-sorted:** every h-th item, starting anywhere, forms a sorted sequence.
+- **In place:** using at most a small (logarithmic or constant) amount of extra memory.
+- **Index priority queue:** a priority queue whose items are integer indices whose keys can be changed.
+- **Inversion:** a pair of items in the wrong order relative to each other.
+- **Partition:** rearranging a subarray around a pivot so smaller items are left and larger right.
+- **Pivot:** the item a partition rearranges around.
+- **Priority queue:** a collection with insert and remove-the-maximum (or minimum).
+- **Quickselect:** finding the k-th smallest item by partitioning and recursing into one side.
+- **Sink / swim:** moving a node down or up a heap to restore heap order.
+- **Stable sort:** a sort that keeps items with equal keys in their original relative order.
+- **Three-way partitioning:** splitting into less than, equal to and greater than the pivot.
+
+## Exercises and self-check
+
+My own exercises; the book's exercises at the end of each section are
+worth a pass too.
+
+**Warm-up (by hand)**
+
+1. Trace selection sort and insertion sort on `9 4 7 1 8 2`. Count compares
+   and exchanges for each, and count the inversions to check insertion sort.
+2. Trace bottom-up mergesort on `9 4 7 1 8 2 6`, one row per pass.
+3. Partition `40 10 70 20 90 30 60` around 40, one row per exchange.
+4. Insert `5 9 3 7 1 8` into an empty max-heap, drawing the array after each
+   insert; then do two delMax operations.
+
+**Build (code and tests)**
+
+5. Write a property test: for a thousand random arrays (with duplicates),
+   every sort's output equals the built-in sort's output.
+6. Write a stability test: sort records with many equal keys and check
+   original order is preserved for the stable sorts; show which unstable
+   sorts fail it.
+7. Add a cutoff to insertion sort for subarrays under some size in both
+   mergesort and quicksort. Find the best cutoff on your machine.
+8. Build a min-oriented index priority queue with `insert`, `delMin`,
+   `decreaseKey` and `contains`. Test it against a brute-force array.
+
+**Stretch (change the problem)**
+
+9. Make quicksort's recursion depth at most `lg n` for any input by
+   recursing on the smaller side only. Prove the bound.
+10. Design an attack: write an input that makes a quicksort with a
+    median-of-three pivot (no shuffle) go quadratic, or explain why it is
+    hard.
+11. Sort 10 GB of numbers using at most 500 MB of memory. Write it,
+    measuring the number of passes over the data.
+
+**Self-check**
+
+<details>
+<summary>1. Which of the chapter's sorts are stable?</summary>
+
+Insertion sort and mergesort. Selection, shellsort, quicksort and heapsort
+are not.
+
+</details>
+
+<details>
+<summary>2. What is the worst case of shuffled quicksort, and why is it not a worry?</summary>
+
+`~n²/2` compares, but it requires the shuffle to produce a sequence of
+terrible pivots, with a probability so small it is less likely than a
+hardware failure for any real n.
+
+</details>
+
+<details>
+<summary>3. How many compares does merging two sorted halves of total size n take at most, and at least?</summary>
+
+At most n − 1 (one per output item except the last). At least n/2, when
+every item of one half is smaller than every item of the other.
+
+</details>
+
+<details>
+<summary>4. Why does insert into a heap swim and delMax sink, and not the other way round?</summary>
+
+Insert adds a new item at the bottom, which may be too big for its spot, so
+it moves up. DelMax puts a bottom item at the root, which is probably too
+small, so it moves down.
+
+</details>
+
+<details>
+<summary>5. You need the 100 largest of a billion numbers streaming in. Which heap, and what size?</summary>
+
+A min-heap of size 100. Each new number replaces the minimum if it is
+larger, so the heap always holds the 100 largest seen so far.
+
+</details>
+
+<details>
+<summary>6. What does three-way partitioning change about quicksort's cost on keys from a small set?</summary>
+
+It drops from `n lg n` to linear, because each distinct key is finished in
+one partition and never revisited.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter sits across two phases of the
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>:
+the heap belongs to phase 3, data structures, and the sorts to phase 4,
+algorithms. I would give it six sessions.
+
+<Timeline caption="Six sessions for chapter 2. Each ends with code, a trace by hand and a row in the benchmark table." items={[
+  { when: "Session 1", what: "2.1: selection, insertion and shellsort with counters. Trace each by hand on one small array. Inversion test for insertion sort." },
+  { when: "Session 2", what: "2.2: merge, top-down and bottom-up mergesort. Stability test. Solve the recurrence on paper; draw the decision tree for three keys." },
+  { when: "Session 3", what: "2.3: partition by hand, quicksort with shuffle, then three-way. Run the sorted-without-shuffle experiment and watch it blow up." },
+  { when: "Session 4", what: "2.4: the binary heap with swim and sink, heapsort, top-k. Prove linear heap construction in my own words." },
+  { when: "Session 5", what: "2.5: comparators, two-pass stable sorts, quickselect, the JavaScript sort traps. Build the which-sort decision table myself." },
+  { when: "Session 6", what: "The full benchmark harness over every sort and input shape. Predict each cell first, then run it, then explain every surprise." },
+]} />
+
+I keep one `ch2/` folder with every sort, the shared counted `less` and
+`exch`, the property and stability tests, and the benchmark. The README
+holds the benchmark table and one paragraph per algorithm on when I would
+choose it. After each session I close everything and rewrite the core loop
+(partition, merge, sink) on paper from memory.
+
+Done when the property test passes for every sort, I can predict the
+benchmark table to within a factor of two, I can trace partition, merge and
+sink by hand without errors, and I can explain in two minutes why
+JavaScript's sort is a mergesort hybrid while Java's sort for `int[]` is a
+quicksort.
