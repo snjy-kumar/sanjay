@@ -14,7 +14,15 @@ export interface Topic {
   label: string;
   /** One or two sentences, in my own words. This is the page's own content. */
   definition: string;
-  group: 'TypeScript' | 'React' | 'JavaScript' | 'Across the stack';
+  group:
+    | 'TypeScript'
+    | 'React'
+    | 'JavaScript'
+    | 'Across the stack'
+    | 'Interface'
+    | 'Backend and data'
+    | 'AI and agents'
+    | 'Product';
 }
 
 export const topics: Topic[] = [
@@ -249,6 +257,117 @@ export const topics: Topic[] = [
       'Moving code from one way to another without breaking it on the way. Order of operations, what stays compatible, and how to know the move is done.',
     group: 'Across the stack',
   },
+  // ---- The planned series ----
+  //
+  // These are the topics of the series that have a slot and a plan but no
+  // notes yet. A topic still only gets a page once a published note carries
+  // it, so adding a slug here creates nothing on the site by itself.
+
+  // Interface
+  {
+    slug: 'accessibility',
+    label: 'Accessibility',
+    definition:
+      'Landmarks, labels, focus, contrast and the keyboard. Whether a person who does not use a mouse can finish the flow, which is a feature and not a chore.',
+    group: 'Interface',
+  },
+  {
+    slug: 'design-systems',
+    label: 'Design systems',
+    definition:
+      'Tokens, primitives, variants and the documentation that holds them together. The line between a folder of components and a system other people can build with.',
+    group: 'Interface',
+  },
+
+  // Backend and data
+  {
+    slug: 'http',
+    label: 'HTTP',
+    definition:
+      'Methods, status codes, headers, cookies, caching and CORS. The contract every request signs, whether or not the code underneath knows it.',
+    group: 'Backend and data',
+  },
+  {
+    slug: 'databases',
+    label: 'Databases',
+    definition:
+      'Schemas, constraints, indexes, query plans, transactions and migrations. Most applications are a database with a UI, so this is where most of the slow and the wrong comes from.',
+    group: 'Backend and data',
+  },
+  {
+    slug: 'auth',
+    label: 'Auth',
+    definition:
+      'Authentication is who you are; authorization is what you may do. Sessions, tokens, password hashing, ownership checks and tenant isolation.',
+    group: 'Backend and data',
+  },
+  {
+    slug: 'observability',
+    label: 'Observability',
+    definition:
+      'Logs, metrics and traces: the way to find out what a running system is actually doing, instead of what I assumed it was doing.',
+    group: 'Backend and data',
+  },
+  {
+    slug: 'delivery',
+    label: 'Delivery',
+    definition:
+      'The path from a commit to production and back: CI gates, previews, deploys and rollbacks. Shipping is a skill of its own.',
+    group: 'Backend and data',
+  },
+  {
+    slug: 'dependencies',
+    label: 'Dependencies',
+    definition:
+      'Semver ranges, lockfiles, audits, licences and publishing. Every project is mostly code other people wrote, and this is how it is trusted.',
+    group: 'Backend and data',
+  },
+
+  // AI and agents
+  {
+    slug: 'llms',
+    label: 'LLMs',
+    definition:
+      'Tokens, context windows, sampling, structured output and cost. The model treated as a component with a contract, not as the architecture.',
+    group: 'AI and agents',
+  },
+  {
+    slug: 'retrieval',
+    label: 'Retrieval',
+    definition:
+      'Embeddings, chunking, search, reranking and citations. A RAG system is a search system with a language model at the end, and it is measured like one.',
+    group: 'AI and agents',
+  },
+  {
+    slug: 'evals',
+    label: 'Evals',
+    definition:
+      'Golden sets, regression checks and pass conditions for a probabilistic feature. A change ships only if it does not regress the eval.',
+    group: 'AI and agents',
+  },
+  {
+    slug: 'agents',
+    label: 'Agents',
+    definition:
+      'A loop with tools, a budget and a stop condition. Tool schemas, permissions, approvals, traces and the discipline of using a script when the steps are known.',
+    group: 'AI and agents',
+  },
+
+  // Product
+  {
+    slug: 'product',
+    label: 'Product',
+    definition:
+      'Problem framing, users, scope and iteration. The part that decides whether anything else was worth building.',
+    group: 'Product',
+  },
+  {
+    slug: 'seo',
+    label: 'SEO',
+    definition:
+      'Titles, descriptions, canonicals, sitemaps, structured data and content in the HTML. How a page is found by someone who does not already know it exists.',
+    group: 'Product',
+  },
 ];
 
 export const topicBySlug = (slug: string): Topic | undefined =>
@@ -259,4 +378,8 @@ export const topicGroups: Topic['group'][] = [
   'React',
   'JavaScript',
   'Across the stack',
+  'Interface',
+  'Backend and data',
+  'AI and agents',
+  'Product',
 ];
