@@ -1,0 +1,808 @@
+---
+title: "HTTP methods, status codes and idempotency"
+series: "backend"
+seriesOrder: 2
+undated: true
+readTime: "about 25 min"
+description: "What each HTTP method promises, how to pick a status code a client can act on, and how idempotency keys and ETags make retries and concurrent edits safe."
+tags: ['http', 'architecture', 'databases']
+related: ['backend/01']
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+
+A user taps "Pay", the train goes into a tunnel, the app retries, and the
+card is charged twice. Nothing in that story is a bug in one line of code.
+It is a missing contract: the server never said whether repeating the
+request was safe, and the client guessed. This note is about that contract:
+what HTTP methods promise, what status codes tell a client to do next, and
+how to make a write safe to repeat.
+
+## Before you start
+
+After this note you will be able to:
+
+- say which HTTP methods are safe, which are idempotent, and why the
+  difference decides what a client, a proxy or a browser may retry;
+- pick a status code from what the client should do next, not from what
+  went wrong on the server;
+- make a `POST` safe to retry with an idempotency key backed by a unique
+  constraint, including the race where two retries arrive at once;
+- stop lost updates with an `ETag` and `If-Match`, and save bandwidth with
+  `If-None-Match` and 304.
+
+What you should already know: the shape of a request and a response from
+[the first note in this series](/sanjay/posts/backend/01/), and basic SQL
+`insert` and `select`.
+
+Reading time: about 25 minutes, plus time to run the two small programs.
+
+## Note map
+
+<Layers layers={[
+  { name: "Methods", note: "what the client asks for, and what that promises" },
+  { name: "Status codes", note: "what happened, phrased as what the client does next" },
+  { name: "Idempotency keys", note: "making a non-idempotent POST safe to repeat" },
+  { name: "Conditional requests", note: "ETags: no lost updates, no wasted downloads" },
+]} caption="The note as four layers, read top to bottom. Each one builds the vocabulary the next one needs: the last two are both about what happens when a request is sent more than once or by more than one person." />
+
+## Methods and what they promise
+
+### In one sentence
+
+An HTTP method is a promise about side effects, and the promise, not the
+name, is what lets browsers, proxies and clients decide what they may
+cache or repeat.
+
+### The idea
+
+HTTP defines a handful of methods. The common ones are `GET` (read a
+resource), `HEAD` (the same without the body), `POST` (process this
+payload, often "create"), `PUT` (replace the resource at this address with
+this payload), `PATCH` (change part of it), `DELETE` (remove it) and
+`OPTIONS` (what can I do here?). The HTTP semantics standard, RFC 9110,
+defines what each one means.
+
+Two properties matter more than the names. A method is **safe** if the
+client is not asking for any change on the server: `GET`, `HEAD`,
+`OPTIONS`. A method is **idempotent** if sending the same request once or
+many times has the same intended effect on the server: all safe methods,
+plus `PUT` and `DELETE`. `POST` and `PATCH` are neither, by default.
+
+"Same intended effect" is about the server's state, not the response.
+Deleting `/notes/7` twice leaves the note deleted either way, even though
+the first call may return 204 and the second 404. Putting the same full
+body to `/notes/7` twice leaves the same note. Posting "create a payment
+of 5 dollars" twice creates two payments.
+
+These promises are what the rest of the web relies on. A browser may
+prefetch a `GET` link. A proxy may retry an idempotent request after a
+dropped connection. A crawler follows `GET` links freely. If a `GET`
+deletes something, all of these will eventually delete it for you.
+
+### Worked example
+
+The simple case is a notes resource and the method for each action:
+
+<Compare left="Action" right="Method and address" caption="One resource, five actions. Read the right column for the promise each method makes: only the POST is neither safe nor idempotent." rows={[
+  ["list my notes", "GET /notes (safe)"],
+  ["read one note", "GET /notes/7 (safe)"],
+  ["create a note", "POST /notes (neither)"],
+  ["replace note 7's title and body", "PUT /notes/7 (idempotent)"],
+  ["delete note 7", "DELETE /notes/7 (idempotent)"],
+]} />
+
+The realistic case is a "mark all as read" button. Developers often write
+it as `GET /notifications/read-all` because it is easy to link to. Then a
+browser extension prefetches links, or a link-preview bot fetches it from
+a chat message, and every notification is marked read without the user
+doing anything. The right method is `POST`, because it changes state and
+does not replace one resource with a known body. Making it `PUT
+/notifications/read-state` with a body of `{"all": true}` is also
+defensible, and has the bonus of being idempotent.
+
+`PATCH` deserves a word. A patch like "set title to X" is idempotent in
+effect, but a patch like "append this tag" or "increment views" is not. The
+standard does not promise idempotency for `PATCH`, so clients must not
+assume it.
+
+### Step by step
+
+<Trace
+  columns={["method", "safe", "idempotent", "cacheable by default", "who may retry automatically"]}
+  rows={[
+    ["GET", "yes", "yes", "yes", "browser, proxy, client library"],
+    ["HEAD", "yes", "yes", "yes", "browser, proxy, client library"],
+    ["OPTIONS", "yes", "yes", "no", "anyone"],
+    ["PUT", "no", "yes", "no", "client, if it resends the same body"],
+    ["DELETE", "no", "yes", "no", "client"],
+    ["POST", "no", "no", "rarely", "nobody, unless the server offers a key"],
+    ["PATCH", "no", "no", "no", "nobody, unless the patch is designed to be"],
+  ]}
+  caption="The method table to memorise. The last column is the practical consequence: a row with 'no' in the idempotent column needs extra design before anything retries it."
+/>
+
+### Common mistake
+
+The common mistake is choosing methods by habit: `GET` for anything that
+can be a link, `POST` for everything else. The first breaks safety, as in
+the "read-all" example. The second throws away idempotency: a `POST
+/notes/7/update` with a full body could have been a `PUT`, and then the
+client library would have retried it safely after a timeout.
+
+The fix is to ask two questions per endpoint: does this change state, and
+would doing it twice be the same as once? The answers pick the method.
+
+### In real systems
+
+HTTP client libraries and service meshes encode these rules. Many retry
+idempotent methods on connection errors and refuse to retry `POST`.
+Browsers warn before resubmitting a `POST` form on reload ("Confirm form
+resubmission") for exactly this reason. Caches, from the browser's own to
+a CDN, only cache `GET` and `HEAD` responses unless told otherwise.
+
+### Check yourself
+
+<details>
+<summary>1. DELETE /notes/7 returns 204 the first time and 404 the second. Is DELETE still idempotent?</summary>
+
+Yes. Idempotency is about the effect on the server: after one call or two,
+note 7 is gone. The responses can differ. Some APIs return 204 both times
+to make retries quieter; both choices are valid.
+
+</details>
+
+<details>
+<summary>2. Is "PATCH /counters/1 with body increment by 1" idempotent?</summary>
+
+No. Each call adds one, so two calls add two. A patch that sets an absolute
+value ("set to 5") would be idempotent in effect.
+
+</details>
+
+## Status codes as instructions
+
+### In one sentence
+
+A status code is the server telling the client what to do next: carry on,
+go elsewhere, fix the request, or try again later.
+
+### The idea
+
+Status codes are three digits, grouped by the first digit. **2xx** means
+it worked. **3xx** means look elsewhere (a redirect, or "you already have
+it"). **4xx** means the client must change something before trying again.
+**5xx** means the server failed and the same request might work later.
+
+That last split is the one that matters most for automation. A client can
+retry a 503 Service Unavailable after a pause; retrying a 422 with the same
+body will fail forever. So picking 4xx versus 5xx is not about blame, it is
+about whether a retry can help.
+
+Within each class, a few codes carry most of the meaning:
+
+- **200 OK** for a successful read or update with a body; **201 Created**
+  for a new resource, with a `Location` header; **204 No Content** for
+  success with no body.
+- **304 Not Modified** for "your cached copy is still good".
+- **400 Bad Request** for malformed syntax; **401 Unauthorized** for "who
+  are you?" (no or bad credentials); **403 Forbidden** for "I know who you
+  are, and no"; **404 Not Found**; **405 Method Not Allowed**, with an
+  `Allow` header; **409 Conflict** for a clash with current state; **412
+  Precondition Failed** for a failed `If-Match`; **413** for too large;
+  **422 Unprocessable Content** for a well-formed request that fails
+  validation; **429 Too Many Requests**, with `Retry-After`.
+- **500 Internal Server Error** for a bug; **502 Bad Gateway** and **504
+  Gateway Timeout** for a failure upstream of a proxy; **503 Service
+  Unavailable** for "overloaded or down for maintenance, try later".
+
+### Worked example
+
+The simple case is choosing codes for one endpoint, `POST /notes`:
+
+<Flow steps={[
+  "Body is not JSON: 400",
+  "No session cookie or bad token: 401",
+  "Logged in, but the notebook belongs to someone else: 403 or 404",
+  "JSON is fine but body is empty: 422 with field errors",
+  "A note with that title already exists: 409",
+  "Database is down: 503 with Retry-After",
+  "Saved: 201 with Location /notes/42",
+]} caption="Status codes in the order a handler meets the failures. Each one maps to a different next step for the client: fix encoding, log in, stop, fix a field, rename, wait, or carry on." />
+
+The realistic case is the 403-or-404 question. If a user asks for
+`/notebooks/91` and notebook 91 exists but belongs to someone else, a 403
+confirms that the id exists. For private data, that leak matters: an
+attacker can walk ids and learn which ones are real. Many APIs return 404
+for "exists but not yours", deliberately making it indistinguishable from
+"does not exist". The note on authorization later in this series comes back
+to this.
+
+The second realistic case is my own server's 405. When I sent `DELETE` to
+an endpoint that only supports `GET` and `PUT`, it answered:
+
+```text
+DELETE 405 GET, PUT
+```
+
+The `Allow` header lists what the endpoint does support, so a client or a
+developer reading the network panel knows what to do instead.
+
+### Step by step
+
+<Figure art={`
+                     did the server understand the request?
+                      /                                \\
+                    no                                 yes
+                    |                                   |
+            400 (syntax)                  is the caller identified?
+                                           /                \\
+                                         no                 yes
+                                         |                   |
+                                        401          is the caller allowed?
+                                                      /            \\
+                                                    no             yes
+                                                    |               |
+                                              403 / 404     does the input pass the rules?
+                                                              /            \\
+                                                            no             yes
+                                                            |               |
+                                                      422 / 409     did the server manage it?
+                                                                      /          \\
+                                                                    no           yes
+                                                                    |             |
+                                                              500 / 503    200 / 201 / 204
+`} caption="A decision tree for picking a status code. Walk it top to bottom; the first 'no' decides the code. 5xx only appears once the request itself was fine." />
+
+### Common mistake
+
+Two mistakes are common. The first is returning 200 with `{"error":
+"..."}` in the body. Every tool that reads status codes, from `fetch`'s
+`res.ok` to load-balancer health checks and error-rate dashboards, now
+sees success. The second is returning 500 for bad input, because an
+unhandled validation exception bubbled up. The dashboards now page someone
+at night for a client's typo, and the client may retry a request that can
+never succeed.
+
+<Compare left="Misleading" right="Actionable" caption="The same failures, coded two ways. The right column lets a client decide whether to retry, prompt the user or give up, without parsing any text." rows={[
+  ["200 with error: invalid email", "422 with field email: invalid"],
+  ["500 for a missing field", "422 for a missing field"],
+  ["500 when the DB is in maintenance", "503 with Retry-After: 30"],
+  ["404 for a wrong method", "405 with Allow: GET, PUT"],
+  ["403 for not logged in", "401 with a WWW-Authenticate header"],
+]} />
+
+### In real systems
+
+Status codes drive real machinery. Load balancers eject instances that
+return too many 5xx. Retry policies retry 502, 503 and 504 but not 4xx.
+Monitoring alerts on the 5xx rate and graphs 4xx separately, because a
+spike of 4xx usually means a broken client release, and a spike of 5xx
+means a broken server. Wrong codes make all of this lie.
+
+### Check yourself
+
+<details>
+<summary>1. A request has a valid token for a user who is suspended. 401 or 403?</summary>
+
+403. The server knows who the caller is; it refuses this caller. 401 would
+tell the client to log in again, which cannot help.
+
+</details>
+
+<details>
+<summary>2. Why should a timeout talking to the payment provider be a 502 or 504 and not a 500?</summary>
+
+It tells the client and the dashboards that an upstream service failed, not
+this server's code, and that the request may succeed if retried later,
+which matters for retry policies and for who gets paged.
+
+</details>
+
+## Idempotency keys: making POST safe to repeat
+
+### In one sentence
+
+An idempotency key is a unique id the client attaches to one user action,
+so the server can recognise a repeat of that action and return the first
+result instead of doing the work again.
+
+### The idea
+
+Networks fail in an awkward way: a client that times out does not know
+whether the server got the request. Maybe the request never arrived. Maybe
+it arrived, the work was done, and the response got lost. From the client's
+side these look identical, and the only safe move for a read is to retry.
+For a `POST` that charges a card, a retry might charge twice.
+
+The fix is to make the action idempotent by design. The client generates a
+random **idempotency key** once per user action (one tap of "Pay", not one
+HTTP attempt) and sends it with every attempt, usually in an
+`Idempotency-Key` header. The server stores the key with the result. If the
+key is new, it does the work. If the key has been seen, it returns the
+stored result. Payment APIs popularised this pattern, and there is an IETF
+draft standardising the header.
+
+Three details make or break it. The key must be **stored atomically with
+the work**: if the row and the key are written in separate steps, a crash
+between them breaks the guarantee. **Concurrent retries** must not both
+do the work: two attempts with the same key arriving at the same moment
+both see "new key". And a key reused with a **different body** is a client
+bug that should be refused, not silently answered with an unrelated result.
+
+A unique constraint in the database handles the first two at once. The
+insert either creates the row with the key or conflicts, and the database
+guarantees only one of two racing inserts wins.
+
+### Worked example
+
+The simple case is the difference itself. I made a `payments` table with a
+unique `idem_key` column and wrote two functions: a naive insert, and an
+idempotent one. The idempotent insert uses `on conflict do nothing`, so a
+repeat inserts nothing and returns no rows:
+
+```ts
+async function payIdem(key: string, amount: number) {
+  const ins = await pool.query(
+    `insert into payments (amount_cents, idem_key) values ($1, $2)
+     on conflict (idem_key) do nothing returning id`, [amount, key]);
+  if (ins.rows.length) return { id: ins.rows[0].id, replay: false };
+  const { rows } = await pool.query(
+    'select id, amount_cents from payments where idem_key = $1', [key]);
+  if (rows[0].amount_cents !== amount)
+    throw new Error('422: key reused with a different body');
+  return { id: rows[0].id, replay: true };
+}
+```
+
+Then I sent each kind twice, raced two attempts with the same key, and
+reused a key with a different amount. The real output:
+
+```text
+naive, sent twice: 1 2
+idempotent, sent twice: { id: '3', replay: false } { id: '3', replay: true }
+two retries racing: [ { id: '5', replay: false }, { id: '5', replay: true } ]
+422: key reused with a different body
+```
+
+And the table afterwards:
+
+```text
+[
+  { id: '1', amount_cents: 500, idem_key: null },
+  { id: '2', amount_cents: 500, idem_key: null },
+  { id: '3', amount_cents: 500, idem_key: 'k-7f3a' },
+  { id: '5', amount_cents: 900, idem_key: 'k-9b21' }
+]
+```
+
+The naive version charged twice. The idempotent version charged once, both
+sequentially and under a race. And id 4 is missing: the losing insert in
+the race took a value from the identity sequence before it hit the
+conflict. Sequences never roll back, so **gaps in ids are normal** and
+never evidence of lost data.
+
+The realistic case adds what a payment API really needs. The stored record
+holds the response status and body, not just the row id, so a replay
+returns byte-for-byte the same answer. Keys expire after a window, such as
+24 hours, because a client will not retry after that. And a request whose
+first attempt is still running gets a 409 "in progress" rather than a
+second execution.
+
+### Step by step
+
+<Trace
+  columns={["time", "attempt A (key k-9b21)", "attempt B (same key)", "table"]}
+  rows={[
+    ["t1", "insert ... on conflict do nothing", "", "A's row is pending, uncommitted"],
+    ["t2", "", "insert ... on conflict do nothing", "B waits: the key may be taken"],
+    ["t3", "commit; returns id 5", "", "row 5 visible with k-9b21"],
+    ["t4", "", "conflict seen; inserts nothing, returns no rows", "unchanged"],
+    ["t5", "", "select by key: id 5, same amount", "unchanged; B replies replay"],
+  ]}
+  caption="Two retries racing. The unique index makes B wait at t2 until A commits, then B sees the conflict. Without the index, both would insert."
+/>
+
+<Flow steps={[
+  "User taps Pay once: client creates key k-9b21",
+  "Attempt 1 times out in a tunnel: client does not know if it worked",
+  "Attempt 2 sends the same key and body",
+  "Server finds k-9b21: returns the stored 201 and payment id",
+  "User sees one payment, card charged once",
+]} caption="The flow from the user's side. The key is born with the user's intent, not with the HTTP attempt; that is the whole trick." />
+
+### Common mistake
+
+The most common mistake is generating the key per HTTP attempt, for
+example inside a fetch wrapper that creates a fresh UUID on every call.
+Every retry then has a new key, and the server sees new actions. The fix is
+to create the key when the user acts and pass it down to every retry of
+that action.
+
+The second mistake is check-then-insert in application code: "select by
+key; if none, insert". Two racing attempts both see none and both insert.
+The fix is the unique constraint, as above, so the database decides.
+
+The third is doing external work before recording the key. If the handler
+calls the card network first and crashes before writing the row, the retry
+charges again. The fix is to record the key and a "started" state first,
+then do the external call with the provider's own idempotency key derived
+from yours, then record the result.
+
+### In real systems
+
+Payment providers accept an idempotency key header on their create
+endpoints and store results for a day or so. Message queues use the same
+idea under the name **deduplication id**, and background-job systems rely
+on idempotent handlers because they deliver at least once. A later note on
+jobs and retries builds on exactly this table.
+
+### Check yourself
+
+<details>
+<summary>1. Why is the gap at id 4 not a problem?</summary>
+
+Identity and sequence values are handed out outside of transactions and are
+never given back, so a failed or conflicting insert still consumes one.
+Ids are unique, not contiguous; nothing should depend on them having no
+gaps.
+
+</details>
+
+<details>
+<summary>2. A client reuses a key with a different amount. Why refuse instead of replaying?</summary>
+
+The same key with a different body means the client has a bug: it thinks
+this is a new action. Replaying the old result would tell it "paid 700"
+when 500 was paid. Refusing with 422 surfaces the bug.
+
+</details>
+
+## Conditional requests: ETags and lost updates
+
+### In one sentence
+
+An ETag is a version label for a resource, and sending it back with
+`If-None-Match` or `If-Match` lets the server skip a download or refuse a
+write based on a stale copy.
+
+### The idea
+
+Two problems share one tool. The first is waste: a client that already has
+a resource re-downloads it every time. The second is the **lost update**:
+Alice and Bob both load a document, both edit, both save with `PUT`, and
+whoever saves second silently overwrites the other's work. `PUT` is
+idempotent, but idempotent is not the same as safe under concurrency.
+
+The server attaches an **ETag** (entity tag) header to each response: an
+opaque string that changes whenever the resource changes, such as a hash
+of the content or a version number. For reads, the client sends it back in
+`If-None-Match`; if it still matches, the server answers **304 Not
+Modified** with no body. For writes, the client sends it in `If-Match`; if
+the resource has changed since, the server refuses with **412
+Precondition Failed**, and the client must reload and merge.
+
+This is **optimistic concurrency control**: nobody locks anything while
+editing, and conflicts are detected at write time. It suits the web, where
+an edit can take minutes and a lock held that long would block everyone.
+
+### Worked example
+
+I wrote a small server that hashes the document into an ETag, answers 304
+for a matching `If-None-Match`, and requires `If-Match` on `PUT`. The core
+of the write check is two lines:
+
+```ts
+if (req.headers['if-match'] !== tag()) { res.writeHead(412); return res.end(); }
+doc = { ...JSON.parse(body), version: doc.version + 1 };
+```
+
+Then I played Alice and Bob. Both read the document and got the same ETag;
+Alice saved first; Bob saved with his stale ETag. The real output:
+
+```text
+GET 200 "6c171570" {"title":"draft","version":1}
+GET again 304
+PUT by Alice 200 "40342d99" {"title":"Alice edit","version":2}
+PUT by Bob (stale) 412
+```
+
+The second read cost a status line and no body. Alice's write succeeded and
+produced a new ETag. Bob's write was refused instead of silently erasing
+Alice's edit; his client now reloads, shows him Alice's version, and lets
+him reapply his change.
+
+The realistic case is the same check in SQL, where it belongs once there
+are several app servers. The version is a column, and the update only
+matches if the version is still the one the client saw:
+
+```sql
+update documents
+   set title = $1, version = version + 1
+ where id = $2 and version = $3
+returning version;
+```
+
+Zero rows updated means someone else got there first: answer 412. The
+check and the write are one statement, so no race can slip between them.
+
+### Step by step
+
+<Timeline items={[
+  { when: "10:00", what: "Alice GETs the doc: ETag v1" },
+  { when: "10:01", what: "Bob GETs the doc: ETag v1" },
+  { when: "10:05", what: "Alice PUTs with If-Match v1: matches, saved as v2" },
+  { when: "10:06", what: "Bob PUTs with If-Match v1: current is v2, 412" },
+  { when: "10:07", what: "Bob GETs v2, sees Alice's edit, merges, PUTs with If-Match v2: saved as v3" },
+]} caption="A lost update prevented. Without If-Match, the 10:06 write would have succeeded and Alice's edit would be gone with no error anywhere." />
+
+### Common mistake
+
+The common mistake is computing the ETag from something that does not
+change when the content does, such as the row's id, or from a timestamp
+with one-second resolution so two edits in the same second share a tag.
+The fix is a version column incremented on every write, or a hash of the
+exact bytes served.
+
+A second mistake is making `If-Match` optional on writes. Old clients that
+omit it keep overwriting. The fix, once all clients send it, is to answer
+**428 Precondition Required** when it is missing.
+
+### In real systems
+
+CDNs and browsers use ETags and `If-None-Match` automatically for static
+files. Document APIs, configuration stores and cloud storage services use
+`If-Match` or a version field for safe writes. The same idea in a
+database is the version column, or Postgres's own row version in system
+columns, though an explicit column is clearer.
+
+### Check yourself
+
+<details>
+<summary>1. Why is PUT, which is idempotent, still exposed to lost updates?</summary>
+
+Idempotency means repeating the same request gives the same state. Lost
+updates come from two different requests based on the same old state.
+Idempotency says nothing about that; preconditions do.
+
+</details>
+
+<details>
+<summary>2. What should a client do after a 412?</summary>
+
+Fetch the current version, show or merge the difference, and retry the
+write with the new ETag. Retrying with the old ETag will keep failing.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="HTTP methods, status codes and idempotency">
+<Level name="Beginner" depth={3}>
+
+At the beginner level, learn the method table and the five status classes,
+and use them honestly. Reads are `GET`. Creates are `POST`. Full replaces
+are `PUT`. Deletes are `DELETE`. Success is 2xx, client mistakes are 4xx,
+server failures are 5xx.
+
+A worked example: a todo API. `GET /todos` lists, `POST /todos` creates and
+returns 201 with the new todo, `PUT /todos/3` replaces todo 3 and returns
+200, `DELETE /todos/3` returns 204. An empty title returns 422 with a
+message naming the field.
+
+The mistake at this level is returning 200 for everything and putting
+`success: false` in the body. The fix is to let the status code carry the
+outcome and the body carry the details.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+At the intermediate level, think about clients that are programs. They
+branch on status codes, retry on some, and cache some responses. Your
+choices decide whether that works. Add `Location` to 201, `Allow` to 405,
+`Retry-After` to 429 and 503.
+
+A worked example: a mobile client with a retry helper that retries
+idempotent methods on network errors and 503, with exponential backoff
+(waits of 1, 2 and 4 seconds) plus random jitter so all clients do not
+retry at the same instant. Because the server returns 422 for validation,
+the helper never retries those.
+
+The mistake is a retry helper that retries every failure, including 4xx
+and `POST`. The fix is a retry policy keyed on method and status.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, make non-idempotent operations safe to retry. Add
+idempotency keys to every create that has a real-world effect: payments,
+emails, orders. Store the response, not just the id, and handle the
+in-progress state.
+
+A worked example: an order endpoint records `(key, status='started')`
+with a unique key, calls the payment provider with a derived key, then
+updates the record with the response. A retry during the call sees
+"started" and gets 409 with `Retry-After: 1`; a retry after sees the
+stored 201.
+
+The mistake is putting the key check in a cache that can be evicted. A
+replay after eviction does the work again. The fix is durable storage with
+a unique constraint and an explicit expiry.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+Edge cases are single specific situations. `HEAD` must return the same
+headers as `GET`, including `content-length`, with no body. A `DELETE` of
+something already gone: 204 or 404, but pick one and document it. A `PUT`
+to an address that does not exist: create it (201) if clients choose ids,
+or 404 if they do not.
+
+A worked example: a client sends `If-None-Match: *`, meaning "only if
+nothing exists here". It is the standard way to say "create, but never
+overwrite" with `PUT`. The server returns 412 if the resource exists.
+
+The mistake is ignoring headers the server does not understand, like
+`If-Match`, and performing the write anyway. The fix is to either
+implement preconditions or reject requests carrying them.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+Corner cases combine two conditions. A retry with the same idempotency key
+arrives after the key expired: the server treats it as new and does the
+work twice. A client sends the same key from two devices for two different
+actions because its key generator is not random enough.
+
+A worked example of the first: a background sync on a phone retries a
+`POST` after the app was offline for two days. The expiry window was 24
+hours. The fix is an expiry longer than any client's retry horizon, and
+clients that give up and ask the user once that horizon passes.
+
+The mistake is choosing the expiry without asking how long clients retry.
+The fix is to write the retry horizon into the API contract.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, status codes feed dashboards and alerts, and methods feed
+caches and retries. Split error-rate graphs into 4xx and 5xx, alert on
+5xx, and watch 409 and 412 rates as signs of contention.
+
+A worked example: after a release, 422s on `POST /orders` jump. No server
+alert fires, correctly, because the server is fine. The 4xx graph shows the
+new mobile build sends a renamed field. Rolling the client back fixes it;
+a server-side alias for the old field name would have avoided it.
+
+The mistake is alerting on all non-2xx. The on-call person gets paged for
+users mistyping passwords. The fix is alerting on 5xx and on unusual
+changes in specific 4xx codes.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The mindset is that every request will be sent twice eventually, and some
+will be sent by two people at once. Design each write so the second copy
+is harmless, and so the second person gets told rather than silently
+overwritten.
+
+A worked example: "send invite email" is retried by a job runner. Without
+idempotency, the invitee gets three emails. With a unique key of `(invite
+id, 'email-sent')`, the second and third attempts are no-ops.
+
+The mistake is assuming exactly-once delivery exists. The fix is
+at-least-once delivery plus idempotent handling, which is achievable.
+
+</Level>
+<Level name="System design" depth={3}>
+
+In system design, these contracts are the glue between services. Each
+service's write endpoints accept idempotency keys, each client has a retry
+policy keyed on method and status, and each mutable resource carries a
+version for optimistic concurrency.
+
+A worked example: a checkout spans an order service, a payment service and
+an email service. The checkout request's key is passed down and each
+service derives its own key from it, such as `checkout-key:payment`. A
+retry of the whole checkout replays each step's stored result instead of
+redoing it.
+
+The mistake is giving each service its own fresh keys per call, which
+breaks replay across services. The fix is deriving keys from the
+top-level action.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+The strategy is to make these rules boring defaults: an API style guide
+with the method table, a fixed list of status codes and when to use each,
+mandatory idempotency keys on creates with side effects, and `If-Match` on
+updates of shared documents. Then enforce them with tests and linting of
+the OpenAPI document.
+
+A worked example: a contract test sends every `POST` twice with the same
+key and asserts one row, sends a stale `If-Match` and asserts 412, and
+sends a malformed body and asserts 400, not 500.
+
+Done when: every write endpoint in your API can be retried by a client
+without a duplicate effect, two concurrent edits can never silently erase
+each other, and a client can decide whether to retry from the status code
+alone.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Should I use PATCH or PUT for updates?** `PUT` when the client sends the
+whole resource; it is idempotent and simple. `PATCH` when sending the whole
+thing is wasteful or would overwrite fields the client does not own. Use a
+defined patch format, such as JSON Merge Patch, rather than inventing one.
+
+**Is 200 with an empty body fine instead of 204?** It works, but 204 says
+"there is no body" explicitly, and some clients skip parsing on 204.
+
+**Where should the idempotency key live: header or body?** A header keeps
+it out of the business payload and lets middleware handle it uniformly.
+That is the common choice.
+
+**Can I make every POST idempotent automatically?** Middleware can store
+key, request hash and response for every `POST`, which covers most cases.
+The work and the record still have to commit together, so it must share
+the database transaction with the handler.
+
+**What about 418?** It is a joke from an April Fools' RFC. Do not use it in
+an API anyone else has to read.
+
+## Key takeaways
+
+- Safe methods change nothing; idempotent methods can be repeated with the
+  same effect; `POST` and `PATCH` promise neither.
+- Never put a state change behind a `GET`.
+- Pick status codes by what the client should do next; 4xx means change
+  the request, 5xx means a retry might work.
+- Never return 200 with an error body, and never 500 for bad input.
+- An idempotency key belongs to the user's action, not the HTTP attempt.
+- A unique constraint makes idempotency keys safe under races.
+- Gaps in identity ids are normal.
+- ETags with `If-Match` turn silent lost updates into explicit 412s.
+
+## Glossary
+
+- **Safe method**: a method that requests no change on the server.
+- **Idempotent method**: a method whose repeated identical requests have
+  the same effect as one.
+- **Status class**: the first digit of a status code (2xx, 3xx, 4xx, 5xx).
+- **Idempotency key**: a client-chosen unique id for one action.
+- **Replay**: returning a stored result for a repeated key.
+- **Lost update**: one write silently overwriting another based on the same
+  old state.
+- **ETag**: an opaque version label for a resource.
+- **Conditional request**: a request with `If-Match` or `If-None-Match`.
+- **304 Not Modified**: the cached copy is still valid.
+- **412 Precondition Failed**: the condition in the request is false.
+- **Optimistic concurrency control**: detecting conflicts at write time
+  instead of locking.
+- **Exponential backoff with jitter**: retry waits that double, with a
+  random spread.
+
+## Practice
+
+**Warm-up.** List every endpoint in an API you wrote with its method and
+the status codes it returns. Mark each `GET` that changes state and each
+200 that carries an error.
+
+**Build.** Add an `Idempotency-Key` header to your create endpoint, backed
+by a unique column. Write a test that fires the same request ten times
+concurrently and asserts exactly one row and ten identical responses.
+
+**Stretch.** Add a `version` column to a shared resource, return it as an
+ETag, require `If-Match` on `PUT`, and write a small two-tab demo that
+shows a 412 and a merge screen instead of a lost update.
