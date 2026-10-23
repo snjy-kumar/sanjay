@@ -36,13 +36,18 @@ The dev server serves the site under its base path, so it is at
 ├── src/
 │   ├── components/
 │   │   ├── CodeBlock.astro  # Labeled code block helper
+│   │   ├── PhaseTable.astro # One plan's phases, gates and where they land
+│   │   ├── PlannedNotes.astro # A planned series' notes: plain text, undated
 │   │   └── WhenTable.astro  # "When to use which" table helper
 │   ├── content/
 │   │   ├── blog/<series>/   # Posts: 01.md, 02.md, ... per series
 │   │   ├── log/             # The raw, unedited session log
-│   │   └── plans/           # The curriculum behind a series
+│   │   └── plans/           # The roadmaps, fundamentals, books and series plans
 │   ├── data/
-│   │   ├── series.ts        # Single source of truth for series journeys
+│   │   ├── series.ts        # Single source of truth for series journeys,
+│   │   │                    #   and the planned notes of each empty slot
+│   │   ├── plans.ts         # Each plan's group, phases, gates, and where
+│   │   │                    #   each phase's notes go
 │   │   ├── tags.ts          # The closed topic vocabulary
 │   │   ├── roadmap.ts       # What is planned next, but not written
 │   │   ├── seriesMarks.ts   # The mark drawn next to each series name
@@ -56,7 +61,7 @@ The dev server serves the site under its base path, so it is at
 │   │   ├── path.astro        # The whole learning path, in one page
 │   │   ├── log.astro         # The raw session log
 │   │   ├── topics/           # The topic index and one page per topic
-│   │   ├── plans/[slug]      # A published curriculum
+│   │   ├── plans/            # The plans index and one page per plan
 │   │   ├── posts/[series]/   # The series page and one page per note
 │   │   ├── rss.xml.ts        # Feed: every note, newest first, full text
 │   │   └── og/               # Share cards, one PNG per page
@@ -89,9 +94,10 @@ The dev server serves the site under its base path, so it is at
 | Series | `/posts/<series>/` | Every note in a series, in order, with the topics it covers |
 | Topic | `/topics/<slug>/` | Every note that mentions a subject, grouped by series |
 | Topics | `/topics/` | The whole vocabulary, with how many notes carry each one |
-| Learning path | `/path/` | Every note ever, in order, with the counters and what is next |
+| Learning path | `/path/` | Every note ever, in order, the three roadmaps compared, the planned series, and what is next |
+| Plans | `/plans/` | Every plan, grouped: traditional core, modern, AI-era, fundamentals, books, series plans |
 | Log | `/log/` | The raw, unedited session log behind the notes |
-| Plan | `/plans/<slug>/` | The curriculum a series was written from |
+| Plan | `/plans/<slug>/` | One plan in full, its phase map, the series it feeds, and related plans |
 
 Every one of them is built from the content collection at build time. Adding
 a note file adds it to all of them — nothing is hand-maintained.
@@ -170,6 +176,20 @@ publishing it, run the workflow by hand with `dry_run` and an optional
 5. Run `npm run promo` to write the social post for the note.
 6. Open a **draft** pull request from a `note/<series>-<number>` branch with
    the title format above, and the bot publishes it on its date.
+
+## Plans
+
+A plan is a markdown page in `src/content/plans/` and an entry in
+`src/data/plans.ts`. The markdown is the plan in full; the entry is the
+wiring: its group, its related plans, and for every phase the gate, the
+series slots or roadmap tracks its notes go to, and the note ids that already
+cover it. A note id only renders once the note is published.
+
+A planned series (no `posts`) lists its notes under `planned` in
+`src/data/series.ts`, each naming the plan and phase it comes from. They are
+shown as plain, undated text and are never linked; a note moves into `posts`
+with a date when it is scheduled. The build stops if `plans.ts`,
+`series.ts` and `roadmap.ts` disagree (`checkPlans()`).
 
 ## Topics
 
