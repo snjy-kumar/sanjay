@@ -1,0 +1,1979 @@
+---
+title: "Site Reliability Engineering, chapter by chapter"
+description: "Google's Site Reliability Engineering book, all 34 chapters from beginner to strategy: risk, SLOs, toil, monitoring, on-call, incidents, postmortems, load and data integrity."
+edition: "first edition (O'Reilly, 2016), free online at sre.google"
+tocVerified: true
+tocSources:
+  - "https://sre.google/sre-book/table-of-contents/"
+notes: []
+date: "2026-10-23"
+---
+
+import Levels from '../../components/book/Levels.astro';
+import Level from '../../components/book/Level.astro';
+import Flow from '../../components/book/Flow.astro';
+import Layers from '../../components/book/Layers.astro';
+import Compare from '../../components/book/Compare.astro';
+import Timeline from '../../components/book/Timeline.astro';
+import Figure from '../../components/book/Figure.astro';
+import { withBase } from '../../utils/base';
+
+## Why this book
+
+It is on the <a href={withBase('/plans/books-that-still-matter/')}>books that still matter</a> list, it backs
+phase 5 (DevOps and production) of the <a href={withBase('/plans/software-ai-developer/')}>software AI developer</a>
+roadmap, and the failure lens of the <a href={withBase('/plans/underrated-fundamentals/')}>underrated fundamentals</a>.
+It is free to read online, written by many authors, one chapter each, about how one very large company runs
+production. I do not run anything at that scale; I read it for the ideas that work at any size: error
+budgets, SLOs, toil, alerting on symptoms, blameless postmortems and handling overload.
+
+## How I would learn it
+
+I read Parts I and II in order, because they define the vocabulary. Part III I read in clusters that match
+what I am building: alerting and on-call with my dashboards, incidents and postmortems with my first game
+day, load balancing and overload with my load tests, and data integrity with my restore drill. Part IV I
+read as advice about teams, and Part V in one sitting. For each chapter I write down one thing I will do
+differently in my own small system, scaled down honestly.
+
+<Timeline items={[
+  { when: 'week 25', what: 'Parts I and II (chapters 1 to 9): risk, SLOs, toil, monitoring, automation, releases, simplicity. Write an SLO for my API.' },
+  { when: 'week 26', what: 'Chapters 10 to 16: alerting, on-call, troubleshooting, emergencies, incidents, postmortems, outage tracking.' },
+  { when: 'week 27', what: 'Chapters 17 to 22: testing, software engineering in SRE, load balancing, overload, cascading failures.' },
+  { when: 'week 28', what: 'Chapters 23 to 27: consensus, cron, pipelines, data integrity, launches. Run a restore drill.' },
+  { when: 'later', what: 'Parts IV and V (chapters 28 to 34) and the appendices, when I work in or lead a team that is on call.' },
+]} caption="Reading order across phase 5. The workbook companion is read alongside Parts II and III." />
+
+Each chapter below climbs the nine levels, in my words and with my examples; it is a paraphrase of what the
+chapter covers, not text from it.
+
+## The book's five parts
+
+<Layers layers={[
+  { name: 'Part I: Introduction', note: 'chapters 1 and 2: what SRE is, and the production environment' },
+  { name: 'Part II: Principles', note: 'chapters 3 to 9: risk, SLOs, toil, monitoring, automation, release engineering, simplicity' },
+  { name: 'Part III: Practices', note: 'chapters 10 to 27: alerting, on-call, incidents, postmortems, testing, load, consensus, data, launches' },
+  { name: 'Part IV: Management', note: 'chapters 28 to 32: onboarding, interrupts, overload, communication, engagement' },
+  { name: 'Part V: Conclusions', note: 'chapters 33 and 34: other industries, and the conclusion' },
+]} caption="Principles before practices: the practices only make sense once error budgets and SLOs are defined." />
+
+## Part I: Introduction
+
+
+### 1. Introduction
+
+**Covers:** What site reliability engineering is: software engineers doing operations, a cap on operational work, error budgets that balance reliability against change, and the tenets of SRE.
+
+<Flow steps={["SLO agreed", "error budget = 1 - SLO", "ship changes while budget remains", "budget spent: slow down, fix reliability", "next window"]} caption={"The error budget turns \"reliable versus fast\" from an argument into a number both sides accept."} />
+
+<Levels label={"Chapter 1, Introduction"}>
+<Level name="Beginner">
+
+SRE treats operations as a software problem: engineers who write code to run systems. Its core idea is that
+100 percent reliability is the wrong target, because users cannot tell 99.99 from 100 and the cost is huge.
+
+</Level>
+<Level name="Intermediate">
+
+The error budget is the allowed unreliability. With a 99.9 percent monthly availability target, the budget
+is 0.1 percent, about 43 minutes a month.
+
+```ts
+const minutesInMonth = 30 * 24 * 60;
+const budget = (slo: number) => (1 - slo) * minutesInMonth;
+console.log(budget(0.999).toFixed(1)); // 43.2
+```
+
+</Level>
+<Level name="Advanced">
+
+The tenets include capping operational work (so engineering time remains for automation), monitoring that
+pages only on symptoms needing action, emergency response measured by time to recover, change management
+with progressive rollouts, demand forecasting, provisioning, and efficiency.
+
+</Level>
+<Level name="Edge cases">
+
+A target of 100 percent leaves a budget of zero, meaning no change can ever ship. That is the boundary that
+shows why the target must be below 100.
+
+</Level>
+<Level name="Corner cases">
+
+A budget spent early plus an important launch: the policy must say what wins. Agreeing that before the
+conflict is the point.
+
+</Level>
+<Level name="Production level">
+
+In practice, the budget is a shared decision tool between product and operations, written in a policy.
+
+</Level>
+<Level name="Mindset">
+
+Reliability is a feature with a cost; choose how much to buy.
+
+</Level>
+<Level name="System design">
+
+Error budgets connect product planning to operations.
+
+</Level>
+<Level name="Strategy">
+
+I set an availability SLO for my API and compute its monthly budget. Done when the budget appears on my dashboard.
+
+</Level>
+</Levels>
+
+### 2. The Production Environment at Google, from the Viewpoint of an SRE
+
+**Covers:** The hardware, cluster management, storage, networking, the development environment and the lifecycle of a request in a large production system, through an example service.
+
+<Flow steps={["user", "DNS and global load balancing", "frontend", "backend services via RPC", "storage", "response"]} caption={"The life of a request in a large system. Every hop is a place to measure, and a place to fail."} />
+
+<Levels label={"Chapter 2, The Production Environment at Google, from the Viewpoint of an SRE"}>
+<Level name="Beginner">
+
+Large systems run on many machines managed by a cluster manager that schedules jobs onto them; software does
+not care which machine it lands on.
+
+</Level>
+<Level name="Intermediate">
+
+Services talk over RPC, store data in distributed storage, and are reached through load balancers at
+several levels.
+
+</Level>
+<Level name="Advanced">
+
+Jobs are made of tasks; the scheduler restarts failed tasks elsewhere. Capacity is planned with headroom so
+losing a cluster still serves peak load (N+2 style planning).
+
+</Level>
+<Level name="Edge cases">
+
+A single task failing is routine; the system expects it. One machine's failure should never page anyone.
+
+</Level>
+<Level name="Corner cases">
+
+A planned maintenance plus an unplanned failure at the same time is why capacity needs more than one spare
+unit.
+
+</Level>
+<Level name="Production level">
+
+In practice, at small scale the same ideas appear as containers on an orchestrator with health checks.
+
+</Level>
+<Level name="Mindset">
+
+Machines are cattle, not pets.
+
+</Level>
+<Level name="System design">
+
+Every later chapter assumes this model: replaceable instances, RPC between services, shared storage.
+
+</Level>
+<Level name="Strategy">
+
+I draw the request path of my API from browser to database. Done when every hop has a timeout and a metric.
+
+</Level>
+</Levels>
+
+## Part II: Principles
+
+
+### 3. Embracing Risk
+
+**Covers:** Managing risk rather than eliminating it: measuring service risk, risk tolerance for consumer and infrastructure services, and motivating the error budget.
+
+<Compare left={"Availability target"} right={"Allowed downtime per 30 days"} rows={[["99%", "about 7.2 hours"], ["99.9%", "about 43 minutes"], ["99.99%", "about 4.3 minutes"], ["99.999%", "about 26 seconds"]]} caption={"Each extra nine cuts the budget by ten. Approximate values I computed."} />
+
+<Levels label={"Chapter 3, Embracing Risk"}>
+<Level name="Beginner">
+
+Every extra nine of reliability costs more and buys less. The right target depends on users and business.
+
+</Level>
+<Level name="Intermediate">
+
+Availability can be measured by time (uptime) or by requests (successful requests divided by total). The
+request-based measure works better for distributed services.
+
+```ts
+const availability = good / total;  // e.g. 999_412 / 1_000_000 = 0.999412
+```
+
+</Level>
+<Level name="Advanced">
+
+Risk tolerance differs: consumer services trade reliability against features; infrastructure used by
+other teams may need different targets for different users (low latency for one, throughput for another).
+
+</Level>
+<Level name="Edge cases">
+
+Zero traffic in a window makes request-based availability undefined; decide whether that counts as up.
+
+</Level>
+<Level name="Corner cases">
+
+A dependency's reliability caps mine: if my service needs two dependencies each at 99.9 percent, I cannot
+promise 99.99.
+
+</Level>
+<Level name="Production level">
+
+In practice: choose a target with product owners, measure it from real traffic, and use the gap as budget.
+
+</Level>
+<Level name="Mindset">
+
+Ask "how reliable does this need to be?" before "how reliable can I make it?".
+
+</Level>
+<Level name="System design">
+
+Reliability targets compose through dependencies.
+
+</Level>
+<Level name="Strategy">
+
+I compute request-based availability for my API over a week. Done when the number comes from logs automatically.
+
+</Level>
+</Levels>
+
+### 4. Service Level Objectives
+
+**Covers:** Service level terminology (indicators, objectives, agreements), choosing indicators, collecting and aggregating them, standardising them, setting objectives and using them to control the service.
+
+<Layers layers={[{"name": "SLI", "note": "a measured ratio, e.g. good requests / all requests"}, {"name": "SLO", "note": "a target for the SLI over a window"}, {"name": "SLA", "note": "a contract with consequences if the SLO is missed"}]} caption={"Three layers. Most teams need SLIs and SLOs; SLAs are a business decision."} />
+
+<Levels label={"Chapter 4, Service Level Objectives"}>
+<Level name="Beginner">
+
+An SLI is a measurement (fraction of requests faster than 300 ms). An SLO is a target for it (99 percent
+over 28 days). An SLA is a contract with penalties.
+
+</Level>
+<Level name="Intermediate">
+
+Choose few SLIs that reflect user experience: availability, latency, quality, freshness. Use percentiles,
+not averages.
+
+```ts
+const p = (xs: number[], q: number) => xs.sort((a, b) => a - b)[Math.ceil(q * xs.length) - 1];
+console.log(p([12, 15, 20, 800], 0.5), p([12, 15, 20, 800], 0.99)); // 15 800
+```
+
+</Level>
+<Level name="Advanced">
+
+Aggregation matters: per-minute averages hide spikes; measure at the load balancer or client for truth.
+Standard SLI definitions across services save arguments.
+
+</Level>
+<Level name="Edge cases">
+
+An average latency of 50 ms can hide that 1 percent of users wait 5 s; averages are the boundary case that
+lies.
+
+</Level>
+<Level name="Corner cases">
+
+A latency SLO plus failed requests that return fast: errors improve latency numbers. Count latency only for
+successful requests, or combine.
+
+</Level>
+<Level name="Production level">
+
+In practice, SLOs are reviewed periodically and published to users of the service.
+
+</Level>
+<Level name="Mindset">
+
+Measure what users feel.
+
+</Level>
+<Level name="System design">
+
+SLOs are the contract between layers of a system.
+
+</Level>
+<Level name="Strategy">
+
+I define two SLIs and SLOs for my API. Done when a dashboard shows both over a 28-day window.
+
+</Level>
+</Levels>
+
+### 5. Eliminating Toil
+
+**Covers:** What toil is (manual, repetitive, automatable, tactical, without lasting value, growing with the service), why less is better, and what counts as engineering.
+
+<Flow steps={["notice repetitive manual task", "measure time spent", "automate or remove", "verify", "reinvest time"]} caption={"The toil loop. Measuring comes first, so the work is chosen by cost."} />
+
+<Levels label={"Chapter 5, Eliminating Toil"}>
+<Level name="Beginner">
+
+Toil is manual, repetitive work that grows with the service and leaves nothing lasting: restarting a stuck
+process by hand every week.
+
+</Level>
+<Level name="Intermediate">
+
+The goal is to keep toil below a cap so time remains for engineering that reduces future toil.
+
+</Level>
+<Level name="Advanced">
+
+Not all operational work is toil; on-call response and postmortems are valuable. Toil is the work a script
+could do.
+
+</Level>
+<Level name="Edge cases">
+
+A task done once a year may not be worth automating; the cost of automation must be lower than the toil.
+
+</Level>
+<Level name="Corner cases">
+
+Automation that needs manual babysitting is toil in a new form.
+
+</Level>
+<Level name="Production level">
+
+In practice: track toil hours and automate the largest item each quarter.
+
+</Level>
+<Level name="Mindset">
+
+If I do it a third time by hand, I write the script.
+
+</Level>
+<Level name="System design">
+
+Toil reduction is investment in scalability of the team.
+
+</Level>
+<Level name="Strategy">
+
+I list my recurring manual tasks and automate the largest. Done when it runs on a schedule with alerts on failure.
+
+</Level>
+</Levels>
+
+### 6. Monitoring Distributed Systems
+
+**Covers:** Why monitor, definitions (white-box and black-box, dashboards, alerts), symptoms versus causes, the four golden signals, tail latency, granularity, and keeping monitoring simple.
+
+<Layers layers={[{"name": "Latency", "note": "how long requests take, split by success and error"}, {"name": "Traffic", "note": "demand, requests per second"}, {"name": "Errors", "note": "rate of failed requests"}, {"name": "Saturation", "note": "how full the most constrained resource is"}]} caption={"The four golden signals. If I can only measure four things, these are the four."} />
+
+<Levels label={"Chapter 6, Monitoring Distributed Systems"}>
+<Level name="Beginner">
+
+Monitoring tells me whether the system works and why not. Black-box checks test from outside; white-box
+metrics come from inside.
+
+</Level>
+<Level name="Intermediate">
+
+The four golden signals: latency, traffic, errors, saturation.
+
+```ts
+histogram.observe({ route, status }, ms);  // latency
+counter.inc({ route, status });            // traffic and errors
+gauge.set(pool.waiting);                   // saturation
+```
+
+</Level>
+<Level name="Advanced">
+
+Alert on symptoms (users see errors) rather than causes (CPU high). Measure tail latency with histograms,
+not averages. Choose granularity to see problems without drowning in data.
+
+</Level>
+<Level name="Edge cases">
+
+A metric with very high cardinality (user ID as a label) breaks the monitoring system.
+
+</Level>
+<Level name="Corner cases">
+
+A black-box probe passing plus real users failing: the probe hits a cached path.
+
+</Level>
+<Level name="Production level">
+
+In practice: few, simple dashboards, and every alert tied to a symptom and a runbook.
+
+</Level>
+<Level name="Mindset">
+
+Monitor what users experience, then dig into causes.
+
+</Level>
+<Level name="System design">
+
+Monitoring is part of the system design; each service exposes the golden signals.
+
+</Level>
+<Level name="Strategy">
+
+I add the four golden signals to my API. Done when a slowed DB shows on the latency chart within a minute.
+
+</Level>
+</Levels>
+
+### 7. The Evolution of Automation at Google
+
+**Covers:** The value of automation (consistency, platform, faster repairs, faster action, time saved), the evolution from manual to autonomous systems, and the risks of automation.
+
+<Flow steps={["manual", "documented script", "generic script", "automation built into system", "autonomous system"]} caption={"The evolution of automation: each step removes a human from the loop and needs more trust in the code."} />
+
+<Levels label={"Chapter 7, The Evolution of Automation at Google"}>
+<Level name="Beginner">
+
+Automation makes work consistent and faster than people doing it by hand.
+
+</Level>
+<Level name="Intermediate">
+
+It evolves from runbooks to scripts to systems that fix themselves.
+
+</Level>
+<Level name="Advanced">
+
+Automation is a platform: once built it can be improved, tested and reused. It also scales mistakes.
+
+</Level>
+<Level name="Edge cases">
+
+Automation that fails silently is worse than manual work.
+
+</Level>
+<Level name="Corner cases">
+
+Automation that conflicts with another automation (two systems fighting over a setting).
+
+</Level>
+<Level name="Production level">
+
+In practice: automation has logs, dry runs, and limits on how much it can change at once.
+
+</Level>
+<Level name="Mindset">
+
+Automate with brakes.
+
+</Level>
+<Level name="System design">
+
+Autonomous systems are designed in, not bolted on.
+
+</Level>
+<Level name="Strategy">
+
+I turn one runbook step into a script with dry-run mode. Done when a dry run prints its plan and a real run logs its actions.
+
+</Level>
+</Levels>
+
+### 8. Release Engineering
+
+**Covers:** Release engineering as a discipline: self-service, high velocity, hermetic builds, policies, continuous build and deployment, configuration management.
+
+<Flow steps={["commit", "hermetic build", "tests", "versioned artifact", "staged rollout", "monitor"]} caption={"A release pipeline. Hermetic builds mean the same input always produces the same artifact."} />
+
+<Levels label={"Chapter 8, Release Engineering"}>
+<Level name="Beginner">
+
+Release engineering makes building and deploying software repeatable and reliable.
+
+</Level>
+<Level name="Intermediate">
+
+Builds should be hermetic (same inputs, same output), versioned, and produced by automation.
+
+</Level>
+<Level name="Advanced">
+
+Configuration is released with the same care as code: versioned, reviewed, rolled out gradually.
+
+</Level>
+<Level name="Edge cases">
+
+A build that depends on network downloads at build time is not hermetic; a vanished package breaks it.
+
+</Level>
+<Level name="Corner cases">
+
+A config change plus a code change at once: if something breaks, which was it?
+
+</Level>
+<Level name="Production level">
+
+In practice: lockfiles, CI-built artifacts, staged rollouts, config in version control.
+
+</Level>
+<Level name="Mindset">
+
+Every release should be boring.
+
+</Level>
+<Level name="System design">
+
+Release tooling is a shared service many teams depend on.
+
+</Level>
+<Level name="Strategy">
+
+I make my build reproducible with a lockfile and CI artifacts. Done when two builds of the same commit are byte-identical or explained.
+
+</Level>
+</Levels>
+
+### 9. Simplicity
+
+**Covers:** System stability against agility, the virtue of boring, not giving up on unused code, the negative lines of code metric, minimal APIs, modularity and release simplicity.
+
+<Compare left={"Complex"} right={"Simple"} rows={[["Clever code", "Boring code"], ["Commented-out features kept", "Deleted, git remembers"], ["Many flags and options", "Few, with good defaults"], ["Big releases", "Small releases"]]} caption={"Simplicity as a reliability property."} />
+
+<Levels label={"Chapter 9, Simplicity"}>
+<Level name="Beginner">
+
+Simple systems are easier to run. Boring is good in production.
+
+</Level>
+<Level name="Intermediate">
+
+Delete unused code; git remembers it. Keep APIs minimal.
+
+</Level>
+<Level name="Advanced">
+
+Modularity and small releases make failures easy to locate.
+
+</Level>
+<Level name="Edge cases">
+
+Code "we might need later" is complexity paid daily for a maybe.
+
+</Level>
+<Level name="Corner cases">
+
+A simple component plus a complex interaction with others: simplicity must be judged at the system level.
+
+</Level>
+<Level name="Production level">
+
+In practice: celebrate deleted code.
+
+</Level>
+<Level name="Mindset">
+
+Every line is a liability.
+
+</Level>
+<Level name="System design">
+
+Simplicity of interfaces reduces coupling across the system.
+
+</Level>
+<Level name="Strategy">
+
+I delete dead code and unused flags from my project. Done when the diff is negative and tests pass.
+
+</Level>
+</Levels>
+
+## Part III: Practices
+
+
+### 10. Practical Alerting
+
+**Covers:** Monitoring at scale with time-series data: collection, storage, rule evaluation, alerting, sharding the monitoring topology, black-box monitoring, and maintaining configuration.
+
+<Flow steps={["scrape metrics", "store time series", "evaluate rules", "fire alert", "route to on-call"]} caption={"Time-series alerting: rules over metrics, not checks per host."} />
+
+<Levels label={"Chapter 10, Practical Alerting"}>
+<Level name="Beginner">
+
+Modern alerting collects metrics as time series and evaluates rules over them.
+
+</Level>
+<Level name="Intermediate">
+
+A rule might fire when the error ratio over five minutes exceeds 5 percent:
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+```
+
+</Level>
+<Level name="Advanced">
+
+Rules combine data across instances, so one host's failure does not page; a service-wide symptom does.
+
+</Level>
+<Level name="Edge cases">
+
+A metric that stops reporting does not trigger a threshold rule; alert on absence too.
+
+</Level>
+<Level name="Corner cases">
+
+A rule over a ratio with tiny traffic: one error in two requests is 50 percent.
+
+</Level>
+<Level name="Production level">
+
+In practice, monitoring config is versioned and tested.
+
+</Level>
+<Level name="Mindset">
+
+Alert on the service, not the machine.
+
+</Level>
+<Level name="System design">
+
+The monitoring system needs its own reliability.
+
+</Level>
+<Level name="Strategy">
+
+I write an error-ratio alert and an absence alert. Done when both fire in a test.
+
+</Level>
+</Levels>
+
+### 11. Being On-Call
+
+**Covers:** On-call life: balancing quantity and quality of shifts, compensation, feeling safe, avoiding operational overload and underload.
+
+<Flow steps={["page", "acknowledge", "triage", "mitigate", "follow-up ticket or postmortem"]} caption={"An on-call response. The aim is mitigation first, root cause later."} />
+
+<Levels label={"Chapter 11, Being On-Call"}>
+<Level name="Beginner">
+
+On-call engineers respond to pages within an agreed time.
+
+</Level>
+<Level name="Intermediate">
+
+The load should be sustainable: few incidents per shift, time to do follow-up.
+
+</Level>
+<Level name="Advanced">
+
+Clear escalation paths, runbooks, and blameless culture make on-call safe.
+
+</Level>
+<Level name="Edge cases">
+
+Too few pages lead to rusty skills; practice with drills.
+
+</Level>
+<Level name="Corner cases">
+
+A page during a shift with many other pages: overload leads to mistakes.
+
+</Level>
+<Level name="Production level">
+
+In practice: rotations, handoffs, and tracking page counts per shift.
+
+</Level>
+<Level name="Mindset">
+
+On-call is a design feedback loop.
+
+</Level>
+<Level name="System design">
+
+Pages are signals about system quality.
+
+</Level>
+<Level name="Strategy">
+
+I write a runbook for my API's top three alerts. Done when a friend could follow it.
+
+</Level>
+</Levels>
+
+### 12. Effective Troubleshooting
+
+**Covers:** A systematic approach: problem report, triage, examine, diagnose, test and treat, with negative results and common pitfalls.
+
+<Flow steps={["problem report", "triage", "examine", "diagnose", "test and treat", "cure"]} caption={"The troubleshooting loop. Hypotheses are tested, not assumed."} />
+
+<Levels label={"Chapter 12, Effective Troubleshooting"}>
+<Level name="Beginner">
+
+Troubleshooting is the scientific method: observe, hypothesise, test.
+
+</Level>
+<Level name="Intermediate">
+
+Triage first: stop the bleeding before understanding.
+
+</Level>
+<Level name="Advanced">
+
+Simplify and reduce: bisect the system to find where data goes wrong. Negative results are valuable.
+
+</Level>
+<Level name="Edge cases">
+
+Correlation is not causation: a deploy at the same time as the outage may be unrelated.
+
+</Level>
+<Level name="Corner cases">
+
+Two problems at once look like one.
+
+</Level>
+<Level name="Production level">
+
+In practice: logs, traces and the ability to query them fast.
+
+</Level>
+<Level name="Mindset">
+
+Prove each step.
+
+</Level>
+<Level name="System design">
+
+Observability is designed to support this loop.
+
+</Level>
+<Level name="Strategy">
+
+I troubleshoot an injected bug using only logs and traces, writing each hypothesis. Done when the write-up shows the path.
+
+</Level>
+</Levels>
+
+### 13. Emergency Response
+
+**Covers:** What to do when systems break: test-induced, change-induced and process-induced emergencies, and lessons from each.
+
+<Flow steps={["detect", "assess", "mitigate (roll back first)", "communicate", "recover", "learn"]} caption={"An emergency response. Rolling back is usually the fastest mitigation."} />
+
+<Levels label={"Chapter 13, Emergency Response"}>
+<Level name="Beginner">
+
+Do not panic; follow a process and ask for help.
+
+</Level>
+<Level name="Intermediate">
+
+Change-induced emergencies are mitigated by rolling back first.
+
+</Level>
+<Level name="Advanced">
+
+Test-induced emergencies (a test that broke production) teach to have abort plans.
+
+</Level>
+<Level name="Edge cases">
+
+No rollback path: forward fix under pressure.
+
+</Level>
+<Level name="Corner cases">
+
+An emergency caused by the emergency tool.
+
+</Level>
+<Level name="Production level">
+
+In practice: rollback is one command.
+
+</Level>
+<Level name="Mindset">
+
+Mitigate first, understand later.
+
+</Level>
+<Level name="System design">
+
+Rollback capability is part of design.
+
+</Level>
+<Level name="Strategy">
+
+I practise a rollback on my API. Done when it takes under five minutes.
+
+</Level>
+</Levels>
+
+### 14. Managing Incidents
+
+**Covers:** Incident management: roles (incident commander, operations, communications, planning), a live incident state document, clear handoffs, and when to declare an incident.
+
+<Layers layers={[{"name": "Incident commander", "note": "coordinates, decides"}, {"name": "Operations lead", "note": "changes the system"}, {"name": "Communications", "note": "updates stakeholders"}, {"name": "Planning", "note": "tracks follow-ups and handoffs"}]} caption={"Separate roles prevent everyone debugging while nobody coordinates."} />
+
+<Levels label={"Chapter 14, Managing Incidents"}>
+<Level name="Beginner">
+
+Big incidents need roles, so people are not all doing the same thing.
+
+</Level>
+<Level name="Intermediate">
+
+An incident commander coordinates; others operate, communicate and plan. A shared document tracks state.
+
+</Level>
+<Level name="Advanced">
+
+Clear handoffs at shift changes keep context.
+
+</Level>
+<Level name="Edge cases">
+
+Declaring early is cheaper than declaring late.
+
+</Level>
+<Level name="Corner cases">
+
+Two incidents at once need two commanders.
+
+</Level>
+<Level name="Production level">
+
+In practice: an incident template and a channel per incident.
+
+</Level>
+<Level name="Mindset">
+
+Coordination is work.
+
+</Level>
+<Level name="System design">
+
+Incident process is part of operations design.
+
+</Level>
+<Level name="Strategy">
+
+I run a mock incident with roles. Done when the state document captures the timeline.
+
+</Level>
+</Levels>
+
+### 15. Postmortem Culture: Learning from Failure
+
+**Covers:** Blameless postmortems: when to write them, how to make them blameless, collaboration and sharing, and building a culture around them.
+
+<Flow steps={["incident ends", "draft timeline", "find contributing causes", "action items with owners", "review and share"]} caption={"A postmortem. Blamelessness keeps people honest, which is what makes the learning real."} />
+
+<Levels label={"Chapter 15, Postmortem Culture: Learning from Failure"}>
+<Level name="Beginner">
+
+After an incident, write a postmortem: what happened, why, and what we will change.
+
+</Level>
+<Level name="Intermediate">
+
+Blameless: focus on systems and processes, not who made the mistake.
+
+</Level>
+<Level name="Advanced">
+
+Action items need owners and deadlines; postmortems are shared widely.
+
+</Level>
+<Level name="Edge cases">
+
+A near miss deserves a postmortem too.
+
+</Level>
+<Level name="Corner cases">
+
+A postmortem with no action items, or too many.
+
+</Level>
+<Level name="Production level">
+
+In practice: a template and a regular review.
+
+</Level>
+<Level name="Mindset">
+
+Failures are data.
+
+</Level>
+<Level name="System design">
+
+Postmortems feed design improvements.
+
+</Level>
+<Level name="Strategy">
+
+I write a postmortem for my last real bug. Done when it has three action items with owners.
+
+</Level>
+</Levels>
+
+### 16. Tracking Outages
+
+**Covers:** Tools for tracking outages over time: aggregating alerts, tagging, and analysing trends.
+
+<Flow steps={["alerts", "grouped into outages", "tagged by cause", "reviewed", "trends inform priorities"]} caption={"Tracking outages turns individual incidents into data about the system."} />
+
+<Levels label={"Chapter 16, Tracking Outages"}>
+<Level name="Beginner">
+
+Track outages over time to see patterns.
+
+</Level>
+<Level name="Intermediate">
+
+Group related alerts into one outage and tag them.
+
+</Level>
+<Level name="Advanced">
+
+Trend analysis shows which components fail most.
+
+</Level>
+<Level name="Edge cases">
+
+Untagged outages are lost data.
+
+</Level>
+<Level name="Corner cases">
+
+Tags that change meaning over time.
+
+</Level>
+<Level name="Production level">
+
+In practice: a simple outage log.
+
+</Level>
+<Level name="Mindset">
+
+Learn from the aggregate.
+
+</Level>
+<Level name="System design">
+
+Outage data guides investment.
+
+</Level>
+<Level name="Strategy">
+
+I keep an outage log for my project. Done when it has a cause tag for each entry.
+
+</Level>
+</Levels>
+
+### 17. Testing for Reliability
+
+**Covers:** Types of software testing (unit, integration, system, smoke, performance, regression), testing at scale, testing in production, and tests for disaster recovery.
+
+<Layers layers={[{"name": "Unit", "note": "functions"}, {"name": "Integration", "note": "components together"}, {"name": "System", "note": "the whole, end to end"}, {"name": "Production probes", "note": "real environment, continuously"}, {"name": "Disaster tests", "note": "failover and restore"}]} caption={"Testing layers for reliability. The last two are where most teams are weakest."} />
+
+<Levels label={"Chapter 17, Testing for Reliability"}>
+<Level name="Beginner">
+
+Tests reduce uncertainty about whether changes will break things.
+
+</Level>
+<Level name="Intermediate">
+
+Different tests catch different failures.
+
+</Level>
+<Level name="Advanced">
+
+Testing configuration and disaster recovery is as important as testing code.
+
+</Level>
+<Level name="Edge cases">
+
+A backup never restored is not tested.
+
+</Level>
+<Level name="Corner cases">
+
+A test environment that differs from production.
+
+</Level>
+<Level name="Production level">
+
+In practice: canaries, synthetic probes, and restore drills.
+
+</Level>
+<Level name="Mindset">
+
+Test what scares you.
+
+</Level>
+<Level name="System design">
+
+Testing is continuous.
+
+</Level>
+<Level name="Strategy">
+
+I restore my database from backup into a fresh instance. Done when the app runs against it.
+
+</Level>
+</Levels>
+
+### 18. Software Engineering in SRE
+
+**Covers:** Why SRE teams build software, with a case study of a capacity planning tool: intent-based configuration, building for adoption, and fostering software engineering in SRE.
+
+<Flow steps={["declare intent (what I need)", "tool computes configuration", "apply", "verify"]} caption={"Intent-based tools: state the goal, let software compute the details."} />
+
+<Levels label={"Chapter 18, Software Engineering in SRE"}>
+<Level name="Beginner">
+
+SREs write software to remove toil.
+
+</Level>
+<Level name="Intermediate">
+
+Good tools let users state intent ("this service needs N+2 in two regions") rather than details.
+
+</Level>
+<Level name="Advanced">
+
+Adoption matters: tools must be easier than the manual way.
+
+</Level>
+<Level name="Edge cases">
+
+A tool only its author can use.
+
+</Level>
+<Level name="Corner cases">
+
+A tool that encodes outdated policy.
+
+</Level>
+<Level name="Production level">
+
+In practice: treat internal tools as products.
+
+</Level>
+<Level name="Mindset">
+
+Build tools people want to use.
+
+</Level>
+<Level name="System design">
+
+Tools encode policy.
+
+</Level>
+<Level name="Strategy">
+
+I write a tool for my most repetitive config task. Done when someone else can use it.
+
+</Level>
+</Levels>
+
+### 19. Load Balancing at the Frontend
+
+**Covers:** Distributing user traffic across datacenters with DNS and virtual IP addresses.
+
+<Flow steps={["user", "DNS picks nearby datacenter", "virtual IP", "network load balancer", "frontend servers"]} caption={"Frontend load balancing: DNS chooses where, the balancer chooses which."} />
+
+<Levels label={"Chapter 19, Load Balancing at the Frontend"}>
+<Level name="Beginner">
+
+DNS sends users to a nearby datacenter.
+
+</Level>
+<Level name="Intermediate">
+
+DNS has limits: caching and resolver locations.
+
+</Level>
+<Level name="Advanced">
+
+Virtual IPs with network balancers spread traffic within a site.
+
+</Level>
+<Level name="Edge cases">
+
+Long DNS TTLs slow failover.
+
+</Level>
+<Level name="Corner cases">
+
+A resolver far from the user sends them to a distant datacenter.
+
+</Level>
+<Level name="Production level">
+
+In practice: managed global load balancers.
+
+</Level>
+<Level name="Mindset">
+
+Know your traffic path.
+
+</Level>
+<Level name="System design">
+
+Edge routing is the first layer of resilience.
+
+</Level>
+<Level name="Strategy">
+
+I trace how my users reach my API. Done when I know each step's failover time.
+
+</Level>
+</Levels>
+
+### 20. Load Balancing in the Datacenter
+
+**Covers:** Distributing requests across backends: healthy task identification, connection pools, subsetting, and policies such as round robin, least loaded and weighted round robin.
+
+<Flow steps={["client", "subset of backends", "policy picks one", "backend", "health feedback"]} caption={"Datacenter load balancing: each client talks to a subset; a policy chooses among them using health feedback."} />
+
+<Levels label={"Chapter 20, Load Balancing in the Datacenter"}>
+<Level name="Beginner">
+
+Inside a datacenter, clients spread requests across backends.
+
+</Level>
+<Level name="Intermediate">
+
+Round robin is simple; least loaded considers load; weighted round robin uses backend-reported capacity.
+
+</Level>
+<Level name="Advanced">
+
+Subsetting limits connections from each client to a subset of backends.
+
+</Level>
+<Level name="Edge cases">
+
+Unhealthy backends must be removed quickly.
+
+</Level>
+<Level name="Corner cases">
+
+Least loaded plus a fast-failing backend: errors are quick, so it looks least loaded and gets all traffic.
+
+</Level>
+<Level name="Production level">
+
+In practice: health checks and outlier detection.
+
+</Level>
+<Level name="Mindset">
+
+Balance by real capacity.
+
+</Level>
+<Level name="System design">
+
+Load balancing is everywhere in a distributed system.
+
+</Level>
+<Level name="Strategy">
+
+I compare round robin and least-requests in a load test with one slow instance. Done when I can explain the difference.
+
+</Level>
+</Levels>
+
+### 21. Handling Overload
+
+**Covers:** Avoiding overload: measuring capacity, per-customer limits, client-side throttling, criticality, utilisation signals, handling overload errors, and deciding when to retry.
+
+<Flow steps={["request arrives", "over capacity?", "low criticality: reject fast", "high criticality: serve", "client backs off"]} caption={"Graceful overload: reject early and cheaply, by criticality, rather than slowing everyone down."} />
+
+<Levels label={"Chapter 21, Handling Overload"}>
+<Level name="Beginner">
+
+Every service has a capacity. Beyond it, reject requests quickly instead of slowing down for everyone.
+
+</Level>
+<Level name="Intermediate">
+
+Per-customer limits stop one client using all capacity. Client-side throttling lets clients reduce requests
+when the server rejects many.
+
+</Level>
+<Level name="Advanced">
+
+Requests carry criticality, so the server sheds low-priority work first. Retries are limited per request
+and per client.
+
+</Level>
+<Level name="Edge cases">
+
+At exactly capacity, small spikes cause queueing.
+
+</Level>
+<Level name="Corner cases">
+
+Retries plus overload multiply load.
+
+</Level>
+<Level name="Production level">
+
+In practice: rate limits, priority queues and retry budgets.
+
+</Level>
+<Level name="Mindset">
+
+Saying no is a feature.
+
+</Level>
+<Level name="System design">
+
+Overload handling is a system-wide property.
+
+</Level>
+<Level name="Strategy">
+
+I add load shedding to my API. Done when a spike shows fast 503s rather than slow timeouts.
+
+</Level>
+</Levels>
+
+### 22. Addressing Cascading Failures
+
+**Covers:** Causes of cascading failures (server overload, resource exhaustion, unavailability), preventing overload, slow startup and cold caching, triggering conditions, testing, and immediate steps.
+
+<Flow steps={["one server overloaded", "fails", "load shifts to others", "they overload", "cascade"]} caption={"A cascading failure is positive feedback. The fixes all break the loop."} />
+
+<Levels label={"Chapter 22, Addressing Cascading Failures"}>
+<Level name="Beginner">
+
+A cascading failure grows: one failure causes more.
+
+</Level>
+<Level name="Intermediate">
+
+Overload leads to failures, failures shift load, which overloads others.
+
+</Level>
+<Level name="Advanced">
+
+Prevent it with load shedding, limiting retries, timeouts and deadlines, and capacity headroom.
+
+</Level>
+<Level name="Edge cases">
+
+Cold caches after restart.
+
+</Level>
+<Level name="Corner cases">
+
+Slow startup plus traffic shift.
+
+</Level>
+<Level name="Production level">
+
+In practice: test cascading scenarios.
+
+</Level>
+<Level name="Mindset">
+
+Break the feedback loop.
+
+</Level>
+<Level name="System design">
+
+Cascades cross service boundaries.
+
+</Level>
+<Level name="Strategy">
+
+I simulate losing one of three instances under load. Done when the other two shed load rather than fail.
+
+</Level>
+</Levels>
+
+### 23. Managing Critical State: Distributed Consensus for Reliability
+
+**Covers:** Why consensus is needed, how it works (Paxos and related), architectural patterns, performance, and deploying distributed consensus systems.
+
+<Flow steps={["propose value", "majority accepts", "value chosen", "replicas apply in order"]} caption={"Consensus: a majority agrees on each value, so any majority remembers it."} />
+
+<Levels label={"Chapter 23, Managing Critical State: Distributed Consensus for Reliability"}>
+<Level name="Beginner">
+
+When several machines must agree (who is the leader), they need consensus.
+
+</Level>
+<Level name="Intermediate">
+
+Consensus algorithms make a majority agree, so the system tolerates minority failures.
+
+</Level>
+<Level name="Advanced">
+
+Patterns: replicated state machines, leader election, distributed locks. Performance depends on network
+latency between replicas.
+
+</Level>
+<Level name="Edge cases">
+
+An even number of replicas adds no fault tolerance.
+
+</Level>
+<Level name="Corner cases">
+
+A network partition plus a leader on the minority side.
+
+</Level>
+<Level name="Production level">
+
+In practice: use existing systems (etcd, ZooKeeper).
+
+</Level>
+<Level name="Mindset">
+
+Do not invent consensus.
+
+</Level>
+<Level name="System design">
+
+Consensus underlies configuration and coordination.
+
+</Level>
+<Level name="Strategy">
+
+I run a three-node etcd and kill one node. Done when writes continue.
+
+</Level>
+</Levels>
+
+### 24. Distributed Periodic Scheduling with Cron
+
+**Covers:** Cron at scale: reliability, idempotency, running cron as a distributed service with leader election and stored state.
+
+<Flow steps={["leader elected", "schedule fires", "record launch intent", "run job", "record completion"]} caption={"Distributed cron: one leader, and launch state stored so a failover does not double-run or skip."} />
+
+<Levels label={"Chapter 24, Distributed Periodic Scheduling with Cron"}>
+<Level name="Beginner">
+
+Cron runs jobs on a schedule.
+
+</Level>
+<Level name="Intermediate">
+
+Jobs should be idempotent: running twice should be safe.
+
+</Level>
+<Level name="Advanced">
+
+Distributed cron uses leader election and stored state to survive failures.
+
+</Level>
+<Level name="Edge cases">
+
+A missed run after a crash.
+
+</Level>
+<Level name="Corner cases">
+
+A failover during a run.
+
+</Level>
+<Level name="Production level">
+
+In practice: managed schedulers with idempotent jobs.
+
+</Level>
+<Level name="Mindset">
+
+Assume each job runs zero, one or two times.
+
+</Level>
+<Level name="System design">
+
+Scheduling is a shared service.
+
+</Level>
+<Level name="Strategy">
+
+I make my nightly job idempotent. Done when running it twice leaves the same result.
+
+</Level>
+</Levels>
+
+### 25. Data Processing Pipelines
+
+**Covers:** Periodic pipelines, the problems of uneven work distribution and periodic load, and a continuous pipeline system as an alternative.
+
+<Flow steps={["input", "stage 1", "stage 2", "stage 3", "output"]} caption={"A pipeline. Periodic batch runs create load spikes; continuous processing smooths them."} />
+
+<Levels label={"Chapter 25, Data Processing Pipelines"}>
+<Level name="Beginner">
+
+Pipelines process data in stages.
+
+</Level>
+<Level name="Intermediate">
+
+Periodic pipelines create load spikes.
+
+</Level>
+<Level name="Advanced">
+
+Continuous pipelines process work as it arrives.
+
+</Level>
+<Level name="Edge cases">
+
+One huge input shard slows everything.
+
+</Level>
+<Level name="Corner cases">
+
+Retries plus duplicate output.
+
+</Level>
+<Level name="Production level">
+
+In practice: monitor lag.
+
+</Level>
+<Level name="Mindset">
+
+Smooth load.
+
+</Level>
+<Level name="System design">
+
+Pipelines connect services and storage.
+
+</Level>
+<Level name="Strategy">
+
+I monitor lag on my embedding pipeline. Done when an alert fires on lag.
+
+</Level>
+</Levels>
+
+### 26. Data Integrity: What You Read Is What You Wrote
+
+**Covers:** Data integrity requirements, backups versus archives, the failure modes (deletion, corruption, software bugs), defence in depth, and lessons from integrity incidents.
+
+<Layers layers={[{"name": "Soft deletion", "note": "undo user mistakes"}, {"name": "Backups and restore", "note": "recover from bugs and disasters"}, {"name": "Early detection", "note": "validators that find corruption"}, {"name": "Out-of-band checks", "note": "independent verification"}]} caption={"Defence in depth for data. No single layer catches everything."} />
+
+<Levels label={"Chapter 26, Data Integrity: What You Read Is What You Wrote"}>
+<Level name="Beginner">
+
+Data integrity means what you read is what you wrote.
+
+</Level>
+<Level name="Intermediate">
+
+Backups are useless without tested restores.
+
+</Level>
+<Level name="Advanced">
+
+Defence in depth: soft deletion, backups, replication, validation.
+
+</Level>
+<Level name="Edge cases">
+
+A bug that corrupts data slowly is found late.
+
+</Level>
+<Level name="Corner cases">
+
+Replicated corruption: replicas copy the bad data.
+
+</Level>
+<Level name="Production level">
+
+In practice: restore drills and checksums.
+
+</Level>
+<Level name="Mindset">
+
+Nobody wants backups; everyone wants restores.
+
+</Level>
+<Level name="System design">
+
+Data integrity spans application and storage.
+
+</Level>
+<Level name="Strategy">
+
+I run a restore drill. Done when restore time is measured and recorded.
+
+</Level>
+</Levels>
+
+### 27. Reliable Product Launches at Scale
+
+**Covers:** Launch coordination engineering: a launch checklist, techniques for reliable launches (gradual rollouts, feature flags, handling abusive clients, overload behaviour), and the team that runs it.
+
+<Flow steps={["checklist review", "capacity plan", "gradual rollout", "monitor", "full launch"]} caption={"A reliable launch. The checklist captures what past launches forgot."} />
+
+<Levels label={"Chapter 27, Reliable Product Launches at Scale"}>
+<Level name="Beginner">
+
+Launches are risky; a checklist helps.
+
+</Level>
+<Level name="Intermediate">
+
+Gradual rollouts and feature flags reduce risk.
+
+</Level>
+<Level name="Advanced">
+
+Plan for abusive clients and overload.
+
+</Level>
+<Level name="Edge cases">
+
+The first minutes.
+
+</Level>
+<Level name="Corner cases">
+
+A launch plus a dependency change.
+
+</Level>
+<Level name="Production level">
+
+In practice: a launch checklist.
+
+</Level>
+<Level name="Mindset">
+
+Learn from past launches.
+
+</Level>
+<Level name="System design">
+
+Launch processes scale reliability.
+
+</Level>
+<Level name="Strategy">
+
+I write a launch checklist for my capstone. Done when every item is checked or waived.
+
+</Level>
+</Levels>
+
+## Part IV: Management
+
+
+### 28. Accelerating SREs to On-Call and Beyond
+
+**Covers:** Training new SREs: learning paths, reverse engineering systems, disaster role-playing, and shadow on-call.
+
+<Flow steps={["learn concepts", "reverse engineer systems", "role-play disasters", "shadow on-call", "primary on-call"]} caption={"A training path from concepts to carrying the pager."} />
+
+<Levels label={"Chapter 28, Accelerating SREs to On-Call and Beyond"}>
+<Level name="Beginner">
+
+New team members need structured training.
+
+</Level>
+<Level name="Intermediate">
+
+Learning paths and documentation help.
+
+</Level>
+<Level name="Advanced">
+
+Disaster role-playing and shadowing build skills.
+
+</Level>
+<Level name="Edge cases">
+
+Training only theory.
+
+</Level>
+<Level name="Corner cases">
+
+Training while overloaded.
+
+</Level>
+<Level name="Production level">
+
+In practice: an onboarding plan.
+
+</Level>
+<Level name="Mindset">
+
+Teach by doing.
+
+</Level>
+<Level name="System design">
+
+Training is part of reliability.
+
+</Level>
+<Level name="Strategy">
+
+I write an onboarding guide for my project. Done when someone else can deploy using it.
+
+</Level>
+</Levels>
+
+### 29. Dealing with Interrupts
+
+**Covers:** Managing operational load: pages, tickets and ongoing duties; cognitive flow; and assigning interrupts to specific people.
+
+<Compare left={"Everyone interrupted"} right={"One person on interrupts"} rows={[["Context switches all day", "Focus time for most"], ["Tickets ignored", "Tickets owned"]]} caption={"Concentrating interrupts protects everyone else's focus."} />
+
+<Levels label={"Chapter 29, Dealing with Interrupts"}>
+<Level name="Beginner">
+
+Interrupts break concentration.
+
+</Level>
+<Level name="Intermediate">
+
+Assign one person to handle interrupts.
+
+</Level>
+<Level name="Advanced">
+
+Protect flow time.
+
+</Level>
+<Level name="Edge cases">
+
+Too many interrupts for one person.
+
+</Level>
+<Level name="Corner cases">
+
+Interrupts plus urgent projects.
+
+</Level>
+<Level name="Production level">
+
+In practice: rotations.
+
+</Level>
+<Level name="Mindset">
+
+Protect focus.
+
+</Level>
+<Level name="System design">
+
+Interrupt load reflects system quality.
+
+</Level>
+<Level name="Strategy">
+
+I schedule interrupt-free blocks. Done when I track how many I keep.
+
+</Level>
+</Levels>
+
+### 30. Embedding an SRE to Recover from Operational Overload
+
+**Covers:** Helping an overloaded team by embedding an SRE: learning the service, sharing context, and driving change.
+
+<Flow steps={["embed", "learn service", "identify sources of stress", "share context", "drive change"]} caption={"Embedding an experienced engineer to help a struggling team."} />
+
+<Levels label={"Chapter 30, Embedding an SRE to Recover from Operational Overload"}>
+<Level name="Beginner">
+
+An embedded SRE helps a team in trouble.
+
+</Level>
+<Level name="Intermediate">
+
+They learn the service and find the biggest problems.
+
+</Level>
+<Level name="Advanced">
+
+They change practices, not just fix symptoms.
+
+</Level>
+<Level name="Edge cases">
+
+Embedding too short.
+
+</Level>
+<Level name="Corner cases">
+
+Embedding without authority.
+
+</Level>
+<Level name="Production level">
+
+In practice: clear goals.
+
+</Level>
+<Level name="Mindset">
+
+Teach, then leave.
+
+</Level>
+<Level name="System design">
+
+Embedding spreads practices.
+
+</Level>
+<Level name="Strategy">
+
+I review my project as an outsider would. Done when I list its top three stressors.
+
+</Level>
+</Levels>
+
+### 31. Communication and Collaboration in SRE
+
+**Covers:** Communication in production meetings, collaboration within SRE and with other teams, and a case study.
+
+<Flow steps={["weekly production meeting", "review outages and changes", "decide actions", "track follow-ups"]} caption={"A production meeting keeps everyone informed."} />
+
+<Levels label={"Chapter 31, Communication and Collaboration in SRE"}>
+<Level name="Beginner">
+
+Teams need communication.
+
+</Level>
+<Level name="Intermediate">
+
+Production meetings review incidents and changes.
+
+</Level>
+<Level name="Advanced">
+
+Collaboration across teams.
+
+</Level>
+<Level name="Edge cases">
+
+Meetings without action.
+
+</Level>
+<Level name="Corner cases">
+
+Distributed teams across time zones.
+
+</Level>
+<Level name="Production level">
+
+In practice: meeting minutes.
+
+</Level>
+<Level name="Mindset">
+
+Communicate clearly.
+
+</Level>
+<Level name="System design">
+
+Communication is infrastructure.
+
+</Level>
+<Level name="Strategy">
+
+I hold a weekly review of my project. Done when four reviews have notes.
+
+</Level>
+</Levels>
+
+### 32. The Evolving SRE Engagement Model
+
+**Covers:** How SRE engages with services: production readiness reviews, early engagement, and frameworks and platforms.
+
+<Flow steps={["early engagement", "design review", "production readiness review", "onboarding", "ongoing support"]} caption={"SRE engagement moves earlier: from reviewing finished systems to shaping designs."} />
+
+<Levels label={"Chapter 32, The Evolving SRE Engagement Model"}>
+<Level name="Beginner">
+
+SRE teams engage with services at different points.
+
+</Level>
+<Level name="Intermediate">
+
+Production readiness reviews check if a service is ready.
+
+</Level>
+<Level name="Advanced">
+
+Early engagement and shared frameworks scale better.
+
+</Level>
+<Level name="Edge cases">
+
+Engaging too late.
+
+</Level>
+<Level name="Corner cases">
+
+Frameworks that do not fit.
+
+</Level>
+<Level name="Production level">
+
+In practice: readiness checklists.
+
+</Level>
+<Level name="Mindset">
+
+Engage early.
+
+</Level>
+<Level name="System design">
+
+Platforms encode reliability.
+
+</Level>
+<Level name="Strategy">
+
+I run a readiness review on my API. Done when all items are met.
+
+</Level>
+</Levels>
+
+## Part V: Conclusions
+
+
+### 33. Lessons Learned from Other Industries
+
+**Covers:** What other high-reliability industries teach: preparedness and disaster testing, postmortem culture, automating away repetitive work, and structured decision making.
+
+<Flow steps={["prepare", "test disasters", "learn", "automate", "decide"]} caption={"Lessons from industries where failure is costly."} />
+
+<Levels label={"Chapter 33, Lessons Learned from Other Industries"}>
+<Level name="Beginner">
+
+Other industries have learned about reliability.
+
+</Level>
+<Level name="Intermediate">
+
+Preparedness and drills.
+
+</Level>
+<Level name="Advanced">
+
+Structured decision making.
+
+</Level>
+<Level name="Edge cases">
+
+Lessons that do not transfer.
+
+</Level>
+<Level name="Corner cases">
+
+Copying rituals without purpose.
+
+</Level>
+<Level name="Production level">
+
+In practice: learn from aviation and medicine.
+
+</Level>
+<Level name="Mindset">
+
+Borrow wisely.
+
+</Level>
+<Level name="System design">
+
+Reliability is universal.
+
+</Level>
+<Level name="Strategy">
+
+I compare one practice with an industry. Done when I write the difference.
+
+</Level>
+</Levels>
+
+### 34. Conclusion
+
+**Covers:** A summary of SRE's principles and where the practice is going.
+
+<Flow steps={["principles", "practices", "management", "evolution"]} caption={"The book's arc in four steps."} />
+
+<Levels label={"Chapter 34, Conclusion"}>
+<Level name="Beginner">
+
+SRE is principles plus practices.
+
+</Level>
+<Level name="Intermediate">
+
+Error budgets and SLOs underpin everything.
+
+</Level>
+<Level name="Advanced">
+
+The practice evolves.
+
+</Level>
+<Level name="Edge cases">
+
+Applying all of it at small scale.
+
+</Level>
+<Level name="Corner cases">
+
+Ignoring it at large scale.
+
+</Level>
+<Level name="Production level">
+
+In practice: start with SLOs.
+
+</Level>
+<Level name="Mindset">
+
+Reliability is engineering.
+
+</Level>
+<Level name="System design">
+
+SRE shapes system design.
+
+</Level>
+<Level name="Strategy">
+
+I write my top five SRE practices for my capstone. Done when each is in use.
+
+</Level>
+</Levels>
+
+## The appendices
+
+The appendices are reference material: an availability table (allowed downtime for each target), a
+collection of best practices for production services, an example incident state document, an example
+postmortem, a launch coordination checklist, and example production meeting minutes. I use the incident
+document, postmortem and checklist as templates, rewritten for my own project.
+
+## Misreadings to avoid
+
+- "Aim for 100 percent." The budget is the point.
+- "SRE means hiring SREs." The ideas work for one developer.
+- "Alert on everything." Alert on symptoms that need action.
+- "Postmortems assign blame." They find systemic fixes.
+
+## Done with this book when
+
+- My API has SLOs, an error budget, golden-signal dashboards and symptom-based alerts.
+- I have runbooks, a postmortem template, and one real postmortem.
+- A restore drill and a rollback have been rehearsed and timed.
+- The phase 5 gate passes.
