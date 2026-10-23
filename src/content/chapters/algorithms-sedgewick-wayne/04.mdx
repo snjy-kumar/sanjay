@@ -1,0 +1,1572 @@
+---
+book: algorithms-sedgewick-wayne
+number: 4
+title: "Graphs"
+description: "Undirected and directed graphs, DFS and BFS, topological sort, strong components, minimum spanning trees and shortest paths, each built and traced in TypeScript."
+date: "2026-10-23"
+---
+
+import Compare from '../../../components/book/Compare.astro';
+import Figure from '../../../components/book/Figure.astro';
+import Flow from '../../../components/book/Flow.astro';
+import Layers from '../../../components/book/Layers.astro';
+import Level from '../../../components/book/Level.astro';
+import Levels from '../../../components/book/Levels.astro';
+import Timeline from '../../../components/book/Timeline.astro';
+import Trace from '../../../components/book/Trace.astro';
+import { withBase } from '../../../utils/base';
+
+A graph is a set of things and the connections between them: people and
+friendships, web pages and links, cities and roads, tasks and the order
+they must run in, packages and their dependencies. Once a problem is drawn
+as a graph, a small set of algorithms answers a huge range of questions
+about it. Can I get from here to there? What is the shortest way? Which
+things depend on which? What is the cheapest way to connect everything?
+This chapter builds those algorithms in four steps: undirected graphs,
+directed graphs, weighted undirected graphs (minimum spanning trees) and
+weighted directed graphs (shortest paths).
+
+## Before you start
+
+After this chapter you will be able to:
+
+- Represent a graph with adjacency lists and explain why that is the default over a matrix.
+- Write depth-first search and breadth-first search, and use them for paths, connected components, cycle detection and two-colouring.
+- Explain why BFS finds shortest paths in edge count and DFS does not.
+- Work with directed graphs: reachability, directed cycle detection, DFS orders, topological sort, and strong components with Kosaraju's two-pass algorithm.
+- Explain the cut property and use it to derive Prim's and Kruskal's minimum spanning tree algorithms.
+- Use edge relaxation to compute shortest paths with Dijkstra's algorithm, the topological-order algorithm for acyclic graphs (including critical paths), and Bellman–Ford for negative weights and negative cycles.
+
+What you should already know:
+<a href={withBase('/books/algorithms-sedgewick-wayne/01-fundamentals/')}>chapter 1</a>
+(bags, stacks, queues and union–find),
+<a href={withBase('/books/algorithms-sedgewick-wayne/02-sorting/')}>chapter 2</a>
+(priority queues) and
+<a href={withBase('/books/algorithms-sedgewick-wayne/03-searching/')}>chapter 3</a>
+(symbol tables, used to map names to vertex numbers). Every structure the
+book has built so far is reused here.
+
+Reading time: about two and a half hours to read; five or six evenings to
+build and run everything.
+
+## Chapter map
+
+<Flow caption="The chapter's four sections. Each adds one feature to the graph, direction or weight, and the search algorithms grow to match." steps={[
+  "4.1 Undirected Graphs: adjacency lists, DFS, BFS, components, cycles, two-colouring",
+  "4.2 Directed Graphs: reachability, directed cycles, topological sort, strong components",
+  "4.3 Minimum Spanning Trees: the cut property, Prim, Kruskal",
+  "4.4 Shortest Paths: relaxation, Dijkstra, acyclic graphs, Bellman–Ford",
+]} />
+
+<Layers caption="The four graph types of the chapter, from simplest to richest. Each layer keeps everything from the one above and adds one property." layers={[
+  { name: "Undirected graph", note: "Vertices and edges with no direction. Questions: connected? which component? a path? the fewest edges?" },
+  { name: "Directed graph", note: "Edges go one way. Questions: reachable? a cycle? an order that respects every edge? which groups reach each other?" },
+  { name: "Edge-weighted undirected graph", note: "Edges have costs. Question: the cheapest set of edges that connects every vertex." },
+  { name: "Edge-weighted directed graph", note: "Directed edges with costs, possibly negative. Question: the cheapest path from a source to every vertex." },
+]} />
+
+All code is my own TypeScript, run on Node 22, and every output block is
+real output from that code. Vertices are numbered `0` to `V − 1`; when the
+real data has names, a symbol table from chapter 3 maps names to numbers.
+
+## 4.1 Undirected Graphs
+
+### In one sentence
+
+An undirected graph stores each vertex's neighbours in a list, and two
+ways of exploring it, depth-first (go deep, back up) and breadth-first (go
+level by level), answer almost every question about connectivity.
+
+### The idea
+
+#### Vocabulary that matters
+
+A **graph** is a set of **vertices** and a set of **edges**, each edge
+connecting two vertices. Two vertices joined by an edge are **adjacent**,
+and the edge is **incident** to both. The **degree** of a vertex is the
+number of edges incident to it. A **path** is a sequence of vertices joined
+by edges; a **simple path** repeats no vertex. A **cycle** is a path that
+starts and ends at the same vertex. A graph is **connected** if there is a
+path between every pair of vertices; otherwise it splits into **connected
+components**. A **tree** is a connected graph with no cycles, and a tree on
+`V` vertices always has exactly `V − 1` edges. A graph is **sparse** if it
+has few edges compared with the `V²/2` possible, which is the normal case:
+a social network user has hundreds of friends, not billions.
+
+#### Representation: adjacency lists
+
+There are three obvious ways to store a graph. A list of edges is compact
+but finding the neighbours of a vertex means scanning all of them. An
+adjacency matrix (a `V × V` table of booleans) answers "is there an edge
+between v and w" in one step but needs `V²` space, impossible for a million
+vertices. The book's default, and nearly everyone's, is **adjacency
+lists**: an array indexed by vertex, where each entry is the list of
+neighbours. Space is `V + 2E` (each undirected edge appears in two lists),
+adding an edge is constant time, and iterating over a vertex's neighbours
+costs its degree, which is exactly what the search algorithms need.
+
+```ts
+export class Graph {
+  V: number; E = 0; adj: number[][];
+  constructor(V: number) { this.V = V; this.adj = Array.from({ length: V }, () => []); }
+  addEdge(v: number, w: number) { this.adj[v].push(w); this.adj[w].push(v); this.E++; }
+}
+```
+
+The order of neighbours in each list depends on the order edges were
+added, and it changes which paths DFS and BFS find (not whether they find
+one). Keep that in mind when a trace does not match a drawing.
+
+<Compare left="Adjacency lists" right="Adjacency matrix" caption="The two standard representations. Real graphs are sparse, so lists win almost always; the matrix wins for small, dense graphs and for constant-time edge tests." rows={[
+  ["space: V + 2E", "space: V²"],
+  ["iterate neighbours of v: degree(v)", "iterate neighbours of v: V"],
+  ["is v–w an edge: degree(v)", "is v–w an edge: 1"],
+  ["add an edge: 1", "add an edge: 1"],
+  ["a million vertices, ten million edges: fine", "a million vertices: 10¹² cells, impossible"],
+]} />
+
+#### Depth-first search
+
+**Depth-first search** (DFS) explores like someone in a maze with a ball of
+string: from the current vertex, take any unexplored edge to an unmarked
+vertex and continue from there; when every edge from the current vertex
+leads somewhere already visited, back up along the string. Recursion is the
+string.
+
+```ts
+export class DepthFirstPaths {
+  marked: boolean[]; edgeTo: number[]; s: number;
+  constructor(g: Graph, s: number) {
+    this.s = s; this.marked = new Array(g.V).fill(false); this.edgeTo = new Array(g.V).fill(-1);
+    this.dfs(g, s);
+  }
+  private dfs(g: Graph, v: number) {
+    this.marked[v] = true;
+    for (const w of g.adj[v]) if (!this.marked[w]) { this.edgeTo[w] = v; this.dfs(g, w); }
+  }
+  pathTo(v: number): number[] | null {
+    if (!this.marked[v]) return null;
+    const p: number[] = []; for (let x = v; x !== this.s; x = this.edgeTo[x]) p.push(x);
+    p.push(this.s); return p.reverse();
+  }
+}
+```
+
+`edgeTo[w] = v` records the edge used to reach `w` for the first time.
+Those edges form a tree rooted at the source, and following `edgeTo` back
+from any vertex gives a path to the source. DFS marks every vertex
+connected to the source in time proportional to the sum of their degrees,
+that is `V + E` in the worst case: each vertex is marked once and each
+adjacency list is scanned once.
+
+#### Breadth-first search
+
+**Breadth-first search** (BFS) replaces the stack with a queue. Put the
+source on the queue; repeatedly take the next vertex off and put all its
+unmarked neighbours on, marking them as they go on. Vertices come off the
+queue in order of their distance from the source: all vertices one edge
+away, then all two edges away, and so on.
+
+```ts
+export class BreadthFirstPaths {
+  marked: boolean[]; edgeTo: number[]; distTo: number[]; s: number;
+  constructor(g: Graph, s: number) {
+    this.s = s; this.marked = new Array(g.V).fill(false);
+    this.edgeTo = new Array(g.V).fill(-1); this.distTo = new Array(g.V).fill(Infinity);
+    const q: number[] = [s]; let head = 0; this.marked[s] = true; this.distTo[s] = 0;
+    while (head < q.length) {
+      const v = q[head++];
+      for (const w of g.adj[v]) if (!this.marked[w]) {
+        this.marked[w] = true; this.edgeTo[w] = v; this.distTo[w] = this.distTo[v] + 1; q.push(w);
+      }
+    }
+  }
+}
+```
+
+The key property: the path BFS finds to any vertex uses the **fewest
+possible edges**. The argument is that the queue always holds vertices at
+distance `d` followed by vertices at distance `d + 1`, never anything else,
+so the first time a vertex is reached is along a shortest path. DFS has no
+such property; it finds *a* path, often a long one. Like DFS, BFS costs
+`V + E`.
+
+(I use an array with a moving `head` index as the queue. `Array.shift()` is
+linear in V8 for large arrays, which would quietly make BFS quadratic.)
+
+#### What DFS and BFS solve
+
+With those two searches, a family of problems falls out:
+
+- **Connected components:** run DFS from every unmarked vertex, giving
+  each new search a new component id. Afterwards, "are v and w connected"
+  is one comparison. This is the same question union–find answered in
+  chapter 1; DFS is better when the graph is fixed, union–find when edges
+  keep arriving.
+- **Cycle detection:** during DFS, finding a marked neighbour that is not
+  the vertex you came from means a cycle.
+- **Two-colouring (bipartite test):** colour the source 0 and every new
+  vertex the opposite colour of the one that found it; an edge between two
+  vertices of the same colour means the graph is not bipartite, which is
+  the same as having an odd cycle.
+- **Degrees of separation:** BFS on a graph built from names, via a symbol
+  table, gives the shortest chain between two people.
+
+### Worked example
+
+My example graph has 8 vertices and 8 edges: a ring-like component
+`0 1 2 3 4 5` with a chord, and a separate edge `6–7`. Its adjacency lists,
+then a DFS from 0 (indented by recursion depth), then a BFS from 0:
+
+```text
+V 8 E 8
+0: 1 2 5
+1: 0 3
+2: 0 3
+3: 1 2 4
+4: 3 5
+5: 0 4
+6: 7
+7: 6
+visit 0
+  visit 1
+    visit 3
+      visit 2
+      visit 4
+        visit 5
+dfs path 0->4 0-1-3-4 edgeTo -1 0 3 1 3 4 -1 -1
+dequeue 0: enqueue [1 2 5] queue now [1 2 5]
+dequeue 1: enqueue [3] queue now [2 5 3]
+dequeue 2: enqueue [] queue now [5 3]
+dequeue 5: enqueue [4] queue now [3 4]
+dequeue 3: enqueue [] queue now [4]
+dequeue 4: enqueue [] queue now []
+bfs path 0->4 0-5-4 dist 0 1 1 2 2 1 Infinity Infinity
+components 2 id 0 0 0 0 0 0 1 1
+cycle? true tree cycle? false
+bipartite? no | square 0 1 0 1
+```
+
+DFS went `0, 1, 3`, then from 3 to 2 (a dead end, since 2's neighbours 0
+and 3 are marked), back to 3, on to 4, then 5. Its path to 4 has three
+edges. BFS found `0–5–4`, two edges, because 5 is a direct neighbour of 0
+and was dequeued before 4 was ever reached. Neither 6 nor 7 was reached
+from 0, so their distances are infinite and the component count is 2. The
+graph has a cycle (`0 1 3 2 0`, among others) and an odd one (`0 1 3 4 5
+0` has five edges), so it is not bipartite; a plain square is.
+
+<Figure art={`
+ the example graph                 DFS tree from 0       BFS tree from 0
+
+     0 ------- 5                        0                      0
+    / \\        |                        |                    / | \\
+   1   2       |                        1                   1  2  5
+    \\ /        |                        |                   |      |
+     3 ------- 4                        3                   3      4
+                                       / \\
+     6 ------- 7                      2   4
+                                            \\
+                                             5
+`} caption="The same graph explored two ways. DFS's tree is deep and thin (its path to 5 has four edges); BFS's tree is shallow and wide, and every path in it is a shortest path." />
+
+And a symbol-graph example: a small friendship graph built from name pairs,
+with BFS from Ana:
+
+```text
+Ana -> Fay Ana > Eve > Dee > Fay (3 steps)
+Ana -> Cy Ana > Bo > Cy (2 steps)
+Ana -> Hal not connected
+```
+
+### Step by step
+
+The BFS queue, one row per dequeue, with the distances it sets:
+
+<Trace
+  columns={["dequeue", "neighbours", "newly marked (distance)", "queue after"]}
+  rows={[
+    ["0", "1 2 5", "1 (1), 2 (1), 5 (1)", "1 2 5"],
+    ["1", "0 3", "3 (2)", "2 5 3"],
+    ["2", "0 3", "none: both marked", "5 3"],
+    ["5", "0 4", "4 (2)", "3 4"],
+    ["3", "1 2 4", "none", "4"],
+    ["4", "3 5", "none", "empty"],
+  ]}
+  caption="BFS from 0. The queue always holds distance-1 vertices before distance-2 ones. Vertex 4 is marked from 5, not from 3, because 5 was dequeued first; that choice is what makes the path to 4 two edges long."
+/>
+
+Then the scale test, connected components on random graphs with as many
+edges as vertices (average degree 2), using an iterative DFS:
+
+```text
+random V 100000 E 100000 components 16191 largest 79695 ms 28
+random V 1000000 E 1000000 components 162023 largest 796930 ms 338
+```
+
+Ten times the graph, about ten times the time: linear, as promised. The
+structure is a classic result of random graph theory: at average degree 2,
+about 80% of the vertices join one **giant component** and the rest are
+scattered in small pieces, which is what both runs show.
+
+### Common mistake
+
+Recursion depth. The recursive DFS above is the clearest code, and it
+breaks on the simplest large graph there is:
+
+```text
+recursive dfs on a 100k path: Maximum call stack size exceeded
+iterative components on the same path: 1
+```
+
+A path of 100,000 vertices needs 100,000 nested calls, and Node's default
+stack holds far fewer. Real graphs have long paths: a linked chain of
+records, a long road, a deep dependency tree. For production code I write
+DFS with an explicit stack, as in the `components` function used for the
+scale test. (An iterative DFS that pushes all neighbours at once visits
+vertices in a slightly different order from the recursive one; for
+components and reachability that does not matter, for DFS orders in 4.2 it
+does.)
+
+The second common mistake is marking vertices when they are dequeued in
+BFS instead of when they are enqueued. The result is still correct but a
+vertex can be enqueued many times, once per marked neighbour, and on dense
+graphs the queue blows up.
+
+### In real systems
+
+- **Social networks** compute degrees of separation and "people you may
+  know" (friends of friends, a BFS to depth 2).
+- **Garbage collectors** run a graph search over the heap: objects are
+  vertices, references are edges, and everything not reachable from the
+  roots is garbage. Mark-and-sweep is literally "mark" in the DFS sense.
+- **Network tools** use BFS for hop counts and component analysis, and
+  flood fill in an image editor (the paint bucket) is DFS or BFS on a grid
+  graph of pixels.
+- **Web crawlers** are BFS over links, with a set of seen URLs as the
+  `marked` array and a queue (with politeness rules) as the frontier.
+- **Game AI and puzzle solvers** use BFS for the fewest moves on unweighted
+  grids and state graphs.
+
+### Check yourself
+
+<details>
+<summary>1. Why does BFS find shortest paths in edge count, while DFS does not?</summary>
+
+BFS processes vertices in order of distance, so the first time it reaches
+a vertex, it is from a vertex one closer to the source. DFS follows one
+branch as deep as it can and can reach a vertex by a long detour before it
+would ever try the short way.
+
+</details>
+
+<details>
+<summary>2. What does it cost to find all connected components, and why?</summary>
+
+`V + E`. Every vertex is marked once and every adjacency list is scanned
+once, across all the searches together.
+
+</details>
+
+<details>
+<summary>3. When is union–find a better choice than DFS for connectivity?</summary>
+
+When edges arrive over time and queries are interleaved with them. DFS
+needs the whole graph and would have to re-run; union–find handles each new
+edge in nearly constant time.
+
+</details>
+
+## 4.2 Directed Graphs
+
+### In one sentence
+
+In a directed graph every edge goes one way, and the same DFS, with one
+extra array and one extra list, detects cycles, produces a topological
+order for scheduling, and in two passes finds the groups of vertices that
+can all reach each other.
+
+### The idea
+
+#### Digraphs
+
+A **directed graph** (digraph) has **directed edges**: `v → w` lets you go
+from `v` to `w` but not back. A vertex has an **outdegree** (edges leaving)
+and an **indegree** (edges arriving). A **directed path** follows edges in
+their direction, and a **directed cycle** is a directed path back to its
+start. The representation is the same adjacency list, but each edge is
+stored once, in the list of its tail.
+
+```ts
+export class Digraph {
+  V: number; E = 0; adj: number[][];
+  constructor(V: number) { this.V = V; this.adj = Array.from({ length: V }, () => []); }
+  addEdge(v: number, w: number) { this.adj[v].push(w); this.E++; }
+  reverse(): Digraph {
+    const r = new Digraph(this.V);
+    for (let v = 0; v < this.V; v++) for (const w of this.adj[v]) r.addEdge(w, v);
+    return r;
+  }
+}
+```
+
+Direction changes the questions. "Connected" splits into "can `v` reach
+`w`?" and "can `w` reach `v`?", which are different. DFS and BFS work
+unchanged and answer **reachability**: which vertices can be reached from a
+source, or from a set of sources. BFS still gives shortest directed paths
+in edge count.
+
+#### Directed cycles
+
+In an undirected graph, any marked neighbour other than the parent closes a
+cycle. In a digraph that is wrong: an edge to a vertex that has already
+been fully explored, in another branch, is not a cycle. The fix is a second
+array, `onStack`, true for exactly the vertices on the current recursion
+path. An edge to a vertex that is **on the stack** points back up the
+current path, and that is a directed cycle.
+
+```ts
+export function findCycle(g: Digraph): number[] | null {
+  const marked = new Array(g.V).fill(false), onStack = new Array(g.V).fill(false);
+  const edgeTo = new Array(g.V).fill(-1); let cycle: number[] | null = null;
+  const dfs = (v: number) => {
+    marked[v] = true; onStack[v] = true;
+    for (const w of g.adj[v]) {
+      if (cycle) return;
+      if (!marked[w]) { edgeTo[w] = v; dfs(w); }
+      else if (onStack[w]) {
+        cycle = []; for (let x = v; x !== w; x = edgeTo[x]) cycle.push(x);
+        cycle.push(w, v); cycle.reverse();
+      }
+    }
+    onStack[v] = false;
+  };
+  for (let v = 0; v < g.V && !cycle; v++) if (!marked[v]) dfs(v);
+  return cycle;
+}
+```
+
+#### DFS orders and topological sort
+
+A **directed acyclic graph** (DAG) is a digraph with no directed cycle, and
+it is the shape of every "must happen before" relation: course
+prerequisites, build steps, package dependencies, spreadsheet formulas,
+data pipelines. A **topological order** lists the vertices so that every
+edge points forward, from earlier to later. A digraph has one exactly when
+it is a DAG.
+
+DFS gives three natural orders: **preorder** (a vertex when the call
+starts), **postorder** (a vertex when its call finishes) and **reverse
+postorder**. The book's remarkable result is that **reverse postorder of a
+DAG is a topological order**. The proof is short: for any edge `v → w`,
+the call `dfs(w)` finishes before `dfs(v)` does. Either `w` was visited
+during `dfs(v)` and so finished first, or `w` was already finished (it
+cannot be on the stack, because that would be a cycle). So `w` comes before
+`v` in postorder, and after it in reverse postorder.
+
+```ts
+export function dfsOrders(g: Digraph) {
+  const marked = new Array(g.V).fill(false); const pre: number[] = [], post: number[] = [];
+  const dfs = (v: number) => {
+    marked[v] = true; pre.push(v);
+    for (const w of g.adj[v]) if (!marked[w]) dfs(w);
+    post.push(v);
+  };
+  for (let v = 0; v < g.V; v++) if (!marked[v]) dfs(v);
+  return { pre, post, reversePost: [...post].reverse() };
+}
+export function topological(g: Digraph): number[] | null {
+  return findCycle(g) ? null : dfsOrders(g).reversePost;
+}
+```
+
+There is a second classic method, not the book's focus but worth knowing
+because many build tools use it: **Kahn's algorithm**. Count each vertex's
+indegree, start with all vertices of indegree 0, and repeatedly output one
+and decrement its neighbours' indegrees, adding any that drop to 0. If
+fewer than `V` vertices come out, the rest are on or behind a cycle.
+
+#### Strong components
+
+Two vertices are **strongly connected** if each can reach the other. That
+is an equivalence relation, so it splits the digraph into **strong
+components**: maximal groups of mutually reachable vertices. Collapse each
+component to a single vertex and what remains is always a DAG (if two
+components could reach each other, they would be one).
+
+**Kosaraju's algorithm** finds them with two DFS passes, and it is one of
+the most surprising short algorithms in the book:
+
+1. Compute the reverse postorder of the **reverse** graph.
+2. Run ordinary DFS on the **original** graph, taking unmarked start
+   vertices in that order. Each DFS marks exactly one strong component.
+
+```ts
+export function kosaraju(g: Digraph): { count: number; id: number[] } {
+  const order = dfsOrders(g.reverse()).reversePost;
+  const id = new Array(g.V).fill(-1); let count = 0;
+  const dfs = (v: number) => { id[v] = count; for (const w of g.adj[v]) if (id[w] === -1) dfs(w); };
+  for (const s of order) if (id[s] === -1) { dfs(s); count++; }
+  return { count, id };
+}
+```
+
+Why it works, informally: the first pass arranges for each second-pass DFS
+to start inside a "sink" component of the remaining graph, one with no
+edges leading to an unvisited component. A DFS started there cannot leak
+into any other component, so it marks exactly its own. Then that component
+is removed in effect, and the next start vertex is in a sink of what
+remains. Both passes are DFS, so the cost is `V + E`.
+
+### Worked example
+
+A course-prerequisite DAG with seven courses: intro (0), data structures
+(1), discrete maths (2), algorithms (3), databases (4), compilers (5) and
+systems (6). The edges say intro comes before data structures and discrete
+maths, both come before algorithms, data structures comes before databases
+and systems, and algorithms and systems both come before compilers.
+
+```text
+pre 0 1 3 5 4 6 2 | post 5 3 4 6 1 2 0 | reverse post 0 2 1 6 4 3 5
+topological intro > discrete > ds > systems > db > algos > compilers
+kahn        intro > ds > discrete > db > systems > algos > compilers
+reachable from ds ds algos db compilers systems
+with 5->1 added: cycle compilers -> ds -> algos -> compilers | topological null | kahn null
+```
+
+Postorder lists compilers first, because it has no outgoing edges and its
+call finishes first; reverse postorder puts it last, after both its
+prerequisites. The DFS order and Kahn's order differ but both are valid:
+a DAG usually has many topological orders. Adding an edge from compilers
+back to data structures creates a cycle, the detector returns it, and both
+methods refuse to produce an order.
+
+<Figure art={`
+ course DAG as adjacency lists (each edge points to a later course)
+
+   intro(0)     ->  ds(1)  discrete(2)
+   ds(1)        ->  algos(3)  db(4)  systems(6)
+   discrete(2)  ->  algos(3)
+   algos(3)     ->  compilers(5)
+   systems(6)   ->  compilers(5)
+
+   longest chain of prerequisites:
+   intro --> ds --> algos --> compilers        (also intro --> ds --> systems --> compilers)
+
+   one topological order:   0   2   1   6   4   3   5
+   every edge points left to right in it
+`} caption="A dependency graph and one valid order. Topological sort is the algorithm every build tool, package manager and task scheduler runs before it starts work." />
+
+Then strong components on an 8-vertex digraph made of three cycles chained
+together: `0 → 1 → 2 → 0`, then `2 → 3`, `3 ⇄ 4`, then `4 → 5`, and
+`5 → 6 → 7 → 5`.
+
+```text
+scc count 3 id 2 2 2 1 1 0 0 0
+groups {5 6 7} {3 4} {0 1 2}
+reverse-graph reverse post 5 7 6 3 4 0 2 1
+```
+
+The second pass starts at 5, the first vertex in the reverse graph's
+reverse postorder. `{5 6 7}` is the sink component of the original graph
+(nothing leaves it), so the DFS from 5 marks exactly those three. Next
+unmarked in the order is 3: its DFS reaches 4, and tries 5, already
+marked, so it marks `{3 4}`. Then 0 marks `{0 1 2}`.
+
+### Step by step
+
+The DFS on the course DAG, recording when each call starts and finishes:
+
+<Trace
+  columns={["event", "vertex", "preorder so far", "postorder so far"]}
+  rows={[
+    ["start", "0 intro", "0", ""],
+    ["start", "1 ds", "0 1", ""],
+    ["start", "3 algos", "0 1 3", ""],
+    ["start, finish", "5 compilers", "0 1 3 5", "5"],
+    ["finish", "3 algos", "", "5 3"],
+    ["start, finish", "4 db", "0 1 3 5 4", "5 3 4"],
+    ["start, finish", "6 systems (5 already done)", "0 1 3 5 4 6", "5 3 4 6"],
+    ["finish", "1 ds", "", "5 3 4 6 1"],
+    ["start, finish", "2 discrete (3 already done)", "0 1 3 5 4 6 2", "5 3 4 6 1 2"],
+    ["finish", "0 intro", "", "5 3 4 6 1 2 0"],
+  ]}
+  caption="A vertex enters postorder only after everything it points to is finished, so reversing postorder puts every vertex before everything it points to. That is the whole proof of topological sort."
+/>
+
+### Common mistake
+
+Using the undirected cycle test on a digraph. In the course DAG, DFS from
+intro finishes algorithms in the first branch; when it later explores
+discrete maths and finds the edge to algorithms, algorithms is marked. The
+undirected rule ("marked and not my parent") would call that a cycle. It
+is not: algorithms is finished, not on the stack. Only edges to vertices
+on the current path close a directed cycle.
+
+The second mistake is using preorder as a topological order. Preorder
+here is `0 1 3 5 4 6 2`, which puts algorithms (3) before discrete maths
+(2), one of its prerequisites. It happens to look plausible on many small
+examples, which is why the bug survives until it does not.
+
+### In real systems
+
+- **Build systems and package managers** (make, Bazel, npm, Cargo, apt)
+  build a dependency DAG and topologically sort it; a cycle is reported as
+  an error ("circular dependency"). Parallel builds run every vertex whose
+  prerequisites are done, which is Kahn's algorithm with a worker pool.
+- **Spreadsheets** recompute cells in topological order of the formula
+  graph and report circular references with a cycle detector.
+- **Data pipelines and workflow schedulers** (Airflow and its relatives)
+  are DAGs of tasks by definition.
+- **Compilers** use strong components in call graphs (mutually recursive
+  functions) and data-flow analysis, and deadlock detectors look for cycles
+  in "waits for" graphs.
+- **Web and social graphs** are analysed for strong components: the web's
+  famous "bow-tie" structure is one giant strong component with pages that
+  only link in or only get linked to.
+
+### Check yourself
+
+<details>
+<summary>1. Why must the first pass of Kosaraju's algorithm use the reverse graph?</summary>
+
+To start each second-pass DFS in a sink component of the original graph.
+The reverse postorder of the reverse graph puts a vertex of a sink
+component (in the original) first. Started anywhere else, a DFS could
+cross into components downstream and merge them.
+
+</details>
+
+<details>
+<summary>2. Is the topological order of a DAG unique?</summary>
+
+Only when a single path visits every vertex. Otherwise any two vertices
+with no path between them can appear in either order, as the DFS and Kahn
+orders of the course DAG show.
+
+</details>
+
+<details>
+<summary>3. A build has 10,000 targets. What does it cost to find an order, and to detect a cycle?</summary>
+
+Both are one DFS: `V + E`, linear in the number of targets plus
+dependencies. The order is the reverse postorder; the cycle check is the
+on-stack test during the same search.
+
+</details>
+
+## 4.3 Minimum Spanning Trees
+
+### In one sentence
+
+A minimum spanning tree connects every vertex of a weighted graph with the
+least total edge weight, and one fact, that the lightest edge crossing any
+cut must be in it, gives two greedy algorithms: Prim grows a single tree,
+Kruskal joins forests.
+
+### The idea
+
+#### The problem
+
+An **edge-weighted graph** attaches a number, the **weight**, to each edge:
+a cost, a distance, a latency. A **spanning tree** of a connected graph is
+a subgraph that contains every vertex and is a tree (connected, no
+cycles), so it has exactly `V − 1` edges. A **minimum spanning tree** (MST)
+is a spanning tree whose total weight is as small as possible. If the
+graph is not connected, the answer is a minimum spanning forest, one tree
+per component.
+
+The application is any "connect everything as cheaply as possible"
+problem: laying cable between buildings, linking sites in a network, or,
+less obviously, clustering (remove the heaviest MST edges and the
+components left are clusters).
+
+#### The cut property
+
+A **cut** splits the vertices into two non-empty groups. A **crossing
+edge** has one end in each group. The **cut property**: for any cut, the
+lightest crossing edge is in the MST (assuming distinct weights; with ties
+it is in *some* MST).
+
+The proof is a swap argument worth knowing. Suppose the lightest crossing
+edge `e` is not in the MST. Adding `e` to the tree creates a cycle. That
+cycle must cross the cut a second time (it leaves one side through `e` and
+has to come back), through some other crossing edge `f`, heavier than `e`.
+Remove `f` and add `e`: still a spanning tree, and lighter. Contradiction.
+
+Every MST algorithm is the same **greedy** loop: find a cut with no tree
+edges crossing it, take its lightest crossing edge, repeat until there are
+`V − 1` edges. The algorithms differ only in which cut they use.
+
+#### Prim's algorithm
+
+**Prim** grows one tree from a start vertex. The cut is "tree vertices
+versus the rest", and the next edge is the lightest one leaving the tree.
+A min priority queue of candidate edges finds it.
+
+The **lazy** version, which I wrote first, puts every edge leaving a newly
+added vertex on the queue and, when it pops an edge, skips it if both ends
+are already in the tree (it became obsolete when its other end joined).
+
+```ts
+export type Edge = { v: number; w: number; weight: number };
+export const other = (e: Edge, x: number) => (x === e.v ? e.w : e.v);
+
+export function lazyPrim(g: EWGraph): Edge[] {
+  const marked = new Array(g.V).fill(false); const mst: Edge[] = [];
+  const pq = new MinPQ<Edge>((a, b) => a.weight < b.weight);
+  const visit = (v: number) => {
+    marked[v] = true;
+    for (const e of g.adj[v]) if (!marked[other(e, v)]) pq.push(e);
+  };
+  visit(0);
+  while (pq.size() && mst.length < g.V - 1) {
+    const e = pq.pop();
+    if (marked[e.v] && marked[e.w]) continue;          // obsolete: both ends already in the tree
+    mst.push(e);
+    if (!marked[e.v]) visit(e.v); if (!marked[e.w]) visit(e.w);
+  }
+  return mst;
+}
+```
+
+The queue can hold up to `E` edges, so the cost is `E log E` time and `E`
+space. The **eager** version keeps, for each non-tree vertex, only the
+lightest edge connecting it to the tree, in an **indexed** priority queue
+keyed by vertex, and decreases that key when a lighter edge appears. That
+bounds the queue at `V` entries and gives `E log V` time. For sparse
+graphs, the two are close; the eager version matters when memory is tight.
+
+#### Kruskal's algorithm
+
+**Kruskal** considers edges in order of weight, lightest first, and adds
+each one unless it would form a cycle with the edges already chosen. The
+chosen edges form a forest of growing trees that merge until one remains.
+"Would it form a cycle" means "are both ends already in the same tree",
+which is exactly the union–find question from chapter 1.
+
+```ts
+export function kruskal(g: EWGraph): Edge[] {
+  const sorted = [...g.edges].sort((a, b) => a.weight - b.weight);
+  const uf = new UF(g.V); const mst: Edge[] = [];
+  for (const e of sorted) {
+    if (mst.length === g.V - 1) break;
+    if (uf.union(e.v, e.w)) mst.push(e);                // union returns false if already connected
+  }
+  return mst;
+}
+```
+
+Each added edge is the lightest crossing the cut between its own tree and
+everything else, so the cut property says it belongs. The cost is the sort,
+`E log E`, plus nearly constant time per union–find operation.
+
+<Compare left="Prim" right="Kruskal" caption="Two greedy MST algorithms, same answer, different cuts. Prim's cut is the growing tree against the rest; Kruskal's is one forest tree against the rest." rows={[
+  ["grows one tree from a start vertex", "merges a forest, lightest edges first"],
+  ["needs a priority queue of edges or vertices", "needs a sort and union–find"],
+  ["E log E (lazy) or E log V (eager)", "E log E, dominated by the sort"],
+  ["works naturally on an adjacency-list graph", "works naturally on a plain list of edges"],
+  ["stops early only when the tree is complete", "can stop as soon as V − 1 edges are chosen"],
+]} />
+
+### Worked example
+
+A six-vertex graph with nine weighted edges: `0–1 (4)`, `0–2 (3)`,
+`1–2 (1)`, `1–3 (2)`, `2–3 (4)`, `3–4 (2)`, `4–5 (6)`, `3–5 (5)`,
+`2–4 (7)`. Both algorithms, logging every decision:
+
+```text
+Prim:
+pop 0-2 3: add
+pop 1-2 1: add
+pop 1-3 2: add
+pop 3-4 2: add
+pop 0-1 4: both ends in tree, skip
+pop 2-3 4: both ends in tree, skip
+pop 3-5 5: add
+total 13
+Kruskal:
+1-2 1: add
+1-3 2: add
+3-4 2: add
+0-2 3: add
+0-1 4: same component, skip
+2-3 4: same component, skip
+3-5 5: add
+total 13
+```
+
+The same five edges, total weight 13, chosen in different orders. Prim
+started at 0 and could only see 0's edges, so it took `0–2 (3)` first, even
+though `1–2 (1)` is the lightest edge in the graph; that edge became
+visible only once 2 joined. Kruskal took the globally lightest edges first
+and connected 0 fourth. Both skipped `0–1` and `2–3`, each of which would
+have closed a cycle, and neither needed `4–5 (6)` or `2–4 (7)`.
+
+<Figure art={`
+ the graph (nine edges)                    the MST (five edges, total 13)
+
+     0 ---4--- 1                              0         1
+      \\       / \\                             \\       / \\
+     3 \\   1 /   \\ 2                         3 \\   1 /   \\ 2
+        \\   /     \\                             \\   /     \\
+          2 ---4--- 3 ---5--- 5                    2         3 ---5--- 5
+           \\        |        /                               |
+          7 \\     2 |     6 /                              2 |
+             \\      |      /                                |
+              ------ 4 -----                                 4
+`} caption="Left: nine weighted edges. Right: the five that both Prim and Kruskal choose. Every non-tree edge is the heaviest edge on the cycle it would close, which is the cycle property, the mirror image of the cut property." />
+
+### Step by step
+
+Prim's priority queue, one row per vertex added, showing what the queue
+held before each pop:
+
+<Trace
+  columns={["tree", "queue (weight: edge)", "pop", "decision"]}
+  rows={[
+    ["{0}", "3: 0–2, 4: 0–1", "0–2", "add, visit 2"],
+    ["{0 2}", "1: 1–2, 4: 0–1, 4: 2–3, 7: 2–4", "1–2", "add, visit 1"],
+    ["{0 1 2}", "2: 1–3, 4: 0–1, 4: 2–3, 7: 2–4", "1–3", "add, visit 3"],
+    ["{0 1 2 3}", "2: 3–4, 4: 0–1, 4: 2–3, 5: 3–5, 7: 2–4", "3–4", "add, visit 4"],
+    ["{0 1 2 3 4}", "4: 0–1, 4: 2–3, 5: 3–5, 6: 4–5, 7: 2–4", "0–1", "obsolete, skip"],
+    ["{0 1 2 3 4}", "4: 2–3, 5: 3–5, 6: 4–5, 7: 2–4", "2–3", "obsolete, skip"],
+    ["{0 1 2 3 4}", "5: 3–5, 6: 4–5, 7: 2–4", "3–5", "add; V − 1 edges, stop"],
+  ]}
+  caption="Lazy Prim. When 1 joined, the edge 0–1 stayed in the queue even though both its ends were now in the tree; it is discarded only when popped. The eager version would never have kept it."
+/>
+
+Then scale: random connected graphs with five edges per vertex.
+
+```text
+V 10000 E 49999: prim 34 ms weight 1183.9916 | kruskal 119 ms weight 1183.9916
+V 100000 E 499999: prim 754 ms weight 12037.1193 | kruskal 1868 ms weight 12037.1193
+```
+
+Both agree on the weight to the last digit, a good check. Kruskal is slower
+here because sorting half a million edge objects with a comparator
+dominates; Prim only ever orders the part of the graph near the growing
+tree. With edges already sorted, or held in a typed array, Kruskal is very
+fast; production code often sorts edge indices by weight in a
+`Float64Array` for exactly this reason.
+
+### Common mistake
+
+The most common mistake is confusing a minimum spanning tree with a
+shortest-path tree. The MST minimises the **total** weight of the network;
+it says nothing about the distance between any two particular vertices. In
+the example, the MST path from 4 to 5 is `4–3–5`, weight 7, while the
+direct edge `4–5` weighs 6: the shortest path between them is not in the
+MST at all, and on bigger graphs the gap can be large. If the question is "cheapest cable network", use
+an MST; if it is "fastest route from A to B", use 4.4.
+
+The second mistake is running an MST algorithm on a digraph. The cut
+property does not hold for directed edges; the directed version
+(minimum-cost arborescence) needs a different algorithm.
+
+### In real systems
+
+- **Network design:** the original motivation, and still used for laying
+  out cable, pipe and power networks, usually as a first approximation
+  before redundancy is added (a tree has no backup paths).
+- **Clustering:** single-linkage clustering is Kruskal stopped early, at
+  `k` components instead of one. Image segmentation algorithms build on the
+  same idea with pixels as vertices.
+- **Approximation algorithms:** the classic 2-approximation for the
+  travelling salesperson problem with triangle inequality walks an MST.
+  (The exact problem is intractable, chapter 6.)
+- **Ethernet's spanning tree protocol** keeps a switched network loop-free
+  by selecting a spanning tree of the links, preferring cheaper (faster)
+  ones.
+
+### Check yourself
+
+<details>
+<summary>1. If every edge weight is increased by 10, does the MST change?</summary>
+
+No. Every spanning tree has exactly `V − 1` edges, so every tree's total
+goes up by the same `10(V − 1)`, and the order of edges by weight is
+unchanged. (Shortest paths, by contrast, can change, because paths have
+different numbers of edges.)
+
+</details>
+
+<details>
+<summary>2. Why does Kruskal need union–find and not just a marked array?</summary>
+
+An edge between two marked vertices may still be needed if they are in
+different trees of the forest. The question is "same tree?", not "seen
+before?", and union–find answers it as trees merge.
+
+</details>
+
+<details>
+<summary>3. What is the cost of lazy Prim on a graph with V vertices and E edges?</summary>
+
+Up to `E` insertions and `E` deletions on a priority queue of up to `E`
+edges: `E log E` time and `E` extra space.
+
+</details>
+
+## 4.4 Shortest Paths
+
+### In one sentence
+
+Every shortest-path algorithm in the book repeats one step, relaxing an
+edge (checking whether going through it gives a shorter route), and the
+algorithms differ only in the order they relax edges: by distance with a
+priority queue (Dijkstra), in topological order (acyclic graphs), or in
+passes until nothing changes (Bellman–Ford).
+
+### The idea
+
+#### The problem and its answer's shape
+
+In an **edge-weighted digraph**, the weight of a path is the sum of its
+edge weights, and a **shortest path** from `s` to `t` is a path of minimum
+weight. The book solves the **single-source** version: shortest paths from
+one source `s` to every vertex. The answer is a **shortest-paths tree**,
+stored exactly like the BFS answer: `distTo[v]` is the length of the
+shortest known path to `v`, and `edgeTo[v]` is the last edge on it.
+Following `edgeTo` back from any vertex gives the path.
+
+A shortest-paths tree exists whenever there is no **negative cycle**
+reachable from `s` (a cycle whose total weight is below zero, which you
+could go round forever, making paths arbitrarily short).
+
+#### Relaxation
+
+**Relaxing** an edge `v → w` means testing whether the best known way to
+reach `w` is improved by going to `v` and then along the edge:
+
+```ts
+if (distTo[v] + e.weight < distTo[w]) { distTo[w] = distTo[v] + e.weight; edgeTo[w] = e; }
+```
+
+The name comes from a rubber band stretched along a path that relaxes to a
+shorter one. The book's **optimality conditions** say when to stop: the
+distances are shortest-path distances exactly when no edge can be relaxed
+any more, that is, `distTo[w] ≤ distTo[v] + weight(v → w)` for every edge.
+So any algorithm that keeps relaxing edges until none can be relaxed is
+correct; what remains is to relax them in an order that finishes fast.
+
+#### Dijkstra's algorithm
+
+For **non-negative weights**, Dijkstra's algorithm takes, at each step, the
+non-tree vertex with the smallest `distTo`, adds it to the tree, and relaxes
+its outgoing edges. It is Prim's algorithm with a different key: Prim keys
+a vertex by the weight of the single edge connecting it to the tree,
+Dijkstra by the total distance from the source.
+
+```ts
+export function dijkstra(g: EWDigraph, s: number) {
+  const distTo = new Array(g.V).fill(Infinity), edgeTo: (DEdge | null)[] = new Array(g.V).fill(null);
+  const done = new Array(g.V).fill(false);
+  distTo[s] = 0; const pq = new MinPQ<[number, number]>((a, b) => a[0] < b[0]); pq.push([0, s]);
+  while (pq.size()) {
+    const [, v] = pq.pop(); if (done[v]) continue;      // lazy: skip stale queue entries
+    done[v] = true;
+    for (const e of g.adj[v]) if (distTo[v] + e.weight < distTo[e.to]) {
+      distTo[e.to] = distTo[v] + e.weight; edgeTo[e.to] = e; pq.push([distTo[e.to], e.to]);
+    }
+  }
+  return { distTo, edgeTo };
+}
+```
+
+The book uses an **indexed** priority queue with a decrease-key operation,
+so each vertex is in the queue once. My version is the **lazy** variant
+that most production code uses with a plain binary heap: push a new entry
+whenever a distance improves, and skip entries for vertices already done.
+The queue holds up to `E` entries instead of `V`, and the cost is
+`E log E` instead of `E log V`, which differ by at most a factor of two
+because `E ≤ V²`.
+
+Why taking the closest vertex is safe: when `v` has the smallest `distTo`
+among non-tree vertices, any other route to `v` would have to leave the
+tree through some vertex at least as far away and then add non-negative
+weights. So `distTo[v]` can never improve again. The argument breaks the
+moment one edge weight is negative, and so does the algorithm.
+
+#### Acyclic graphs: relax in topological order
+
+If the digraph is a DAG, there is a faster and simpler method that
+**allows negative weights**: relax every vertex's outgoing edges in
+topological order. When a vertex is reached in that order, every edge into
+it has already been relaxed, so its distance is final. Each edge is relaxed
+exactly once: `V + E` time, no priority queue.
+
+```ts
+export function acyclicSP(g: EWDigraph, s: number, longest = false) {
+  const sign = longest ? -1 : 1;
+  const distTo = new Array(g.V).fill(Infinity), edgeTo: (DEdge | null)[] = new Array(g.V).fill(null);
+  distTo[s] = 0;
+  for (const v of topoOrder(g)) for (const e of g.adj[v])
+    if (distTo[v] + sign * e.weight < distTo[e.to]) { distTo[e.to] = distTo[v] + sign * e.weight; edgeTo[e.to] = e; }
+  return { distTo: distTo.map(d => sign * d), edgeTo };
+}
+```
+
+Negating the weights turns shortest into **longest** paths, which in a
+general graph is an intractable problem (chapter 6) but in a DAG is just
+as easy. That gives the **critical path method** for scheduling: model
+each job as an edge whose weight is its duration, with zero-weight edges
+for precedence, and the longest path from a start vertex to a finish vertex
+is the minimum time to finish the whole project. The jobs on it are
+**critical**: delaying any of them delays everything.
+
+#### Bellman–Ford: negative weights and negative cycles
+
+For general digraphs with negative weights, **Bellman–Ford** relaxes all
+`E` edges, `V` times over. After pass `i`, every shortest path with at most
+`i` edges is correct, and a shortest path has at most `V − 1` edges, so `V`
+passes suffice: `EV` time. The book's practical version uses a **queue** of
+vertices whose distance changed in the last pass, because only their
+outgoing edges can relax anything. On typical graphs that is far faster
+than `EV`, though the worst case is the same.
+
+If relaxations are still happening after `V` passes, there is a negative
+cycle. The book detects it by checking, every `V` relaxations, whether the
+`edgeTo` links contain a cycle: any cycle in them has negative weight.
+
+```ts
+export function bellmanFord(g: EWDigraph, s: number) {
+  const distTo = new Array(g.V).fill(Infinity), edgeTo: (DEdge | null)[] = new Array(g.V).fill(null);
+  const onQ = new Array(g.V).fill(false);
+  distTo[s] = 0; const q = [s]; onQ[s] = true; let calls = 0, cycle: number[] | null = null;
+  while (q.length && !cycle) {
+    const v = q.shift()!; onQ[v] = false;
+    for (const e of g.adj[v]) {
+      if (distTo[v] + e.weight < distTo[e.to]) {
+        distTo[e.to] = distTo[v] + e.weight; edgeTo[e.to] = e;
+        if (!onQ[e.to]) { q.push(e.to); onQ[e.to] = true; }
+      }
+      if (++calls % g.V === 0) { cycle = findNegCycle(g.V, edgeTo); if (cycle) break; }
+    }
+  }
+  return { distTo, edgeTo, cycle };
+}
+```
+
+The classic application is **arbitrage**. Make a vertex per currency and an
+edge per exchange rate with weight `−ln(rate)`. Multiplying rates along a
+loop becomes adding logs, and a loop whose rates multiply to more than 1
+becomes a cycle with negative total weight. Bellman–Ford finds it.
+
+<Compare left="Algorithm" right="When to use it" caption="Choosing a shortest-path algorithm. The constraint on the weights decides, then the shape of the graph." rows={[
+  ["BFS: V + E", "unweighted graphs (every edge costs 1)"],
+  ["Dijkstra: E log V", "non-negative weights, the common case: roads, latencies, costs"],
+  ["topological order: V + E", "DAGs, any weights; longest paths and critical paths too"],
+  ["Bellman–Ford: EV worst case", "negative weights; detects negative cycles"],
+]} />
+
+### Worked example
+
+A six-vertex digraph: `0→1 (7)`, `0→2 (2)`, `2→1 (3)`, `1→3 (1)`,
+`2→3 (8)`, `2→4 (5)`, `4→3 (2)`, `3→5 (4)`, `4→5 (9)`. Dijkstra from 0,
+logging each vertex taken and the distances it improved:
+
+```text
+take 0 (dist 0): relax 1=7, 2=2
+take 2 (dist 2): relax 1=5, 3=10, 4=7
+take 1 (dist 5): relax 3=6
+take 3 (dist 6): relax 5=10
+take 4 (dist 7): relax nothing
+take 5 (dist 10): relax nothing
+dist 0 5 2 6 7 10
+path to 1 0->2->1
+path to 2 0->2
+path to 3 0->2->1->3
+path to 4 0->2->4
+path to 5 0->2->1->3->5
+```
+
+The direct edge `0→1` costs 7, but going through 2 costs 5, so vertex 1's
+distance improves when 2 is taken. Vertex 3 is first reached at 10 (via
+`2→3`), then improved to 6 via 1. Vertex 4, taken at 7, tries `4→3` (7 + 2
+= 9, worse than 6) and `4→5` (16, worse than 10), and relaxes nothing.
+
+<Figure art={`
+ edges (weight)                       shortest-paths tree from 0
+
+   0 --7--> 1                              0
+   0 --2--> 2                              |
+   2 --3--> 1                            2 (2)
+   1 --1--> 3                           /     \\
+   2 --8--> 3                       1 (5)     4 (7)
+   2 --5--> 4                         |
+   4 --2--> 3                       3 (6)
+   3 --4--> 5                         |
+   4 --9--> 5                       5 (10)
+
+ tree edges: 0->2, 2->1, 1->3, 3->5, 2->4      distances in brackets
+`} caption="Dijkstra's answer is a tree: one edgeTo link per vertex. Four of the nine edges are not used; each would make some distance longer, which is exactly the optimality condition." />
+
+Then the critical path. Six jobs with durations and prerequisites: design
+(3 days), backend (5, after design), frontend (4, after design), tests (2,
+after backend and frontend), docs (1, after design), release (1, after
+tests and docs). Built as a DAG with a start vertex, a finish vertex, and
+an edge per job, then solved as a longest path:
+
+```text
+design    start 0
+backend   start 3
+frontend  start 3
+tests     start 8
+docs      start 3
+release   start 10
+finish 11 critical path design > backend > tests > release
+```
+
+The project needs 11 days. Frontend could slip by a day without moving the
+finish (tests waits for backend anyway, at day 8), and docs has six days of
+slack. Backend has none: a one-day slip in backend is a one-day slip in the
+release.
+
+### Step by step
+
+Dijkstra's queue, which in the lazy version can hold stale entries:
+
+<Trace
+  columns={["pop", "status", "relaxations", "queue after (dist: vertex)"]}
+  rows={[
+    ["0: 0", "take 0", "1 = 7, 2 = 2", "2: 2, 7: 1"],
+    ["2: 2", "take 2", "1 = 5, 3 = 10, 4 = 7", "5: 1, 7: 1, 7: 4, 10: 3"],
+    ["5: 1", "take 1", "3 = 6", "6: 3, 7: 1, 7: 4, 10: 3"],
+    ["6: 3", "take 3", "5 = 10", "7: 1, 7: 4, 10: 3, 10: 5"],
+    ["7: 1", "stale (1 is done), skip", "none", "7: 4, 10: 3, 10: 5"],
+    ["7: 4", "take 4", "none", "10: 3, 10: 5"],
+    ["10: 3", "stale, skip", "none", "10: 5"],
+    ["10: 5", "take 5", "none", "empty"],
+  ]}
+  caption="Two entries went stale: vertex 1 at distance 7 and vertex 3 at distance 10, both superseded by shorter routes. The lazy version pays for them with an extra pop each instead of a decrease-key."
+/>
+
+And the negative-weight failure, on a four-vertex graph with edges
+`0→1 (2)`, `0→2 (5)`, `2→1 (−4)`, `1→3 (1)`:
+
+```text
+dijkstra with a negative edge 0 1 5 3 | bellman-ford 0 1 5 2
+```
+
+Dijkstra takes vertex 1 at distance 2 and relaxes `1→3`, giving 3 a
+distance of 3. Later it takes 2 at distance 5 and improves vertex 1 to 1
+via the negative edge, but 1 is already done, so the improvement never
+reaches vertex 3. Bellman–Ford keeps relaxing until nothing changes and
+gets 3's true distance, 2.
+
+Then arbitrage. I made up exchange rates for four currencies that are
+consistent with each other, then mispriced one quote, EUR to GBP, by 1%:
+
+```text
+rates 1.000 0.9200 0.7899 151.1 | 1.087 1.000 0.8672 164.2 | 1.266 1.165 1.000 191.2 | 0.006620 0.006090 0.005229 1.000
+arbitrage EUR->GBP GBP->EUR 1000 -> 1010.00
+```
+
+Bellman–Ford found the negative cycle, EUR to GBP and back, and following
+it turns 1,000 euros into 1,010. Real markets close such gaps within
+milliseconds; the algorithm is how the gaps are found.
+
+Finally, the two general algorithms on the same large graph, 200,000
+vertices and a million edges with positive integer weights:
+
+```text
+V 200000 E 1000000: dijkstra 723 ms, bellman-ford 5468 ms, same distances true
+```
+
+The same distances for all 200,000 vertices, and Dijkstra about seven
+times faster. When weights are non-negative, there is no reason to pay for
+Bellman–Ford's generality.
+
+### Common mistake
+
+Running Dijkstra on a graph with negative edges, as above. It does not
+crash; it returns wrong distances that look plausible. Typical sources of
+negative weights are costs that can be credits (refunds, rebates), log
+transformations of probabilities or rates, and "rewards" in game or
+planning graphs. If any weight can be negative, use Bellman–Ford or, for a
+DAG, the topological method. A useful trick, used by Johnson's algorithm,
+reweights the edges to remove negatives while keeping shortest paths the
+same, so Dijkstra can then be used; it needs one Bellman–Ford run first.
+
+A second mistake is adding a constant to every weight to make them
+non-negative. Unlike for MSTs, this changes the answer: a path with more
+edges gets a bigger penalty, so short-in-edges paths win unfairly.
+
+### In real systems
+
+- **Routing on the internet:** link-state protocols (OSPF, IS-IS) give
+  every router the full map and each runs Dijkstra to build its forwarding
+  table. Distance-vector protocols (RIP, and in spirit BGP) are distributed
+  Bellman–Ford: each router tells its neighbours its distances and they
+  relax.
+- **Maps and navigation:** road networks have tens of millions of vertices.
+  Production route planners run Dijkstra's ideas with heavy preprocessing
+  (contraction hierarchies, landmarks) and A*, which adds a lower-bound
+  estimate of the remaining distance to the priority.
+- **Project management:** the critical path method, from the late 1950s,
+  is the topological algorithm on the job graph, and it is what Gantt-chart
+  tools compute.
+- **Finance:** negative-cycle detection on log-transformed rates is the
+  textbook arbitrage detector.
+- **Build and CI systems** compute the critical path of a build graph to
+  know which steps to speed up: shortening a step off the critical path
+  does not shorten the build.
+
+### Check yourself
+
+<details>
+<summary>1. What is the difference between Prim's and Dijkstra's algorithms?</summary>
+
+The same loop with a priority queue of vertices; the key differs. Prim
+keys a vertex by the weight of the lightest edge to the tree, Dijkstra by
+the total distance from the source through the tree. Prim builds an MST of
+an undirected graph; Dijkstra builds a shortest-paths tree of a digraph.
+
+</details>
+
+<details>
+<summary>2. Why can the topological method handle negative weights when Dijkstra cannot?</summary>
+
+In topological order, every edge into a vertex has been relaxed before the
+vertex's own edges are used, whatever the weights. Dijkstra relies instead
+on "the closest vertex cannot improve", which a negative edge can violate.
+
+</details>
+
+<details>
+<summary>3. Why is "longest path" easy in a DAG but hard in general?</summary>
+
+In a DAG, negate the weights and solve shortest paths in topological order;
+there are no cycles to exploit. In a general graph, longest simple path
+includes the Hamiltonian path problem, which is NP-complete.
+
+</details>
+
+## From beginner to strategy
+
+<Levels label="Chapter 4, Graphs">
+<Level name="Beginner" depth={3}>
+
+At the smallest scale, a graph is dots and lines, and the first skill is
+seeing them in a problem that does not mention graphs. Friends on a social
+network, flights between airports, pages and links, cells of a maze. Once
+you can draw it, you can ask the two basic questions: can I get from here
+to there, and what is the shortest way?
+
+The smallest working example is BFS on an adjacency list:
+
+```ts
+const adj: number[][] = [[1, 2], [0, 3], [0, 3], [1, 2]];   // a square: 0-1, 0-2, 1-3, 2-3
+const dist = new Array(adj.length).fill(-1); const queue = [0]; dist[0] = 0;
+for (let head = 0; head < queue.length; head++) {
+  const v = queue[head];
+  for (const w of adj[v]) if (dist[w] === -1) { dist[w] = dist[v] + 1; queue.push(w); }
+}
+// dist = [0, 1, 1, 2]
+```
+
+Vertex 3 is two steps from 0 whichever way you go round the square. The
+beginner's mistake is to search without marking, so the search goes round
+the square forever.
+
+</Level>
+<Level name="Intermediate" depth={3}>
+
+In a real program the graph is often **implicit**: you never build the
+adjacency lists, you compute the neighbours on demand. A maze or a game map
+is a grid where each open cell is a vertex and its open neighbours (up,
+down, left, right) are its edges. BFS on that grid finds the fewest moves:
+
+```text
+S**#******
+.#*#*####*
+.#***#...*
+.####.#.#*
+......#.#G
+steps 17 cells expanded 29
+```
+
+The stars are the path BFS reconstructed from its `prev` links: 17 moves,
+found after expanding 29 cells. The same pattern covers word ladders (words
+are vertices, one-letter changes are edges), puzzle solvers (states and
+moves) and "friends of friends" features: generate neighbours on the fly,
+keep a `Set` of visited states, and BFS.
+
+</Level>
+<Level name="Advanced" depth={3}>
+
+At the advanced level, the question is how to search **less** of the
+graph. Dijkstra explores in growing circles around the source, in every
+direction, even away from the target. **A\*** adds a lower bound on the
+remaining distance to each vertex's priority (on a grid, the Manhattan
+distance), so the search leans towards the target and still returns a
+shortest path as long as the bound never overestimates. On a 600 × 600 grid
+with a quarter of the cells blocked, from one corner to the other:
+
+```text
+grid 600x600, 25% walls: dijkstra dist 1198 settled 268248 | A* dist 1198 settled 54223
+```
+
+Same distance, five times fewer vertices settled. Route planners go much
+further, precomputing shortcuts (contraction hierarchies) so a
+continent-scale query settles only a few hundred vertices. The advanced
+habit is to ask what extra knowledge (a bound, a precomputation, a
+direction) lets the search skip work without losing correctness.
+
+</Level>
+<Level name="Edge cases" depth={3}>
+
+- **Self-loops and parallel edges.** The book's graphs allow both. A
+  self-loop makes an undirected graph cyclic and appears twice in its own
+  adjacency list; parallel edges count twice in degrees. Decide whether
+  your input can contain them.
+- **Disconnected graphs.** A single DFS or BFS from one source sees one
+  component; algorithms that need all vertices (components, topological
+  sort, Kosaraju) loop over every unmarked vertex.
+- **The source itself.** `distTo[s] = 0` and `pathTo(s)` is `[s]`; test
+  both, since off-by-one bugs in path reconstruction show up here.
+- **Unreachable vertices** keep distance infinity. Never print infinity as
+  a number in an API response; return "no path".
+- **Ties in weights.** The MST is unique only if weights are distinct; with
+  ties, different algorithms may return different trees of the same total.
+
+</Level>
+<Level name="Corner cases" depth={3}>
+
+- **Deep recursion.** A path graph of 100,000 vertices overflowed Node's
+  stack in my recursive DFS. Write DFS iteratively for any input you do not
+  control.
+- **Negative edges in Dijkstra** give wrong answers silently, as in the
+  four-vertex example.
+- **Negative cycles** make shortest paths undefined. Bellman–Ford must
+  detect them rather than loop forever, and a reported "shortest distance"
+  to a vertex behind a negative cycle is meaningless.
+- **Floating-point weights** accumulate rounding error, so two paths that
+  should tie may differ in the last bit. Compare with a tolerance, or use
+  integer weights (cents, milliseconds) when you can.
+- **Huge degree vertices** (a celebrity in a social graph) make
+  "for each neighbour" loops expensive and BFS frontiers enormous; real
+  systems sample or cap them.
+
+</Level>
+<Level name="Production level" depth={3}>
+
+In production, graphs are usually too big or too dynamic for the
+textbook's in-memory arrays. Adjacency lists in compressed form (CSR: one
+array of offsets, one array of neighbours) cut memory by an order of
+magnitude compared with arrays of arrays. Graph databases (Neo4j and
+others) store adjacency directly so traversals are pointer-chasing rather
+than joins. At web scale, systems such as Pregel-style frameworks run BFS,
+connected components and PageRank as rounds of message passing between
+vertices, which is distributed Bellman–Ford in spirit.
+
+Dynamic graphs raise new questions: recomputing shortest paths after one
+edge changes, or connectivity as edges arrive (union–find again). For most
+application code, though, the graph fits in memory and the textbook
+algorithms, written iteratively, are what you want.
+
+</Level>
+<Level name="Mindset" depth={3}>
+
+The habit is to name the graph before choosing an algorithm: what are the
+vertices, what are the edges, are they directed, are they weighted, can
+weights be negative, is it acyclic? Those five answers pick the algorithm
+almost mechanically. BFS for unweighted, Dijkstra for non-negative,
+topological order for DAGs, Bellman–Ford for negative, union–find or DFS
+for connectivity, Prim or Kruskal for MST.
+
+The second habit is noticing that one search algorithm (mark, frontier,
+relax) underlies everything. DFS, BFS, Prim, Dijkstra and A* differ only in
+what kind of queue holds the frontier and what key orders it.
+
+</Level>
+<Level name="System design" depth={3}>
+
+At the system level, graphs appear as dependency graphs (services,
+packages, build steps), routing graphs (networks, maps, message brokers)
+and relationship graphs (social, fraud rings, recommendations). Design
+questions are graph questions: a startup order for services is a
+topological sort; a cycle in service dependencies means neither can start
+first; the services on every path from the load balancer to the database
+are single points of failure (articulation points, a DFS extension);
+fraud rings show up as dense strong components in a payment graph.
+
+When I review a design, I draw its dependency graph and check three
+things: no cycles, the critical path through a request, and which vertices
+every path goes through.
+
+</Level>
+<Level name="Strategy" depth={3}>
+
+Build in this order: the `Graph` and `Digraph` classes; DFS and BFS paths
+with path reconstruction; components, cycle detection and two-colouring;
+DFS orders, topological sort and Kosaraju; the weighted graph classes, lazy
+Prim and Kruskal (reuse chapter 1's union–find and chapter 2's heap);
+Dijkstra, the acyclic algorithm with critical paths, and Bellman–Ford with
+negative-cycle detection. Test every algorithm on the same handful of
+small graphs drawn on paper, then on large random ones where two
+algorithms must agree (Prim against Kruskal, Dijkstra against
+Bellman–Ford).
+
+Done when I can say, for any graph problem described in words, which
+algorithm solves it and its cost, and can trace DFS orders and Dijkstra's
+queue by hand.
+
+</Level>
+</Levels>
+
+## Questions people ask
+
+**Adjacency list or matrix?** List, unless the graph is small and dense or
+you need constant-time edge tests. Almost all real graphs are sparse.
+
+**DFS or BFS?** BFS when you need shortest paths in edge count or the
+closest things first. DFS when you need the structure of the graph: orders,
+cycles, components, strong components. For plain reachability either works;
+an iterative version of either avoids stack limits.
+
+**Why does Dijkstra fail with negative weights if it is just "relax in a
+clever order"?** Because its order assumes a settled vertex can never
+improve, which a later negative edge can break. The relaxation step is
+fine; the order is the problem.
+
+**Is A\* a different algorithm from Dijkstra?** It is Dijkstra with a
+modified priority: distance so far plus an estimate of the distance
+remaining. With an estimate of zero it is exactly Dijkstra.
+
+**What about all-pairs shortest paths?** Run Dijkstra from every vertex for
+sparse graphs with non-negative weights. For dense graphs, the
+Floyd–Warshall algorithm (three nested loops, `V³`) is simpler. The book
+mentions both; it focuses on single-source.
+
+**Where do strong components matter in practice?** Anywhere a cycle means
+something: mutually recursive functions in a compiler, groups of web pages
+that all reach each other, services that depend on each other in a
+circle, and the condensation of a graph into a DAG of components before
+running DAG algorithms on it.
+
+**Are these algorithms used as written?** The ideas are. Production code
+uses iterative searches, compact arrays instead of objects, and a binary
+heap with lazy deletion instead of an indexed priority queue, as I did
+here. Those changes affect constants and memory, not the algorithms.
+
+## Key takeaways
+
+- Represent sparse graphs with adjacency lists: `V + E` space and neighbour iteration in time proportional to degree.
+- DFS and BFS both cost `V + E`; BFS finds shortest paths in edge count, DFS reveals structure.
+- Connected components, cycle detection and two-colouring are small changes to DFS or BFS.
+- In digraphs, a directed cycle is an edge to a vertex on the current DFS stack, not just a marked one.
+- Reverse postorder of a DAG is a topological order; Kahn's indegree method is the queue-based alternative.
+- Kosaraju's algorithm finds strong components with two DFS passes, the first on the reverse graph.
+- The cut property (the lightest crossing edge is in the MST) justifies both Prim and Kruskal.
+- Prim grows one tree with a priority queue; Kruskal merges a forest with sorting and union–find.
+- Shortest-path algorithms all relax edges; they differ in the order: by distance (Dijkstra), topological (DAGs), or in rounds (Bellman–Ford).
+- Dijkstra needs non-negative weights; the topological method handles negative weights and longest paths in DAGs; Bellman–Ford handles negative weights and finds negative cycles.
+- Critical paths and arbitrage are shortest-path problems after a change of weights.
+
+## Glossary
+
+- **Adjacency list:** for each vertex, the list of its neighbours.
+- **Bipartite graph:** a graph whose vertices can be coloured with two colours so every edge joins different colours.
+- **Breadth-first search (BFS):** a search that visits vertices in order of their distance in edges from the source, using a queue.
+- **Critical path:** the longest path through a job graph; its length is the project's minimum duration.
+- **Cut:** a partition of the vertices into two non-empty sets.
+- **Cut property:** the lightest edge crossing any cut belongs to the minimum spanning tree.
+- **Depth-first search (DFS):** a search that follows one path as deep as possible before backing up.
+- **Digraph:** a directed graph, whose edges go one way.
+- **Directed acyclic graph (DAG):** a digraph with no directed cycles.
+- **Edge relaxation:** replacing a vertex's best known distance when a path through a given edge is shorter.
+- **Minimum spanning tree (MST):** a spanning tree of minimum total edge weight.
+- **Negative cycle:** a directed cycle whose total weight is negative.
+- **Postorder:** the order in which DFS calls finish.
+- **Reachability:** whether a directed path exists from one vertex to another.
+- **Shortest-paths tree:** the tree of last edges (`edgeTo`) on shortest paths from a source.
+- **Spanning tree:** a subgraph that is a tree and includes every vertex.
+- **Strong component:** a maximal set of vertices that can all reach each other.
+- **Topological order:** an ordering of a DAG's vertices with every edge pointing forward.
+
+## Exercises and self-check
+
+My own exercises; the book's exercises at the end of each section are
+worth a pass too.
+
+**Warm-up (by hand)**
+
+1. Draw the graph with edges `0–1, 0–3, 1–2, 2–3, 3–4, 4–5, 5–6, 6–4`. Run
+   DFS and BFS from 0 (neighbours in the order listed) and draw both trees.
+2. Is that graph bipartite? Find the odd cycle or give the colouring.
+3. Give the preorder, postorder and a topological order of the digraph
+   `0→1, 0→2, 1→3, 2→3, 3→4`.
+4. Run Kruskal and Prim (from 0) on the 4.3 example graph with `1–2`
+   reweighted to 8. Which edges change?
+5. Run Dijkstra from 0 on the 4.4 example with `0→2` reweighted to 6, one
+   row per vertex taken.
+
+**Build (in TypeScript)**
+
+6. Write an iterative DFS that produces exactly the same preorder as the
+   recursive one. (Hint: push neighbours in reverse order, and mark on pop.)
+7. Add articulation-point detection (vertices whose removal disconnects the
+   graph) to DFS using discovery times and low links.
+8. Write the eager version of Prim with an indexed min priority queue and
+   compare its maximum queue size with the lazy version on a dense graph.
+9. Add A\* to your Dijkstra with a pluggable heuristic, and check on random
+   grids that it always returns the same distance as Dijkstra.
+
+**Measure**
+
+10. Measure components on random graphs with average degree 0.5, 1, 1.5, 2
+    and 3. Plot the size of the largest component and find where the giant
+    component appears.
+11. Compare Kruskal with an object sort against Kruskal sorting edge
+    indices in a `Float64Array`, at a million edges.
+
+**Apply**
+
+12. Read your project's `package.json` dependencies (or any dependency
+    manifest) into a digraph, topologically sort it, and report any cycle.
+13. Model a real project of yours as jobs with durations and dependencies,
+    compute its critical path, and list each job's slack.
+
+<details>
+<summary>Answer to warm-up 2</summary>
+
+No. `4–5–6–4` is a triangle, an odd cycle, so no two-colouring exists. The
+part `0 1 2 3` alone (a square) is bipartite: 0 and 2 one colour, 1 and 3
+the other.
+
+</details>
+
+<details>
+<summary>Answer to warm-up 3</summary>
+
+DFS from 0 with neighbours in the listed order: preorder `0 1 3 4 2`,
+postorder `4 3 1 2 0`, reverse postorder `0 2 1 3 4`, which is a valid
+topological order.
+
+</details>
+
+## How I'd study this chapter
+
+This chapter belongs to phase 4, algorithms, of the
+<a href={withBase('/plans/traditional-software-developer/')}>traditional core roadmap</a>.
+It reuses every earlier chapter, so I would only start it with chapters 1
+to 3 built and tested. I would give it six sessions.
+
+<Timeline caption="Six sessions for chapter 4. Each ends with code, a trace by hand on a graph drawn on paper, and a large-scale run." items={[
+  { when: "Session 1", what: "4.1: Graph class, DFS and BFS with paths, the iterative DFS. Trace both on a paper graph." },
+  { when: "Session 2", what: "4.1: components, cycles, two-colouring, a symbol graph with degrees of separation, the giant-component experiment." },
+  { when: "Session 3", what: "4.2: Digraph, directed cycles, DFS orders, topological sort and Kahn. Then Kosaraju, traced by hand." },
+  { when: "Session 4", what: "4.3: the cut property proof in my own words, lazy Prim, Kruskal with union–find, agreement test at scale." },
+  { when: "Session 5", what: "4.4: relaxation, Dijkstra with its queue traced, the acyclic algorithm and a critical path for a real project." },
+  { when: "Session 6", what: "4.4: Bellman–Ford, negative cycles and arbitrage, then A* on grids. Write the which-algorithm table from memory." },
+]} />
+
+I keep one `ch4/` folder with the graph classes, every algorithm, a set of
+small hand-drawn test graphs with their expected answers, and the scale
+tests. The README holds the "name the graph, pick the algorithm" table.
+
+Done when every algorithm passes the small graphs, the pairs agree at
+scale (Prim and Kruskal, Dijkstra and Bellman–Ford, Dijkstra and A\*), I
+can trace DFS orders, Kosaraju and Dijkstra's queue by hand, and I can map
+any graph problem described in words to its algorithm and cost.
