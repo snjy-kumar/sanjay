@@ -172,6 +172,26 @@ structure with reasons instead of preferences.
 
 **Get it:** [Book site](https://fundamentalsofsoftwarearchitecture.com/).
 
+## Book understanding by engineering topic
+
+Books should not be collected as trophies; each book is an instrument to master a specific engineering discipline and mental model. Below is the topic-wise map of what each book teaches, the invariant mental model it establishes, and how to verify understanding in code.
+
+| Engineering Topic | Recommended Book | Core Mental Model / Takeaway | Proof in Code / Practice Artifact |
+| :--- | :--- | :--- | :--- |
+| **Software Design & Complexity** | *A Philosophy of Software Design* (John Ousterhout) | Complexity is incremental. Deep modules hide information behind simple interfaces; shallow modules amplify changes. | Refactor a complex subsystem: simplify its public interface by 50% while hiding internal state machines. |
+| **Debugging Methodology** | *Debugging: The 9 Indispensable Rules* (David J. Agans) | Never guess. Make it fail reliably, understand the system rules, divide and conquer, and prove the fix before closing. | Write reproduction steps, an audit trail, and regression tests for a bug before touching implementation. |
+| **Type Systems & Invariants** | *Effective TypeScript* (Dan Vanderkam) | Types are a verification harness, not decoration. Wide types leak bugs; strict boundaries and narrowing keep generated code honest. | Enable strict compiler flags, replace wide primitives with branded types or discriminated unions, eliminate all `any`. |
+| **Legacy Codebases & Refactoring** | *Working Effectively with Legacy Code* (Michael Feathers) | Legacy code is code without tests. Find natural seams, introduce sensing variables, break dependencies, and wrap changes in tests. | Extract a seam in a sprawling legacy function and write a characterization test before modifying logic. |
+| **Database Internals & SQL Performance** | *Use the Index, Luke* (Markus Winand) | Databases are B-trees and block I/O. Indexes only work when matching access patterns; query plans reveal runtime truth. | Run `EXPLAIN ANALYZE` on a slow endpoint, inspect index scans vs sequential scans, and design an optimal compound index. |
+| **Web Transport & Networking** | *High Performance Browser Networking* (Ilya Grigorik) | Speed is latency and connection mechanics (TCP slow start, TLS handshakes, HTTP/2 multiplexing, head-of-line blocking). | Profile network waterfalls in Chrome DevTools: eliminate roundtrips, optimize connection reuse, measure CWV. |
+| **Operating Systems & Linux Shell** | *The Linux Command Line* (William Shotts) / *OSTEP* | The computer is processes, file descriptors, virtual memory, signals, and pipes. Operational fluency beats GUI crutches. | Debug an unreachable production service via SSH: inspect `ps`, `ss`, open file descriptors, system logs, and memory. |
+| **Testing & Behavioral Verification** | *Unit Testing: Principles, Practices, and Patterns* (Vladimir Khorikov) | Tests must verify observable business behavior, not implementation details. Mocking internal collaborators produces fragile tests. | Rewrite a brittle test suite: eliminate mocks of private helpers and verify end-to-end outcome invariants. |
+| **Distributed Systems & Data Architecture** | *Designing Data-Intensive Applications* (Martin Kleppmann) | There is no magic database. Understand replication lag, partition tolerance, consensus, write-ahead logs, and transactions. | Model a dual-write problem between Postgres and cache/search index, and design an idempotent event-driven reconciliation. |
+| **Systems Performance & Observability** | *Systems Performance* (Brendan Gregg) | Performance is measurement, not intuition. Use the USE method (Utilization, Saturation, Errors) across CPU, memory, and I/O. | Profile CPU flame graphs and memory heap allocations under load to identify the exact bottleneck. |
+| **Software Architecture & Tradeoffs** | *Fundamentals of Software Architecture* (Mark Richards & Neal Ford) | Architecture is the decisions that are hard to change. Every pattern has tradeoffs; evaluate coupling, cohesion, and scalability forces. | Author an Architectural Decision Record (ADR) analyzing three structural options for a service boundary. |
+| **Code Comprehension & Cognition** | *The Programmer's Brain* (Felienne Hermans) | Reading code uses short-term memory, working memory, and long-term memory. Structure code to minimize cognitive load. | Re-structure an unreadable module using cognitive chunking, semantic naming conventions, and explicit variable roles. |
+| **Technical Writing & Communication** | *On Writing Well* (William Zinsser) | Clarity of writing is clarity of thought. Eliminate clutter, state invariants directly, and write for the reader's decision-making. | Write a 1-page design proposal or incident postmortem that enables a team decision without verbal explanation. |
+
 ## Free, legal, and worth bookmarking
 
 Several of the best books in this list cost nothing. Start with these if money
