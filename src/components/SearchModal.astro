@@ -1,0 +1,202 @@
+---
+import { withBase } from '../utils/base';
+---
+
+<dialog id="search-dialog" class="search-dialog" aria-label="Search site">
+  <div class="search-box">
+    <div class="search-input-row">
+      <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="7" cy="7" r="4.5"></circle>
+        <path d="M10.5 10.5L14 14"></path>
+      </svg>
+      <input
+        type="search"
+        id="search-input"
+        class="search-input"
+        placeholder="Search notes, topics, roadmaps... (Esc to close)"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button type="button" id="search-close" class="search-close" aria-label="Close search">Esc</button>
+    </div>
+    <div id="search-results" class="search-results" role="listbox">
+      <p class="search-hint">Type to search notes, topics, and curricula...</p>
+    </div>
+  </div>
+</dialog>
+
+<script is:inline define:vars={{ searchIndexUrl: withBase('/search-index.json') }}>
+  (function () {
+    let indexData = null;
+    let selectedIndex = -1;
+
+    function getElements() {
+      const dialog = document.getElementById('search-dialog');
+      const input = document.getElementById('search-input');
+      const results = document.getElementById('search-results');
+      const closeBtn = document.getElementById('search-close');
+      return { dialog, input, results, closeBtn };
+    }
+
+    async function loadIndex() {
+      if (indexData) return indexData;
+      try {
+        const res = await fetch(searchIndexUrl);
+        if (res.ok) {
+          indexData = await res.json();
+          return indexData;
+        }
+      } catch (err) {
+        console.error('Failed to load search index', err);
+      }
+      return [];
+    }
+
+    function openModal() {
+      const { dialog, input } = getElements();
+      if (!dialog) return;
+      if (typeof dialog.showModal === 'function') {
+        if (!dialog.open) dialog.showModal();
+      } else {
+        dialog.setAttribute('open', '');
+      }
+      loadIndex();
+      if (input) {
+        input.value = '';
+        input.focus();
+        renderResults('');
+      }
+    }
+
+    function closeModal() {
+      const { dialog } = getElements();
+      if (!dialog) return;
+      if (typeof dialog.close === 'function') {
+        dialog.close();
+      } else {
+        dialog.removeAttribute('open');
+      }
+    }
+
+    function renderResults(query) {
+      const { results } = getElements();
+      if (!results) return;
+
+      const q = query.trim().toLowerCase();
+      if (!q) {
+        results.innerHTML = '<p class="search-hint">Type to search notes, topics, and curricula...</p>';
+        selectedIndex = -1;
+        return;
+      }
+
+      if (!indexData) {
+        results.innerHTML = '<p class="search-hint">Loading index...</p>';
+        return;
+      }
+
+      const tokens = q.split(/\s+/).filter(Boolean);
+      const matches = indexData.filter((item) => {
+        const text = `${item.title} ${item.category} ${item.description || ''} ${(item.tags || []).join(' ')}`.toLowerCase();
+        return tokens.every((token) => text.includes(token));
+      }).slice(0, 10);
+
+      if (matches.length === 0) {
+        results.innerHTML = `<p class="search-empty">No results found for "<strong>${escapeHtml(query)}</strong>"</p>`;
+        selectedIndex = -1;
+        return;
+      }
+
+      results.innerHTML = matches
+        .map(
+          (item, idx) => `
+        <a class="search-item ${idx === 0 ? 'is-selected' : ''}" href="${item.url}" role="option" data-idx="${idx}">
+          <div class="search-item-main">
+            <span class="search-item-title">${escapeHtml(item.title)}</span>
+            <span class="search-item-meta">${escapeHtml(item.category)} · ${escapeHtml(item.type)}</span>
+          </div>
+          ${item.description ? `<p class="search-item-desc">${escapeHtml(item.description)}</p>` : ''}
+        </a>`
+        )
+        .join('');
+
+      selectedIndex = 0;
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function setupListeners() {
+      const { dialog, input, closeBtn, results } = getElements();
+      if (!dialog) return;
+
+      if (closeBtn) closeBtn.addEventListener('click', closeModal);
+
+      dialog.addEventListener('click', (e) => {
+        if (e.target === dialog) closeModal();
+      });
+
+      if (input) {
+        input.addEventListener('input', (e) => {
+          renderResults(e.target.value);
+        });
+
+        input.addEventListener('keydown', (e) => {
+          const items = results ? Array.from(results.querySelectorAll('.search-item')) : [];
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (items.length > 0) {
+              selectedIndex = (selectedIndex + 1) % items.length;
+              updateSelection(items);
+            }
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (items.length > 0) {
+              selectedIndex = (selectedIndex - 1 + items.length) % items.length;
+              updateSelection(items);
+            }
+          } else if (e.key === 'Enter') {
+            if (items.length > 0 && selectedIndex >= 0 && items[selectedIndex]) {
+              e.preventDefault();
+              items[selectedIndex].click();
+            }
+          }
+        });
+      }
+
+      document.querySelectorAll('[data-open-search]').forEach((btn) => {
+        btn.addEventListener('click', openModal);
+      });
+    }
+
+    function updateSelection(items) {
+      items.forEach((item, idx) => {
+        if (idx === selectedIndex) {
+          item.classList.add('is-selected');
+          item.scrollIntoView({ block: 'nearest' });
+        } else {
+          item.classList.remove('is-selected');
+        }
+      });
+    }
+
+    function handleGlobalKeys(e) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        openModal();
+        return;
+      }
+      if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(e.target?.tagName) && !e.target?.isContentEditable) {
+        e.preventDefault();
+        openModal();
+      }
+    }
+
+    window.removeEventListener('keydown', handleGlobalKeys);
+    window.addEventListener('keydown', handleGlobalKeys);
+
+    setupListeners();
+    document.addEventListener('astro:page-load', setupListeners);
+  })();
+</script>
