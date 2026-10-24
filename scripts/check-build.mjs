@@ -160,6 +160,18 @@ if (hasSeriesPages && (await exists(postsDir))) {
 // Every note in the collection has to have a page in the build. This also
 // catches a stale dist: if the build failed and left the previous output in
 // place, the note that was being written is missing from it.
+const plansContentDir = path.join('src', 'content', 'plans');
+if (await exists(plansContentDir)) {
+  for (const file of await readdir(plansContentDir)) {
+    if (!file.endsWith('.md') && !file.endsWith('.mdx')) continue;
+    const slug = file.replace(/\.mdx?$/, '');
+    const page = path.join(dist, 'plans', slug, 'index.html');
+    if (!(await exists(page))) {
+      note(`plans/${slug}/: the plan has no page in the build`);
+    }
+  }
+}
+
 const contentDir = path.join('src', 'content', 'blog');
 if (await exists(contentDir)) {
   const noteIds = new Set();
