@@ -1,10 +1,11 @@
-// What is coming next, but not yet scheduled.
+// What is coming next, but not yet shaped into a series.
 //
-// A series in series.ts is a committed curriculum with dated notes. A track
-// here is an intention: the plan exists, the notes do not. Keeping them apart
-// stops the learning path from claiming more than it has done.
+// A series in series.ts can be active, scheduled, or planned. A planned
+// series has a name, a description, and a slot, but no notes yet. A track
+// here is an intention that has not earned a series slot: the plan exists,
+// the shape does not yet.
 //
-// The path page shows these under the published series, so the strategy is
+// The path page shows these under the dedicated series, so the strategy is
 // visible without pretending the work is done.
 
 export interface RoadmapTrack {
@@ -19,35 +20,11 @@ export interface RoadmapTrack {
 
 export const roadmap: RoadmapTrack[] = [
   {
-    id: 'node',
-    name: 'Node and APIs',
+    id: 'career',
+    name: 'Career and open source',
     why:
-      'Every project on my GitHub is Express, Prisma and Postgres, and none of it is written up yet. The notes I write are frontend; the work I do is full-stack.',
-    size: 'about 16 notes',
-    topics: ['architecture', 'security', 'testing', 'debugging'],
-  },
-  {
-    id: 'testing',
-    name: 'Testing',
-    why:
-      'A test is the part of the work that keeps its value after the feature is forgotten. Reducers are easy to test; components and APIs are where the discipline actually shows.',
-    size: 'about 8 notes',
-    topics: ['testing', 'debugging', 'architecture'],
-  },
-  {
-    id: 'tooling',
-    name: 'How this site works',
-    why:
-      'This site runs a daily publish bot, a build gate, a share-card renderer and a feed. Nobody sees that work in a screenshot, and it is most of what I have learned about shipping.',
-    size: 'about 8 notes',
-    topics: ['tooling', 'performance'],
-  },
-  {
-    id: 'bugs',
-    name: 'Bugs I fixed',
-    why:
-      'A note that starts from a real failure teaches more than one that starts from documentation. Symptom, cause, fix, and the rule I kept so it does not come back.',
-    size: 'one or two a month',
-    topics: ['debugging', 'testing'],
+      'The last phase of the path: case studies, open-source contributions, interviews, and choosing a specialization. These are notes about the work around the code.',
+    size: 'about 6 notes',
+    topics: ['architecture', 'testing', 'debugging'],
   },
 ];
